@@ -225,11 +225,25 @@ def scan():
         rr=max(1.0,min(4.0,float(request.args.get("rr","2"))))
         markets=get_markets()
         # Fetch tickers in bulk for ranking, then analyze highest 24h turnover markets.
-        tickers=api_get("/v1/ticker", {"markets": ",".join(markets)})
-        if isinstance(tickers, list):
-            tick_by_market={x.get("market"):x for x in tickers}
-        else:
-            tick_by_market={}
+        
+        tick_by_market={}
+        batch_size=50
+        for i in range(0, len(markets), batch_size):
+            batch=markets[i:i + batch_size]
+            try:
+                tickers=api_get("/v1/ticker", {"markets": ",".join(batch)})
+                if isinstance(tickers, list):
+                    tick_by_market.update({
+                        x.get("market"): x for x in tickers
+                        if x.get("market")
+                    })
+            except Exception:
+                continue
+
+        
+      
+      
+            
         ranked=sorted(markets,key=lambda m: float(tick_by_market.get(m,{}).get("acc_trade_price_24h",0)),reverse=True)[:limit]
         results=[]
         for market in ranked:
