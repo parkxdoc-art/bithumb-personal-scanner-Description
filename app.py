@@ -129,6 +129,42 @@ def get_markets():
 def candles(market, minute, count=80):
     return api_get(f"/v1/candles/minutes/{minute}", {"market": market, "count": count})
 
+def analyze_5m_ma5(raw):
+    """완성된 5분봉으로 MA5와 돌파 상태 분석"""
+    if not isinstance(raw, list) or len(raw) < 6:
+        return {"ma5": None, "status": "데이터 부족"}
+
+    now_kst = datetime.now(KST)
+    completed = []
+
+    for candle in raw:
+        start = datetime.fromisoformat(
+            candle["candle_date_time_kst"]
+        ).replace(tzinfo=KST)
+
+        if start + timedelta(minutes=5) <= now_kst:
+            completed.append(candle)
+
+    completed.sort(key=lambda x: x["candle_date_time_kst"])
+
+    if len(completed) < 6:
+        return {"ma5": None, "status": "완성된 캔들 부족"}
+
+    closes = [float(x["trade_price"]) for x in completed]
+    ma5 = sum(closes[-5:]) / 5
+    prev_ma5 = sum(closes[-6:-1]) / 5
+
+    if closes[-2] <= prev_ma5 and closes[-1] > ma5:
+        status = "MA5 상향 돌파"
+    elif closes[-1] > ma5:
+        status = "MA5 위 유지"
+    else:
+        status = "MA5 아래"
+
+    return {"ma5": round(ma5, 8), "status": status}
+
+
+
 def ema(values, period):
     if len(values) < period: return None
     k = 2 / (period + 1)
