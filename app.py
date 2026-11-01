@@ -186,6 +186,7 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
     raw = candles(market, minute, 80)
     if not isinstance(raw, list) or len(raw) < 35:
         return None
+    ma5_info = analyze_5m_ma5(raw if minute == 5 else [])
     # Bithumb candle endpoint returns newest first; analysis uses oldest first.
     rows = list(reversed(raw))
     closes=[float(x["trade_price"]) for x in rows]
