@@ -246,7 +246,7 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
     value24=float(ticker.get("acc_trade_price_24h", 0)) if ticker else 0
     return {"market":market,"price":current,"change":change,"value24":value24,
             "vol_ratio":vol_ratio,"resistance":resistance,"signal":signal,"label":label,
-            "note":note,"stop":stop,"target":target}
+            "note":note,"stop":stop,"target":target,"target":target,"ma5_info":ma5_info}
 
 @app.get("/")
 def index():
