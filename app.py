@@ -195,7 +195,7 @@ def atr(rows, period=14):
     return sum(trs[-period:])/period if len(trs)>=period else None
 
 
-def calculate_score(change, ma5_info=None):
+def calculate_score(change, ma5_info=None, vol_ratio=None):
     score = 0
     if change >= 3:
         score = 25
@@ -210,6 +210,15 @@ def calculate_score(change, ma5_info=None):
         score += 25
     elif ma5_status == "MA5 위 유지":
         score += 15 
+    if vol_ratio is not None:
+        if vol_ratio >= 2.0:
+            score += 20
+        elif vol_ratio >= 1.5:
+            score += 15
+        elif vol_ratio >= 1.2:
+            score += 10
+
+    
   return score
     
 
