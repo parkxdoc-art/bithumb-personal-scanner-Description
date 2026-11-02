@@ -93,6 +93,7 @@ async function scan(){
  try{
   const allResults = [];
   const r=await fetch("/api/scan?"+qs.toString());const d=await r.json();
+  allResults.push(...d.results);
   if(!r.ok)throw new Error(d.error||"API 오류");
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
   document.getElementById("count").innerHTML=d.count+' <small>마켓</small>';
