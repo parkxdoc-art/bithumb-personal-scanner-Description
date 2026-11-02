@@ -194,7 +194,13 @@ def atr(rows, period=14):
         trs.append(max(hi-lo, abs(hi-prev), abs(lo-prev)))
     return sum(trs[-period:])/period if len(trs)>=period else None
 
+
+def calculate_score():
+    return 0
+
+
 def scan_market(market, minute, volume_multiple, rr, ticker=None):
+  
     raw = candles(market, minute, 80)
     if not isinstance(raw, list) or len(raw) < 35:
         return None
