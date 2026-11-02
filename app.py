@@ -91,6 +91,7 @@ async function scan(){
  document.getElementById("connection").textContent="조회 중";
  const qs=new URLSearchParams({tf:document.getElementById("tf").value,limit:document.getElementById("limit").value,vol:document.getElementById("vol").value,rr:document.getElementById("rr").value});
  try{
+  const allResults = [];
   const r=await fetch("/api/scan?"+qs.toString());const d=await r.json();
   if(!r.ok)throw new Error(d.error||"API 오류");
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
