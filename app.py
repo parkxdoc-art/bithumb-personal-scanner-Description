@@ -299,9 +299,12 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
     ticker = ticker or {}
     change=float(ticker.get("signed_change_rate", 0))*100 if ticker else ((current/closes[-2]-1)*100 if closes[-2] else 0)
     value24=float(ticker.get("acc_trade_price_24h", 0)) if ticker else 0
+        score = calculate_score(
+        change, ma5_info, vol_ratio, value24, signal, rr
+    )
     return {"market":market,"price":current,"change":change,"value24":value24,
             "vol_ratio":vol_ratio,"resistance":resistance,"signal":signal,"label":label,
-            "note":note,"stop":stop,"target":target,"target":target,"ma5_info":ma5_info}
+            "note":note,"stop":stop,"target":target,"target":target,"ma5_info":ma5_info,"score":score}
 
 @app.get("/")
 def index():
