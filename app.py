@@ -195,8 +195,16 @@ def atr(rows, period=14):
     return sum(trs[-period:])/period if len(trs)>=period else None
 
 
-def calculate_score():
-    return 0
+def calculate_score(change):
+    score = 0
+    if change >= 3:
+        score = 25
+    elif change >= 1:
+        score = 15
+    elif change > 0:
+        score = 5
+    return score
+    
 
 
 def scan_market(market, minute, volume_multiple, rr, ticker=None):
