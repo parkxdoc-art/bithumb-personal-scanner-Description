@@ -97,7 +97,7 @@ async function scan(){
   for (let page = 0; page < totalPages; page++) {
   qs.set("page", page);
   const r=await fetch("/api/scan?"+qs.toString()); d=await r.json();
-  if(!r.ok)throw new Error(d.error||"API 오류");
+  if(!r.ok)throw new Error("API 오류: "+r.status);
   allResults.push(...d.results);
   
   }
