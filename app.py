@@ -93,9 +93,16 @@ async function scan(){
  const totalPages = 10;
  try{
   const allResults = [];
-  const r=await fetch("/api/scan?"+qs.toString());const d=await r.json();
-  allResults.push(...d.results);
+  let d;
+  for (let page = 0; page < totalPages; page++) {
+  qs.set("page", page);
+  const r=await fetch("/api/scan?"+qs.toString()); d=await r.json();
   if(!r.ok)throw new Error(d.error||"API 오류");
+  allResults.push(...d.results);
+  
+  }
+  d.results = allResults;
+  d.count = allResults.length;
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
   document.getElementById("count").innerHTML=d.count+' <small>마켓</small>';
   document.getElementById("buys").innerHTML=d.results.filter(x=>x.signal==="BUY").length+' <small>코인</small>';
