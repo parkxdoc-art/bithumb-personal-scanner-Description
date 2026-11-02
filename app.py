@@ -203,7 +203,7 @@ def calculate_score(change, ma5_info=None, vol_ratio=None, value24=None, signal=
         score = 15
     elif change > 0:
         score = 5
-       ma5_info = ma5_info or {}
+    ma5_info = ma5_info or {}
     ma5_status = ma5_info.get("status", "")
 
     if ma5_status == "MA5 상향 돌파":
