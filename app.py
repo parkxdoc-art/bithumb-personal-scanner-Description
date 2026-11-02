@@ -90,7 +90,7 @@ async function scan(){
  const status=document.getElementById("status");status.textContent="빗썸 데이터를 조회하고 조건을 계산하는 중…";
  document.getElementById("connection").textContent="조회 중";
  const qs=new URLSearchParams({tf:document.getElementById("tf").value,limit:document.getElementById("limit").value,vol:document.getElementById("vol").value,rr:document.getElementById("rr").value,page:0});
- const totalPages = 1;
+ let totalPages = 1;
  try{
   const allResults = [];
   let d;
@@ -98,10 +98,14 @@ async function scan(){
   qs.set("page", page);
   const r=await fetch("/api/scan?"+qs.toString()); d=await r.json();
   if(!r.ok)throw new Error("API 오류: "+r.status);
+  if (page === 0) {
+  totalPages = Math.ceil(d.count / Number(qs.get("limit")));
+}
   allResults.push(...d.results);
-  status.textContent = `1차 조회 완료: ${allResults.length}개 코인`;
+  status.textContent = `${page + 1}/${totalPages}페이지 분석 완료 · ${allResults.length}개 코인`;
   
   }
+  const totalMarkets = d.count;
   d.results = allResults;
   d.results.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
   d.count = allResults.length;
