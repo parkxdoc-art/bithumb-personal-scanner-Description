@@ -99,6 +99,7 @@ async function scan(){
   const r=await fetch("/api/scan?"+qs.toString()); d=await r.json();
   if(!r.ok)throw new Error("API 오류: "+r.status);
   allResults.push(...d.results);
+  status.textContent = `1차 조회 완료: ${allResults.length}개 코인`;
   
   }
   d.results = allResults;
