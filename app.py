@@ -258,6 +258,7 @@ def scan():
         minute=int(request.args.get("tf","5"))
         if minute not in (1,3,5,10,30): minute=5
         limit=max(10,min(80,int(request.args.get("limit","40"))))
+        page = max(0, int(request.args.get("page", "0")))
         volume_multiple=max(1.0,min(3.0,float(request.args.get("vol","1.5"))))
         rr=max(1.0,min(4.0,float(request.args.get("rr","2"))))
         markets=get_markets()
