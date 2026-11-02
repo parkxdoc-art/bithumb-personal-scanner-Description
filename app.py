@@ -103,6 +103,7 @@ async function scan(){
   
   }
   d.results = allResults;
+  d.results.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
   d.count = allResults.length;
   d.scanned = allResults.length;
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
