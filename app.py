@@ -232,7 +232,7 @@ def calculate_score(change, ma5_info=None, vol_ratio=None, value24=None, signal=
 
     if rr is not None and rr >= 2:
         score += 5
-  return score
+    return score
     
 
 
