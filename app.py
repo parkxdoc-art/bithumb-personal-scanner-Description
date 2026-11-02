@@ -103,6 +103,7 @@ async function scan(){
   }
   d.results = allResults;
   d.count = allResults.length;
+  d.scanned = allResults.length;
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
   document.getElementById("count").innerHTML=d.count+' <small>마켓</small>';
   document.getElementById("buys").innerHTML=d.results.filter(x=>x.signal==="BUY").length+' <small>코인</small>';
