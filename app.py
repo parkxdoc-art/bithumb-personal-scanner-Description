@@ -116,7 +116,7 @@ async function scan(){
   status.textContent=`완료: ${d.scanned}개 코인 캔들 분석. 신호는 확정된 종가 기반의 참고용이며, 실시간 주문은 하지 않습니다. 손절·목표가는 단순 ATR 기반 참고값입니다.`;
  }catch(e){document.getElementById("connection").textContent="연결 실패";status.textContent="오류: "+e.message+" · 잠시 후 다시 시도하세요. Render 무료 서버라면 기동에 시간이 걸릴 수 있습니다."}
 }
-function toggleAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;document.getElementById("autoBtn").textContent="자동 갱신 켜기"}else{scan();autoTimer=setInterval(scan,60000);document.getElementById("autoBtn").textContent="자동 갱신 끄기"}}
+function toggleAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;document.getElementById("autoBtn").textContent="자동 갱신 켜기"}else{scan();autoTimer=setInterval(scan,180000);document.getElementById("autoBtn").textContent="자동 갱신 끄기"}}
 </script></body></html>
 """
 
