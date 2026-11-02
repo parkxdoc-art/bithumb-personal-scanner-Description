@@ -90,7 +90,7 @@ async function scan(){
  const status=document.getElementById("status");status.textContent="빗썸 데이터를 조회하고 조건을 계산하는 중…";
  document.getElementById("connection").textContent="조회 중";
  const qs=new URLSearchParams({tf:document.getElementById("tf").value,limit:document.getElementById("limit").value,vol:document.getElementById("vol").value,rr:document.getElementById("rr").value,page:0});
- const totalPages = 10;
+ const totalPages = 1;
  try{
   const allResults = [];
   let d;
