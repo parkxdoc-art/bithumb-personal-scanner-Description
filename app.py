@@ -120,7 +120,7 @@ scanning = true;
     failedPages.push(page + 1);
     status.textContent = `${page + 1}페이지 오류 · 다음 페이지 계속`;
   }
-  await new Promise(resolve => setTimeout(resolve, 1000)); 
+  
   }
   const totalMarkets = d ? d.count : 0;
   if (!d) d = {count: 0, results: [], updated: "-"}; d.results = allResults;
