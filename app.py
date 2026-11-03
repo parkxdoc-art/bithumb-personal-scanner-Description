@@ -108,16 +108,17 @@ async function scan(){
   const totalMarkets = d.count;
   d.results = allResults;
   d.results.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
+  const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
   d.count = allResults.length;
   d.scanned = allResults.length;
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
   document.getElementById("count").innerHTML=d.count+' <small>마켓</small>';
-  document.getElementById("buys").innerHTML=d.results.filter(x=>x.signal==="BUY").length+' <small>코인</small>';
-  document.getElementById("watches").innerHTML=d.results.filter(x=>x.signal==="WATCH").length+' <small>코인</small>';
+  document.getElementById("buys").innerHTML=candidates.filter(x=>x.signal==="BUY").length+' <small>코인</small>';
+  document.getElementById("watches").innerHTML=candidates.filter(x=>x.signal==="WATCH").length+' <small>코인</small>';
   document.getElementById("updated").textContent=d.updated;
   const body=document.getElementById("rows");
-  if(!d.results.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
-  else body.innerHTML=d.results.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
+  if(!candidates.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
+  else body.innerHTML=candidates.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
   status.textContent=`완료: ${d.scanned}개 코인 캔들 분석. 신호는 확정된 종가 기반의 참고용이며, 실시간 주문은 하지 않습니다. 손절·목표가는 단순 ATR 기반 참고값입니다.`;
  }catch(e){document.getElementById("connection").textContent="연결 실패";status.textContent="오류: "+e.message+" · 잠시 후 다시 시도하세요. Render 무료 서버라면 기동에 시간이 걸릴 수 있습니다."}
 }
