@@ -91,22 +91,35 @@ async function scan(){
  document.getElementById("connection").textContent="조회 중";
  const qs=new URLSearchParams({tf:document.getElementById("tf").value,limit:document.getElementById("limit").value,vol:document.getElementById("vol").value,rr:document.getElementById("rr").value,page:0});
  let totalPages = 1;
+ let scanAll = true;
+ 
  try{
   const allResults = [];
   let d;
+  const failedPages = [];
   for (let page = 0; page < totalPages; page++) {
-  qs.set("page", page);
-  const r=await fetch("/api/scan?"+qs.toString()); d=await r.json();
-  if(!r.ok)throw new Error("API 오류: "+r.status);
-  
-  
+    qs.set("page", page);
+  try {
+    const r = await fetch("/api/scan?" + qs.toString(), {
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!r.ok) throw new Error("API 오류: " + r.status);
+    d = await r.json();
 
-  allResults.push(...d.results);
-  status.textContent = `${page + 1}/${totalPages}페이지 분석 완료 · ${allResults.length}개 코인`;
-  
+    if (scanAll && page === 0) {
+      totalPages = Math.ceil(d.count / Number(qs.get("limit")));
+    }
+
+    allResults.push(...d.results);
+    status.textContent = `${page + 1}/${totalPages}페이지 분석 완료 · ${allResults.length}개 코인`;
+  } catch (pageError) {
+    failedPages.push(page + 1);
+    status.textContent = `${page + 1}페이지 오류 · 다음 페이지 계속`;
   }
-  const totalMarkets = d.count;
-  d.results = allResults;
+  await new Promise(resolve => setTimeout(resolve, 1000)); 
+  }
+  const totalMarkets = d ? d.count : 0;
+  if (!d) d = {count: 0, results: [], updated: "-"}; d.results = allResults;
   d.results.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
   d.count = allResults.length;
@@ -116,7 +129,7 @@ async function scan(){
   document.getElementById("buys").innerHTML=candidates.filter(x=>x.signal==="BUY").length+' <small>코인</small>';
   document.getElementById("watches").innerHTML=candidates.filter(x=>x.signal==="WATCH").length+' <small>코인</small>';
   document.getElementById("updated").textContent=d.updated;
-  const body=document.getElementById("rows");
+  const body=document.getElementById(s");
   if(!candidates.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
   else body.innerHTML=candidates.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
   status.textContent=`완료: ${d.scanned}개 코인 캔들 분석. 신호는 확정된 종가 기반의 참고용이며, 실시간 주문은 하지 않습니다. 손절·목표가는 단순 ATR 기반 참고값입니다.`;
