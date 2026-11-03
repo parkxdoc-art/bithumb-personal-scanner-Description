@@ -367,13 +367,27 @@ def scan():
             
         ranked=sorted(markets,key=lambda m: float(tick_by_market.get(m,{}).get("acc_trade_price_24h",0)),reverse=True)[page * limit:(page + 1) * limit]
         results=[]
-        for market in ranked:
-            try:
-                item=scan_market(market,minute,volume_multiple,rr,tick_by_market.get(market))
-                if item: results.append(item)
-                time.sleep(0.08)
-            except Exception:
-                continue
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(
+                    scan_market, market, minute,
+                    volume_multiple, rr, tick_by_market.get(market)
+                )
+                for market in ranked
+            ]
+            for future in as_completed(futures):
+                try:
+                    item = future.result()
+                    if item:
+                        results.append(item)
+                except Exception:
+                    continue
+            
+        
+                
+                
+            
+                
         order={"BUY":0,"WATCH":1,"WAIT":2,"SELL":3}
         results.sort(key=lambda x:(order.get(x["signal"],9),-(x.get("vol_ratio") or 0)))
         return jsonify({"count":len(markets),"scanned":len(results),"results":results,
