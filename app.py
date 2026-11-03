@@ -411,7 +411,7 @@ def scan():
         order={"BUY":0,"WATCH":1,"WAIT":2,"SELL":3}
         results.sort(key=lambda x:(order.get(x["signal"],9),-(x.get("vol_ratio") or 0)))
         return jsonify({"count":len(markets),"scanned":len(results),"results":results,
-                        "updated":f"{datetime.now(KST):%H:%M:%S} KST · {time.perf_counter()-scan_start:.1f}초"
+                        "updated":f"{datetime.now(KST):%H:%M:%S} KST · {time.perf_counter()-scan_start:.1f}초"})
     except Exception as e:
         return jsonify({"error":str(e)}), 502
 
