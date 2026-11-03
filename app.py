@@ -367,9 +367,9 @@ def scan():
         markets=get_markets()
         # Fetch tickers in bulk for ranking, then analyze highest 24h turnover markets.
         
-        tick_by_market={}
+        tick_by_market = CACHE.get("tickers", {}) if time.time() - CACHE.get("tickers_at", 0) < 300 else {}
         batch_size=50
-        for i in range(0, len(markets), batch_size):
+        for i in (range(0, len(markets), batch_size) if len(tick_by_market) != len(markets) else []):
             batch=markets[i:i + batch_size]
             try:
                 tickers=api_get("/v1/ticker", {"markets": ",".join(batch)})
@@ -384,7 +384,7 @@ def scan():
         
       
       
-            
+        if len(tick_by_market) == len(markets): CACHE.update(tickers=tick_by_market.copy(), tickers_at=time.time())     
         ranked=sorted(markets,key=lambda m: float(tick_by_market.get(m,{}).get("acc_trade_price_24h",0)),reverse=True)[page * limit:(page + 1) * limit]
         results=[]
         with ThreadPoolExecutor(max_workers=5) as executor:
