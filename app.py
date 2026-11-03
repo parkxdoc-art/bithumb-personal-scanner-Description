@@ -356,6 +356,7 @@ def index():
 
 @app.get("/api/scan")
 def scan():
+    scan_start = time.perf_counter()
     try:
         minute=int(request.args.get("tf","5"))
         if minute not in (1,3,5,10,30): minute=5
@@ -410,7 +411,7 @@ def scan():
         order={"BUY":0,"WATCH":1,"WAIT":2,"SELL":3}
         results.sort(key=lambda x:(order.get(x["signal"],9),-(x.get("vol_ratio") or 0)))
         return jsonify({"count":len(markets),"scanned":len(results),"results":results,
-                        "updated":datetime.now(KST).strftime("%H:%M:%S KST")})
+                        "updated":f"{datetime.now(KST):%H:%M:%S} KST · {time.perf_counter()-scan_start:.1f}초"
     except Exception as e:
         return jsonify({"error":str(e)}), 502
 
