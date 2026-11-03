@@ -164,14 +164,32 @@ function toggleAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;docu
 </script></body></html>
 """
 
+
+from threading import local
+
+_API_LOCAL = local()
+
 def api_get(path, params=None, timeout=12):
-    r = requests.get(BITHUMB + path, params=params, timeout=timeout,
-                     headers={"accept": "application/json", "User-Agent": "BithumbSignalScanner/1.0"})
+    session = getattr(_API_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        _API_LOCAL.session = session
+
+    r = session.get(
+        BITHUMB + path,
+        params=params,
+        timeout=timeout,
+        headers={
+            "accept": "application/json",
+            "User-Agent": "BithumbSignalScanner/1.0"
+        }
+    )
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and data.get("status") not in (None, "0000"):
         raise RuntimeError(data.get("message", "Bithumb API error"))
     return data
+
 
 def get_markets():
     now = time.time()
