@@ -132,7 +132,7 @@ async function scan(){
   const body=document.getElementById("rows");
   if(!candidates.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
   else body.innerHTML=candidates.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
-  status.textContent=`완료: ${d.scanned}개 코인 캔들 분석. 신호는 확정된 종가 기반의 참고용이며, 실시간 주문은 하지 않습니다. 손절·목표가는 단순 ATR 기반 참고값입니다.`;
+  status.textContent = `완료: ${d.scanned}/${d.count}개 코인 분석 · 실패 페이지 ${failedPages.length}개${failedPages.length ? " (" + failedPages.join(", ") + "페이지)" : ""}`;
  }catch(e){document.getElementById("connection").textContent="연결 실패";status.textContent="오류: "+e.message+" · 잠시 후 다시 시도하세요. Render 무료 서버라면 기동에 시간이 걸릴 수 있습니다."}
 }
 function toggleAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;document.getElementById("autoBtn").textContent="자동 갱신 켜기"}else{scan();autoTimer=setInterval(scan,180000);document.getElementById("autoBtn").textContent="자동 갱신 끄기"}}
