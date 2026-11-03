@@ -101,30 +101,48 @@ scanning = true;
   const allResults = [];
   let d;
   const failedPages = [];
-  for (let page = 0; page < totalPages; page++) {
-    qs.set("page", page);
-  try {
-    const r = await fetch("/api/scan?" + qs.toString(), {
+    async function fetchPage(page) {
+    const params = new URLSearchParams(qs);
+    params.set("page", page);
+
+    const r = await fetch("/api/scan?" + params.toString(), {
       signal: AbortSignal.timeout(60000)
     });
     if (!r.ok) throw new Error("API 오류: " + r.status);
-    d = await r.json();
+    return await r.json();
+  }
 
-    if (scanAll && page === 0) {
-      totalPages = Math.ceil(d.count / Number(qs.get("limit")));
+  async function runPage(page) {
+    try {
+      const result = await fetchPage(page);
+      allResults.push(...result.results);
+      status.textContent = `${allResults.length}/${result.count}개 코인 분석 중`;
+      return result;
+    } catch (e) {
+      failedPages.push(page + 1);
+      return null;
     }
+  }
 
-    allResults.push(...d.results);
-    status.textContent = `${page + 1}/${totalPages}페이지 분석 완료 · ${allResults.length}개 코인`;
-  } catch (pageError) {
-    failedPages.push(page + 1);
-    status.textContent = `${page + 1}페이지 오류 · 다음 페이지 계속`;
+  d = await runPage(0);
+
+  if (!d) {
+    throw new Error("첫 페이지 조회 실패");
+  }
+
+  totalPages = Math.ceil(d.count / Number(qs.get("limit")));
+
+  for (let page = 1; page < totalPages; page += 3) {
+    const pages = Array.from(
+      {length: Math.min(3, totalPages - page)},
+      (_, i) => page + i
+    );
+    await Promise.all(pages.map(runPage));
   }
   
-  }
   const totalMarkets = d ? d.count : 0;
-  if (!d) d = {count: 0, results: [], updated: "-"}; d.results = allResults;
-  d.results.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
+  if (!d) d = {count: 0, results: [], updated: "-"}; 
+  d.results = allResults.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
   d.count = totalMarkets;
   d.scanned = allResults.length;
