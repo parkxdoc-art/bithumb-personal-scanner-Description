@@ -98,9 +98,9 @@ async function scan(){
   qs.set("page", page);
   const r=await fetch("/api/scan?"+qs.toString()); d=await r.json();
   if(!r.ok)throw new Error("API 오류: "+r.status);
-  if (page === 0) {
-  totalPages = Math.ceil(d.count / Number(qs.get("limit")));
-}
+  
+  
+
   allResults.push(...d.results);
   status.textContent = `${page + 1}/${totalPages}페이지 분석 완료 · ${allResults.length}개 코인`;
   
