@@ -122,7 +122,7 @@ async function scan(){
   if (!d) d = {count: 0, results: [], updated: "-"}; d.results = allResults;
   d.results.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
-  d.count = allResults.length;
+  d.count = totalMarkets;
   d.scanned = allResults.length;
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
   document.getElementById("count").innerHTML=d.count+' <small>마켓</small>';
