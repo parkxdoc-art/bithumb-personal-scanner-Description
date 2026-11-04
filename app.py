@@ -193,6 +193,9 @@ function updateBuyOutcomes(results, tf) {
 
         if (match) {
           item[field] = Number(match.price);
+          
+          item[`source_candle_${m}m`] = match.time;
+
           changed = true;
         }
       }
