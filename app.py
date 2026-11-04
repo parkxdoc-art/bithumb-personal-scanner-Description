@@ -141,9 +141,15 @@ function showBuyHistory() {
       return;
     }
 
-    area.textContent = history.slice(-20).reverse().map(x =>
-      `${x.market} | ${x.tf}분봉\n신호: ${x.candle_time}\n가격: ${x.signal_price}원\n`
-    ).join("\n");
+    area.textContent = history.slice(-20).reverse().map(x => {
+      const result = (p) => {
+        if (p == null || Number(x.signal_price) <= 0) return "대기";
+        const r = (Number(p) / Number(x.signal_price) - 1) * 100;
+        return `${p}원 (${r >= 0 ? "+" : ""}${r.toFixed(2)}%)`;
+      };
+      return `${x.market} | ${x.tf}분봉\n신호: ${x.candle_time}\n기준가: ${x.signal_price}원\n15분: ${result(x.price_15m)}\n30분: ${result(x.price_30m)}\n60분: ${result(x.price_60m)}\n`;
+    }).join("\n");
+
   } catch (e) {
     area.textContent = "BUY 기록을 읽을 수 없습니다.";
   }
