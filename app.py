@@ -83,6 +83,8 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 
 <div class="panel">
   <h2>BUY 신호 기록</h2>
+
+<button type="button" onclick="exportBuyHistory()">BUY 기록 CSV 백업</button>
   
 <div id="buyStats" style="white-space:pre-wrap;line-height:1.8;margin:12px 0 18px;">성과 통계 준비 중...</div>
 
@@ -94,6 +96,56 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <script>
 let autoTimer=null;
 let scanning=false;
+
+function exportBuyHistory() {
+  try {
+    const history = JSON.parse(
+      localStorage.getItem("bithumb_v2_buy_history") || "[]"
+    );
+
+    if (!Array.isArray(history) || !history.length) {
+      alert("백업할 BUY 기록이 없습니다.");
+      return;
+    }
+
+    const fields = [
+      "market", "tf", "candle_time", "detected_at",
+      "signal_price", "price_15m", "price_30m", "price_60m",
+      "source_candle_15m", "source_candle_30m",
+      "source_candle_60m"
+    ];
+
+    const safeCSV = value => {
+      const s = String(value ?? "");
+      const safe = /^[\s]*[=+\-@]/.test(s) ? "'" + s : s;
+      return '"' + safe.replace(/"/g, '""') + '"';
+    };
+
+    const csv = [
+      fields.join(","),
+      ...history.map(x =>
+        fields.map(k => safeCSV(x[k])).join(",")
+      )
+    ].join("\r\n");
+
+    const blob = new Blob(["\uFEFF", csv], {
+      type: "text/csv;charset=utf-8;"
+    });
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "bithumb_v2_buy_history.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) {
+    console.error(e);
+    alert("CSV 백업에 실패했습니다.");
+  }
+}
 
 function saveBuySignals(results, tf) {
   try {
