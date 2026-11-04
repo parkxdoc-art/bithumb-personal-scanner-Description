@@ -638,6 +638,8 @@ function toggleAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;docu
 
 showRecentBuyAlerts();
 
+setInterval(showRecentBuyAlerts, 60000);
+
 </script></body></html>
 """
 
