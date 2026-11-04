@@ -83,6 +83,9 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 
 <div class="panel">
   <h2>BUY 신호 기록</h2>
+  
+<div id="buyStats" style="white-space:pre-wrap;line-height:1.8;margin:12px 0 18px;">성과 통계 준비 중...</div>
+
   <pre id="buyHistory" style="white-space:pre-wrap;font-family:inherit;font-size:14px;">기록을 불러오는 중...</pre>
 </div>
 
@@ -163,6 +166,48 @@ function showBuyHistory() {
 
   } catch (e) {
     area.textContent = "BUY 기록을 읽을 수 없습니다.";
+  }
+}
+
+function showBuyStats() {
+  const area = document.getElementById("buyStats");
+  if (!area) return;
+
+  try {
+    const history = JSON.parse(
+      localStorage.getItem("bithumb_v2_buy_history") || "[]"
+    );
+
+    const lines = [`누적 BUY 신호: ${history.length}개`];
+
+    for (const m of [15, 30, 60]) {
+      const valid = history.filter(x =>
+        x[`source_candle_${m}m`] &&
+        Number(x.signal_price) > 0 &&
+        Number(x[`price_${m}m`]) > 0
+      );
+
+      if (!valid.length) {
+        lines.push(`${m}분: 집계 가능한 기록 없음`);
+        continue;
+      }
+
+      const returns = valid.map(x =>
+        (Number(x[`price_${m}m`]) / Number(x.signal_price) - 1) * 100
+      );
+
+      const avg = returns.reduce((a, b) => a + b, 0) / returns.length;
+      const wins = returns.filter(r => r > 0).length;
+      const winRate = wins / returns.length * 100;
+
+      lines.push(
+        `${m}분 | 평균 ${avg.toFixed(2)}% | 상승 비율 ${winRate.toFixed(1)}% | 표본 ${valid.length}개`
+      );
+    }
+
+    area.textContent = lines.join("\n");
+  } catch (e) {
+    area.textContent = "성과 통계를 읽을 수 없습니다.";
   }
 }
 
@@ -283,6 +328,8 @@ scanning = true;
     updateBuyOutcomes(allResults, document.getElementById("tf").value);
 
     showBuyHistory();
+
+    showBuyStats();
 
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
   d.count = totalMarkets;
