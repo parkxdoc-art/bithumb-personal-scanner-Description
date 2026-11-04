@@ -491,6 +491,12 @@ function money(x){if(x==null)return "—";let n=Number(x);if(n>=1e8)return (n/1e
 async function scan(){
 if (scanning) return;
 scanning = true;
+ const buyAlertBox = document.getElementById("buyAlert");
+    if (buyAlertBox) {
+      buyAlertBox.textContent = "";
+      buyAlertBox.style.display = "none";
+    }
+
  const status=document.getElementById("status");status.textContent="빗썸 데이터를 조회하고 조건을 계산하는 중…";
  document.getElementById("connection").textContent="조회 중";
  const qs=new URLSearchParams({tf:document.getElementById("tf").value,limit:document.getElementById("limit").value,vol:document.getElementById("vol").value,rr:document.getElementById("rr").value,page:0});
