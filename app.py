@@ -149,6 +149,42 @@ function showBuyHistory() {
   }
 }
 
+function updateBuyOutcomes(results, tf) {
+  if (String(tf) !== "5") return;
+
+  try {
+    const key = "bithumb_v2_buy_history";
+    const history = JSON.parse(localStorage.getItem(key) || "[]");
+    const byMarket = new Map(results.map(x => [x.market, x]));
+    let changed = false;
+
+    for (const item of history) {
+      if (String(item.tf) !== "5") continue;
+
+      const x = byMarket.get(item.market);
+      if (!x || !x.candle_time) continue;
+
+      const start = Date.parse(item.candle_time + "+09:00");
+      const latest = Date.parse(x.candle_time + "+09:00");
+      if (!Number.isFinite(start) || !Number.isFinite(latest)) continue;
+
+      const minutes = (latest - start) / 60000;
+
+      for (const m of [15, 30, 60]) {
+        const field = `price_${m}m`;
+        if (minutes === m && item[field] == null) {
+          item[field] = x.price;
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) localStorage.setItem(key, JSON.stringify(history));
+  } catch (e) {
+    console.warn("BUY 성과 갱신 실패:", e);
+  }
+}
+
 function won(x){if(x==null||!Number.isFinite(Number(x)))return "—";return Number(x).toLocaleString("ko-KR",{maximumFractionDigits:4})+"원"}
 function pct(x){return x==null?"—":(Number(x)>=0?"+":"")+Number(x).toFixed(2)+"%"}
 function money(x){if(x==null)return "—";let n=Number(x);if(n>=1e8)return (n/1e8).toFixed(1)+"억";if(n>=1e4)return (n/1e4).toFixed(0)+"만";return n.toLocaleString("ko-KR")}
@@ -209,6 +245,8 @@ scanning = true;
   d.results = allResults.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
   
     saveBuySignals(allResults, document.getElementById("tf").value);
+
+    updateBuyOutcomes(allResults, document.getElementById("tf").value);
 
     showBuyHistory();
 
