@@ -178,10 +178,18 @@ function updateBuyOutcomes(results, tf) {
         if (item[field] != null) continue;
 
         const target = start + m * 60000;
-        const match = candles.find(r => {
-          const closedAt = Date.parse(r.time + "+09:00") + 5 * 60000;
-          return closedAt >= target && closedAt < target + 5 * 60000;
-        });
+        
+        if (Date.now() < target) continue;
+
+        const match = candles
+          .filter(r => {
+            const closedAt = Date.parse(r.time + "+09:00") + 5 * 60000;
+            return Number.isFinite(closedAt) &&
+              closedAt <= target &&
+              closedAt >= start;
+          })
+          .at(-1);
+
 
         if (match) {
           item[field] = Number(match.price);
