@@ -347,12 +347,25 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
             vol_ratio=(volumes[-1]/avg_vol) if avg_vol>0 else None
             atrv=atr(rows)
             # retest tolerance around the line; last candle must hold line and close green.
-            broke_prev=prev_close <= line_prev * (1+tolerance)
+            
+            breakout_seen = False
+            for i in range(max(b + 1, len(rows) - 8), len(rows) - 2):
+                previous_line = highs[b] + slope * ((i - 1) - b)
+                breakout_line = highs[b] + slope * (i - b)
+                if (
+                    closes[i - 1] <= previous_line * (1 + tolerance)
+                    and closes[i] > breakout_line * (1 + tolerance)
+                ):
+                    breakout_seen = True
+                    break
+
             close_above=current > line_now * (1+tolerance)
             retest=(lows[-1] <= line_now*(1+tolerance) and current >= line_now and current > closes[-2])
             vol_ok=vol_ratio is not None and vol_ratio >= volume_multiple
             # If breakout was very recent, mark WATCH; only retest bounce is BUY.
-            if close_above and vol_ok and retest:
+            
+            if close_above and vol_ok and retest and breakout_seen:
+
                 signal="BUY";label="진입 확인";resistance="돌파선 지지 확인"
                 note="종가가 저항선 위 + 재확인 반등 + 거래량 조건"
             elif close_above or (current >= line_now*(1-tolerance) and vol_ok):
