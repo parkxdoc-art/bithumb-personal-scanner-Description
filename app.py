@@ -349,6 +349,9 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
             # retest tolerance around the line; last candle must hold line and close green.
             
             breakout_seen = False
+          
+            breakout_index = None
+
             for i in range(max(b + 1, len(rows) - 8), len(rows) - 2):
                 previous_line = highs[b] + slope * ((i - 1) - b)
                 breakout_line = highs[b] + slope * (i - b)
@@ -357,14 +360,27 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
                     and closes[i] > breakout_line * (1 + tolerance)
                 ):
                     breakout_seen = True
+                  
+                    breakout_index = i
+
                     break
+
+            support_held = (
+                breakout_index is not None
+                and all(
+                    closes[j] >= (highs[b] + slope * (j - b)) * (1 - tolerance)
+                    for j in range(breakout_index + 1, len(rows) - 1)
+                )
+            )
 
             close_above=current > line_now * (1+tolerance)
             retest=(lows[-1] <= line_now*(1+tolerance) and current >= line_now and current > closes[-2])
             vol_ok=vol_ratio is not None and vol_ratio >= volume_multiple
             # If breakout was very recent, mark WATCH; only retest bounce is BUY.
             
-            if close_above and vol_ok and retest and breakout_seen:
+            
+            if close_above and vol_ok and retest and breakout_seen and support_held:
+
 
                 signal="BUY";label="진입 확인";resistance="돌파선 지지 확인"
                 note="종가가 저항선 위 + 재확인 반등 + 거래량 조건"
