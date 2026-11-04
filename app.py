@@ -50,7 +50,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   <div class="card"><div class="k">마지막 갱신</div><div class="v" style="font-size:17px" id="updated">—</div></div>
 </div>
 <div id="buyAlert" role="status" aria-live="polite" style="display:none;margin:14px 0;padding:14px;border:1px solid #2b8a68;border-radius:12px;color:#7bedbb;font-weight:700;"></div>
-<button type="button" onclick="document.getElementById('buyAlert').textContent='🧪 BUY 알림 테스트 (실제 신호 아님)';document.getElementById('buyAlert').style.display='block';">🧪 알림 테스트</button>
+
 <div class="panel">
 <h2>스캔 설정</h2>
 <div class="controls">
