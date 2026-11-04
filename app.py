@@ -127,8 +127,8 @@ function exportBuyHistory() {
         fields.map(k => safeCSV(x[k])).join(",")
       )
     ].join("\r\n");
+    const blob = new Blob([csv], {
 
-    const blob = new Blob(["\uFEFF", csv], {
       type: "text/csv;charset=utf-8;"
     });
 
