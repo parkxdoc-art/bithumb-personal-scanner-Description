@@ -305,7 +305,23 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
         return None
     ma5_info = analyze_5m_ma5(raw if minute == 5 else [])
     # Bithumb candle endpoint returns newest first; analysis uses oldest first.
-    rows = list(reversed(raw))
+    
+    now_kst = datetime.now(KST)
+    completed = []
+
+    for candle in raw:
+        start = datetime.fromisoformat(
+            candle["candle_date_time_kst"]
+        ).replace(tzinfo=KST)
+
+        if start + timedelta(minutes=minute) <= now_kst:
+            completed.append(candle)
+
+    if len(completed) < 35:
+        return None
+
+    rows = list(reversed(completed))
+
     closes=[float(x["trade_price"]) for x in rows]
     highs=[float(x["high_price"]) for x in rows]
     lows=[float(x["low_price"]) for x in rows]
