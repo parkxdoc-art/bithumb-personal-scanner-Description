@@ -85,6 +85,37 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <script>
 let autoTimer=null;
 let scanning=false;
+
+function saveBuySignals(results, tf) {
+  try {
+    const key = "bithumb_v2_buy_history";
+    const history = JSON.parse(localStorage.getItem(key) || "[]");
+    const known = new Set(history.map(x =>
+      `${x.market}|${x.tf}|${x.candle_time}`
+    ));
+
+    for (const x of results) {
+      if (x.signal !== "BUY" || !x.candle_time) continue;
+
+      const id = `${x.market}|${tf}|${x.candle_time}`;
+      if (known.has(id)) continue;
+
+      history.push({
+        market: x.market,
+        tf: tf,
+        candle_time: x.candle_time,
+        signal_price: x.price,
+        detected_at: new Date().toISOString()
+      });
+      known.add(id);
+    }
+
+    localStorage.setItem(key, JSON.stringify(history.slice(-1000)));
+  } catch (e) {
+    console.warn("BUY 기록 실패:", e);
+  }
+}
+
 function won(x){if(x==null||!Number.isFinite(Number(x)))return "—";return Number(x).toLocaleString("ko-KR",{maximumFractionDigits:4})+"원"}
 function pct(x){return x==null?"—":(Number(x)>=0?"+":"")+Number(x).toFixed(2)+"%"}
 function money(x){if(x==null)return "—";let n=Number(x);if(n>=1e8)return (n/1e8).toFixed(1)+"억";if(n>=1e4)return (n/1e4).toFixed(0)+"만";return n.toLocaleString("ko-KR")}
@@ -143,6 +174,9 @@ scanning = true;
   const totalMarkets = d ? d.count : 0;
   if (!d) d = {count: 0, results: [], updated: "-"}; 
   d.results = allResults.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
+  
+    saveBuySignals(allResults, document.getElementById("tf").value);
+
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
   d.count = totalMarkets;
   d.scanned = allResults.length;
