@@ -147,7 +147,18 @@ function showBuyHistory() {
         const r = (Number(p) / Number(x.signal_price) - 1) * 100;
         return `${p}원 (${r >= 0 ? "+" : ""}${r.toFixed(2)}%)`;
       };
-      return `${x.market} | ${x.tf}분봉\n신호: ${x.candle_time}\n기준가: ${x.signal_price}원\n15분: ${result(x.price_15m)}\n30분: ${result(x.price_30m)}\n60분: ${result(x.price_60m)}\n`;
+      
+      return `${x.market} | ${x.tf}분봉
+신호: ${x.candle_time}
+기준가: ${x.signal_price}원
+15분: ${result(x.price_15m)}
+사용 캔들: ${x.source_candle_15m || "시각 미기록"}
+30분: ${result(x.price_30m)}
+사용 캔들: ${x.source_candle_30m || "시각 미기록"}
+60분: ${result(x.price_60m)}
+사용 캔들: ${x.source_candle_60m || "시각 미기록"}
+`;
+
     }).join("\n");
 
   } catch (e) {
