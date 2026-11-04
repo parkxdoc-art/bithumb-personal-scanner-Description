@@ -52,6 +52,11 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <div id="buyAlert" role="status" aria-live="polite" style="display:none;margin:14px 0;padding:14px;border:1px solid #2b8a68;border-radius:12px;color:#7bedbb;font-weight:700;"></div>
 
 <div class="panel">
+  <h2>최근 BUY 신호</h2>
+  <div id="recentBuyAlerts" style="white-space:pre-line;line-height:1.8;">최근 신호를 불러오는 중...</div>
+</div>
+
+<div class="panel">
 <h2>스캔 설정</h2>
 <div class="controls">
   <div class="field"><label for="tf">캔들 주기</label><select id="tf"><option value="1">1분</option><option value="3">3분</option><option value="5" selected>5분</option><option value="10">10분</option><option value="30">30분</option></select></div>
@@ -351,6 +356,38 @@ function saveBuySignals(results, tf) {
   }
 }
 
+function showRecentBuyAlerts() {
+  const area = document.getElementById("recentBuyAlerts");
+  if (!area) return;
+
+  try {
+    const history = JSON.parse(
+      localStorage.getItem("bithumb_v2_buy_history") || "[]"
+    );
+
+    if (!Array.isArray(history)) {
+      throw new Error("BUY 기록 형식 오류");
+    }
+
+    const recent = history
+      .filter(x => x && x.market && x.candle_time)
+      .sort((a, b) =>
+        String(b.detected_at || b.candle_time)
+          .localeCompare(String(a.detected_at || a.candle_time))
+      )
+      .slice(0, 5);
+
+    area.textContent = recent.length
+      ? recent.map(x =>
+          `🚨 ${x.market} | ${x.tf}분봉 | ${x.candle_time}`
+        ).join("\n")
+      : "아직 기록된 BUY 신호가 없습니다.";
+
+  } catch (e) {
+    area.textContent = "최근 BUY 신호를 불러오지 못했습니다.";
+  }
+}
+
 function showBuyHistory() {
   const area = document.getElementById("buyHistory");
   if (!area) return;
@@ -558,6 +595,8 @@ scanning = true;
 
     showBuyStats();
 
+    showRecentBuyAlerts();
+
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
   d.count = totalMarkets;
   d.scanned = allResults.length;
@@ -576,6 +615,9 @@ finally {
 }
 }
 function toggleAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;document.getElementById("autoBtn").textContent="자동 갱신 켜기"}else{scan();autoTimer=setInterval(scan,180000);document.getElementById("autoBtn").textContent="자동 갱신 끄기"}}
+
+showRecentBuyAlerts();
+
 </script></body></html>
 """
 
