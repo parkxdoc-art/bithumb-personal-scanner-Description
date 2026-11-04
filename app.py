@@ -142,6 +142,9 @@ function parseBuyCsv(text) {
 }
 
 async function importBuyHistory(event) {
+
+  alert("CSV 복원 함수 실행 확인!");
+
   const input = event.target;
   const file = input.files?.[0];
   if (!file) return;
