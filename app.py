@@ -411,6 +411,9 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
     )
     return {"market":market,"price":current,"change":change,"value24":value24,
             "vol_ratio":vol_ratio,"resistance":resistance,"signal":signal,"label":label,
+            
+            "candle_time": rows[-1]["candle_date_time_kst"],
+
             "note":note,"stop":stop,"target":target,"target":target,"ma5_info":ma5_info,"score":score}
 
 @app.get("/")
