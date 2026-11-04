@@ -52,7 +52,8 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <div id="buyAlert" role="status" aria-live="polite" style="display:none;margin:14px 0;padding:14px;border:1px solid #2b8a68;border-radius:12px;color:#7bedbb;font-weight:700;"></div>
 
 <div class="panel">
-  <h2>최근 BUY 신호</h2>
+  <h2>최근 BUY 기록 (과거 신호)</h2>
+
   <div id="recentBuyAlerts" style="white-space:pre-line;line-height:1.8;">최근 신호를 불러오는 중...</div>
 </div>
 
@@ -356,6 +357,24 @@ function saveBuySignals(results, tf) {
   }
 }
 
+function formatBuyElapsed(candleTime) {
+  const s = String(candleTime || "");
+  const time = Date.parse(
+    /(?:Z|[+-]\d{2}:\d{2})$/.test(s) ? s : s + "+09:00"
+  );
+
+  if (!Number.isFinite(time)) return "시간 확인 불가";
+
+  const minutes = Math.floor((Date.now() - time) / 60000);
+
+  if (minutes < 0) return "시각 확인 필요";
+  if (minutes < 60) return `${minutes}분 전`;
+  if (minutes < 1440)
+    return `${Math.floor(minutes / 60)}시간 ${minutes % 60}분 전`;
+
+  return `${Math.floor(minutes / 1440)}일 전`;
+}
+
 function showRecentBuyAlerts() {
   const area = document.getElementById("recentBuyAlerts");
   if (!area) return;
@@ -379,7 +398,8 @@ function showRecentBuyAlerts() {
 
     area.textContent = recent.length
       ? recent.map(x =>
-          `🚨 ${x.market} | ${x.tf}분봉 | ${x.candle_time}`
+          `🚨 ${x.market} | ${x.tf}분봉 | ${x.candle_time} | ⏱ ${formatBuyElapsed(x.candle_time)}`
+
         ).join("\n")
       : "아직 기록된 BUY 신호가 없습니다.";
 
