@@ -629,6 +629,20 @@ scanning = true;
   if(!candidates.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
   else body.innerHTML=candidates.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
   status.textContent = `완료: ${d.scanned}/${d.count}개 코인 분석 · 실패 페이지 ${failedPages.length}개${failedPages.length ? " (" + failedPages.join(", ") + "페이지)" : ""}`;
+  
+    const scanIncomplete =
+      failedPages.length > 0 || d.scanned < totalMarkets;
+
+    if (scanIncomplete) {
+      status.textContent =
+        "⚠️ 일부 분석 실패 — 결과 불완전! " +
+        status.textContent +
+        " | BUY 신호 수는 전체 시장 기준이 아닙니다.";
+      status.style.color = "#ffb86b";
+    } else {
+      status.style.color = "";
+    }
+
  }catch(e){document.getElementById("connection").textContent="연결 실패";status.textContent="오류: "+e.message+" · 잠시 후 다시 시도하세요. Render 무료 서버라면 기동에 시간이 걸릴 수 있습니다."}
 finally {
   scanning = false;
