@@ -169,20 +169,26 @@ function updateBuyOutcomes(results, tf) {
 
       const x = byMarket.get(item.market);
       if (!x || !x.candle_time) continue;
-
-      const start = Date.parse(item.candle_time + "+09:00");
-      const latest = Date.parse(x.candle_time + "+09:00");
-      if (!Number.isFinite(start) || !Number.isFinite(latest)) continue;
-
-      const minutes = (latest - start) / 60000;
+      const start = Date.parse(item.candle_time + "+09:00") + 5 * 60000;
+      if (!Number.isFinite(start)) continue;
+      const candles = Array.isArray(x.recent_closes) ? x.recent_closes : [];
 
       for (const m of [15, 30, 60]) {
         const field = `price_${m}m`;
-        if (minutes === m && item[field] == null) {
-          item[field] = x.price;
+        if (item[field] != null) continue;
+
+        const target = start + m * 60000;
+        const match = candles.find(r => {
+          const closedAt = Date.parse(r.time + "+09:00") + 5 * 60000;
+          return closedAt >= target && closedAt < target + 5 * 60000;
+        });
+
+        if (match) {
+          item[field] = Number(match.price);
           changed = true;
         }
       }
+ 
     }
 
     if (changed) localStorage.setItem(key, JSON.stringify(history));
@@ -526,6 +532,8 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
             "vol_ratio":vol_ratio,"resistance":resistance,"signal":signal,"label":label,
             
             "candle_time": rows[-1]["candle_date_time_kst"],
+
+            "recent_closes": [{"time": r["candle_date_time_kst"], "price": float(r["trade_price"])} for r in rows[-36:]] if minute == 5 else [],
 
             "note":note,"stop":stop,"target":target,"target":target,"ma5_info":ma5_info,"score":score}
 
