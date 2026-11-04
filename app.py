@@ -85,7 +85,9 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   <h2>BUY 신호 기록</h2>
 
 <button type="button" onclick="exportBuyHistory()">BUY 기록 CSV 백업</button>
-  
+<input type="file" id="buyRestoreFile" accept=".csv,text/csv" style="display:none" onchange="importBuyHistory(event)">
+<button type="button" onclick="document.getElementById('buyRestoreFile').click()">BUY 기록 CSV 복원</button>
+ 
 <div id="buyStats" style="white-space:pre-wrap;line-height:1.8;margin:12px 0 18px;">성과 통계 준비 중...</div>
 
   <pre id="buyHistory" style="white-space:pre-wrap;font-family:inherit;font-size:14px;">기록을 불러오는 중...</pre>
@@ -96,6 +98,151 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <script>
 let autoTimer=null;
 let scanning=false;
+
+function parseBuyCsv(text) {
+  const rows = [];
+  let row = [];
+  let value = "";
+  let quoted = false;
+  let s = String(text);
+
+  if (s.charCodeAt(0) === 65279) {
+    s = s.slice(1);
+  }
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+
+    if (c === '"') {
+      if (quoted && s[i + 1] === '"') {
+        value += '"';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (c === "," && !quoted) {
+      row.push(value);
+      value = "";
+    } else if (!quoted && (c.charCodeAt(0) === 10 || c.charCodeAt(0) === 13)) {
+      if (c.charCodeAt(0) === 13 && s.charCodeAt(i + 1) === 10) i++;
+      row.push(value);
+      if (row.some(x => x !== "")) rows.push(row);
+      row = [];
+      value = "";
+    } else {
+      value += c;
+    }
+  }
+
+  if (quoted) throw new Error("CSV 형식 오류");
+  row.push(value);
+  if (row.some(x => x !== "")) rows.push(row);
+
+  return rows;
+}
+
+async function importBuyHistory(event) {
+  const input = event.target;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  try {
+    if (file.size > 2 * 1024 * 1024) {
+      throw new Error("파일 크기가 너무 큽니다.");
+    }
+
+    const rows = parseBuyCsv(await file.text());
+    if (rows.length < 2) {
+      throw new Error("복원할 기록이 없습니다.");
+    }
+
+    const fields = [
+      "market", "tf", "candle_time", "detected_at",
+      "signal_price", "price_15m", "price_30m",
+      "price_60m", "source_candle_15m",
+      "source_candle_30m", "source_candle_60m"
+    ];
+
+    const header = rows[0].map(x => x.trim());
+    if (fields.some(k => !header.includes(k))) {
+      throw new Error("BUY 백업 파일 형식이 아닙니다.");
+    }
+
+    const key = "bithumb_v2_buy_history";
+    const current = JSON.parse(
+      localStorage.getItem(key) || "[]"
+    );
+
+    if (!Array.isArray(current)) {
+      throw new Error("기존 기록 형식 오류");
+    }
+
+    const known = new Set(current.map(x =>
+      `${x.market}|${x.tf}|${x.candle_time}`
+    ));
+
+    const added = [];
+
+    for (const row of rows.slice(1)) {
+      if (row.length !== header.length) {
+        throw new Error("CSV 열 개수가 맞지 않습니다.");
+      }
+
+      const x = Object.fromEntries(
+        fields.map(k => [k, row[header.indexOf(k)]])
+      );
+
+      if (!/^KRW-[A-Z0-9]+$/.test(x.market) ||
+          !/^(1|3|5|10|30)$/.test(x.tf) ||
+          !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(x.candle_time) ||
+          !(Number(x.signal_price) > 0)) {
+        throw new Error("BUY 기록 데이터 오류");
+      }
+
+      for (const k of [
+        "signal_price", "price_15m",
+        "price_30m", "price_60m"
+      ]) {
+        if (x[k] === "") {
+          x[k] = null;
+        } else {
+          x[k] = Number(x[k]);
+          if (!Number.isFinite(x[k]) || x[k] <= 0) {
+            throw new Error("가격 데이터 오류");
+          }
+        }
+      }
+
+      const id = `${x.market}|${x.tf}|${x.candle_time}`;
+      if (known.has(id)) continue;
+
+      known.add(id);
+      added.push(x);
+    }
+
+    if (!added.length) {
+      alert("새롭게 복원할 기록이 없습니다.");
+      return;
+    }
+
+    if (!confirm(`${added.length}개 기록을 추가할까요?`)) {
+      return;
+    }
+
+    localStorage.setItem(
+      key, JSON.stringify([...current, ...added])
+    );
+
+    showBuyHistory();
+    showBuyStats();
+
+    alert(`${added.length}개 BUY 기록 복원 완료!`);
+  } catch (e) {
+    alert("CSV 복원 실패: " + e.message);
+  } finally {
+    input.value = "";
+  }
+}
 
 function exportBuyHistory() {
   try {
