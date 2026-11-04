@@ -80,6 +80,12 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <p class="note">대각선은 최근 확인된 스윙 고점 두 개를 연결한 단순 모델입니다. 차트마다 선을 직접 긋는 것과 동일하지 않을 수 있으며, 신호는 캔들 종가 확정 후 판단해야 합니다.</p>
 </div>
 </div>
+
+<div class="panel">
+  <h2>BUY 신호 기록</h2>
+  <pre id="buyHistory" style="white-space:pre-wrap;font-family:inherit;font-size:14px;">기록을 불러오는 중...</pre>
+</div>
+
 <footer>신호 알림 전용 · 자동 주문 없음 · 공개 시장 데이터 기반 · 투자 판단 책임은 사용자에게 있습니다. 과거 조건의 유효성이 미래 수익을 보장하지 않습니다.</footer>
 </main>
 <script>
@@ -113,6 +119,28 @@ function saveBuySignals(results, tf) {
     localStorage.setItem(key, JSON.stringify(history.slice(-1000)));
   } catch (e) {
     console.warn("BUY 기록 실패:", e);
+  }
+}
+
+function showBuyHistory() {
+  const area = document.getElementById("buyHistory");
+  if (!area) return;
+
+  try {
+    const history = JSON.parse(
+      localStorage.getItem("bithumb_v2_buy_history") || "[]"
+    );
+
+    if (!history.length) {
+      area.textContent = "아직 기록된 BUY 신호가 없습니다.";
+      return;
+    }
+
+    area.textContent = history.slice(-20).reverse().map(x =>
+      `${x.market} | ${x.tf}분봉\n신호: ${x.candle_time}\n가격: ${x.signal_price}원\n`
+    ).join("\n");
+  } catch (e) {
+    area.textContent = "BUY 기록을 읽을 수 없습니다.";
   }
 }
 
@@ -176,6 +204,8 @@ scanning = true;
   d.results = allResults.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0));
   
     saveBuySignals(allResults, document.getElementById("tf").value);
+
+    showBuyHistory();
 
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, 5);
   d.count = totalMarkets;
