@@ -49,6 +49,9 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   <div class="card"><div class="k">관심 후보</div><div class="v" id="watches">— <small>코인</small></div></div>
   <div class="card"><div class="k">마지막 갱신</div><div class="v" style="font-size:17px" id="updated">—</div></div>
 </div>
+
+<div id="buyAlert" role="status" aria-live="polite" style="display:none;margin:14px 0;padding:14px;border:1px solid #2b8a68;border-radius:12px;color:#7bedbb;font-weight:700;"></div>
+
 <div class="panel">
 <h2>스캔 설정</h2>
 <div class="controls">
@@ -324,6 +327,14 @@ function saveBuySignals(results, tf) {
         detected_at: new Date().toISOString()
       });
       known.add(id);
+      
+      const alertBox = document.getElementById("buyAlert");
+      if (alertBox) {
+        alertBox.textContent =
+          `🚨 새 BUY 신호: ${x.market} | ${tf}분봉 | ${x.candle_time}`;
+        alertBox.style.display = "block";
+      }
+
     }
 
     localStorage.setItem(key, JSON.stringify(history.slice(-1000)));
