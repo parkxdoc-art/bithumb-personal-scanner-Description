@@ -307,6 +307,8 @@ function saveBuySignals(results, tf) {
       `${x.market}|${x.tf}|${x.candle_time}`
     ));
 
+    const newBuyAlerts = [];
+
     for (const x of results) {
       if (x.signal !== "BUY" || !x.candle_time) continue;
 
@@ -327,16 +329,23 @@ function saveBuySignals(results, tf) {
       });
       known.add(id);
       
-      const alertBox = document.getElementById("buyAlert");
-      if (alertBox) {
-        alertBox.textContent =
-          `🚨 새 BUY 신호: ${x.market} | ${tf}분봉 | ${x.candle_time}`;
-        alertBox.style.display = "block";
-      }
+
+      newBuyAlerts.push(`🚨 새 BUY 신호: ${x.market} | ${tf}분봉 | ${x.candle_time}`);
+
 
     }
 
     localStorage.setItem(key, JSON.stringify(history.slice(-1000)));
+    
+    if (newBuyAlerts.length > 0) {
+      const alertBox = document.getElementById("buyAlert");
+      if (alertBox) {
+        alertBox.textContent = newBuyAlerts.join("\n");
+        alertBox.style.whiteSpace = "pre-line";
+        alertBox.style.display = "block";
+      }
+    }
+
   } catch (e) {
     console.warn("BUY 기록 실패:", e);
   }
