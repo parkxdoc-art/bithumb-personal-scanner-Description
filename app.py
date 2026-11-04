@@ -111,6 +111,11 @@ function saveBuySignals(results, tf) {
         tf: tf,
         candle_time: x.candle_time,
         signal_price: x.price,
+        
+        price_15m: null,
+        price_30m: null,
+        price_60m: null,
+
         detected_at: new Date().toISOString()
       });
       known.add(id);
