@@ -664,6 +664,18 @@ function toggleAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;docu
 showRecentBuyAlerts();
 
 setInterval(showRecentBuyAlerts, 60000);
+document.getElementById("rows").addEventListener("click", function(event) {
+  const cell = event.target.closest("td");
+  if (!cell || cell.cellIndex !== 0) return;
+
+  const market = cell.textContent.trim();
+  if (!/^KRW-[A-Z0-9]+$/.test(market)) return;
+
+  const symbol = market.slice(4);
+  const url = `https://www.bithumb.com/react/trade/order/${symbol}-KRW`;
+
+  window.open(url, "_blank", "noopener,noreferrer");
+});
 
 </script></body></html>
 """
