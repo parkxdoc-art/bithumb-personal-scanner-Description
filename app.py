@@ -71,6 +71,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <div class="panel">
 <h2>스캔 결과</h2>
 <label for="resultLimit">표시 코인 수 <select id="resultLimit"><option value="5" selected>5개</option><option value="10">10개</option><option value="20">20개</option></select></label>
+<div id="resultCount" style="margin:12px 0;color:#7bedbb;font-size:14px;">조건 충족 후보 계산 전</div>
 <div class="tablewrap"><table><thead><tr><th>마켓</th><th>확정봉 종가</th><th>24h 변동</th><th>거래대금</th><th>거래량 배수</th><th>저항선 상태</th><th>예시 손절가</th><th>예시 목표가</th><th>신호</th><th>종합 점수</th><th>5분봉 MA5</th><th>관찰 메모</th></tr></thead><tbody id="rows"><tr><td colspan="10">아직 스캔하지 않았습니다.</td></tr></tbody></table></div>
 </div>
 <div class="two">
@@ -619,6 +620,14 @@ scanning = true;
     showRecentBuyAlerts();
 
   const candidates = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).slice(0, Number(document.getElementById("resultLimit").value));
+  const qualifiedCount = d.results.filter(x => (x.signal === "BUY" || x.signal === "WATCH") && Number(x.value24) >= 500000000).length;
+  const selectedLimit = Number(document.getElementById("resultLimit").value);
+  const resultCountBox = document.getElementById("resultCount");
+
+    if (resultCountBox) {
+      resultCountBox.textContent =
+        `✅ 조건 충족 ${qualifiedCount}개 / 최대 표시 ${selectedLimit}개 (현재 ${candidates.length}개 표시)`;
+    }
 
   d.count = totalMarkets;
   d.scanned = allResults.length;
