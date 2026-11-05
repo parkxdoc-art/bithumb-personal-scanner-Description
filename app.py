@@ -681,6 +681,14 @@ const selectedSignal = signalFilterBox?.value || "ALL";
 body.querySelectorAll("tr").forEach((row, index) => {
 
     const market = row.cells[0]?.textContent.trim().toUpperCase() || "";
+const signal = allCandidates[index]?.signal;
+const marketCell = row.cells[0];
+
+if (marketCell) {
+  marketCell.style.color =
+    signal === "BUY" ? "#4ade80" : "#fbbf24";
+  marketCell.style.fontWeight = "700";
+}
     
 const isMatch = market.includes(query) &&
   (selectedSignal === "ALL" || allCandidates[index]?.signal === selectedSignal);
