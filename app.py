@@ -36,6 +36,27 @@ select,input,button{background:#0d1527;border:1px solid #33415e;color:var(--text
 .note{font-size:12px;color:var(--muted);line-height:1.65}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}
 footer{margin-top:18px;color:var(--muted);font-size:11px}
 @media(max-width:760px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:1fr}.rules{grid-template-columns:1fr}h1{font-size:22px}.v{font-size:21px}}
+#rows td:first-child[data-signal]::after {
+  content: attr(data-signal);
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: middle;
+}
+
+#rows td:first-child[data-signal="BUY"]::after {
+  color: #4ade80;
+  background: #123d35;
+}
+
+#rows td:first-child[data-signal="WATCH"]::after {
+  color: #fbbf24;
+  background: #40351e;
+}
+
 </style>
 </head>
 <body><main>
@@ -684,7 +705,8 @@ body.querySelectorAll("tr").forEach((row, index) => {
 const signal = allCandidates[index]?.signal;
 const marketCell = row.cells[0];
 
-if (marketCell) {
+if (marketCell) { marketCell.dataset.signal = signal;
+
   marketCell.style.color =
     signal === "BUY" ? "#4ade80" : "#fbbf24";
   marketCell.style.fontWeight = "700";
