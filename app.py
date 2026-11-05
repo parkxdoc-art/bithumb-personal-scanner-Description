@@ -707,6 +707,40 @@ if (searchBox) {
 }
 
 if (signalFilterBox) signalFilterBox.onchange = filterCoinResults;
+const resultSortBox = document.getElementById("resultSort");
+const defaultRanks = new Map(
+  d.results.map((x, i) => [x.market, i])
+);
+
+if (resultSortBox) {
+  resultSortBox.onchange = function() {
+    const mode = resultSortBox.value;
+
+    allCandidates.sort((a, b) => {
+      if (mode === "volume") {
+        return Number(b.value24) - Number(a.value24);
+      }
+      if (mode === "change") {
+        return Number(b.change) - Number(a.change);
+      }
+      return defaultRanks.get(a.market) - defaultRanks.get(b.market);
+    });
+
+    const rowsByMarket = new Map(
+      Array.from(body.querySelectorAll("tr")).map(row => [
+        row.cells[0]?.textContent.trim(),
+        row
+      ])
+    );
+
+    allCandidates.forEach(x => {
+      const row = rowsByMarket.get(x.market);
+      if (row) body.appendChild(row);
+    });
+
+    filterCoinResults();
+  };
+}
 
   status.textContent = `완료: ${d.scanned}/${d.count}개 코인 분석 · 실패 페이지 ${failedPages.length}개${failedPages.length ? " (" + failedPages.join(", ") + "페이지)" : ""}`;
   
