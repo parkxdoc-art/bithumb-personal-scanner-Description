@@ -72,6 +72,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <h2>스캔 결과</h2>
 <label for="resultLimit">표시 코인 수 <select id="resultLimit"><option value="5" selected>5개</option><option value="10">10개</option><option value="20">20개</option></select></label>
 <div id="resultCount" style="margin:12px 0;color:#7bedbb;font-size:14px;">조건 충족 후보 계산 전</div>
+<a href="intent://www.bithumb.com/#Intent;scheme=https;package=com.btckorea.bithumb;S.browser_fallback_url=https%3A%2F%2Fwww.bithumb.com%2F;end" style="display:inline-block;margin:8px 0;padding:12px 16px;background:#345ee7;color:white;border-radius:10px;text-decoration:none;">📱 빗썸 앱 실행 테스트</a>
 <div class="tablewrap"><table><thead><tr><th>마켓</th><th>확정봉 종가</th><th>24h 변동</th><th>거래대금</th><th>거래량 배수</th><th>저항선 상태</th><th>예시 손절가</th><th>예시 목표가</th><th>신호</th><th>종합 점수</th><th>5분봉 MA5</th><th>관찰 메모</th></tr></thead><tbody id="rows"><tr><td colspan="10">아직 스캔하지 않았습니다.</td></tr></tbody></table></div>
 </div>
 <div class="two">
