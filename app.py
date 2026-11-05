@@ -74,6 +74,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <div id="resultCount" style="margin:12px 0;color:#7bedbb;font-size:14px;">조건 충족 후보 계산 전</div>
 <label for="resultSort">정렬 기준 <select id="resultSort"><option value="default">기본 추천순</option><option value="volume">24시간 거래대금 높은순</option><option value="change">24시간 상승률 높은순</option></select></label>
 <div class="field" style="margin:12px 0;"><label for="coinSearch">🔎 코인 검색</label><input type="search" id="coinSearch" placeholder="코인 검색 (예: XRP, BTC)" autocomplete="off"></div>
+<label for="signalFilter">신호 필터 <select id="signalFilter"><option value="ALL">전체 후보</option><option value="BUY">BUY만</option><option value="WATCH">WATCH만</option></select></label>
 <div class="tablewrap"><table><thead><tr><th>마켓</th><th>확정봉 종가</th><th>24h 변동</th><th>거래대금</th><th>거래량 배수</th><th>저항선 상태</th><th>예시 손절가</th><th>예시 목표가</th><th>신호</th><th>종합 점수</th><th>5분봉 MA5</th><th>관찰 메모</th></tr></thead><tbody id="rows"><tr><td colspan="10">아직 스캔하지 않았습니다.</td></tr></tbody></table></div>
 </div>
 <div class="two">
@@ -667,17 +668,23 @@ const candidates = allCandidates.slice(
   else body.innerHTML=allCandidates.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
   
 const searchBox = document.getElementById("coinSearch");
-
+const signalFilterBox = document.getElementById("signalFilter");
 function filterCoinResults() {
   if (!allCandidates.length) return;
+const query = (searchBox.value || "").trim().toUpperCase();
+const selectedSignal = signalFilterBox?.value || "ALL";
 
-  const query = (searchBox.value || "").trim().toUpperCase();
   let matched = 0;
   let shown = 0;
 
-  body.querySelectorAll("tr").forEach(row => {
+  
+body.querySelectorAll("tr").forEach((row, index) => {
+
     const market = row.cells[0]?.textContent.trim().toUpperCase() || "";
-    const isMatch = market.includes(query);
+    
+const isMatch = market.includes(query) &&
+  (selectedSignal === "ALL" || allCandidates[index]?.signal === selectedSignal);
+
 
     if (isMatch) matched++;
 
@@ -698,6 +705,8 @@ if (searchBox) {
   searchBox.oninput = filterCoinResults;
   filterCoinResults();
 }
+
+if (signalFilterBox) signalFilterBox.onchange = filterCoinResults;
 
   status.textContent = `완료: ${d.scanned}/${d.count}개 코인 분석 · 실패 페이지 ${failedPages.length}개${failedPages.length ? " (" + failedPages.join(", ") + "페이지)" : ""}`;
   
