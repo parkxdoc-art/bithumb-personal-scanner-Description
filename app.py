@@ -896,6 +896,42 @@ if (scanAgeBox) {
       scanAgeBox.style.fontWeight = "600";
     }
 
+    // 상세 분석창이 열려 있으면 스캔 경과 시간도 갱신
+    const detailPanel = document.getElementById("coinDetail");
+    const detailScanTime = document.getElementById("coinDetailScanTime");
+
+    if (
+      detailPanel &&
+      detailScanTime &&
+      detailPanel.style.display !== "none"
+    ) {
+      const scanTime = new Date(scanAt).toLocaleString("ko-KR", {
+        timeZone: "Asia/Seoul",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+
+      const ageText = minutes < 1
+        ? "방금"
+        : minutes < 60
+          ? `${minutes}분 경과`
+          : `${Math.floor(minutes / 60)}시간 ${minutes % 60}분 경과`;
+
+      detailScanTime.textContent =
+        `스캔 결과 생성: ${scanTime} KST · ${ageText}`;
+
+      detailScanTime.style.color =
+        minutes >= 15 ? "#fb7185" :
+        minutes >= 5 ? "#fbbf24" : "#4ade80";
+
+      detailScanTime.style.fontWeight =
+        minutes >= 5 ? "700" : "600";
+    }
+
   };
 
   refreshScanAge();
@@ -977,6 +1013,12 @@ if (detailScanTime) {
 
     detailScanTime.textContent =
       `스캔 결과 생성: ${scanTime} KST · ${ageText}`;
+      
+detailScanTime.style.color =
+  minutes >= 15 ? "#fb7185" :
+  minutes >= 5 ? "#fbbf24" : "#4ade80";
+detailScanTime.style.fontWeight = minutes >= 5 ? "700" : "600";
+
   } else {
     detailScanTime.textContent = "스캔 생성 시각 정보 없음";
   }
