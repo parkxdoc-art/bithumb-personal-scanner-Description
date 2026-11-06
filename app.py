@@ -696,6 +696,11 @@ function bithumbGuideWon(value) {
 async function scan(){
 if (scanning) return;
 scanning = true;
+const coinDetailPanel = document.getElementById("coinDetail");
+if (coinDetailPanel) {
+  coinDetailPanel.style.display = "none";
+}
+
 const scanResultsNotice = document.getElementById("scanResultsNotice");
 
 if (scanResultsNotice) {
@@ -907,7 +912,7 @@ if (scanAgeBox) {
 
   btn.onclick = (event) => {
     event.stopPropagation();
-
+    if (scanning) return;
     const detail = document.getElementById("coinDetail");
     if (!detail) return;
 
