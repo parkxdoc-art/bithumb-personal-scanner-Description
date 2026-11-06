@@ -193,6 +193,11 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <div class="tablewrap"><table><thead><tr><th>마켓</th><th>확정봉 종가</th><th>24h 변동</th><th>거래대금</th><th>거래량 배수</th><th>저항선 상태</th><th>예시 손절가</th><th>예시 목표가</th><th>신호</th><th>종합 점수</th><th>5분봉 MA5</th><th>관찰 메모</th></tr></thead><tbody id="rows"><tr><td colspan="10">아직 스캔하지 않았습니다.</td></tr></tbody></table></div>
 <div id="coinDetail" style="display:none;margin-top:14px;padding:14px;border:1px solid #34405a;border-radius:10px;">
   <strong id="coinDetailTitle">코인 상세 분석</strong>
+<div id="coinDetailScanTime"
+     style="margin-top:6px;margin-bottom:12px;font-size:12px;color:#9ba9c4;">
+  스캔 기준 시각 확인 중
+</div>
+
   <div id="coinDetailBody" style="margin-top:10px;white-space:pre-wrap;line-height:1.7;"></div>
 </div>
 </div>
@@ -940,6 +945,42 @@ if (scanAgeBox) {
       `${x.market} 상세 분석`;
     document.getElementById("coinDetailTitle").dataset.signal =
       x.signal === "BUY" ? "BUY" : "WATCH";
+
+const detailScanTime = document.getElementById("coinDetailScanTime");
+
+if (detailScanTime) {
+  const scanAt = Number(
+    document.getElementById("updated")?.dataset.scanResultsAt
+  );
+
+  if (Number.isFinite(scanAt) && scanAt > 0) {
+    const scanTime = new Date(scanAt).toLocaleString("ko-KR", {
+      timeZone: "Asia/Seoul",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+
+    const minutes = Math.max(
+      0,
+      Math.floor((Date.now() - scanAt) / 60000)
+    );
+
+    const ageText = minutes < 1
+      ? "방금"
+      : minutes < 60
+        ? `${minutes}분 경과`
+        : `${Math.floor(minutes / 60)}시간 ${minutes % 60}분 경과`;
+
+    detailScanTime.textContent =
+      `스캔 결과 생성: ${scanTime} KST · ${ageText}`;
+  } else {
+    detailScanTime.textContent = "스캔 생성 시각 정보 없음";
+  }
+}
 
    
     const detailBody = document.getElementById("coinDetailBody");
