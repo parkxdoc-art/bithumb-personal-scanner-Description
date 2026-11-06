@@ -111,6 +111,28 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   color: #ff8996;
 }
 
+/* 상세 분석 제목 BUY/WATCH 배지 */
+#coinDetailTitle[data-signal]::after {
+  content: attr(data-signal);
+  float: right;
+  margin-left: 8px;
+  padding: 3px 9px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+#coinDetailTitle[data-signal="BUY"]::after {
+  color: #4ade80;
+  background: #123d35;
+}
+
+#coinDetailTitle[data-signal="WATCH"]::after {
+  color: #fbbf24;
+  background: #40351e;
+}
+
 </style>
 </head>
 <body><main>
@@ -764,6 +786,8 @@ const candidates = allCandidates.slice(
 
     document.getElementById("coinDetailTitle").textContent =
       `${x.market} 상세 분석`;
+    document.getElementById("coinDetailTitle").dataset.signal =
+      x.signal === "BUY" ? "BUY" : "WATCH";
 
    
     const detailBody = document.getElementById("coinDetailBody");
