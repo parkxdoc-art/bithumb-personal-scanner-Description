@@ -651,6 +651,36 @@ function updateBuyOutcomes(results, tf) {
 function won(x){if(x==null||!Number.isFinite(Number(x)))return "—";return Number(x).toLocaleString("ko-KR",{maximumFractionDigits:4})+"원"}
 function pct(x){return x==null?"—":(Number(x)>=0?"+":"")+Number(x).toFixed(2)+"%"}
 function money(x){if(x==null)return "—";let n=Number(x);if(n>=1e8)return (n/1e8).toFixed(1)+"억";if(n>=1e4)return (n/1e4).toFixed(0)+"만";return n.toLocaleString("ko-KR")}
+
+function bithumbGuideWon(value) {
+  if (value == null || value === "") return "—";
+
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0) return "—";
+
+  let tick;
+
+  if (price >= 1000000) tick = 1000;
+  else if (price >= 500000) tick = 500;
+  else if (price >= 100000) tick = 100;
+  else if (price >= 50000) tick = 50;
+  else if (price >= 10000) tick = 10;
+  else if (price >= 5000) tick = 5;
+  else if (price >= 100) tick = 1;
+  else if (price >= 10) tick = 0.01;
+  else if (price >= 1) tick = 0.001;
+  else tick = 0.0001;
+
+  const rounded = Math.round(price / tick) * tick;
+  const digits = tick >= 1 ? 0 :
+    tick === 0.01 ? 2 :
+    tick === 0.001 ? 3 : 4;
+
+  return rounded.toLocaleString("ko-KR", {
+    maximumFractionDigits: digits
+  }) + "원";
+}
+
 async function scan(){
 if (scanning) return;
 scanning = true;
@@ -803,8 +833,11 @@ const candidates = allCandidates.slice(
       ["거래량 배수",
         x.vol_ratio == null ? "-" : Number(x.vol_ratio).toFixed(2) + "배"],
       ["종합 점수", x.score ?? "-"],
-      ["손절가", won(x.stop), "stop"],
-      ["목표가", won(x.target), "target"],
+      
+      ["손절 참고가", bithumbGuideWon(x.stop), "stop"],
+      ["목표 참고가", bithumbGuideWon(x.target), "target"],
+
+      
       ["신호", `${x.signal ?? "-"} (${x.label ?? "-"})`,
         x.signal === "BUY" ? "buy" : "watch", true],
       ["24시간 거래대금", money(x.value24), "", true],
