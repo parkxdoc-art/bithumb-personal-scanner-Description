@@ -97,6 +97,10 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <div class="field" style="margin:12px 0;"><label for="coinSearch">🔎 코인 검색</label><input type="search" id="coinSearch" placeholder="코인 검색 (예: XRP, BTC)" autocomplete="off"></div>
 <label for="signalFilter">신호 필터 <select id="signalFilter"><option value="ALL">전체 후보</option><option value="BUY">BUY만</option><option value="WATCH">WATCH만</option></select></label>
 <div class="tablewrap"><table><thead><tr><th>마켓</th><th>확정봉 종가</th><th>24h 변동</th><th>거래대금</th><th>거래량 배수</th><th>저항선 상태</th><th>예시 손절가</th><th>예시 목표가</th><th>신호</th><th>종합 점수</th><th>5분봉 MA5</th><th>관찰 메모</th></tr></thead><tbody id="rows"><tr><td colspan="10">아직 스캔하지 않았습니다.</td></tr></tbody></table></div>
+<div id="coinDetail" style="display:none;margin-top:14px;padding:14px;border:1px solid #34405a;border-radius:10px;">
+  <strong id="coinDetailTitle">코인 상세 분석</strong>
+  <div id="coinDetailBody" style="margin-top:10px;white-space:pre-wrap;line-height:1.7;"></div>
+</div>
 </div>
 <div class="two">
 <div class="panel"><h2>진입·청산 규칙</h2><div class="rules">
@@ -687,7 +691,50 @@ const candidates = allCandidates.slice(
   const body=document.getElementById("rows");
   if(!candidates.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
   else body.innerHTML=allCandidates.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
-  
+ body.querySelectorAll("tr").forEach((row, index) => {
+  const x = allCandidates[index];
+  if (!x || !row.cells[0]) return;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.title = "코인 상세 분석 보기";
+  btn.setAttribute("aria-label", "코인 상세 분석 보기");
+  btn.style.cssText = "margin-left:8px;padding:3px 6px;border:1px solid #475569;border-radius:6px;background:#24314f;color:#cbd5e1;vertical-align:middle;cursor:pointer;";
+  btn.innerHTML = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 11v6 M12 7h.01"/></svg>';
+
+  btn.onclick = (event) => {
+    event.stopPropagation();
+
+    const detail = document.getElementById("coinDetail");
+    if (!detail) return;
+
+    document.getElementById("coinDetailTitle").textContent =
+      `${x.market} 상세 분석`;
+
+    document.getElementById("coinDetailBody").textContent =
+      `신호: ${x.signal ?? "-"} (${x.label ?? "-"})\n` +
+      `현재가: ${won(x.price)}\n` +
+      `24시간 변동: ${pct(x.change)}\n` +
+      `24시간 거래대금: ${money(x.value24)}\n` +
+      `거래량 배수: ${x.vol_ratio == null ? "-" : x.vol_ratio.toFixed(2) + "배"}\n` +
+      `저항선: ${x.resistance ?? "-"}\n` +
+      `손절가: ${won(x.stop)}\n` +
+      `목표가: ${won(x.target)}\n` +
+      `종합 점수: ${x.score ?? "-"}\n` +
+      `5분봉 MA5: ${x.ma5_info?.ma5 ?? "-"}\n` +
+      `MA5 상태: ${x.ma5_info?.status ?? "-"}\n` +
+      `분석 메모: ${x.note ?? "-"}`;
+
+    detail.style.display = "block";
+    detail.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest"
+    });
+  };
+
+  row.cells[0].appendChild(btn);
+});
+ 
 const searchBox = document.getElementById("coinSearch");
 const signalFilterBox = document.getElementById("signalFilter");
 function filterCoinResults() {
