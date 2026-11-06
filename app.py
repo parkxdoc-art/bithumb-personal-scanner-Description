@@ -153,11 +153,17 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 </div>
 <div id="buyAlert" role="status" aria-live="polite" style="display:none;margin:14px 0;padding:14px;border:1px solid #2b8a68;border-radius:12px;color:#7bedbb;font-weight:700;"></div>
 
-<div class="panel">
-  <h2>최근 BUY 기록 (과거 신호)</h2>
 
-  <div id="recentBuyAlerts" style="white-space:pre-line;line-height:1.8;">최근 신호를 불러오는 중...</div>
-</div>
+<details class="panel">
+  <summary style="cursor:pointer;font-size:16px;font-weight:700;">
+    최근 24시간 BUY 기록 · 눌러서 보기
+  </summary>
+  <div id="recentBuyAlerts"
+       style="white-space:pre-line;line-height:1.8;margin-top:12px;">
+    최근 신호를 불러오는 중...
+  </div>
+</details>
+
 
 <div class="panel">
 <h2>스캔 설정</h2>
@@ -507,7 +513,21 @@ function showRecentBuyAlerts() {
     }
 
     const recent = history
-      .filter(x => x && x.market && x.candle_time)
+      .filter(x => {
+  if (!x || !x.market || !x.candle_time) return false;
+
+  const s = String(x.candle_time);
+  const signalTime = Date.parse(
+    /(?:Z|[+-]\d{2}:\d{2})$/.test(s) ? s : s + "+09:00"
+  );
+
+  const ageMs = Date.now() - signalTime;
+
+  return Number.isFinite(signalTime) &&
+    ageMs >= 0 &&
+    ageMs < 24 * 60 * 60 * 1000;
+})
+
       .sort((a, b) =>
         String(b.detected_at || b.candle_time)
           .localeCompare(String(a.detected_at || a.candle_time))
