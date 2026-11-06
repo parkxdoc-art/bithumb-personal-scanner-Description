@@ -796,7 +796,23 @@ const candidates = allCandidates.slice(
   document.getElementById("updated").textContent=d.updated;
   const body=document.getElementById("rows");
   if(!candidates.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
-  else body.innerHTML=allCandidates.map(x=>`<tr><td><b>${x.market}</b></td><td>${won(x.price)}</td><td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td><td>${money(x.value24)}</td><td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td><td>${x.resistance}</td><td>${won(x.stop)}</td><td>${won(x.target)}</td><td><span class="signal ${x.signal}">${x.label}</span></td><td>${x.score ?? '-'}</td><td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td><td>${x.note}</td></tr>`).join("");
+  else body.innerHTML = allCandidates.map(x => `
+  <tr>
+    <td><b>${x.market}</b></td>
+    <td>${won(x.price)}</td>
+    <td class="${x.change>=0?'good':'bad'}">${pct(x.change)}</td>
+    <td>${money(x.value24)}</td>
+    <td>${x.vol_ratio==null?'—':x.vol_ratio.toFixed(2)+'배'}</td>
+    <td>${x.resistance}</td>
+    <td>${bithumbGuideWon(x.stop)}</td>
+    <td>${bithumbGuideWon(x.target)}</td>
+    <td><span class="signal ${x.signal}">${x.label}</span></td>
+    <td>${x.score ?? '-'}</td>
+    <td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td>
+    <td>${x.note}</td>
+  </tr>
+`).join("");
+
  body.querySelectorAll("tr").forEach((row, index) => {
   const x = allCandidates[index];
   if (!x || !row.cells[0]) return;
