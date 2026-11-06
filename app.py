@@ -57,6 +57,60 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   background: #40351e;
 }
 
+/* 코인 상세 분석 카드형 디자인 */
+#coinDetailTitle {
+  display: block;
+  font-size: 18px;
+  font-weight: 800;
+  margin-bottom: 14px;
+}
+
+.coin-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  white-space: normal;
+}
+
+.coin-detail-item {
+  min-width: 0;
+  background: #1b2943;
+  border: 1px solid #34405a;
+  border-radius: 12px;
+  padding: 12px;
+  white-space: normal;
+}
+
+.coin-detail-item.wide {
+  grid-column: 1 / -1;
+}
+
+.coin-detail-label {
+  font-size: 12px;
+  color: #9ba9c4;
+  margin-bottom: 6px;
+}
+
+.coin-detail-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: #edf3ff;
+  overflow-wrap: anywhere;
+}
+
+.coin-detail-value.buy,
+.coin-detail-value.target {
+  color: #4ade80;
+}
+
+.coin-detail-value.watch {
+  color: #fbbf24;
+}
+
+.coin-detail-value.stop {
+  color: #ff8996;
+}
+
 </style>
 </head>
 <body><main>
@@ -711,19 +765,62 @@ const candidates = allCandidates.slice(
     document.getElementById("coinDetailTitle").textContent =
       `${x.market} 상세 분석`;
 
-    document.getElementById("coinDetailBody").textContent =
-      `신호: ${x.signal ?? "-"} (${x.label ?? "-"})\n` +
-      `현재가: ${won(x.price)}\n` +
-      `24시간 변동: ${pct(x.change)}\n` +
-      `24시간 거래대금: ${money(x.value24)}\n` +
-      `거래량 배수: ${x.vol_ratio == null ? "-" : x.vol_ratio.toFixed(2) + "배"}\n` +
-      `저항선: ${x.resistance ?? "-"}\n` +
-      `손절가: ${won(x.stop)}\n` +
-      `목표가: ${won(x.target)}\n` +
-      `종합 점수: ${x.score ?? "-"}\n` +
-      `5분봉 MA5: ${x.ma5_info?.ma5 ?? "-"}\n` +
-      `MA5 상태: ${x.ma5_info?.status ?? "-"}\n` +
-      `분석 메모: ${x.note ?? "-"}`;
+   
+    const detailBody = document.getElementById("coinDetailBody");
+    detailBody.replaceChildren();
+
+    const detailGrid = document.createElement("div");
+    detailGrid.className = "coin-detail-grid";
+
+    const detailItems = [
+      ["현재가", won(x.price)],
+      ["24시간 변동", pct(x.change),
+        Number(x.change) >= 0 ? "buy" : "stop"],
+      ["거래량 배수",
+        x.vol_ratio == null ? "-" : Number(x.vol_ratio).toFixed(2) + "배"],
+      ["종합 점수", x.score ?? "-"],
+      ["손절가", won(x.stop), "stop"],
+      ["목표가", won(x.target), "target"],
+      ["신호", `${x.signal ?? "-"} (${x.label ?? "-"})`,
+        x.signal === "BUY" ? "buy" : "watch", true],
+      ["24시간 거래대금", money(x.value24), "", true],
+      ["저항선", x.resistance ?? "-", "", true],
+      ["5분봉 MA5", x.ma5_info?.ma5 ?? "-"],
+      ["MA5 상태", x.ma5_info?.status ?? "-"],
+      ["분석 메모", x.note ?? "-", "", true]
+    ];
+
+    detailItems.forEach(([label, value, color, wide]) => {
+      const item = document.createElement("div");
+      item.className = "coin-detail-item" + (wide ? " wide" : "");
+
+      const labelEl = document.createElement("div");
+      labelEl.className = "coin-detail-label";
+      labelEl.textContent = label;
+
+      const valueEl = document.createElement("div");
+      valueEl.className = "coin-detail-value" + (color ? " " + color : "");
+      valueEl.textContent = String(value ?? "-");
+
+      item.appendChild(labelEl);
+      item.appendChild(valueEl);
+      detailGrid.appendChild(item);
+    });
+
+    detailBody.appendChild(detailGrid);
+ 
+    
+      
+      
+      
+      
+      
+      
+      
+      
+      
+    
+      
 
     detail.style.display = "block";
     detail.scrollIntoView({
