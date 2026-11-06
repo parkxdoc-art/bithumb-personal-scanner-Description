@@ -829,6 +829,22 @@ if (scanAgeBox) {
       scanAgeBox.textContent =
         `스캔 완료 후 ${hours}시간 ${remainingMinutes}분 경과`;
     }
+    
+    if (minutes >= 15) {
+      scanAgeBox.style.color = "#fb7185";
+      scanAgeBox.style.fontWeight = "700";
+      scanAgeBox.textContent =
+        "⛔ 오래된 분석 · " + scanAgeBox.textContent;
+    } else if (minutes >= 5) {
+      scanAgeBox.style.color = "#fbbf24";
+      scanAgeBox.style.fontWeight = "700";
+      scanAgeBox.textContent =
+        "⚠️ 갱신 권장 · " + scanAgeBox.textContent;
+    } else {
+      scanAgeBox.style.color = "#4ade80";
+      scanAgeBox.style.fontWeight = "600";
+    }
+
   };
 
   refreshScanAge();
