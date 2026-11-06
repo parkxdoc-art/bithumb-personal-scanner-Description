@@ -172,6 +172,13 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 </div>
 <div class="panel">
 <h2>스캔 결과</h2>
+<div id="scanResultsNotice"
+     role="status"
+     aria-live="polite"
+     style="display:none;margin:10px 0;padding:10px 12px;border:1px solid #fbbf24;border-radius:10px;background:#40351e;color:#fbbf24;font-size:13px;font-weight:700;">
+  ⚠️ 새 스캔 진행 중 — 현재 표는 이전 스캔 결과입니다.
+</div>
+
 <label for="resultLimit">표시 코인 수 <select id="resultLimit"><option value="5" selected>5개</option><option value="10">10개</option><option value="20">20개</option></select></label>
 <div id="resultCount" style="margin:12px 0;color:#7bedbb;font-size:14px;">조건 충족 후보 계산 전</div>
 <label for="resultSort">정렬 기준 <select id="resultSort"><option value="default">기본 추천순</option><option value="volume">24시간 거래대금 높은순</option><option value="change">24시간 상승률 높은순</option></select></label>
@@ -689,6 +696,20 @@ function bithumbGuideWon(value) {
 async function scan(){
 if (scanning) return;
 scanning = true;
+const scanResultsNotice = document.getElementById("scanResultsNotice");
+
+if (scanResultsNotice) {
+  const hasPreviousScan = Boolean(
+    document.getElementById("updated")?.dataset.scanResultsAt
+  );
+
+  scanResultsNotice.style.display = "block";
+
+  scanResultsNotice.textContent = hasPreviousScan
+    ? "⚠️ 새 스캔 진행 중 — 현재 표는 이전 스캔 결과입니다."
+    : "⏳ 첫 스캔 진행 중 — 결과를 불러오는 중입니다.";
+}
+
  const buyAlertBox = document.getElementById("buyAlert");
     if (buyAlertBox) {
       buyAlertBox.textContent = "";
@@ -1064,7 +1085,37 @@ if (resultSortBox) {
       status.style.color = "";
     }
 
- }catch(e){document.getElementById("connection").textContent="연결 실패";status.textContent="오류: "+e.message+" · 잠시 후 다시 시도하세요. Render 무료 서버라면 기동에 시간이 걸릴 수 있습니다."}
+    if (scanResultsNotice) {
+      if (scanIncomplete) {
+        scanResultsNotice.textContent =
+          "⚠️ 일부 분석 실패 — 현재 표는 불완전한 새 스캔 결과입니다.";
+        scanResultsNotice.style.display = "block";
+      } else {
+        scanResultsNotice.style.display = "none";
+      }
+    }
+
+
+} catch (e) {
+  document.getElementById("connection").textContent = "연결 실패";
+
+  status.textContent =
+    "오류: " + e.message +
+    " · 잠시 후 다시 시도하세요. Render 무료 서버라면 기동에 시간이 걸릴 수 있습니다.";
+
+  if (scanResultsNotice) {
+    const hasPreviousScan = Boolean(
+      document.getElementById("updated")?.dataset.scanResultsAt
+    );
+
+    scanResultsNotice.textContent = hasPreviousScan
+      ? "⚠️ 새 스캔 실패 — 현재 표는 이전 스캔 결과입니다."
+      : "⚠️ 첫 스캔 실패 — 표시할 스캔 결과가 없습니다.";
+
+    scanResultsNotice.style.display = "block";
+  }
+}
+
 finally {
   scanning = false;
 }
