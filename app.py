@@ -144,7 +144,12 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   <div class="card"><div class="k">검색 대상</div><div class="v" id="count">— <small>마켓</small></div></div>
   <div class="card"><div class="k">진입 확인</div><div class="v good" id="buys">— <small>코인</small></div></div>
   <div class="card"><div class="k">관심 후보</div><div class="v" id="watches">— <small>코인</small></div></div>
-  <div class="card"><div class="k">마지막 갱신</div><div class="v" style="font-size:17px" id="updated">—</div></div>
+  <div class="card">
+  <div class="k">마지막 갱신</div>
+  <div class="v" style="font-size:17px" id="updated">—</div>
+  <div id="scanAge" style="font-size:12px;color:#9ba9c4;margin-top:6px;">스캔 기록 없음</div>
+</div>
+
 </div>
 <div id="buyAlert" role="status" aria-live="polite" style="display:none;margin:14px 0;padding:14px;border:1px solid #2b8a68;border-radius:12px;color:#7bedbb;font-weight:700;"></div>
 
@@ -794,6 +799,45 @@ const candidates = allCandidates.slice(
   document.getElementById("buys").innerHTML=allResults.filter(x=>x.signal==="BUY").length+' <small>코인</small>';
   document.getElementById("watches").innerHTML=allResults.filter(x=>x.signal==="WATCH").length+' <small>코인</small>';
   document.getElementById("updated").textContent=d.updated;
+  document.getElementById("updated").dataset.scanResultsAt = String(Date.now());
+  
+const scanAgeBox = document.getElementById("scanAge");
+
+if (scanAgeBox) {
+  const refreshScanAge = () => {
+    const scanAt = Number(
+      document.getElementById("updated").dataset.scanResultsAt
+    );
+
+    if (!scanAt) {
+      scanAgeBox.textContent = "스캔 기록 없음";
+      return;
+    }
+
+    const minutes = Math.max(
+      0,
+      Math.floor((Date.now() - scanAt) / 60000)
+    );
+
+    if (minutes < 1) {
+      scanAgeBox.textContent = "방금 스캔 완료";
+    } else if (minutes < 60) {
+      scanAgeBox.textContent = `스캔 완료 후 ${minutes}분 경과`;
+    } else {
+      const hours = Math.floor(minutes / 60);
+      const remainingMinutes = minutes % 60;
+      scanAgeBox.textContent =
+        `스캔 완료 후 ${hours}시간 ${remainingMinutes}분 경과`;
+    }
+  };
+
+  refreshScanAge();
+
+  if (!window.scanAgeTimer) {
+    window.scanAgeTimer = setInterval(refreshScanAge, 30000);
+  }
+}
+
   const body=document.getElementById("rows");
   if(!candidates.length){body.innerHTML='<tr><td colspan="10">조건에 맞는 결과가 없습니다.</td></tr>'}
   else body.innerHTML = allCandidates.map(x => `
