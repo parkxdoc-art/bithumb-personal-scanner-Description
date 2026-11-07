@@ -1031,6 +1031,32 @@ detailScanTime.style.fontWeight = minutes >= 5 ? "700" : "600";
     const detailGrid = document.createElement("div");
     detailGrid.className = "coin-detail-grid";
 
+const riskEntryPrice = Number(x.price);
+const riskStopPrice = Number(x.stop);
+const riskTargetPrice = Number(x.target);
+
+const riskValuesValid =
+  Number.isFinite(riskEntryPrice) &&
+  Number.isFinite(riskStopPrice) &&
+  Number.isFinite(riskTargetPrice) &&
+  riskEntryPrice > 0 &&
+  riskStopPrice > 0 &&
+  riskStopPrice < riskEntryPrice &&
+  riskTargetPrice > riskEntryPrice;
+
+const riskLossPct = riskValuesValid
+  ? ((riskEntryPrice - riskStopPrice) / riskEntryPrice) * 100
+  : null;
+
+const riskGainPct = riskValuesValid
+  ? ((riskTargetPrice - riskEntryPrice) / riskEntryPrice) * 100
+  : null;
+
+const riskReward = riskValuesValid
+  ? (riskTargetPrice - riskEntryPrice) /
+    (riskEntryPrice - riskStopPrice)
+  : null;
+
     const detailItems = [
       ["현재가", won(x.price)],
       ["24시간 변동", pct(x.change),
@@ -1039,8 +1065,13 @@ detailScanTime.style.fontWeight = minutes >= 5 ? "700" : "600";
         x.vol_ratio == null ? "-" : Number(x.vol_ratio).toFixed(2) + "배"],
       ["종합 점수", x.score ?? "-"],
       
-      ["손절 참고가", bithumbGuideWon(x.stop), "stop"],
-      ["목표 참고가", bithumbGuideWon(x.target), "target"],
+
+     ["손절 참고가", bithumbGuideWon(x.stop), "stop"],
+     ["목표 참고가", bithumbGuideWon(x.target), "target"],
+     ["예상 손절폭", riskLossPct == null ? "—" : `-${riskLossPct.toFixed(2)}%`, "stop"],
+     ["예상 목표폭", riskGainPct == null ? "—" : `+${riskGainPct.toFixed(2)}%`, "target"],
+     ["이론적 손익비", riskReward == null ? "—" : `1 : ${riskReward.toFixed(2)}`, "buy", true],
+ 
 
       
       ["신호", `${x.signal ?? "-"} (${x.label ?? "-"})`,
