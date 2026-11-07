@@ -920,10 +920,34 @@ const candidates = allCandidates.slice(
   const selectedLimit = Number(document.getElementById("resultLimit").value);
   const resultCountBox = document.getElementById("resultCount");
 
-    if (resultCountBox) {
-      resultCountBox.textContent =
-        `✅ 조건 충족 ${qualifiedCount}개 / 최대 표시 ${selectedLimit}개 (현재 ${candidates.length}개 표시)`;
-    }
+ if (resultCountBox) {
+  const watchBase = d.results.filter(x =>
+    x.signal === "WATCH" &&
+    Number(x.value24) >= 500000000
+  );
+
+  const watchVolCount = watchBase.filter(x =>
+    Number(x.vol_ratio) >= 1.5
+  ).length;
+
+  const watchScoreCount = watchBase.filter(x =>
+    Number(x.score) >= 50
+  ).length;
+
+  const watchBothCount = watchBase.filter(x =>
+    Number(x.vol_ratio) >= 1.5 &&
+    Number(x.score) >= 50
+  ).length;
+
+  resultCountBox.textContent =
+    `🔎 5억 이상 BUY/WATCH ${qualifiedCount}개 | ` +
+    `WATCH ${watchBase.length}개 | ` +
+    `거래량 통과 ${watchVolCount}개 | ` +
+    `점수 통과 ${watchScoreCount}개 | ` +
+    `동시 통과 ${watchBothCount}개 | ` +
+    `현재 표시 ${candidates.length}개`;
+}
+
 
   d.count = totalMarkets;
   d.scanned = allResults.length;
