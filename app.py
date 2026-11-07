@@ -198,6 +198,18 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   스캔 기준 시각 확인 중
 </div>
 
+<div style="margin:12px 0;padding:12px;background:#1b2943;border:1px solid #34405a;border-radius:10px;">
+  <label for="tradeFeeRate" style="display:block;margin-bottom:8px;font-size:13px;color:#a9b7d2;">
+    거래 수수료 설정 (매수·매도 각각)
+  </label>
+  <select id="tradeFeeRate"
+          style="width:100%;padding:10px;background:#11172b;color:#edf3ff;border:1px solid #34405a;border-radius:8px;">
+    <option value="0.25">기본 수수료 0.25%</option>
+    <option value="0.04">할인 쿠폰 0.04%</option>
+    <option value="0">무료 수수료 0%</option>
+  </select>
+</div>
+
   <div id="coinDetailBody" style="margin-top:10px;white-space:pre-wrap;line-height:1.7;"></div>
 </div>
 </div>
@@ -1078,6 +1090,44 @@ const riskReward = riskValuesValid
     (riskEntryPrice - riskStopPrice)
   : null;
 
+const feeSelect = document.getElementById("tradeFeeRate");
+const feePercent = Number(feeSelect?.value ?? 0.25);
+const feeRate = Number.isFinite(feePercent) && feePercent >= 0
+  ? feePercent / 100
+  : 0.0025;
+
+// 매수·매도 수수료를 각각 반영
+const netEntryCost = riskValuesValid
+  ? riskEntryPrice * (1 + feeRate)
+  : null;
+
+const netStopProceeds = riskValuesValid
+  ? riskStopPrice * (1 - feeRate)
+  : null;
+
+const netTargetProceeds = riskValuesValid
+  ? riskTargetPrice * (1 - feeRate)
+  : null;
+
+// 수수료 포함 예상 손실률
+const netLossPct = riskValuesValid
+  ? ((netEntryCost - netStopProceeds) / netEntryCost) * 100
+  : null;
+
+// 수수료 포함 예상 순수익률
+const netGainPct = riskValuesValid
+  ? ((netTargetProceeds - netEntryCost) / netEntryCost) * 100
+  : null;
+
+// 수수료 포함 실질 손익비
+const netRiskReward =
+  netLossPct != null &&
+  netGainPct != null &&
+  netLossPct > 0 &&
+  netGainPct > 0
+    ? netGainPct / netLossPct
+    : null;
+
     const detailItems = [
       ["현재가", won(x.price)],
       ["24시간 변동", pct(x.change),
@@ -1093,8 +1143,10 @@ const riskReward = riskValuesValid
      ["예상 목표폭", riskGainPct == null ? "—" : `+${riskGainPct.toFixed(2)}%`, "target"],
      ["이론적 손익비", riskReward == null ? "—" : `1 : ${riskReward.toFixed(2)}`, "buy", true],
  
+     ["수수료 포함 예상 손절폭", netLossPct == null ? "—" : `-${netLossPct.toFixed(2)}%`, "stop"],
+     ["수수료 포함 예상 순수익률", netGainPct == null ? "—" : `${netGainPct >= 0 ? "+" : ""}${netGainPct.toFixed(2)}%`, netGainPct != null && netGainPct < 0 ? "stop" : "target"],
+     ["수수료 반영 실질 손익비", netRiskReward == null ? "—" : `1 : ${netRiskReward.toFixed(2)}`, "buy", true],
 
-      
       ["신호", `${x.signal ?? "-"} (${x.label ?? "-"})`,
         x.signal === "BUY" ? "buy" : "watch", true],
       ["24시간 거래대금", money(x.value24), "", true],
@@ -1122,20 +1174,56 @@ const riskReward = riskValuesValid
     });
 
     detailBody.appendChild(detailGrid);
- 
-    
-      
-      
-      
-      
-      
-      
-      
-      
-      
-    
-      
+    if (feeSelect) {
+  feeSelect.onchange = () => {
+    if (!riskValuesValid) return;
 
+    const rate = Number(feeSelect.value) / 100;
+    if (!Number.isFinite(rate) || rate < 0 || rate >= 1) return;
+
+    const buyCost = riskEntryPrice * (1 + rate);
+    const stopProceeds = riskStopPrice * (1 - rate);
+    const targetProceeds = riskTargetPrice * (1 - rate);
+
+    const lossPct = ((buyCost - stopProceeds) / buyCost) * 100;
+    const gainPct = ((targetProceeds - buyCost) / buyCost) * 100;
+
+    const rewardRatio = lossPct > 0 && gainPct > 0
+      ? gainPct / lossPct
+      : null;
+
+    const updateFeeCard = (label, value, color) => {
+      const card = Array.from(detailGrid.children).find(
+        el => el.querySelector(".coin-detail-label")?.textContent.trim() === label
+      );
+
+      const valueEl = card?.querySelector(".coin-detail-value");
+      if (!valueEl) return;
+
+      valueEl.textContent = value;
+      valueEl.className = "coin-detail-value" + (color ? " " + color : "");
+    };
+
+    updateFeeCard(
+      "수수료 포함 예상 손절폭",
+      `-${lossPct.toFixed(2)}%`,
+      "stop"
+    );
+
+    updateFeeCard(
+      "수수료 포함 예상 순수익률",
+      `${gainPct >= 0 ? "+" : ""}${gainPct.toFixed(2)}%`,
+      gainPct < 0 ? "stop" : "target"
+    );
+
+    updateFeeCard(
+      "수수료 반영 실질 손익비",
+      rewardRatio == null ? "—" : `1 : ${rewardRatio.toFixed(2)}`,
+      rewardRatio == null ? "" : "buy"
+    );
+  };
+}
+ 
     detail.style.display = "block";
     detail.scrollIntoView({
       behavior: "smooth",
