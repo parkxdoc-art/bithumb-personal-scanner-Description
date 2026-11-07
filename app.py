@@ -526,7 +526,14 @@ function saveBuySignals(results, tf) {
         tf: tf,
         candle_time: x.candle_time,
         signal_price: x.price,
-        
+   
+    value24: x.value24 ?? null,
+    vol_ratio: x.vol_ratio ?? null,
+    score: x.score ?? null,
+    ma5_status: x.ma5_info?.status ?? null,
+    stop_price: x.stop ?? null,
+    target_price: x.target ?? null,
+     
         price_15m: null,
         price_30m: null,
         price_60m: null,
