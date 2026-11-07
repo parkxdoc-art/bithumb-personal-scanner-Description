@@ -988,6 +988,16 @@ if (scanAgeBox) {
     const detail = document.getElementById("coinDetail");
     if (!detail) return;
 
+if (
+  detail.style.display === "block" &&
+  detail.dataset.market === x.market
+) {
+  detail.style.display = "none";
+  return;
+}
+
+detail.dataset.market = x.market;
+
     document.getElementById("coinDetailTitle").textContent =
       `${x.market} 상세 분석`;
     document.getElementById("coinDetailTitle").dataset.signal =
