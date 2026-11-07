@@ -287,6 +287,11 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
  
 <div id="buyStats" style="white-space:pre-wrap;line-height:1.8;margin:12px 0 18px;">성과 통계 준비 중...</div>
 
+<div id="buyCompareStats"
+     style="white-space:pre-wrap;line-height:1.8;margin:12px 0;padding:12px;border:1px solid #34405a;border-radius:10px;background:#1b2943;font-size:13px;">
+  📊 BUY 신호 성과 비교
+  강화 BUY 비교 데이터 수집 준비 중...
+</div>
 
 <details style="margin-top:14px;">
   <summary style="display:block;cursor:pointer;background:#123d35;color:#4ade80;border:1px solid #2b8a68;border-radius:10px;padding:12px 14px;font-size:15px;font-weight:800;">
@@ -679,6 +684,59 @@ function showBuyStats() {
     const history = JSON.parse(
       localStorage.getItem("bithumb_v2_buy_history") || "[]"
     );
+
+const compareBox = document.getElementById("buyCompareStats");
+
+if (compareBox) {
+  const comparable = history.filter(x =>
+    x &&
+    x.vol_ratio != null &&
+    x.score != null &&
+    Number.isFinite(Number(x.vol_ratio)) &&
+    Number.isFinite(Number(x.score))
+  );
+
+  const enhanced = comparable.filter(x =>
+    Number(x.vol_ratio) >= 1.5 &&
+    Number(x.score) >= 50
+  );
+
+  compareBox.textContent =
+    "📊 BUY 신호 성과 비교 (실험)\n" +
+    `분석 가능한 신규 BUY: ${comparable.length}개\n` +
+    `강화 조건 통과: ${enhanced.length}개\n` +
+    "강화 기준: 거래량 1.5배 이상 + 점수 50 이상\n" +
+
+[15, 30, 60].map(m => {
+  const getStats = group => {
+    const valid = group.filter(x =>
+      x[`source_candle_${m}m`] &&
+      Number(x.signal_price) > 0 &&
+      Number(x[`price_${m}m`]) > 0
+    );
+
+    if (!valid.length) return "평가 완료 0개";
+
+    const returns = valid.map(x =>
+      (Number(x[`price_${m}m`]) /
+        Number(x.signal_price) - 1) * 100
+    );
+
+    const avg = returns.reduce((a, b) => a + b, 0)
+      / returns.length;
+
+    const wins = returns.filter(r => r > 0).length;
+    const winRate = wins / returns.length * 100;
+
+    return `평균 ${avg >= 0 ? "+" : ""}${avg.toFixed(2)}% | 상승 ${winRate.toFixed(1)}% | ${valid.length}개`;
+  };
+
+  return `${m}분 후
+기존 BUY(분석정보 보유): ${getStats(comparable)}
+강화 BUY: ${getStats(enhanced)}`;
+}).join("\n\n");
+
+}
 
     const lines = [`누적 BUY 신호: ${history.length}개`];
 
