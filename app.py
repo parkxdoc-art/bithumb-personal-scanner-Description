@@ -885,10 +885,21 @@ const resultSort = document.getElementById("resultSort").value;
 
 
 const allCandidates = d.results
-  .filter(x =>
-    (x.signal === "BUY" || x.signal === "WATCH") &&
-    Number(x.value24) >= 500000000
-  )
+
+.filter(x => {
+  if (x.signal === "BUY") {
+    return Number(x.value24) >= 500000000;
+  }
+
+  if (x.signal === "WATCH") {
+    return Number(x.value24) >= 500000000 &&
+      Number(x.vol_ratio) >= 1.5 &&
+      Number(x.score) >= 50;
+  }
+
+  return false;
+})
+  
   .sort((a, b) => {
     if (resultSort === "volume") {
       return Number(b.value24) - Number(a.value24);
