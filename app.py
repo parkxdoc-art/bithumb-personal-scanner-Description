@@ -899,15 +899,31 @@ if (x.signal === "WATCH") {
   return false;
 })
   
-  .sort((a, b) => {
-    if (resultSort === "volume") {
-      return Number(b.value24) - Number(a.value24);
-    }
-    if (resultSort === "change") {
-      return Number(b.change) - Number(a.change);
-    }
-    return 0;
-  });
+
+.sort((a, b) => {
+  if (resultSort === "volume") {
+    return Number(b.value24) - Number(a.value24);
+  }
+
+  if (resultSort === "change") {
+    return Number(b.change) - Number(a.change);
+  }
+
+  if (a.signal !== b.signal) {
+    return a.signal === "BUY" ? -1 : 1;
+  }
+
+  if (a.signal === "WATCH") {
+    const watchPriority = x =>
+      (Number(x.vol_ratio) >= 1.5 ? 1 : 0) +
+      (Number(x.score) >= 50 ? 1 : 0);
+
+    return watchPriority(b) - watchPriority(a);
+  }
+
+  return 0;
+});
+
 
 const candidates = allCandidates.slice(
   0,
@@ -1475,7 +1491,15 @@ if (resultSortBox) {
       if (mode === "change") {
         return Number(b.change) - Number(a.change);
       }
-      return defaultRanks.get(a.market) - defaultRanks.get(b.market);
+  
+const priority = x =>
+  (x.signal === "BUY" ? 3 : 0) +
+  (x.signal === "WATCH" && Number(x.vol_ratio) >= 1.5 ? 1 : 0) +
+  (x.signal === "WATCH" && Number(x.score) >= 50 ? 1 : 0);
+
+return priority(b) - priority(a) ||
+  defaultRanks.get(a.market) - defaultRanks.get(b.market);
+
     });
 
     const rowsByMarket = new Map(
