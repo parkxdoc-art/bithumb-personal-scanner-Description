@@ -210,6 +210,13 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   </select>
 </div>
 
+<div id="tradeRiskWarning"
+     role="status"
+     aria-live="polite"
+     style="display:none;margin:12px 0;padding:12px 14px;background:#40272c;border:1px solid #fb7185;border-radius:10px;color:#fecdd3;font-size:13px;font-weight:700;line-height:1.6;">
+  ⚠️ 진입 전 위험 조건을 확인하세요.
+</div>
+
   <div id="coinDetailBody" style="margin-top:10px;white-space:pre-wrap;line-height:1.7;"></div>
 </div>
 </div>
@@ -1128,6 +1135,32 @@ const netRiskReward =
     ? netGainPct / netLossPct
     : null;
 
+const tradeRiskWarning = document.getElementById("tradeRiskWarning");
+
+function updateTradeRiskWarning(gainPct, rewardRatio) {
+  if (!tradeRiskWarning) return;
+
+  if (gainPct == null || !Number.isFinite(gainPct)) {
+    tradeRiskWarning.style.display = "none";
+    return;
+  }
+
+  if (gainPct <= 0) {
+    tradeRiskWarning.textContent =
+      "⚠️ 진입 전 주의! 수수료 반영 예상 순수익률이 0% 이하입니다.";
+  } else if (rewardRatio != null && rewardRatio < 1) {
+    tradeRiskWarning.textContent =
+      "⚠️ 진입 전 주의! 수수료 반영 실질 손익비가 1:1 미만입니다.";
+  } else {
+    tradeRiskWarning.style.display = "none";
+    return;
+  }
+
+  tradeRiskWarning.style.display = "block";
+}
+
+updateTradeRiskWarning(netGainPct, netRiskReward);
+
     const detailItems = [
       ["현재가", won(x.price)],
       ["24시간 변동", pct(x.change),
@@ -1221,6 +1254,9 @@ const netRiskReward =
       rewardRatio == null ? "—" : `1 : ${rewardRatio.toFixed(2)}`,
       rewardRatio == null ? "" : "buy"
     );
+ 
+    updateTradeRiskWarning(gainPct, rewardRatio);
+   
   };
 }
  
