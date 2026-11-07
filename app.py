@@ -891,11 +891,10 @@ const allCandidates = d.results
     return Number(x.value24) >= 500000000;
   }
 
-  if (x.signal === "WATCH") {
-    return Number(x.value24) >= 500000000 &&
-      Number(x.vol_ratio) >= 1.5 &&
-      Number(x.score) >= 50;
-  }
+if (x.signal === "WATCH") {
+  return Number(x.value24) >= 500000000;
+}
+
 
   return false;
 })
