@@ -930,7 +930,20 @@ const candidates = allCandidates.slice(
   document.getElementById("connection").textContent="빗썸 공개 API 연결됨";
   document.getElementById("count").innerHTML=d.count+' <small>마켓</small>';
   document.getElementById("buys").innerHTML=allResults.filter(x=>x.signal==="BUY").length+' <small>코인</small>';
-  document.getElementById("watches").innerHTML=allResults.filter(x=>x.signal==="WATCH").length+' <small>코인</small>';
+  
+const totalWatchCount = allResults.filter(
+  x => x.signal === "WATCH"
+).length;
+
+const refinedWatchCount = allCandidates.filter(
+  x => x.signal === "WATCH"
+).length;
+
+document.getElementById("watches").innerHTML =
+  refinedWatchCount + ' <small>코인</small>' +
+  '<div style="font-size:12px;font-weight:400;color:#94a3b8;margin-top:6px;">전체 WATCH: ' +
+  totalWatchCount + '개</div>';
+
   document.getElementById("updated").textContent=d.updated;
   document.getElementById("updated").dataset.scanResultsAt = String(Date.now());
   
