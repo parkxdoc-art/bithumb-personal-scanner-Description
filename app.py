@@ -217,6 +217,47 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   ⚠️ 진입 전 위험 조건을 확인하세요.
 </div>
 
+<div style="margin:12px 0;padding:14px;background:#1b2943;border:1px solid #34405a;border-radius:12px;">
+
+  <div style="font-size:16px;font-weight:800;margin-bottom:12px;">
+    💰 투자금별 예상 손익 계산기
+  </div>
+
+  <label for="tradeCapital" style="display:block;font-size:13px;color:#9ba9c4;margin-bottom:6px;">
+    투자금 선택 (매수 수수료 포함 총액)
+  </label>
+
+  <select id="tradeCapital" style="width:100%;margin-bottom:12px;">
+    <option value="100000">10만 원</option>
+    <option value="300000" selected>30만 원</option>
+    <option value="500000">50만 원</option>
+    <option value="1000000">100만 원</option>
+  </select>
+
+  <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">
+
+    <div class="coin-detail-item">
+      <div class="coin-detail-label">손절 시 예상 손익</div>
+      <div id="tradeCapitalLoss" class="coin-detail-value stop">
+        계산 대기
+      </div>
+    </div>
+
+    <div class="coin-detail-item">
+      <div class="coin-detail-label">목표가 도달 시 예상 손익</div>
+      <div id="tradeCapitalGain" class="coin-detail-value target">
+        계산 대기
+      </div>
+    </div>
+
+  </div>
+
+  <div style="font-size:11px;color:#9ba9c4;margin-top:10px;">
+    수수료 반영 예상 금액 · 슬리피지 제외 · 자동 주문 없음
+  </div>
+
+</div>
+
   <div id="coinDetailBody" style="margin-top:10px;white-space:pre-wrap;line-height:1.7;"></div>
 </div>
 </div>
@@ -1161,6 +1202,58 @@ function updateTradeRiskWarning(gainPct, rewardRatio) {
 
 updateTradeRiskWarning(netGainPct, netRiskReward);
 
+const capitalSelect = document.getElementById("tradeCapital");
+const capitalLossEl = document.getElementById("tradeCapitalLoss");
+const capitalGainEl = document.getElementById("tradeCapitalGain");
+
+function refreshCapitalEstimate() {
+  if (!capitalSelect || !capitalLossEl || !capitalGainEl) return;
+
+  const capital = Number(capitalSelect.value);
+  const fee = Number(feeSelect?.value ?? 0.25) / 100;
+
+  if (
+    !riskValuesValid ||
+    !Number.isFinite(capital) ||
+    capital <= 0 ||
+    !Number.isFinite(fee) ||
+    fee < 0 ||
+    fee >= 1
+  ) {
+    capitalLossEl.textContent = "계산 불가";
+    capitalGainEl.textContent = "계산 불가";
+    return;
+  }
+
+  const quantity = capital / (riskEntryPrice * (1 + fee));
+
+  const stopPnL =
+    quantity * riskStopPrice * (1 - fee) - capital;
+
+  const targetPnL =
+    quantity * riskTargetPrice * (1 - fee) - capital;
+
+  const formatPnL = value =>
+    (value < 0 ? "-" : "+") +
+    Math.round(Math.abs(value)).toLocaleString("ko-KR") +
+    "원";
+
+  capitalLossEl.textContent = formatPnL(stopPnL);
+  capitalGainEl.textContent = formatPnL(targetPnL);
+
+  capitalLossEl.className =
+    "coin-detail-value " + (stopPnL < 0 ? "stop" : "target");
+
+  capitalGainEl.className =
+    "coin-detail-value " + (targetPnL < 0 ? "stop" : "target");
+}
+
+refreshCapitalEstimate();
+
+if (capitalSelect) {
+  capitalSelect.onchange = refreshCapitalEstimate;
+}
+
     const detailItems = [
       ["현재가", won(x.price)],
       ["24시간 변동", pct(x.change),
@@ -1256,7 +1349,7 @@ updateTradeRiskWarning(netGainPct, netRiskReward);
     );
  
     updateTradeRiskWarning(gainPct, rewardRatio);
-   
+    refreshCapitalEstimate(); 
   };
 }
  
