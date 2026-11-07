@@ -227,7 +227,18 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
  
 <div id="buyStats" style="white-space:pre-wrap;line-height:1.8;margin:12px 0 18px;">성과 통계 준비 중...</div>
 
-  <pre id="buyHistory" style="white-space:pre-wrap;font-family:inherit;font-size:14px;">기록을 불러오는 중...</pre>
+
+<details style="margin-top:14px;">
+  <summary style="display:block;cursor:pointer;background:#123d35;color:#4ade80;border:1px solid #2b8a68;border-radius:10px;padding:12px 14px;font-size:15px;font-weight:800;">
+    📂 BUY 목록 · 눌러서 보기
+  </summary>
+
+  <pre id="buyHistory"
+       style="white-space:pre-wrap;font-family:inherit;font-size:14px;margin:14px 0 0;">
+    기록을 불러오는 중...
+  </pre>
+</details>
+  
 </div>
 
 <footer>신호 알림 전용 · 자동 주문 없음 · 공개 시장 데이터 기반 · 투자 판단 책임은 사용자에게 있습니다. 과거 조건의 유효성이 미래 수익을 보장하지 않습니다.</footer>
