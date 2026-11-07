@@ -470,8 +470,11 @@ function exportBuyHistory() {
       "market", "tf", "candle_time", "detected_at",
       "signal_price", "price_15m", "price_30m", "price_60m",
       "source_candle_15m", "source_candle_30m",
-      "source_candle_60m"
-    ];
+  "source_candle_60m",
+  "value24", "vol_ratio", "score",
+  "ma5_status", "stop_price", "target_price"
+];
+
 
     const safeCSV = value => {
       const s = String(value ?? "");
