@@ -473,13 +473,14 @@ function exportBuyHistory() {
 
     const fields = [
       "market", "tf", "candle_time", "detected_at",
-      "signal_price", "price_15m", "price_30m", "price_60m",
+      "signal_price", "price_15m", "price_30m",
+      "price_60m",
       "source_candle_15m", "source_candle_30m",
-  "source_candle_60m",
-  "value24", "vol_ratio", "score",
-  "ma5_status", "stop_price", "target_price"
-];
-
+      "source_candle_60m",
+      "value24", "vol_ratio", "score",
+      "ma5_status", "trend15", "stop_price",
+      "target_price"
+    ];
 
     const safeCSV = value => {
       const s = String(value ?? "");
@@ -534,17 +535,19 @@ function saveBuySignals(results, tf) {
         tf: tf,
         candle_time: x.candle_time,
         signal_price: x.price,
-   
-    value24: x.value24 ?? null,
-    vol_ratio: x.vol_ratio ?? null,
-    score: x.score ?? null,
-    ma5_status: x.ma5_info?.status ?? null,
-    stop_price: x.stop ?? null,
-    target_price: x.target ?? null,
-     
+
+        value24: x.value24 ?? null,
+        vol_ratio: x.vol_ratio ?? null,
+        score: x.score ?? null,
+        ma5_status: x.ma5_info?.status ?? null,
+        trend15: x.trend15 ?? null,
+        stop_price: x.stop ?? null,
+        target_price: x.target ?? null,
+
         price_15m: null,
         price_30m: null,
         price_60m: null,
+
 
         detected_at: new Date().toISOString()
       });
