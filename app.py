@@ -2728,6 +2728,177 @@ def backtest_eth_followup_check():
             "error": str(e)
         }), 500
 
+@app.get("/api/backtest-multiday-check")
+def backtest_multiday_check():
+    """임시 진단: 3종목 X 3날짜 과거 신호 재현."""
+    markets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
+    dates = ["2026-11-01", "2026-11-04", "2026-11-07"]
+
+    minute = 5
+    volume_multiple = 1.5
+    rr = 2.0
+
+    results = []
+    totals = {"BUY": 0, "WATCH": 0, "WAIT": 0}
+    total_windows = 0
+
+    for date in dates:
+        cutoff = datetime.fromisoformat(
+            date + "T12:00:00"
+        ).replace(tzinfo=KST)
+
+        for market in markets:
+            try:
+                rows = backtest_completed_rows(
+                    market,
+                    minute,
+                    cutoff,
+                    count=200
+                )
+
+                windows = make_backtest_windows(
+                    rows,
+                    minute=minute,
+                    lookback=80,
+                    forward_bars=12
+                )
+
+                counts = {
+                    "BUY": 0,
+                    "WATCH": 0,
+                    "WAIT": 0
+                }
+
+                future_independent = True
+                buy_examples = []
+
+                for window in windows:
+                    result = backtest_replay_signal(
+                        window,
+                        volume_multiple=volume_multiple,
+                        rr=rr
+                    )
+
+                    control_window = {
+                        "cutoff_kst": window["cutoff_kst"],
+                        "signal_rows": window["signal_rows"],
+                        "evaluation_rows": []
+                    }
+
+                    control = backtest_replay_signal(
+                        control_window,
+                        volume_multiple=volume_multiple,
+                        rr=rr
+                    )
+
+                    if result is None or control is None:
+                        raise ValueError(
+                            "과거 신호 재현 실패"
+                        )
+
+                    if result != control:
+                        future_independent = False
+
+                    signal = result["signal"]
+
+                    if signal not in counts:
+                        raise ValueError(
+                            "알 수 없는 신호"
+                        )
+
+                    counts[signal] += 1
+
+                    if signal == "BUY" and len(buy_examples) < 3:
+                        entry = float(
+                            result["entry_close"]
+                        )
+
+                        future = window["evaluation_rows"]
+
+                        if entry <= 0 or len(future) != 12:
+                            raise ValueError(
+                                "BUY 사후 평가 자료 오류"
+                            )
+
+                        returns = {}
+
+                        for minutes, index in [
+                            (15, 2),
+                            (30, 5),
+                            (60, 11)
+                        ]:
+                            price = float(
+                                future[index]["trade_price"]
+                            )
+
+                            returns[f"{minutes}m"] = round(
+                                (price / entry - 1) * 100,
+                                3
+                            )
+
+                        buy_examples.append({
+                            "candle_time_kst": result[
+                                "candle_time_kst"
+                            ],
+                            "entry_close": entry,
+                            "vol_ratio": result[
+                                "vol_ratio"
+                            ],
+                            "return_pct": returns
+                        })
+
+                group_ok = (
+                    len(windows) > 0
+                    and future_independent
+                    and sum(counts.values()) == len(windows)
+                )
+
+                results.append({
+                    "date": date,
+                    "market": market,
+                    "ok": group_ok,
+                    "completed_candles": len(rows),
+                    "window_count": len(windows),
+                    "signal_counts": counts,
+                    "future_evaluation_independent":
+                        future_independent,
+                    "buy_examples": buy_examples
+                })
+
+                total_windows += len(windows)
+
+                for name in totals:
+                    totals[name] += counts[name]
+
+            except Exception as e:
+                results.append({
+                    "date": date,
+                    "market": market,
+                    "ok": False,
+                    "error_type": type(e).__name__
+                })
+
+    all_ok = (
+        len(results) == len(markets) * len(dates)
+        and all(x["ok"] for x in results)
+        and sum(totals.values()) == total_windows
+    )
+
+    return jsonify({
+        "ok": all_ok,
+        "test_only": True,
+        "market_count": len(markets),
+        "date_count": len(dates),
+        "test_group_count": len(results),
+        "total_windows": total_windows,
+        "total_signal_counts": totals,
+        "results": results,
+        "fee_slippage_included": False,
+        "historical_value24_verified": False
+    })
+
+
+
 @app.get("/")
 def index():
     return render_template_string(HTML)
