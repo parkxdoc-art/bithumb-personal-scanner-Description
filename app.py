@@ -2574,6 +2574,159 @@ def backtest_eth_breakout_check():
             "error_type": type(e).__name__
         }), 500
 
+@app.get("/api/backtest-eth-followup-check")
+def backtest_eth_followup_check():
+    """임시 진단: ETH 돌파 이후 60분 검증."""
+    market = "KRW-ETH"
+    minute = 5
+    cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
+    event_time = "2026-11-07T06:55:00"
+
+    try:
+        rows = backtest_completed_rows(
+            market, minute, cutoff, count=200
+        )
+
+        windows = make_backtest_windows(
+            rows,
+            minute=minute,
+            lookback=80,
+            forward_bars=12
+        )
+
+        by_time = {
+            w["signal_rows"][-1]["candle_date_time_kst"]: w
+            for w in windows
+        }
+
+        event_window = by_time.get(event_time)
+
+        if event_window is None:
+            raise ValueError("기준 신호 캔들을 찾지 못함")
+
+        event_result = backtest_replay_signal(
+            event_window,
+            volume_multiple=1.5,
+            rr=2.0
+        )
+
+        if event_result is None:
+            raise ValueError("기준 신호 분석 실패")
+
+        future = event_window["evaluation_rows"]
+
+        if len(future) != 12:
+            raise ValueError("60분 평가 캔들 부족")
+
+        entry = float(event_result["entry_close"])
+        stop = event_result["stop_price"]
+        target = event_result["target_price"]
+
+        followup = []
+
+        for index, candle in enumerate(future, start=1):
+            candle_time = candle["candle_date_time_kst"]
+            close = float(candle["trade_price"])
+            high = float(candle["high_price"])
+            low = float(candle["low_price"])
+
+            next_window = by_time.get(candle_time)
+            next_result = (
+                backtest_replay_signal(
+                    next_window,
+                    volume_multiple=1.5,
+                    rr=2.0
+                )
+                if next_window is not None
+                else None
+            )
+
+            followup.append({
+                "minutes_after_signal_close": index * 5,
+                "candle_time_kst": candle_time,
+                "close": close,
+                "high": high,
+                "low": low,
+                "return_pct": round(
+                    (close / entry - 1) * 100, 3
+                ),
+                "replayed_signal": (
+                    next_result["signal"]
+                    if next_result else "분석 불가"
+                ),
+                "breakout_seen": (
+                    next_result["breakout_seen"]
+                    if next_result else None
+                ),
+                "support_held": (
+                    next_result["support_held"]
+                    if next_result else None
+                ),
+                "retest": (
+                    next_result["retest"]
+                    if next_result else None
+                ),
+                "stop_touched": (
+                    stop is not None
+                    and stop > 0
+                    and low <= stop
+                ),
+                "target_touched": (
+                    target is not None
+                    and target > 0
+                    and high >= target
+                )
+            })
+
+        first_stop = next(
+            (x["candle_time_kst"] for x in followup
+             if x["stop_touched"]),
+            None
+        )
+
+        first_target = next(
+            (x["candle_time_kst"] for x in followup
+             if x["target_touched"]),
+            None
+        )
+
+        return jsonify({
+            "ok": True,
+            "test_only": True,
+            "market": market,
+            "event_candle_kst": event_time,
+            "event_signal": event_result["signal"],
+            "event_breakout_seen": event_result["breakout_seen"],
+            "entry_reference_price": entry,
+            "stop_reference_price": stop,
+            "target_reference_price": target,
+            "returns_pct": {
+                "15m": followup[2]["return_pct"],
+                "30m": followup[5]["return_pct"],
+                "60m": followup[11]["return_pct"]
+            },
+            "first_stop_touch": first_stop,
+            "first_target_touch": first_target,
+            "same_candle_stop_target_ambiguity": any(
+                x["stop_touched"] and x["target_touched"]
+                for x in followup
+            ),
+            "buy_count_next_60m": sum(
+                x["replayed_signal"] == "BUY"
+                for x in followup
+            ),
+            "first_three_candles": followup[:3],
+            "all_followup_candles": followup,
+            "fee_slippage_included": False,
+            "historical_value24_verified": False
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error": str(e)
+        }), 500
 
 @app.get("/")
 def index():
