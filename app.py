@@ -2897,7 +2897,146 @@ def backtest_multiday_check():
         "historical_value24_verified": False
     })
 
+@app.get("/api/backtest-eth-data-check")
+def backtest_eth_data_check():
+    """임시 진단: 11월 4일 ETH 과거 5분봉 연속성 검사."""
+    market = "KRW-ETH"
+    minute = 5
+    lookback = 80
+    forward_bars = 12
 
+    cutoff = datetime(
+        2026, 11, 4, 12, 0, tzinfo=KST
+    )
+
+    try:
+        rows = backtest_completed_rows(
+            market,
+            minute,
+            cutoff,
+            count=200
+        )
+
+        if not rows:
+            raise ValueError("과거 캔들 없음")
+
+        windows = make_backtest_windows(
+            rows,
+            minute=minute,
+            lookback=lookback,
+            forward_bars=forward_bars
+        )
+
+        times = []
+
+        for candle in rows:
+            dt = datetime.fromisoformat(
+                candle["candle_date_time_kst"]
+            )
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=KST)
+            else:
+                dt = dt.astimezone(KST)
+
+            times.append(dt)
+
+        times.sort()
+
+        expected_seconds = minute * 60
+
+        gaps = []
+        run_lengths = []
+        run_length = 1
+
+        for previous, current in zip(
+            times, times[1:]
+        ):
+            delta_seconds = int(
+                (current - previous).total_seconds()
+            )
+
+            if delta_seconds == expected_seconds:
+                run_length += 1
+                continue
+
+            run_lengths.append(run_length)
+            run_length = 1
+
+            missing_count = None
+
+            if (
+                delta_seconds > expected_seconds
+                and delta_seconds % expected_seconds == 0
+            ):
+                missing_count = (
+                    delta_seconds // expected_seconds - 1
+                )
+
+            gaps.append({
+                "previous_candle_kst":
+                    previous.isoformat(),
+                "next_candle_kst":
+                    current.isoformat(),
+                "interval_minutes":
+                    delta_seconds / 60,
+                "missing_5m_candles":
+                    missing_count,
+                "duplicate_timestamp":
+                    delta_seconds == 0
+            })
+
+        run_lengths.append(run_length)
+
+        required_bars = lookback + forward_bars
+
+        expected_from_runs = sum(
+            max(0, length - required_bars + 1)
+            for length in run_lengths
+        )
+
+        theoretical_windows = max(
+            0,
+            len(times) - required_bars + 1
+        )
+
+        matching = (
+            len(windows) == expected_from_runs
+        )
+
+        return jsonify({
+            "ok": matching,
+            "test_only": True,
+            "market": market,
+            "cutoff_kst": cutoff.isoformat(),
+            "completed_candles": len(times),
+            "first_candle_kst":
+                times[0].isoformat(),
+            "last_candle_kst":
+                times[-1].isoformat(),
+            "data_continuous": len(gaps) == 0,
+            "gap_count": len(gaps),
+            "gap_examples": gaps[:20],
+            "run_lengths": run_lengths,
+            "longest_continuous_run":
+                max(run_lengths),
+            "theoretical_windows_without_gaps":
+                theoretical_windows,
+            "expected_windows_from_runs":
+                expected_from_runs,
+            "actual_window_count":
+                len(windows),
+            "window_count_matches":
+                matching,
+            "historical_value24_verified": False
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error": str(e)
+        }), 500
 
 @app.get("/")
 def index():
