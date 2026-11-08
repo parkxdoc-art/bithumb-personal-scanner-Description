@@ -1820,33 +1820,59 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
     lows=[float(x["low_price"]) for x in rows]
     volumes=[float(x["candle_acc_trade_volume"]) for x in rows]
     current=closes[-1]
-    trend15 = None
-    if minute == 5:
+   
+    trend15 = "정보 없음"
+
+    if minute != 5:
+        trend15 = "5분봉에서만 분석"
+    else:
         groups15 = {}
+
         for c in rows:
-            dt = datetime.fromisoformat(c["candle_date_time_kst"])
+            dt = datetime.fromisoformat(
+                c["candle_date_time_kst"]
+            )
             key = dt.replace(
                 minute=(dt.minute // 15) * 15,
-                second=0, microsecond=0
+                second=0,
+                microsecond=0
             )
-            groups15.setdefault(key, []).append(
-                (dt.minute % 15, float(c["trade_price"]))
-            )
+            groups15.setdefault(key, {})[
+                dt.minute % 15
+            ] = float(c["trade_price"])
 
-        bars15 = [
-            (key, values[-1][1])
+        complete15 = {
+            key: values[10]
             for key, values in groups15.items()
-            if [m for m, _ in values] == [0, 5, 10]
+            if all(m in values for m in (0, 5, 10))
+        }
+
+        latest_expected = now_kst.replace(
+            tzinfo=None,
+            minute=(now_kst.minute // 15) * 15,
+            second=0,
+            microsecond=0
+        ) - timedelta(minutes=15)
+
+        last11 = [
+            complete15.get(
+                latest_expected - timedelta(minutes=15 * i)
+            )
+            for i in range(10, -1, -1)
         ]
 
-        last11 = bars15[-11:]
-        if len(last11) == 11 and all(
-            last11[i][0] - last11[i - 1][0] == timedelta(minutes=15)
-            for i in range(1, 11)
-        ):
-            ma_now = sum(v for _, v in last11[1:]) / 10
-            ma_prev = sum(v for _, v in last11[:-1]) / 10
-            close_now = last11[-1][1]
+        valid_count = sum(
+            v is not None for v in last11
+        )
+
+        if valid_count < 11:
+            trend15 = (
+                f"연속 15분봉 부족 ({valid_count}/11개)"
+            )
+        else:
+            ma_now = sum(last11[1:]) / 10
+            ma_prev = sum(last11[:-1]) / 10
+            close_now = last11[-1]
 
             if close_now > ma_now and ma_now > ma_prev:
                 trend15 = "상승"
@@ -1854,6 +1880,7 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
                 trend15 = "하락"
             else:
                 trend15 = "중립"
+ 
 
     # Candidate pivot highs: higher than two neighbors on either side.
     pivots=[]
