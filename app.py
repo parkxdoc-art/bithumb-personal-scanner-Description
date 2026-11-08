@@ -688,58 +688,86 @@ function showBuyStats() {
       localStorage.getItem("bithumb_v2_buy_history") || "[]"
     );
 
-const compareBox = document.getElementById("buyCompareStats");
+    const compareBox = document.getElementById("buyCompareStats");
 
-if (compareBox) {
-  const comparable = history.filter(x =>
-    x &&
-    x.vol_ratio != null &&
-    x.score != null &&
-    Number.isFinite(Number(x.vol_ratio)) &&
-    Number.isFinite(Number(x.score))
-  );
+    if (compareBox) {
+      const comparable = history.filter(x =>
+        x &&
+        x.vol_ratio != null &&
+        x.score != null &&
+        Number.isFinite(Number(x.vol_ratio)) &&
+        Number.isFinite(Number(x.score))
+      );
 
-  const enhanced = comparable.filter(x =>
-    Number(x.vol_ratio) >= 1.5 &&
-    Number(x.score) >= 50
-  );
+      const enhanced = comparable.filter(x =>
+        Number(x.vol_ratio) >= 1.5 &&
+        Number(x.score) >= 50
+      );
 
-  compareBox.textContent =
-    "📊 BUY 신호 성과 비교 (실험)\n" +
-    `분석 가능한 신규 BUY: ${comparable.length}개\n` +
-    `강화 조건 통과: ${enhanced.length}개\n` +
-    "강화 기준: 거래량 1.5배 이상 + 점수 50 이상\n" +
+      const getStats = (group, m) => {
+        const valid = group.filter(x =>
+          x[`source_candle_${m}m`] &&
+          Number(x.signal_price) > 0 &&
+          Number(x[`price_${m}m`]) > 0
+        );
 
-[15, 30, 60].map(m => {
-  const getStats = group => {
-    const valid = group.filter(x =>
-      x[`source_candle_${m}m`] &&
-      Number(x.signal_price) > 0 &&
-      Number(x[`price_${m}m`]) > 0
-    );
+        if (!valid.length) return "평가 완료 0개";
 
-    if (!valid.length) return "평가 완료 0개";
+        const returns = valid.map(x =>
+          (Number(x[`price_${m}m`]) / Number(x.signal_price) - 1) * 100
+        );
 
-    const returns = valid.map(x =>
-      (Number(x[`price_${m}m`]) /
-        Number(x.signal_price) - 1) * 100
-    );
+        const avg = returns.reduce((a, b) => a + b, 0)
+          / returns.length;
 
-    const avg = returns.reduce((a, b) => a + b, 0)
-      / returns.length;
+        const winRate = returns.filter(r => r > 0).length
+          / returns.length * 100;
 
-    const wins = returns.filter(r => r > 0).length;
-    const winRate = wins / returns.length * 100;
+        return `평균 ${avg >= 0 ? "+" : ""}${avg.toFixed(2)}% | 상승 ${winRate.toFixed(1)}% | ${valid.length}개`;
+      };
 
-    return `평균 ${avg >= 0 ? "+" : ""}${avg.toFixed(2)}% | 상승 ${winRate.toFixed(1)}% | ${valid.length}개`;
-  };
+      const enhancedText = [15, 30, 60].map(m =>
+        `${m}분 후\n` +
+        `기존 BUY(분석정보 보유): ${getStats(comparable, m)}\n` +
+        `강화 BUY: ${getStats(enhanced, m)}`
+      ).join("\n\n");
 
-  return `${m}분 후
-기존 BUY(분석정보 보유): ${getStats(comparable)}
-강화 BUY: ${getStats(enhanced)}`;
-}).join("\n\n");
+      const trendBuy = comparable.filter(x =>
+        Number(x.tf) === 5
+      );
 
-}
+      const trendGroups = [
+        ["상승", trendBuy.filter(x => x.trend15 === "상승")],
+        ["중립", trendBuy.filter(x => x.trend15 === "중립")],
+        ["하락", trendBuy.filter(x => x.trend15 === "하락")],
+        ["데이터 부족/미확인", trendBuy.filter(x =>
+          !["상승", "중립", "하락"].includes(x.trend15)
+        )]
+      ];
+
+      const trendText = trendBuy.length === 0
+        ? "새로운 5분봉 BUY 기록 대기 중"
+        : [15, 30, 60].map(m =>
+            `${m}분 후\n` +
+            trendGroups.map(([label, group]) =>
+              `${label} BUY: ${getStats(group, m)}`
+            ).join("\n")
+          ).join("\n\n");
+
+      compareBox.textContent =
+        "📊 BUY 신호 성과 비교 (실험)\n" +
+        `분석 가능한 신규 BUY: ${comparable.length}개\n` +
+        `강화 조건 통과: ${enhanced.length}개\n` +
+        "강화 기준: 거래량 1.5배 이상 + 점수 50 이상\n\n" +
+        enhancedText + "\n\n" +
+        "📈 15분봉 추세별 BUY 성과 (5분봉 BUY만)\n" +
+        `분석 대상: ${trendBuy.length}개\n` +
+        trendGroups.map(([label, group]) =>
+          `${label} ${group.length}개`
+        ).join(" | ") +
+        "\n\n" + trendText;
+    }
+
 
     const lines = [`누적 BUY 신호: ${history.length}개`];
 
