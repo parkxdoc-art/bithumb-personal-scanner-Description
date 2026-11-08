@@ -2318,12 +2318,97 @@ def backtest_replay_signal(window, volume_multiple=1.5, rr=2.0):
     }
 
 
+@app.get("/api/backtest-replay-check")
+def backtest_replay_check():
+    """임시 진단: 과거 신호 재현과 미래 데이터 독립성 검사."""
+    market = "KRW-BTC"
+    minute = 5
+    cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
+
+    try:
+        rows = backtest_completed_rows(
+            market, minute, cutoff, count=150
+        )
+
+        windows = make_backtest_windows(
+            rows, minute=minute,
+            lookback=80, forward_bars=12
+        )
+
+        counts = {"BUY": 0, "WATCH": 0, "WAIT": 0}
+        future_independent = True
+        first_buy = None
+
+        for window in windows:
+            result = backtest_replay_signal(
+                window, volume_multiple=1.5, rr=2.0
+            )
+
+            without_future = {
+                "cutoff_kst": window["cutoff_kst"],
+                "signal_rows": window["signal_rows"],
+                "evaluation_rows": []
+            }
+
+            control = backtest_replay_signal(
+                without_future, volume_multiple=1.5, rr=2.0
+            )
+
+            if result is None or control is None:
+                return jsonify({
+                    "ok": False,
+                    "error": "신호 재현 결과 없음"
+                }), 500
+
+            future_independent = (
+                future_independent and result == control
+            )
+
+            signal = result["signal"]
+
+            if signal not in counts:
+                return jsonify({
+                    "ok": False,
+                    "error": "알 수 없는 신호"
+                }), 500
+
+            counts[signal] += 1
+
+            if signal == "BUY" and first_buy is None:
+                first_buy = {
+                    "candle_time_kst": result["candle_time_kst"],
+                    "entry_close": result["entry_close"],
+                    "vol_ratio": result["vol_ratio"]
+                }
+
+        ok = (
+            len(windows) > 0
+            and future_independent
+            and sum(counts.values()) == len(windows)
+        )
+
+        return jsonify({
+            "ok": ok,
+            "market": market,
+            "completed_candles": len(rows),
+            "window_count": len(windows),
+            "replay_count": sum(counts.values()),
+            "signal_counts": counts,
+            "future_evaluation_independent": future_independent,
+            "historical_value24_verified": False,
+            "first_buy": first_buy
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error_type": type(e).__name__
+        }), 500
 
 
 @app.get("/")
 def index():
     return render_template_string(HTML)
-
 
 @app.get("/api/scan")
 def scan():
