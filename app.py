@@ -1725,7 +1725,30 @@ def get_markets():
     return markets
 
 def candles(market, minute, count=80):
-    return api_get(f"/v1/candles/minutes/{minute}", {"market": market, "count": count})
+    return api_get(
+        f"/v1/candles/minutes/{minute}",
+        {"market": market, "count": count}
+    )
+
+
+def candles_before(market, minute, to_kst, count=80):
+    """백테스트용: 지정한 KST 시각 이전의 캔들 조회."""
+    if not isinstance(to_kst, datetime):
+        raise ValueError("to_kst must be a datetime")
+
+    if to_kst.tzinfo is not None:
+        to_kst = to_kst.astimezone(KST)
+
+    params = {
+        "market": market,
+        "count": max(1, min(int(count), 200)),
+        "to": to_kst.strftime("%Y-%m-%dT%H:%M:%S")
+    }
+
+    return api_get(
+        f"/v1/candles/minutes/{minute}",
+        params
+    )
 
 def analyze_5m_ma5(raw):
     """완성된 5분봉으로 MA5와 돌파 상태 분석"""
