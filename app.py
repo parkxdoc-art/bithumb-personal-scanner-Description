@@ -2139,6 +2139,65 @@ def make_backtest_windows(rows, minute=5, lookback=80, forward_bars=12):
 
     return windows
 
+def prepare_backtest_signal_inputs(window):
+    """과거 신호 판단용 캔들만 사용해 분석 자료 준비."""
+    if not isinstance(window, dict):
+        return None
+
+    rows = window.get("signal_rows")
+    cutoff = window.get("cutoff_kst")
+
+    if (
+        not isinstance(rows, list)
+        or len(rows) < 35
+        or not isinstance(cutoff, datetime)
+    ):
+        return None
+
+    try:
+        closes = [
+            float(c["trade_price"]) for c in rows
+        ]
+        highs = [
+            float(c["high_price"]) for c in rows
+        ]
+        lows = [
+            float(c["low_price"]) for c in rows
+        ]
+        volumes = [
+            float(c["candle_acc_trade_volume"])
+            for c in rows
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if any(
+        high < low or volume < 0
+        for high, low, volume
+        in zip(highs, lows, volumes)
+    ):
+        return None
+
+    avg_vol = sum(volumes[-21:-1]) / 20
+
+    vol_ratio = (
+        volumes[-1] / avg_vol
+        if avg_vol > 0 else None
+    )
+
+    return {
+        "cutoff_kst": cutoff,
+        "rows": rows,
+        "closes": closes,
+        "highs": highs,
+        "lows": lows,
+        "volumes": volumes,
+        "current": closes[-1],
+        "vol_ratio": vol_ratio
+    }
+
+
+
 @app.get("/")
 def index():
     return render_template_string(HTML)
