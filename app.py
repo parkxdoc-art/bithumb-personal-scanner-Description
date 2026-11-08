@@ -2139,6 +2139,65 @@ def make_backtest_windows(rows, minute=5, lookback=80, forward_bars=12):
 
     return windows
 
+@app.get("/api/backtest-window-check")
+def backtest_window_check():
+    """임시 테스트: 과거/사후 캔들 분리 검증."""
+    cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
+    minute = 5
+
+    try:
+        rows = backtest_completed_rows(
+            "KRW-BTC", minute, cutoff, count=150
+        )
+
+        windows = make_backtest_windows(
+            rows, minute=minute,
+            lookback=80, forward_bars=12
+        )
+
+        def candle_start(candle):
+            dt = datetime.fromisoformat(
+                candle["candle_date_time_kst"]
+            )
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=KST)
+            return dt.astimezone(KST)
+
+        separation_ok = bool(windows) and all(
+            len(w["signal_rows"]) == 80
+            and len(w["evaluation_rows"]) == 12
+            and candle_start(w["signal_rows"][-1])
+                + timedelta(minutes=minute)
+                == w["cutoff_kst"]
+            and candle_start(w["evaluation_rows"][0])
+                == w["cutoff_kst"]
+            and candle_start(w["evaluation_rows"][-1])
+                + timedelta(minutes=minute)
+                <= cutoff
+            for w in windows
+        )
+
+        return {
+            "ok": separation_ok,
+            "market": "KRW-BTC",
+            "completed_candles": len(rows),
+            "window_count": len(windows),
+            "signal_bars": 80,
+            "evaluation_bars": 12,
+            "data_separation_ok": separation_ok,
+            "latest_test_cutoff_kst": (
+                windows[-1]["cutoff_kst"].isoformat()
+                if windows else None
+            )
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__
+        }, 500
+
+
 @app.get("/")
 def index():
     return render_template_string(HTML)
