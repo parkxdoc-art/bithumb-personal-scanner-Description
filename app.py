@@ -1750,6 +1750,50 @@ def candles_before(market, minute, to_kst, count=80):
         params
     )
 
+def backtest_completed_rows(market, minute, cutoff_kst, count=80):
+    """과거 기준 시점까지 완료된 캔들만 시간순으로 반환."""
+    if not isinstance(cutoff_kst, datetime):
+        raise ValueError("cutoff_kst must be datetime")
+
+    if cutoff_kst.tzinfo is None:
+        cutoff_kst = cutoff_kst.replace(tzinfo=KST)
+    else:
+        cutoff_kst = cutoff_kst.astimezone(KST)
+
+    raw = candles_before(
+        market, minute, cutoff_kst, count=count
+    )
+
+    if not isinstance(raw, list):
+        return []
+
+    completed = []
+
+    for candle in raw:
+        if not isinstance(candle, dict):
+            continue
+
+        try:
+            start = datetime.fromisoformat(
+                candle["candle_date_time_kst"]
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=KST)
+        else:
+            start = start.astimezone(KST)
+
+        if start + timedelta(minutes=minute) <= cutoff_kst:
+            completed.append(candle)
+
+    completed.sort(
+        key=lambda x: x["candle_date_time_kst"]
+    )
+
+    return completed
+
 def analyze_5m_ma5(raw):
     """완성된 5분봉으로 MA5와 돌파 상태 분석"""
     if not isinstance(raw, list) or len(raw) < 6:
