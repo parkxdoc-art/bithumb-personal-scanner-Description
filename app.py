@@ -1410,9 +1410,9 @@ if (capitalSelect) {
       ["저항선", x.resistance ?? "-", "", true],
       ["5분봉 MA5", x.ma5_info?.ma5 ?? "-"],
       ["MA5 상태", x.ma5_info?.status ?? "-"],
+      ["15분봉 추세", x.trend15 ?? "정보 없음"],
       ["분석 메모", x.note ?? "-", "", true]
-    ];
-
+      ];
     detailItems.forEach(([label, value, color, wide]) => {
       const item = document.createElement("div");
       item.className = "coin-detail-item" + (wide ? " wide" : "");
@@ -1820,6 +1820,41 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
     lows=[float(x["low_price"]) for x in rows]
     volumes=[float(x["candle_acc_trade_volume"]) for x in rows]
     current=closes[-1]
+    trend15 = None
+    if minute == 5:
+        groups15 = {}
+        for c in rows:
+            dt = datetime.fromisoformat(c["candle_date_time_kst"])
+            key = dt.replace(
+                minute=(dt.minute // 15) * 15,
+                second=0, microsecond=0
+            )
+            groups15.setdefault(key, []).append(
+                (dt.minute % 15, float(c["trade_price"]))
+            )
+
+        bars15 = [
+            (key, values[-1][1])
+            for key, values in groups15.items()
+            if [m for m, _ in values] == [0, 5, 10]
+        ]
+
+        last11 = bars15[-11:]
+        if len(last11) == 11 and all(
+            last11[i][0] - last11[i - 1][0] == timedelta(minutes=15)
+            for i in range(1, 11)
+        ):
+            ma_now = sum(v for _, v in last11[1:]) / 10
+            ma_prev = sum(v for _, v in last11[:-1]) / 10
+            close_now = last11[-1][1]
+
+            if close_now > ma_now and ma_now > ma_prev:
+                trend15 = "상승"
+            elif close_now < ma_now and ma_now < ma_prev:
+                trend15 = "하락"
+            else:
+                trend15 = "중립"
+
     # Candidate pivot highs: higher than two neighbors on either side.
     pivots=[]
     for i in range(2, len(highs)-2):
@@ -1909,7 +1944,8 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
 
             "recent_closes": [{"time": r["candle_date_time_kst"], "price": float(r["trade_price"])} for r in rows[-36:]] if minute == 5 else [],
 
-            "note":note,"stop":stop,"target":target,"target":target,"ma5_info":ma5_info,"score":score}
+            
+            "trend15":trend15,"note":note,"stop":stop,"target":target,"ma5_info":ma5_info,"score":score}
 
 @app.get("/")
 def index():
