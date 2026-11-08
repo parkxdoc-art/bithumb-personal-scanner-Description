@@ -2317,93 +2317,113 @@ def backtest_replay_signal(window, volume_multiple=1.5, rr=2.0):
         "historical_value24_verified": False
     }
 
-
 @app.get("/api/backtest-replay-check")
 def backtest_replay_check():
-    """임시 진단: 과거 신호 재현과 미래 데이터 독립성 검사."""
-    market = "KRW-BTC"
+    """임시 진단: BTC, ETH, XRP 과거 BUY 신호 비교."""
     minute = 5
     cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
+    markets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
 
-    try:
-        rows = backtest_completed_rows(
-            market, minute, cutoff, count=150
-        )
+    market_results = {}
+    total_counts = {"BUY": 0, "WATCH": 0, "WAIT": 0}
 
-        windows = make_backtest_windows(
-            rows, minute=minute,
-            lookback=80, forward_bars=12
-        )
-
-        counts = {"BUY": 0, "WATCH": 0, "WAIT": 0}
-        future_independent = True
-        first_buy = None
-
-        for window in windows:
-            result = backtest_replay_signal(
-                window, volume_multiple=1.5, rr=2.0
+    for market in markets:
+        try:
+            rows = backtest_completed_rows(
+                market, minute, cutoff, count=200
             )
 
-            without_future = {
-                "cutoff_kst": window["cutoff_kst"],
-                "signal_rows": window["signal_rows"],
-                "evaluation_rows": []
-            }
-
-            control = backtest_replay_signal(
-                without_future, volume_multiple=1.5, rr=2.0
+            windows = make_backtest_windows(
+                rows,
+                minute=minute,
+                lookback=80,
+                forward_bars=12
             )
 
-            if result is None or control is None:
-                return jsonify({
-                    "ok": False,
-                    "error": "신호 재현 결과 없음"
-                }), 500
+            counts = {"BUY": 0, "WATCH": 0, "WAIT": 0}
+            future_independent = True
+            first_buy = None
 
-            future_independent = (
-                future_independent and result == control
-            )
+            for window in windows:
+                result = backtest_replay_signal(
+                    window,
+                    volume_multiple=1.5,
+                    rr=2.0
+                )
 
-            signal = result["signal"]
-
-            if signal not in counts:
-                return jsonify({
-                    "ok": False,
-                    "error": "알 수 없는 신호"
-                }), 500
-
-            counts[signal] += 1
-
-            if signal == "BUY" and first_buy is None:
-                first_buy = {
-                    "candle_time_kst": result["candle_time_kst"],
-                    "entry_close": result["entry_close"],
-                    "vol_ratio": result["vol_ratio"]
+                without_future = {
+                    "cutoff_kst": window["cutoff_kst"],
+                    "signal_rows": window["signal_rows"],
+                    "evaluation_rows": []
                 }
 
-        ok = (
-            len(windows) > 0
-            and future_independent
-            and sum(counts.values()) == len(windows)
-        )
+                control = backtest_replay_signal(
+                    without_future,
+                    volume_multiple=1.5,
+                    rr=2.0
+                )
 
-        return jsonify({
-            "ok": ok,
-            "market": market,
-            "completed_candles": len(rows),
-            "window_count": len(windows),
-            "replay_count": sum(counts.values()),
-            "signal_counts": counts,
-            "future_evaluation_independent": future_independent,
-            "historical_value24_verified": False,
-            "first_buy": first_buy
-        })
+                if result is None or control is None:
+                    raise ValueError("신호 재현 결과 없음")
 
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error_type": type(e).__name__
-        }), 500
+                if result != control:
+                    future_independent = False
+
+                signal = result["signal"]
+
+                if signal not in counts:
+                    raise ValueError("알 수 없는 신호")
+
+                counts[signal] += 1
+
+                if signal == "BUY" and first_buy is None:
+                    first_buy = {
+                        "candle_time_kst": result["candle_time_kst"],
+                        "entry_close": result["entry_close"],
+                        "vol_ratio": result["vol_ratio"]
+                    }
+
+            market_ok = (
+                len(windows) > 0
+                and future_independent
+                and sum(counts.values()) == len(windows)
+            )
+
+            market_results[market] = {
+                "ok": market_ok,
+                "completed_candles": len(rows),
+                "window_count": len(windows),
+                "replay_count": sum(counts.values()),
+                "signal_counts": counts,
+                "future_evaluation_independent": future_independent,
+                "first_buy": first_buy
+            }
+
+            for signal in total_counts:
+                total_counts[signal] += counts[signal]
+
+        except Exception as e:
+            market_results[market] = {
+                "ok": False,
+                "error_type": type(e).__name__
+            }
+
+    all_ok = all(
+        market_results[m].get("ok") is True
+        for m in markets
+    )
+
+    return jsonify({
+        "ok": all_ok,
+        "test_only": True,
+        "market_count": len(markets),
+        "cutoff_kst": cutoff.isoformat(),
+        "signal_bars": 80,
+        "evaluation_bars": 12,
+        "market_results": market_results,
+        "total_signal_counts": total_counts,
+        "historical_value24_verified": False
+    })
 
 
 @app.get("/")
