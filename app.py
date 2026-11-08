@@ -2319,10 +2319,18 @@ def backtest_replay_signal(window, volume_multiple=1.5, rr=2.0):
 
 @app.get("/api/backtest-replay-check")
 def backtest_replay_check():
-    """임시 진단: BTC, ETH, XRP 과거 BUY 신호 비교."""
+    """임시 진단: 과거 BUY 조건별 통과 횟수 검사."""
     minute = 5
     cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
     markets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
+
+    conditions = [
+        "close_above",
+        "volume_ok",
+        "retest",
+        "breakout_seen",
+        "support_held"
+    ]
 
     market_results = {}
     total_counts = {"BUY": 0, "WATCH": 0, "WAIT": 0}
@@ -2341,6 +2349,15 @@ def backtest_replay_check():
             )
 
             counts = {"BUY": 0, "WATCH": 0, "WAIT": 0}
+
+            condition_pass_counts = {
+                name: 0 for name in conditions
+            }
+
+            cumulative_pass_counts = {
+                name: 0 for name in conditions
+            }
+
             future_independent = True
             first_buy = None
 
@@ -2376,6 +2393,19 @@ def backtest_replay_check():
 
                 counts[signal] += 1
 
+                passed_so_far = True
+
+                for name in conditions:
+                    passed = result[name] is True
+
+                    if passed:
+                        condition_pass_counts[name] += 1
+
+                    passed_so_far = passed_so_far and passed
+
+                    if passed_so_far:
+                        cumulative_pass_counts[name] += 1
+
                 if signal == "BUY" and first_buy is None:
                     first_buy = {
                         "candle_time_kst": result["candle_time_kst"],
@@ -2393,8 +2423,9 @@ def backtest_replay_check():
                 "ok": market_ok,
                 "completed_candles": len(rows),
                 "window_count": len(windows),
-                "replay_count": sum(counts.values()),
                 "signal_counts": counts,
+                "condition_pass_counts": condition_pass_counts,
+                "cumulative_pass_counts": cumulative_pass_counts,
                 "future_evaluation_independent": future_independent,
                 "first_buy": first_buy
             }
@@ -2424,7 +2455,6 @@ def backtest_replay_check():
         "total_signal_counts": total_counts,
         "historical_value24_verified": False
     })
-
 
 @app.get("/")
 def index():
