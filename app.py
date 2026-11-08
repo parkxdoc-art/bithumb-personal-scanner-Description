@@ -2458,7 +2458,7 @@ def backtest_replay_check():
 
 @app.get("/api/backtest-eth-breakout-check")
 def backtest_eth_breakout_check():
-    """임시 진단: ETH BUY 직전 탈락 원인 검사."""
+    """임시 진단: ETH 돌파 판정 기준선과 실제 종가 추적."""
     market = "KRW-ETH"
     minute = 5
     cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
@@ -2467,12 +2467,9 @@ def backtest_eth_breakout_check():
         rows = backtest_completed_rows(
             market, minute, cutoff, count=200
         )
-
         windows = make_backtest_windows(
-            rows,
-            minute=minute,
-            lookback=80,
-            forward_bars=12
+            rows, minute=minute,
+            lookback=80, forward_bars=12
         )
 
         near_buy_count = 0
@@ -2480,13 +2477,10 @@ def backtest_eth_breakout_check():
 
         for window in windows:
             result = backtest_replay_signal(
-                window,
-                volume_multiple=1.5,
-                rr=2.0
+                window, volume_multiple=1.5, rr=2.0
             )
-
             if result is None:
-                raise ValueError("신호 재현 결과 없음")
+                raise ValueError("과거 신호 재현 실패")
 
             if not (
                 result["close_above"]
@@ -2497,24 +2491,14 @@ def backtest_eth_breakout_check():
                 continue
 
             near_buy_count += 1
-
             if len(examples) >= 3:
                 continue
 
             signal_rows = window["signal_rows"]
-
-            highs = [
-                float(c["high_price"])
-                for c in signal_rows
-            ]
-
-            closes = [
-                float(c["trade_price"])
-                for c in signal_rows
-            ]
+            highs = [float(c["high_price"]) for c in signal_rows]
+            closes = [float(c["trade_price"]) for c in signal_rows]
 
             pivots = []
-
             for i in range(2, len(highs) - 2):
                 if (
                     highs[i] >= max(highs[i - 2:i])
@@ -2526,99 +2510,60 @@ def backtest_eth_breakout_check():
                 raise ValueError("저항선 고점 부족")
 
             a, b = pivots[-2], pivots[-1]
-
             if not (highs[b] < highs[a] and b > a):
                 raise ValueError("하락 저항선 없음")
 
             slope = (highs[b] - highs[a]) / (b - a)
             tolerance = 0.004
-
-            search_start = max(
-                b + 1,
-                len(signal_rows) - 8
-            )
-
+            search_start = max(b + 1, len(signal_rows) - 8)
             search_end = len(signal_rows) - 2
+            trace = []
 
-            crossings = []
+            for i in range(b + 1, len(signal_rows)):
+                previous_line = highs[b] + slope * ((i - 1) - b)
+                current_line = highs[b] + slope * (i - b)
+                previous_threshold = previous_line * (1 + tolerance)
+                current_threshold = current_line * (1 + tolerance)
+                previous_ok = closes[i - 1] <= previous_threshold
+                current_ok = closes[i] > current_threshold
 
-            for i in range(
-                max(b + 1, 1),
-                len(signal_rows) - 1
-            ):
-                previous_line = (
-                    highs[b] + slope * ((i - 1) - b)
-                )
-
-                breakout_line = (
-                    highs[b] + slope * (i - b)
-                )
-
-                crossed = (
-                    closes[i - 1]
-                    <= previous_line * (1 + tolerance)
-                    and closes[i]
-                    > breakout_line * (1 + tolerance)
-                )
-
-                if crossed:
-                    crossings.append({
-                        "candle_time_kst": signal_rows[i][
-                            "candle_date_time_kst"
-                        ],
-                        "index": i,
-                        "bars_before_latest": (
-                            len(signal_rows) - 1 - i
-                        ),
-                        "inside_original_search": (
-                            search_start <= i < search_end
-                        )
-                    })
-
-            inside_count = sum(
-                c["inside_original_search"]
-                for c in crossings
-            )
-
-            if inside_count > 0:
-                reason = "탐색 범위 내 돌파 존재 - 추가 점검"
-            elif crossings:
-                reason = "원래 탐색 범위 밖에 돌파 후보 존재"
-            else:
-                reason = "선택된 저항선 이후 돌파 후보 없음"
+                trace.append({
+                    "index": i,
+                    "candle_time_kst": signal_rows[i]["candle_date_time_kst"],
+                    "previous_close": closes[i - 1],
+                    "previous_threshold": round(previous_threshold, 4),
+                    "close": closes[i],
+                    "current_threshold": round(current_threshold, 4),
+                    "previous_at_or_below": previous_ok,
+                    "current_strictly_above": current_ok,
+                    "crossed": previous_ok and current_ok,
+                    "inside_original_search": search_start <= i < search_end
+                })
 
             examples.append({
-                "signal_candle_kst": result[
-                    "candle_time_kst"
-                ],
-                "signal_cutoff_kst": result[
-                    "cutoff_kst"
-                ],
+                "signal_candle_kst": result["candle_time_kst"],
                 "entry_close": result["entry_close"],
                 "vol_ratio": result["vol_ratio"],
-                "pivot_a_index": a,
                 "pivot_b_index": b,
-                "pivot_a_high": highs[a],
-                "pivot_b_high": highs[b],
-                "pivot_b_candle_kst": signal_rows[b][
-                    "candle_date_time_kst"
-                ],
                 "search_start_index": search_start,
                 "search_end_exclusive": search_end,
-                "search_candles_checked": max(
-                    0, search_end - search_start
+                "crossing_in_original_search": sum(
+                    c["crossed"] and c["inside_original_search"]
+                    for c in trace
                 ),
-                "crossing_candidates": crossings,
-                "diagnosis": reason
+                "crossing_outside_original_search": sum(
+                    c["crossed"] and not c["inside_original_search"]
+                    for c in trace
+                ),
+                "candles_after_pivot": trace
             })
 
         return jsonify({
-            "ok": True,
+            "ok": len(windows) > 0,
             "test_only": True,
             "market": market,
             "window_count": len(windows),
-            "three_conditions_passed_but_no_breakout":
-                near_buy_count,
+            "three_conditions_passed_but_no_breakout": near_buy_count,
             "examples": examples,
             "historical_value24_verified": False
         })
@@ -2628,7 +2573,6 @@ def backtest_eth_breakout_check():
             "ok": False,
             "error_type": type(e).__name__
         }), 500
-
 
 
 @app.get("/")
