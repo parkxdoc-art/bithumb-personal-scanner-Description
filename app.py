@@ -2197,6 +2197,128 @@ def prepare_backtest_signal_inputs(window):
     }
 
 
+def backtest_replay_signal(window, volume_multiple=1.5, rr=2.0):
+    """5분봉 과거 캔들만으로 실시간 BUY 조건 재현."""
+    data = prepare_backtest_signal_inputs(window)
+    if data is None:
+        return None
+
+    rows = data["rows"]
+    closes = data["closes"]
+    highs = data["highs"]
+    lows = data["lows"]
+    current = data["current"]
+    vol_ratio = data["vol_ratio"]
+
+    pivots = []
+    for i in range(2, len(highs) - 2):
+        if (
+            highs[i] >= max(highs[i - 2:i])
+            and highs[i] > max(highs[i + 1:i + 3])
+        ):
+            pivots.append(i)
+
+    signal = "WAIT"
+    breakout_seen = False
+    support_held = False
+    close_above = False
+    retest = False
+    vol_ok = False
+    stop = None
+    target = None
+    line_now = None
+
+    if len(pivots) >= 2:
+        a, b = pivots[-2], pivots[-1]
+
+        if highs[b] < highs[a] and b > a:
+            slope = (highs[b] - highs[a]) / (b - a)
+            line_now = highs[b] + slope * ((len(rows) - 1) - b)
+            tolerance = 0.004
+
+            breakout_index = None
+
+            for i in range(max(b + 1, len(rows) - 8), len(rows) - 2):
+                previous_line = highs[b] + slope * ((i - 1) - b)
+                breakout_line = highs[b] + slope * (i - b)
+
+                if (
+                    closes[i - 1] <= previous_line * (1 + tolerance)
+                    and closes[i] > breakout_line * (1 + tolerance)
+                ):
+                    breakout_seen = True
+                    breakout_index = i
+                    break
+
+            support_held = (
+                breakout_index is not None
+                and all(
+                    closes[j] >=
+                    (highs[b] + slope * (j - b)) * (1 - tolerance)
+                    for j in range(breakout_index + 1, len(rows) - 1)
+                )
+            )
+
+            close_above = current > line_now * (1 + tolerance)
+
+            retest = (
+                lows[-1] <= line_now * (1 + tolerance)
+                and current >= line_now
+                and current > closes[-2]
+            )
+
+            vol_ok = (
+                vol_ratio is not None
+                and vol_ratio >= volume_multiple
+            )
+
+            if (
+                close_above
+                and vol_ok
+                and retest
+                and breakout_seen
+                and support_held
+            ):
+                signal = "BUY"
+
+            elif (
+                close_above
+                or (
+                    current >= line_now * (1 - tolerance)
+                    and vol_ok
+                )
+            ):
+                signal = "WATCH"
+
+            atrv = atr(rows)
+
+            if line_now and atrv:
+                stop = max(
+                    0.0,
+                    min(lows[-1], current - 1.2 * atrv)
+                )
+                risk = max(0.0, current - stop)
+                target = current + rr * risk
+
+    return {
+        "signal": signal,
+        "is_buy": signal == "BUY",
+        "candle_time_kst": rows[-1]["candle_date_time_kst"],
+        "cutoff_kst": data["cutoff_kst"].isoformat(),
+        "entry_close": current,
+        "vol_ratio": vol_ratio,
+        "close_above": close_above,
+        "volume_ok": vol_ok,
+        "retest": retest,
+        "breakout_seen": breakout_seen,
+        "support_held": support_held,
+        "stop_price": stop,
+        "target_price": target,
+        "historical_value24_verified": False
+    }
+
+
+
 
 @app.get("/")
 def index():
