@@ -2032,60 +2032,6 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
 def index():
     return render_template_string(HTML)
 
-@app.get("/api/backtest-candle-check")
-def backtest_candle_check():
-    """임시 진단: 과거 캔들 조회와 미래 데이터 혼입 검사."""
-    market = "KRW-BTC"
-    minute = 5
-    cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
-
-    try:
-        raw = candles_before(
-            market, minute, cutoff, count=5
-        )
-
-        if not isinstance(raw, list):
-            return {
-                "ok": False,
-                "error": "캔들 API 응답 형식 오류"
-            }, 502
-
-        starts = [
-            datetime.fromisoformat(
-                c["candle_date_time_kst"]
-            ).replace(tzinfo=KST)
-            for c in raw
-        ]
-
-        completed = all(
-            t + timedelta(minutes=minute) <= cutoff
-            for t in starts
-        )
-
-        return {
-            "ok": bool(starts) and completed,
-            "market": market,
-            "minute": minute,
-            "cutoff_kst": cutoff.isoformat(),
-            "received_count": len(starts),
-            "newest_candle_kst": (
-                max(starts).isoformat()
-                if starts else None
-            ),
-            "oldest_candle_kst": (
-                min(starts).isoformat()
-                if starts else None
-            ),
-            "no_future_data": completed
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error_type": type(e).__name__
-        }, 500
-
-
 
 @app.get("/api/scan")
 def scan():
