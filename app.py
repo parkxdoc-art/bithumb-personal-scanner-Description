@@ -2072,6 +2072,73 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
             
             "trend15":trend15,"note":note,"stop":stop,"target":target,"ma5_info":ma5_info,"score":score}
 
+def make_backtest_windows(rows, minute=5, lookback=80, forward_bars=12):
+    """신호 판정용 과거 캔들과 사후 평가용 캔들을 분리."""
+    if not isinstance(rows, list):
+        return []
+
+    if minute <= 0 or lookback < 35 or forward_bars < 1:
+        return []
+
+    valid = []
+
+    for candle in rows:
+        if not isinstance(candle, dict):
+            continue
+
+        try:
+            start = datetime.fromisoformat(
+                candle["candle_date_time_kst"]
+            )
+
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=KST)
+            else:
+                start = start.astimezone(KST)
+
+            valid.append((start, candle))
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    valid.sort(key=lambda item: item[0])
+
+    if len(valid) < lookback + forward_bars:
+        return []
+
+    windows = []
+
+    for i in range(lookback - 1, len(valid) - forward_bars):
+        chunk = valid[
+            i - lookback + 1 : i + forward_bars + 1
+        ]
+
+        continuous = all(
+            chunk[j][0] - chunk[j - 1][0]
+            == timedelta(minutes=minute)
+            for j in range(1, len(chunk))
+        )
+
+        if not continuous:
+            continue
+
+        cutoff = (
+            chunk[lookback - 1][0]
+            + timedelta(minutes=minute)
+        )
+
+        windows.append({
+            "cutoff_kst": cutoff,
+            "signal_rows": [
+                candle for _, candle in chunk[:lookback]
+            ],
+            "evaluation_rows": [
+                candle for _, candle in chunk[lookback:]
+            ]
+        })
+
+    return windows
+
 @app.get("/")
 def index():
     return render_template_string(HTML)
