@@ -3032,7 +3032,7 @@ def backtest_multiday_check():
                     backtest_completed_rows_2pages(
                         market, minute, cutoff
                     )
-                    if date == "2026-11-08" and market == "KRW-ETH"
+      if date == "2026-11-08" and market in ("KRW-BTC", "KRW-ETH", "KRW-XRP")
                     else backtest_completed_rows(
                         market, minute, cutoff, count=200
                     )
