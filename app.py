@@ -2978,8 +2978,7 @@ def backtest_multiday_check():
         "KRW-BTC", "KRW-ETH", "KRW-XRP",
         "KRW-SOL", "KRW-DOGE", "KRW-ADA"
     ]
-    dates = ["2026-11-01", "2026-11-04", "2026-11-07"]
-
+    dates = ["2026-11-01", "2026-11-04", "2026-11-07", "2026-11-08"]
     minute = 5
     volume_multiple = 1.5
     rr = 2.0
