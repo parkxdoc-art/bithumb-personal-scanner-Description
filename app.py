@@ -2826,20 +2826,20 @@ def backtest_multiday_check():
                             "알 수 없는 신호"
                         )
 
-                counts[signal] += 1
+                    counts[signal] += 1
 
-                passed_so_far = True
+                    passed_so_far = True
 
-                for name in conditions:
-                    passed = result.get(name) is True
+                    for name in conditions:
+                        passed = result.get(name) is True
 
-                    if passed:
-                        condition_pass_counts[name] += 1
+                        if passed:
+                            condition_pass_counts[name] += 1
 
-                    passed_so_far = passed_so_far and passed
+                        passed_so_far = passed_so_far and passed
 
-                    if passed_so_far:
-                        cumulative_pass_counts[name] += 1
+                        if passed_so_far:
+                            cumulative_pass_counts[name] += 1
 
                     if signal == "BUY" and len(buy_examples) < 3:
                         entry = float(
