@@ -3038,6 +3038,164 @@ def backtest_eth_data_check():
             "error": str(e)
         }), 500
 
+@app.get("/api/backtest-data-quality-matrix")
+def backtest_data_quality_matrix():
+    """임시 진단: BTC, ETH, XRP의 3개 날짜 데이터 품질."""
+    markets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
+    dates = ["2026-11-01", "2026-11-04", "2026-11-07"]
+
+    minute = 5
+    lookback = 80
+    forward_bars = 12
+    required_bars = lookback + forward_bars
+
+    results = []
+
+    for date in dates:
+        cutoff = datetime.fromisoformat(
+            date + "T12:00:00"
+        ).replace(tzinfo=KST)
+
+        for market in markets:
+            try:
+                rows = backtest_completed_rows(
+                    market,
+                    minute,
+                    cutoff,
+                    count=200
+                )
+
+                if not rows:
+                    raise ValueError("과거 캔들 없음")
+
+                times = []
+
+                for candle in rows:
+                    dt = datetime.fromisoformat(
+                        candle["candle_date_time_kst"]
+                    )
+
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=KST)
+                    else:
+                        dt = dt.astimezone(KST)
+
+                    times.append(dt)
+
+                times.sort()
+
+                gaps = []
+                run_lengths = []
+                run_length = 1
+                expected_seconds = minute * 60
+
+                for previous, current in zip(
+                    times, times[1:]
+                ):
+                    delta = int(
+                        (current - previous).total_seconds()
+                    )
+
+                    if delta == expected_seconds:
+                        run_length += 1
+                        continue
+
+                    run_lengths.append(run_length)
+                    run_length = 1
+
+                    missing = None
+
+                    if (
+                        delta > expected_seconds
+                        and delta % expected_seconds == 0
+                    ):
+                        missing = (
+                            delta // expected_seconds - 1
+                        )
+
+                    gaps.append({
+                        "previous_kst": previous.isoformat(),
+                        "next_kst": current.isoformat(),
+                        "interval_minutes": delta / 60,
+                        "missing_5m_candles": missing
+                    })
+
+                run_lengths.append(run_length)
+
+                expected_windows = sum(
+                    max(0, n - required_bars + 1)
+                    for n in run_lengths
+                )
+
+                windows = make_backtest_windows(
+                    rows,
+                    minute=minute,
+                    lookback=lookback,
+                    forward_bars=forward_bars
+                )
+
+                matches = (
+                    expected_windows == len(windows)
+                )
+
+                estimated_missing = sum(
+                    gap["missing_5m_candles"] or 0
+                    for gap in gaps
+                )
+
+                results.append({
+                    "date": date,
+                    "market": market,
+                    "ok": matches,
+                    "completed_candles": len(rows),
+                    "requested_candles": 200,
+                    "data_continuous": len(gaps) == 0,
+                    "gap_count": len(gaps),
+                    "estimated_missing_candles":
+                        estimated_missing,
+                    "gap_examples": gaps[:3],
+                    "run_lengths": run_lengths,
+                    "expected_window_count":
+                        expected_windows,
+                    "actual_window_count": len(windows),
+                    "window_count_matches": matches
+                })
+
+            except Exception as e:
+                results.append({
+                    "date": date,
+                    "market": market,
+                    "ok": False,
+                    "error_type": type(e).__name__
+                })
+
+    all_ok = (
+        len(results) == len(markets) * len(dates)
+        and all(x["ok"] for x in results)
+    )
+
+    return jsonify({
+        "ok": all_ok,
+        "test_only": True,
+        "group_count": len(results),
+        "groups_with_gaps": sum(
+            x.get("gap_count", 0) > 0
+            for x in results
+        ),
+        "total_gap_count": sum(
+            x.get("gap_count", 0)
+            for x in results
+        ),
+        "total_valid_windows": sum(
+            x.get("actual_window_count", 0)
+            for x in results
+        ),
+        "results": results,
+        "historical_value24_verified": False
+    })
+
+
+
 @app.get("/")
 def index():
     return render_template_string(HTML)
