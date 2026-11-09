@@ -2640,7 +2640,7 @@ def backtest_eth_followup_check():
             rows,
             minute=minute,
             lookback=80,
-            forward_bars=12
+            forward_bars=36
         )
 
         by_time = {
@@ -2664,8 +2664,8 @@ def backtest_eth_followup_check():
 
         future = event_window["evaluation_rows"]
 
-        if len(future) != 12:
-            raise ValueError("60분 평가 캔들 부족")
+        if len(future) != 36:
+            raise ValueError("180분 평가 캔들 부족")
 
         entry = float(event_result["entry_close"])
         stop = event_result["stop_price"]
@@ -2749,21 +2749,30 @@ def backtest_eth_followup_check():
             "entry_reference_price": entry,
             "stop_reference_price": stop,
             "target_reference_price": target,
+   
             "returns_pct": {
                 "15m": followup[2]["return_pct"],
                 "30m": followup[5]["return_pct"],
-                "60m": followup[11]["return_pct"]
+                "60m": followup[11]["return_pct"],
+                "180m": followup[35]["return_pct"]
             },
+         
             "first_stop_touch": first_stop,
             "first_target_touch": first_target,
             "same_candle_stop_target_ambiguity": any(
                 x["stop_touched"] and x["target_touched"]
                 for x in followup
             ),
+ 
             "buy_count_next_60m": sum(
+                x["replayed_signal"] == "BUY"
+                for x in followup[:12]
+            ),
+            "buy_count_next_180m": sum(
                 x["replayed_signal"] == "BUY"
                 for x in followup
             ),
+           
             "first_three_candles": followup[:3],
             "all_followup_candles": followup,
             "fee_slippage_included": False,
