@@ -2971,6 +2971,40 @@ def backtest_eth_followup_check():
             "error": str(e)
         }), 500
 
+def backtest_completed_rows_2pages(market, minute, cutoff_kst):
+    """백테스트 전용: 과거 완료 캔들 최대 400개 수집."""
+
+    recent = backtest_completed_rows(
+        market, minute, cutoff_kst, count=200
+    )
+
+    if not recent:
+        return []
+
+    oldest = datetime.fromisoformat(
+        recent[0]["candle_date_time_kst"]
+    )
+
+    if oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=KST)
+    else:
+        oldest = oldest.astimezone(KST)
+
+    older = backtest_completed_rows(
+        market, minute, oldest, count=200
+    )
+
+    by_time = {}
+
+    for candle in older + recent:
+        by_time[candle["candle_date_time_kst"]] = candle
+
+    return [
+        by_time[t] for t in sorted(by_time)
+    ]
+
+
+
 @app.get("/api/backtest-multiday-check")
 def backtest_multiday_check():
     """임시 진단: 6종목 X 3날짜 과거 신호 재현."""
@@ -2994,11 +3028,14 @@ def backtest_multiday_check():
 
         for market in markets:
             try:
-                rows = backtest_completed_rows(
-                    market,
-                    minute,
-                    cutoff,
-                    count=200
+                rows = (
+                    backtest_completed_rows_2pages(
+                        market, minute, cutoff
+                    )
+                    if date == "2026-11-08" and market == "KRW-ETH"
+                    else backtest_completed_rows(
+                        market, minute, cutoff, count=200
+                    )
                 )
 
                 windows = make_backtest_windows(
