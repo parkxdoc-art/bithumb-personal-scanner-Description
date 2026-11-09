@@ -2844,13 +2844,18 @@ def backtest_eth_followup_check():
             datetime(2026, 11, 1, 12, 0, tzinfo=KST),
             "2026-11-01T07:00:00"
         ),
+  
         "btc_1104": (
             "KRW-BTC",
             datetime(2026, 11, 4, 12, 0, tzinfo=KST),
             "2026-11-04T05:35:00"
+        ),
+        "xrp_1108": (
+            "KRW-XRP",
+            datetime(2026, 11, 8, 12, 0, tzinfo=KST),
+            "2026-11-08T08:55:00"
         )
     }
-
     case = request.args.get("case", "eth_1107")
 
     if case not in scenarios:
