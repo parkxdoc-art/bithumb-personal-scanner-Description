@@ -2474,6 +2474,77 @@ def backtest_replay_signal(window, volume_multiple=1.5, rr=2.0):
         "historical_value24_verified": False
     }
 
+@app.get("/api/backtest-synthetic-buy-check")
+def backtest_synthetic_buy_check():
+    """임시 진단: 가상 캔들로 BUY 판정 가능 여부 확인."""
+
+    base = datetime(2026, 11, 8, tzinfo=KST)
+
+    closes = [108.0] * 80
+    closes[73:] = [
+        111.5, 111.5, 114.0, 114.2,
+        114.3, 114.35, 114.6
+    ]
+
+    rows = []
+
+    for i, close in enumerate(closes):
+        rows.append({
+            "candle_date_time_kst": (
+                base + timedelta(minutes=i * 5)
+            ).strftime("%Y-%m-%dT%H:%M:%S"),
+            "trade_price": close,
+            "high_price": (
+                120 if i == 30
+                else 115 if i == 60
+                else close + 0.5
+            ),
+            "low_price": (
+                111.8 if i == 79
+                else close - 1
+            ),
+            "candle_acc_trade_volume": (
+                220 if i == 79
+                else 100
+            )
+        })
+
+    window = {
+        "cutoff_kst": base + timedelta(minutes=400),
+        "signal_rows": rows,
+        "evaluation_rows": []
+    }
+
+    result = backtest_replay_signal(
+        window, volume_multiple=1.5, rr=2.0
+    )
+
+    conditions = [
+        "close_above",
+        "volume_ok",
+        "retest",
+        "breakout_seen",
+        "support_held"
+    ]
+
+    passed = (
+        result is not None
+        and result["signal"] == "BUY"
+        and all(result[name] is True for name in conditions)
+    )
+
+    return jsonify({
+        "ok": passed,
+        "test_only": True,
+        "synthetic_data": True,
+        "signal": result["signal"] if result else None,
+        "condition_results": (
+            {name: result[name] for name in conditions}
+            if result else {}
+        ),
+        "historical_value24_verified": False
+    })
+
 @app.get("/api/backtest-replay-check")
 def backtest_replay_check():
     """임시 진단: 과거 BUY 조건별 통과 횟수 검사."""
