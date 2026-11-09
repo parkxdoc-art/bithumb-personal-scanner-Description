@@ -3342,6 +3342,19 @@ def backtest_multiday_check():
         "test_group_count": len(results),
         "total_windows": total_windows,
         "total_signal_counts": totals,
+        "buy_condition_funnel": {
+            name: sum(
+                group.get("cumulative_pass_counts", {}).get(name, 0)
+                for group in results
+            )
+            for name in (
+                "close_above",
+                "volume_ok",
+                "retest",
+                "breakout_seen",
+                "support_held"
+            )
+        },
         "results": results,
         "fee_slippage_included": False,
         "historical_value24_verified": False
