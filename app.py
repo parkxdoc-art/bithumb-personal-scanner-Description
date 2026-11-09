@@ -2797,8 +2797,11 @@ def backtest_multiday_check():
                     "volume_and_retest": 0
                 }
 
+
                 future_independent = True
                 buy_examples = []
+                near_buy_examples = []
+
                 for window in windows:
                     result = backtest_replay_signal(
                         window,
@@ -2866,6 +2869,28 @@ def backtest_multiday_check():
                         if passed_so_far:
                             cumulative_pass_counts[name] += 1
 
+                    if (
+                        result.get("close_above") is True
+                        and result.get("volume_ok") is True
+                        and result.get("retest") is True
+                        and result.get("signal") != "BUY"
+                        and len(near_buy_examples) < 3
+                    ):
+                        near_buy_examples.append({
+                            "candle_time_kst": result.get("candle_time_kst"),
+                            "cutoff_kst": result.get("cutoff_kst"),
+                            "signal": result.get("signal"),
+                            "entry_close": result.get("entry_close"),
+                            "vol_ratio": result.get("vol_ratio"),
+                            "breakout_seen": result.get("breakout_seen"),
+                            "support_held": result.get("support_held"),
+                            "failed_conditions": [
+                                name
+                                for name in ("breakout_seen", "support_held")
+                                if result.get(name) is not True
+                            ]
+                        })
+
                     if signal == "BUY" and len(buy_examples) < 3:
                         entry = float(
                             result["entry_close"]
@@ -2922,7 +2947,8 @@ def backtest_multiday_check():
                     "cumulative_pass_counts": cumulative_pass_counts,
                     "pair_pass_counts": pair_pass_counts,
                     "future_evaluation_independent": future_independent,
-                    "buy_examples": buy_examples
+                    "buy_examples": buy_examples,
+                    "near_buy_examples": near_buy_examples
                 })
 
                 total_windows += len(windows)
