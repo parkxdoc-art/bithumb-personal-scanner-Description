@@ -3044,7 +3044,10 @@ def backtest_eth_data_check():
 @app.get("/api/backtest-data-quality-matrix")
 def backtest_data_quality_matrix():
     """임시 진단: BTC, ETH, XRP의 3개 날짜 데이터 품질."""
-    markets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
+    markets = [
+        "KRW-BTC", "KRW-ETH", "KRW-XRP",
+        "KRW-SOL", "KRW-DOGE", "KRW-ADA"
+    ]    
     dates = ["2026-11-01", "2026-11-04", "2026-11-07"]
 
     minute = 5
