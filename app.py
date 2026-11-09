@@ -2600,10 +2600,36 @@ def backtest_eth_breakout_check():
 @app.get("/api/backtest-eth-followup-check")
 def backtest_eth_followup_check():
     """임시 진단: ETH 돌파 이후 60분 검증."""
-    market = "KRW-ETH"
+
+    scenarios = {
+        "eth_1107": (
+            "KRW-ETH",
+            datetime(2026, 11, 7, 12, 0, tzinfo=KST),
+            "2026-11-07T06:55:00"
+        ),
+        "eth_1101": (
+            "KRW-ETH",
+            datetime(2026, 11, 1, 12, 0, tzinfo=KST),
+            "2026-11-01T07:00:00"
+        ),
+        "btc_1104": (
+            "KRW-BTC",
+            datetime(2026, 11, 4, 12, 0, tzinfo=KST),
+            "2026-11-04T05:35:00"
+        )
+    }
+
+    case = request.args.get("case", "eth_1107")
+
+    if case not in scenarios:
+        return jsonify({
+            "ok": False,
+            "error": "알 수 없는 테스트 사례"
+        }), 400
+
+    market, cutoff, event_time = scenarios[case]
     minute = 5
-    cutoff = datetime(2026, 11, 7, 12, 0, tzinfo=KST)
-    event_time = "2026-11-07T06:55:00"
+
 
     try:
         rows = backtest_completed_rows(
