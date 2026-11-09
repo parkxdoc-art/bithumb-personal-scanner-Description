@@ -2782,12 +2782,19 @@ def backtest_multiday_check():
                     "support_held"
                 ]
 
+
                 condition_pass_counts = {
                     name: 0 for name in conditions
                 }
 
                 cumulative_pass_counts = {
                     name: 0 for name in conditions
+                }
+
+                pair_pass_counts = {
+                    "close_and_volume": 0,
+                    "close_and_retest": 0,
+                    "volume_and_retest": 0
                 }
 
                 future_independent = True
@@ -2827,6 +2834,24 @@ def backtest_multiday_check():
                         )
 
                     counts[signal] += 1
+
+                    if (
+                        result.get("close_above") is True
+                        and result.get("volume_ok") is True
+                    ):
+                        pair_pass_counts["close_and_volume"] += 1
+
+                    if (
+                        result.get("close_above") is True
+                        and result.get("retest") is True
+                    ):
+                        pair_pass_counts["close_and_retest"] += 1
+
+                    if (
+                        result.get("volume_ok") is True
+                        and result.get("retest") is True
+                    ):
+                        pair_pass_counts["volume_and_retest"] += 1
 
                     passed_so_far = True
 
@@ -2895,6 +2920,7 @@ def backtest_multiday_check():
                     "signal_counts": counts,
                     "condition_pass_counts": condition_pass_counts,
                     "cumulative_pass_counts": cumulative_pass_counts,
+                    "pair_pass_counts": pair_pass_counts,
                     "future_evaluation_independent": future_independent,
                     "buy_examples": buy_examples
                 })
