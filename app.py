@@ -2730,8 +2730,11 @@ def backtest_eth_followup_check():
 
 @app.get("/api/backtest-multiday-check")
 def backtest_multiday_check():
-    """임시 진단: 3종목 X 3날짜 과거 신호 재현."""
-    markets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
+    """임시 진단: 6종목 X 3날짜 과거 신호 재현."""
+    markets = [
+        "KRW-BTC", "KRW-ETH", "KRW-XRP",
+        "KRW-SOL", "KRW-DOGE", "KRW-ADA"
+    ]
     dates = ["2026-11-01", "2026-11-04", "2026-11-07"]
 
     minute = 5
