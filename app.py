@@ -3124,6 +3124,20 @@ def backtest_multiday_check():
                             "signal": result.get("signal"),
                             "entry_close": result.get("entry_close"),
                             "vol_ratio": result.get("vol_ratio"),
+                            "hypothetical_returns_pct": (
+                                {
+                                    f"{m}m": round(
+                                        (
+                                            float(window["evaluation_rows"][idx]["trade_price"])
+                                            / float(result["entry_close"]) - 1
+                                        ) * 100, 3
+                                    )
+                                    for m, idx in ((15, 2), (30, 5), (60, 11))
+                                }
+                                if len(window["evaluation_rows"]) == 12
+                                and float(result["entry_close"]) > 0
+                                else {}
+                            ),
                             "breakout_seen": result.get("breakout_seen"),
                             "support_held": result.get("support_held"),
                             "failed_conditions": [
