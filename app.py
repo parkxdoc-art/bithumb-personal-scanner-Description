@@ -2643,9 +2643,22 @@ def backtest_eth_followup_check():
             forward_bars=36
         )
 
+ 
         by_time = {
             w["signal_rows"][-1]["candle_date_time_kst"]: w
             for w in windows
+        }
+
+        signal_windows = make_backtest_windows(
+            rows,
+            minute=minute,
+            lookback=80,
+            forward_bars=1
+        )
+
+        signal_by_time = {
+            w["signal_rows"][-1]["candle_date_time_kst"]: w
+            for w in signal_windows
         }
 
         event_window = by_time.get(event_time)
@@ -2679,7 +2692,8 @@ def backtest_eth_followup_check():
             high = float(candle["high_price"])
             low = float(candle["low_price"])
 
-            next_window = by_time.get(candle_time)
+  
+            next_window = signal_by_time.get(candle_time)
             next_result = (
                 backtest_replay_signal(
                     next_window,
