@@ -2766,15 +2766,32 @@ def backtest_multiday_check():
                     forward_bars=12
                 )
 
+
+
                 counts = {
                     "BUY": 0,
                     "WATCH": 0,
                     "WAIT": 0
                 }
 
+                conditions = [
+                    "close_above",
+                    "volume_ok",
+                    "retest",
+                    "breakout_seen",
+                    "support_held"
+                ]
+
+                condition_pass_counts = {
+                    name: 0 for name in conditions
+                }
+
+                cumulative_pass_counts = {
+                    name: 0 for name in conditions
+                }
+
                 future_independent = True
                 buy_examples = []
-
                 for window in windows:
                     result = backtest_replay_signal(
                         window,
@@ -2809,7 +2826,20 @@ def backtest_multiday_check():
                             "알 수 없는 신호"
                         )
 
-                    counts[signal] += 1
+                counts[signal] += 1
+
+                passed_so_far = True
+
+                for name in conditions:
+                    passed = result.get(name) is True
+
+                    if passed:
+                        condition_pass_counts[name] += 1
+
+                    passed_so_far = passed_so_far and passed
+
+                    if passed_so_far:
+                        cumulative_pass_counts[name] += 1
 
                     if signal == "BUY" and len(buy_examples) < 3:
                         entry = float(
@@ -2863,8 +2893,9 @@ def backtest_multiday_check():
                     "completed_candles": len(rows),
                     "window_count": len(windows),
                     "signal_counts": counts,
-                    "future_evaluation_independent":
-                        future_independent,
+                    "condition_pass_counts": condition_pass_counts,
+                    "cumulative_pass_counts": cumulative_pass_counts,
+                    "future_evaluation_independent": future_independent,
                     "buy_examples": buy_examples
                 })
 
