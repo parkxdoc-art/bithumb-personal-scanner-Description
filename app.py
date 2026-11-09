@@ -2295,7 +2295,259 @@ def make_backtest_windows(rows, minute=5, lookback=80, forward_bars=12):
         })
 
     return windows
+# 실험 전용: 기존 실시간 BUY 판정에는 영향 없음.
+def backtest_fibonacci_signal(window, volume_multiple=1.5):
+    data = prepare_backtest_signal_inputs(window)
+    if data is None:
+        return None
 
+    rows = data["rows"]
+    highs = data["highs"]
+    lows = data["lows"]
+    closes = data["closes"]
+    current = data["current"]
+    vol_ratio = data["vol_ratio"]
+    if len(rows) < 80:
+        return {"signal": "WAIT"}
+
+    # 가장 최근 3개 봉 이전에 확정된 상승 고점 사용
+    peak_i = max(range(len(rows) - 35, len(rows) - 3),
+                 key=lambda i: highs[i])
+    low_start = max(0, peak_i - 30)
+    if peak_i - low_start < 5:
+        return {"signal": "WAIT"}
+    low_i = min(range(low_start, peak_i), key=lambda i: lows[i])
+    swing_low = lows[low_i]
+    swing_high = highs[peak_i]
+    if swing_low <= 0 or (swing_high / swing_low - 1) < 0.025:
+        return {"signal": "WAIT"}
+
+    span = swing_high - swing_low
+    fib_382 = swing_high - span * 0.382
+    fib_618 = swing_high - span * 0.618
+    recent_start = max(peak_i + 1, len(rows) - 6)
+    pullback_lows = lows[recent_start:]
+    if not pullback_lows:
+        return {"signal": "WAIT"}
+
+    # 완료된 80개 5분봉 거래대금으로 유동성 보수적 확인
+    recent_value = sum(
+        float(c.get("candle_acc_trade_price", 0))
+        for c in rows
+    )
+    liquidity_ok = recent_value >= 500_000_000
+    trend_ok = (
+        sum(closes[-21:-1]) / 20
+        > sum(closes[-41:-21]) / 20
+    )
+    touch_ok = (
+        any(fib_618 <= low <= fib_382 for low in pullback_lows)
+        and min(pullback_lows) >= fib_618 * 0.995
+    )
+    bounce_ok = (
+        current > closes[-2]
+        and current > float(rows[-1].get("opening_price", current))
+        and current >= fib_618
+        and current < swing_high * 1.01
+    )
+    volume_ok = (
+        vol_ratio is not None
+        and vol_ratio >= volume_multiple
+    )
+
+    is_buy = all((
+        liquidity_ok, trend_ok, touch_ok,
+        bounce_ok, volume_ok
+    ))
+    return {
+        "signal": "BUY" if is_buy else "WAIT",
+        "entry_close": current,
+        "fib_382": round(fib_382, 8),
+        "fib_618": round(fib_618, 8),
+        "vol_ratio": vol_ratio,
+        "liquidity_ok": liquidity_ok,
+        "trend_ok": trend_ok,
+        "touch_ok": touch_ok,
+        "bounce_ok": bounce_ok,
+        "volume_ok": volume_ok,
+    }
+
+
+@app.get("/api/backtest-ab-fibonacci")
+def backtest_ab_fibonacci():
+    """A: 기존 로직, B: 피보나치. 동일 데이터로 비교."""
+    dates = [
+        "2026-11-01", "2026-11-04",
+        "2026-11-07", "2026-11-08"
+    ]
+    markets = [
+        "KRW-BTC", "KRW-ETH", "KRW-XRP",
+        "KRW-SOL", "KRW-DOGE", "KRW-ADA"
+    ]
+    stats = {
+        name: {
+            "signals": 0,
+            "returns": {15: [], 30: [], 60: []},
+            "examples": []
+        }
+        for name in ("A_existing", "B_fibonacci")
+    }
+    last_event = {name: {} for name in stats}
+    tested_windows = 0
+    errors = []
+
+    for date in dates:
+        cutoff = datetime.fromisoformat(
+            date + "T12:00:00"
+        ).replace(tzinfo=KST)
+
+        for market in markets:
+            try:
+                if (
+                    date == "2026-11-08"
+                    and market in (
+                        "KRW-BTC", "KRW-ETH", "KRW-XRP"
+                    )
+                ):
+                    rows = backtest_completed_rows_2pages(
+                        market, 5, cutoff
+                    )
+                else:
+                    rows = backtest_completed_rows(
+                        market, 5, cutoff, count=200
+                    )
+
+                windows = make_backtest_windows(
+                    rows,
+                    minute=5,
+                    lookback=80,
+                    forward_bars=12
+                )
+                tested_windows += len(windows)
+
+                for window in windows:
+                    signals = {
+                        "A_existing": backtest_replay_signal(
+                            window
+                        ),
+                        "B_fibonacci": backtest_fibonacci_signal(
+                            window
+                        ),
+                    }
+
+                    event_at = window["cutoff_kst"]
+                    future = window["evaluation_rows"]
+
+                    if len(future) != 12:
+                        continue
+
+                    entry = float(future[0]["opening_price"])
+                    if entry <= 0:
+                        continue
+
+                    for name, signal in signals.items():
+                        if (
+                            not signal
+                            or signal.get("signal") != "BUY"
+                        ):
+                            continue
+
+                        previous = last_event[name].get(market)
+
+                        if (
+                            previous
+                            and event_at - previous
+                            < timedelta(minutes=60)
+                        ):
+                            continue
+
+                        last_event[name][market] = event_at
+                        bucket = stats[name]
+                        bucket["signals"] += 1
+                        returns = {}
+
+                        for minutes, idx in (
+                            (15, 2), (30, 5), (60, 11)
+                        ):
+                            gross = (
+                                float(
+                                    future[idx]["trade_price"]
+                                ) / entry - 1
+                            ) * 100
+
+                            bucket["returns"][minutes].append(
+                                gross
+                            )
+                            returns[f"{minutes}m"] = round(
+                                gross, 3
+                            )
+
+                        if len(bucket["examples"]) < 5:
+                            bucket["examples"].append({
+                                "market": market,
+                                "signal_time_kst": (
+                                    window["signal_rows"][-1]
+                                    ["candle_date_time_kst"]
+                                ),
+                                "entry_next_open": entry,
+                                "gross_return_pct": returns,
+                            })
+
+            except (
+                KeyError, TypeError, ValueError,
+                requests.RequestException
+            ) as exc:
+                errors.append({
+                    "date": date,
+                    "market": market,
+                    "error": str(exc)[:150]
+                })
+
+    results = {}
+
+    for name, bucket in stats.items():
+        result = {
+            "signals": bucket["signals"],
+            "examples": bucket["examples"]
+        }
+
+        for minutes, values in bucket["returns"].items():
+            result[f"{minutes}m"] = {
+                "samples": len(values),
+                "avg_gross_return_pct": (
+                    round(sum(values) / len(values), 3)
+                    if values else None
+                ),
+                "positive_rate_pct": (
+                    round(
+                        100 * sum(v > 0 for v in values)
+                        / len(values), 1
+                    )
+                    if values else None
+                ),
+            }
+
+        results[name] = result
+
+    return jsonify({
+        "ok": len(errors) == 0,
+        "scope": {
+            "dates": dates,
+            "markets": markets,
+            "minute": 5,
+            "tested_windows": tested_windows,
+            "cooldown_minutes": 60
+        },
+        "comparison": results,
+        "interpretation_notes": [
+            "다음 봉 시가 진입, 15/30/60분 뒤 종가 청산",
+            "수수료와 슬리피지 미반영 총수익률",
+            "80봉 거래대금 5억원은 보수적인 필터",
+            "같은 종목/전략의 60분 내 중복 신호 제외",
+            "A전략은 기존 백테스트 로직을 재사용"
+        ],
+        "errors": errors,
+    })
 def prepare_backtest_signal_inputs(window):
     """과거 신호 판단용 캔들만 사용해 분석 자료 준비."""
     if not isinstance(window, dict):
