@@ -1750,6 +1750,163 @@ def candles_before(market, minute, to_kst, count=80):
         params
     )
 
+def backtest_value24_candle_pages(market, cutoff_kst):
+    """과거 24시간 거래대금 검증을 위한 캔들 수집."""
+    first = candles_before(
+        market, 5, cutoff_kst, count=200
+    )
+
+    if not isinstance(first, list) or not first:
+        return []
+
+    try:
+        oldest = min(
+            datetime.fromisoformat(
+                c["candle_date_time_kst"]
+            )
+            for c in first
+        )
+    except (KeyError, TypeError, ValueError):
+        return []
+
+    if oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=KST)
+    else:
+        oldest = oldest.astimezone(KST)
+
+    second = candles_before(
+        market, 5, oldest, count=200
+    )
+
+    if not isinstance(second, list):
+        return []
+
+    return first + second
+
+def backtest_value24_at_cutoff(market, cutoff_kst):
+    """과거 기준 시각 직전 24시간 거래대금 검증."""
+    from math import isfinite
+
+    if cutoff_kst.tzinfo is None:
+        cutoff_kst = cutoff_kst.replace(tzinfo=KST)
+    else:
+        cutoff_kst = cutoff_kst.astimezone(KST)
+
+    start = cutoff_kst - timedelta(hours=24)
+    raw = backtest_value24_candle_pages(
+        market, cutoff_kst
+    )
+
+    by_time = {}
+    duplicate_count = 0
+
+    for candle in raw:
+        try:
+            dt = datetime.fromisoformat(
+                candle["candle_date_time_kst"]
+            )
+            value = float(
+                candle["candle_acc_trade_price"]
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        else:
+            dt = dt.astimezone(KST)
+
+        if not isfinite(value) or value < 0:
+            continue
+
+        if start <= dt < cutoff_kst:
+            if dt in by_time:
+                duplicate_count += 1
+            by_time[dt] = value
+
+    expected = [
+        start + timedelta(minutes=5 * i)
+        for i in range(288)
+    ]
+
+    missing = [
+        dt for dt in expected
+        if dt not in by_time
+    ]
+
+    ok = (
+        len(missing) == 0
+        and duplicate_count == 0
+        and len(by_time) == 288
+    )
+
+    value24 = (
+        round(sum(by_time[dt] for dt in expected), 2)
+        if ok else None
+    )
+
+    return {
+        "ok": ok,
+        "value24": value24,
+        "pass_500m": (
+            value24 >= 500_000_000
+            if ok else None
+        ),
+        "valid_candles": len(by_time),
+        "missing_count": len(missing),
+        "duplicate_count": duplicate_count
+    }
+
+@app.get("/api/backtest-value24-check")
+def backtest_value24_check():
+    """임시 진단: 과거 신호 시점의 24시간 거래대금 검사."""
+
+    scenarios = {
+        "eth_1101": (
+            "KRW-ETH",
+            datetime(2026, 11, 1, 7, 5, tzinfo=KST)
+        ),
+        "btc_1104": (
+            "KRW-BTC",
+            datetime(2026, 11, 4, 5, 40, tzinfo=KST)
+        ),
+        "eth_1107": (
+            "KRW-ETH",
+            datetime(2026, 11, 7, 7, 0, tzinfo=KST)
+        )
+    }
+
+    case = request.args.get("case", "eth_1101")
+
+    if case not in scenarios:
+        return jsonify({
+            "ok": False,
+            "error": "알 수 없는 테스트 사례"
+        }), 400
+
+    try:
+        market, cutoff = scenarios[case]
+
+        result = backtest_value24_at_cutoff(
+            market, cutoff
+        )
+
+        return jsonify({
+            "test_only": True,
+            "case": case,
+            "market": market,
+            "cutoff_kst": cutoff.isoformat(),
+            **result
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "test_only": True,
+            "error_type": type(e).__name__,
+            "error": str(e)
+        }), 500
+
 def backtest_completed_rows(market, minute, cutoff_kst, count=80):
     """과거 기준 시점까지 완료된 캔들만 시간순으로 반환."""
     if not isinstance(cutoff_kst, datetime):
