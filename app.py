@@ -2700,6 +2700,10 @@ def backtest_eth_breakout_check():
         "btc_1104": (
             "KRW-BTC",
             datetime(2026, 11, 4, 12, 0, tzinfo=KST)
+        ),
+        "xrp_1108": (
+            "KRW-XRP",
+            datetime(2026, 11, 8, 12, 0, tzinfo=KST)
         )
     }
 
