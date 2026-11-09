@@ -2831,7 +2831,11 @@ def backtest_eth_followup_check():
 
         if event_result is None:
             raise ValueError("기준 신호 분석 실패")
+        event_cutoff = event_window["cutoff_kst"]
 
+        value24_check = backtest_value24_at_cutoff(
+            market, event_cutoff
+        )
         future = event_window["evaluation_rows"]
 
         if len(future) != 36:
@@ -2947,7 +2951,17 @@ def backtest_eth_followup_check():
             "first_three_candles": followup[:3],
             "all_followup_candles": followup,
             "fee_slippage_included": False,
-            "historical_value24_verified": False
+            "historical_value24_verified": value24_check["ok"],
+            "historical_value24_krw": value24_check["value24"],
+            "historical_value24_pass_500m": value24_check["pass_500m"],
+            "historical_value24_valid_candles": value24_check["valid_candles"],
+            "historical_value24_missing_count": value24_check["missing_count"],
+            "historical_value24_duplicate_count": value24_check["duplicate_count"],
+            "eligible_buy_after_500m_filter": (
+                event_result["signal"] == "BUY"
+                and value24_check["ok"] is True
+                and value24_check["pass_500m"] is True
+            ) 
         })
 
     except Exception as e:
