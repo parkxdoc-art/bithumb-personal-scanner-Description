@@ -1,4 +1,4 @@
-"""V5: gap-aware A/B backtest with raw-price TP/SL scenario comparison. No live BUY changes."""
+"""V6: pre-entry B-signal diagnostics on top of unchanged V5 A/B replay and TP/SL comparison."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -173,10 +173,73 @@ def analyze_exit_scenarios(future, entry, fee):
         }
     return results
 
+# Fixed, exploratory entry-time gates; no future candle is used in these gates.
+# These gates DO NOT change the underlying A/B BUY decisions or any V5 result.
+V6_GATE_LABELS = (
+    ("all", "B 전체 BUY (기준)"),
+    ("raw80", "신호 전 80봉 모두 원본"),
+    ("momentum", "15분 ≥ 0% · 30분 ≥ +0.5%"),
+    ("momentum_volume", "방향 + 거래량 ≥ 1.5배"),
+    ("raw_momentum_volume", "원본80 + 방향 + 거래량"),
+)
+V6_STATUSES = ("tp_first", "sl_first", "same_bar", "gap_unknown", "time_exit")
+
+
+def v6_gate_flags(quality):
+    """Pre-signal features only: close returns, prior bar volumes and past gaps.
+
+    Outcome and future-gap flags deliberately do NOT enter this function.
+    """
+    before = quality["before_pct"]
+    m15, m30 = before.get("15m"), before.get("30m")
+    raw80 = quality["gap_before_80"] == 0
+    momentum = (m15 is not None and m30 is not None
+                and m15 >= 0.0 and m30 >= 0.5)
+    vr = quality["volume_ratio_20"]
+    volume = vr is not None and vr >= 1.5
+    return {
+        "all": True,
+        "raw80": raw80,
+        "momentum": momentum,
+        "momentum_volume": momentum and volume,
+        "raw_momentum_volume": raw80 and momentum and volume,
+    }
+
+
+def new_v6_summary():
+    return {key: {
+        "signals": 0, "resolvable": 0, "net_sum": 0.0, "positive": 0,
+        "one_hour_sum": 0.0, "three_hour_sum": 0.0,
+        "statuses": {status: 0 for status in V6_STATUSES},
+        "future_6h_raw": 0,
+    } for key, _ in V6_GATE_LABELS}
+
+
+def add_v6_observation(summary, flags, scenario, quality, net):
+    """Summarize an already-issued B BUY without changing it."""
+    state, pnl = scenario["status"], scenario["net_pct"]
+    if state not in V6_STATUSES:
+        raise ValueError("V6 손익비 결과 종류 오류")
+    for key, allowed in flags.items():
+        if not allowed:
+            continue
+        row = summary[key]
+        row["signals"] += 1
+        row["statuses"][state] += 1
+        row["one_hour_sum"] += net["1h"]
+        row["three_hour_sum"] += net["3h"]
+        if quality["excursions"]["6h"]["gap_bars"] == 0:
+            row["future_6h_raw"] += 1
+        if pnl is not None:
+            row["resolvable"] += 1
+            row["net_sum"] += pnl
+            row["positive"] += int(pnl > 0)
+
+
 PAGE = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>단타 A/B 백테스트 V5 | 빗썸 스캐너</title>
+<title>단타 A/B 백테스트 V6 | 빗썸 스캐너</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;color:#edf3ff;padding:16px}
@@ -204,7 +267,7 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 @media(min-width:750px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
 <a href="/">← 빗썸 실시간 스캐너로 돌아가기</a>
-<h1>📊 단타 A/B 검증판 · V5</h1>
+<h1>📊 단타 A/B 검증판 · V6</h1>
 <p>기존 BUY(A)와 피보나치(B)를 같은 과거 5분봉에서 비교합니다. 실시간 주문 기능은 없습니다.</p>
 <section><h2>백테스트 설정</h2>
 <div class="controls">
@@ -247,6 +310,12 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 <div class="tablewrap"><table><thead><tr><th>전략</th><th>가격 익절/손절</th><th>익절 먼저</th><th>손절 먼저</th><th>동일봉 불명</th><th>공백 불명</th><th>6h 종가청산</th><th>판정가능</th><th>평균 순수익률</th><th>수익 비율</th></tr></thead><tbody id="scenarioRows"></tbody></table></div>
 <small id="scenarioNotice">결과 대기 중</small>
 </section>
+<section><h2>V6 · B전략 진입 시점 조건 비교 (실험)</h2>
+<p>기존 B BUY를 유지한 채, <b>신호 발생 시점 이전</b>에 이미 확인 가능한 정보로만 분류합니다. 조건은 기준 / 원본 80봉 / 직전 15분 ≥ 0%와 30분 ≥ +0.5% / 여기에 직전 거래량 ≥ 20봉 평균 1.5배 / 원본+방향+거래량입니다. 미래 고가·저가는 진입 판정에 쓰지 않습니다.</p>
+<p><b>비교 손익비:</b> V5 가격 기준 +3% 익절 / -2% 손절, 최대 6시간. 수수료 반영. 순수익 평균·수익 비율은 익절·손절·6시간 종가 청산으로 판정할 수 있는 사례만 사용하고, 공백·동일봉 불명은 제외합니다. 원본 80봉 조건은 과거 데이터 품질로만 선별합니다. <b>미래 6시간 원본봉 수는 품질 진단일 뿐, 필터에 쓰지 않습니다.</b></p>
+<div class="tablewrap"><table><thead><tr><th>진입 전 조건</th><th>원래 B BUY 중</th><th>익절 먼저</th><th>손절 먼저</th><th>불명</th><th>판정가능</th><th>평균 6h 가정 순수익</th><th>수익 비율</th><th>1h 종가 평균</th><th>3h 종가 평균</th><th>미래 6h 원본봉만</th></tr></thead><tbody id="v6Rows"></tbody></table></div>
+<small id="v6Notice">결과 대기 중</small>
+</section>
 <section><h2>BUY별 진입 품질 · 진입 후 움직임</h2>
 <small>진입 전 15·30·60분 수익률, 직전 봉 거래량/이전 20봉 평균, 6시간 중 실제 봉의 고가·저가 기준 최대 상승/하락을 비교합니다. 미래 최대치와 선도달 정보는 신호 시점에 알 수 없으므로 검증에만 사용합니다.</small>
 <div id="qualityCards">결과 대기 중</div>
@@ -257,7 +326,7 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 </section>
 <section><h2>발생 신호 예시</h2><div id="events">결과 대기 중</div></section>
 <section><h2>검증 범위에 대한 주의</h2><p>
-하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V5 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
+하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V5/V6 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
 </p></section>
 </main><script>
 const $ = id => document.getElementById(id);
@@ -340,6 +409,28 @@ function paint(all, done, total, rankInfo) {
   }
   $('scenarioRows').innerHTML=scenarioResults.join('');
   $('scenarioNotice').textContent='판정가능 = 익절/손절 선도달 또는 6시간 종가 청산. 불명 사례는 평균·수익 비율에서 제외하며, 한 날짜·중복 종목의 결과만으로 전략 우열을 확정하지 않습니다.';
+  const v6Defs=[
+    ['all','B 전체 BUY (기준)'],
+    ['raw80','신호 전 80봉 원본'],
+    ['momentum','15분 ≥0% · 30분 ≥+0.5%'],
+    ['momentum_volume','방향 + 거래량 ≥1.5배'],
+    ['raw_momentum_volume','원본80 + 방향 + 거래량']
+  ];
+  const v6Out=[];
+  for(const [gate,label] of v6Defs){
+    const t={signals:0,resolvable:0,net_sum:0,positive:0,one_hour_sum:0,three_hour_sum:0,future_6h_raw:0,
+      statuses:{tp_first:0,sl_first:0,same_bar:0,gap_unknown:0,time_exit:0}};
+    for(const x of complete){
+      const v=(x.v6||{})[gate];if(!v)continue;
+      for(const k of ['signals','resolvable','net_sum','positive','one_hour_sum','three_hour_sum','future_6h_raw'])t[k]+=v[k]||0;
+      for(const k of Object.keys(t.statuses))t.statuses[k]+=(v.statuses||{})[k]||0;
+    }
+    const unknown=t.statuses.same_bar+t.statuses.gap_unknown;
+    v6Out.push(`<tr><td>${label}</td><td>${fmt(t.signals)}</td><td>${fmt(t.statuses.tp_first)}</td><td>${fmt(t.statuses.sl_first)}</td><td>${fmt(unknown)}</td><td>${fmt(t.resolvable)}</td><td>${pct(t.resolvable?t.net_sum/t.resolvable:null)}</td><td>${pct(t.resolvable?100*t.positive/t.resolvable:null)}</td><td>${pct(t.signals?t.one_hour_sum/t.signals:null)}</td><td>${pct(t.signals?t.three_hour_sum/t.signals:null)}</td><td>${fmt(t.future_6h_raw)}</td></tr>`);
+  }
+  $('v6Rows').innerHTML=v6Out.join('');
+  $('v6Notice').textContent='이 조건은 검증 목적의 사전 정보 분류입니다. 상승·거래량 기준은 임시 가설이며 최적화된 BUY 필터가 아닙니다. 적은 표본과 같은 종목 반복 신호, 현재 시점 코인 선정 편향, 원본 누락 문제 때문에 실전 우열은 확정할 수 없습니다.';
+
   const details=[];
   for(const x of complete) for(const strategy of ['A','B']) {
     for(const e of x.strategies[strategy].examples) details.push({strategy,e});
@@ -366,6 +457,7 @@ function paint(all, done, total, rankInfo) {
       const res=e.scenarios&&e.scenarios[d.id];
       if(res)line(`${d.label} → ${scenarioNames[res.status]||res.status}${res.minutes==null?'':' · '+res.minutes+'분'} · 순수익 ${pct(res.net_pct)}`, 'V5 가격기준');
     }
+    if(e.v6_gates)line('원본80 '+(e.v6_gates.raw80?'통과':'제외')+' · 15/30분 방향 '+(e.v6_gates.momentum?'통과':'제외')+' · 방향+거래량 '+(e.v6_gates.momentum_volume?'통과':'제외'), 'V6 신호시점 분류');
     if(q.gap_before_80 || moves.gap_bars)line(`과거 80봉 보정 ${q.gap_before_80}개 / 이후 6시간 보정 ${moves.gap_bars}개 · 해석 주의`, '데이터 품질');
     root.appendChild(card);
   }
@@ -542,6 +634,7 @@ def register_daytrade_review(app, deps):
             "market": market, "windows": 0, "coverage_reason": "", "history_rows": 0,
             "gap_filled": 0, "unfilled_gaps": 0, "max_gap_minutes": 0, "coverage_rejects": 0,
             "strategies": {"A": empty_strategy(), "B": empty_strategy()},
+            "v6": new_v6_summary(),
             "diagnostics": {name: 0 for name in (
                 "aBreakout", "aSupport", "bTrend", "bTouch", "bBounce",
                 "bVolume", "bAllPrice", "bSwing25", "bEvaluated", "liquidity", "excluded")},
@@ -665,6 +758,12 @@ def register_daytrade_review(app, deps):
                         result["return_sums"][key] += ret
                         result["positive"][key] += int(ret > 0)
                         net[key] = round(ret, 3)
+                    # V6 is observational only: B BUY was determined above.
+                    # No future candle or TP/SL outcome enters the gate flags.
+                    v6_flags = v6_gate_flags(quality) if strategy == "B" else None
+                    if strategy == "B":
+                        add_v6_observation(output["v6"], v6_flags,
+                                           scenarios["p3_s2"], quality, net)
                     result["signals"] += 1
                     last_event[strategy] = at
                     if len(result["examples"]) < 12:
@@ -672,6 +771,7 @@ def register_daytrade_review(app, deps):
                             "market": market, "time": at.strftime("%m-%d %H:%M"),
                             "entry": entry, "net": net, "quality": quality,
                             "scenarios": scenarios,
+                            "v6_gates": v6_flags,
                         })
             if output["windows"] == 0:
                 output["coverage_reason"] = (f"원본 {coverage['actual']}봉 / 보정 {coverage['filled']}봉 / "
@@ -683,6 +783,7 @@ def register_daytrade_review(app, deps):
             output["error"] = f"{type(exc).__name__}: {exc}"[:180]
             output["windows"] = 0
             output["strategies"] = {"A": empty_strategy(), "B": empty_strategy()}
+            output["v6"] = new_v6_summary()
             return output
 
     @app.get("/backtest-daytrade")
