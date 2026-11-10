@@ -1,4 +1,4 @@
-"""V10: scan the full active Bithumb KRW universe in resumable 5-market batches.
+"""V10.1: faster full-KRW backtests in resumable concurrent 5-market batches.
 
 All V9 strategy logic is unchanged. Existing 10/30/50 snapshots remain untouched.
 The full-universe option stores original raw candles in separate IndexedDB chunks.
@@ -925,24 +925,32 @@ async function getAllCohort(){
   await snapshotStore('put',cohort.key,cohort);  // freeze before the first batch
   return cohort;
 }
+// V10.1: two 5-market batches in flight, each saved as soon as it completes.
+// This changes scheduling only; candle history and all strategies are unchanged.
+const FULL_SCAN_CONCURRENCY=2;
 async function runAllBacktest(){
   if(running)return;
   running=true;$('start').disabled=true;
   for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=true;
   $('coinRows').innerHTML='';
   const date=$('day').value,fee=$('fee').value;
-  const all=[];
-  let total=0,saved=0,failures=0;
+  let total=0,saved=0,failures=0,finished=0,lastPainted=0;
+  const resultsByBatch=[];
   try{
     const cohort=await getAllCohort();
     const markets=cohort.markets;
     total=markets.length;
+    const batches=[];
+    for(let i=0;i<total;i+=5)batches.push({start:i,markets:markets.slice(i,i+5)});
     $('progress').max=total;$('progress').value=0;
-    for(let i=0;i<total;i+=5){
-      const batch=markets.slice(i,i+5),key=allChunkKey(date,i);
+    let nextBatch=0;
+    let firstError=null;
+
+    async function runBatch(batchNo){
+      const task=batches[batchNo];
+      const batch=task.markets,key=allChunkKey(date,task.start);
       let chunk=await snapshotStore('get',key);
       let resp;
-      const qs=new URLSearchParams({date,markets:batch.join(','),fee,capture:'1'});
       if(chunk){
         validateAllChunk(chunk,date,batch);
         resp=await fetch('/api/daytrade-replay',{
@@ -951,12 +959,16 @@ async function runAllBacktest(){
               snapshots:batch.map(market=>({market,rows:chunk.rawByMarket[market]}))})
         });
       }else{
+        const qs=new URLSearchParams({date,markets:batch.join(','),fee,capture:'1'});
         resp=await fetch('/api/daytrade-batch?'+qs.toString(),{cache:'no-store'});
       }
-      if(!resp.ok)throw new Error(`코인 ${i+1}~${Math.min(i+5,total)} 응답 오류(${resp.status}) · 다시 시작하면 이어서 진행`);
+      if(!resp.ok)throw new Error(`코인 ${task.start+1}~${task.start+batch.length} 응답 오류(${resp.status})`);
       const r=await resp.json();
       if(!r.ok||!Array.isArray(r.results)||r.results.length!==batch.length)
-        throw new Error(r.error||'분석 응답이 불완전합니다 · 다시 시작하면 이어서 진행');
+        throw new Error(r.error||'분석 응답이 불완전합니다');
+      // Strictly verify response ordering/identity before saving data or results.
+      if(r.results.some((x,j)=>!x||x.market!==batch[j]))
+        throw new Error('응답 코인 순서가 일치하지 않습니다');
       if(!chunk){
         const rawByMarket={};
         for(const item of r.results){
@@ -968,26 +980,44 @@ async function runAllBacktest(){
         if(batch.every(m=>Array.isArray(rawByMarket[m]))){
           chunk={schema:SNAP_SCHEMA,key,date,markets:batch.slice(),rawByMarket};
           validateAllChunk(chunk,date,batch);
+          // Save raw candles BEFORE counting the batch as complete.
           await snapshotStore('put',key,chunk);
         }else{
           failures+=batch.length;
         }
       }
       if(chunk)saved+=batch.length;
-      all.push(...r.results);
-      $('progress').max=total;$('progress').value=i+batch.length;
-      $('status').textContent=`전체 KRW ${i+batch.length}/${total}개 검사 · 원본 저장 ${saved}개 · ${chunk?'고정 데이터 재검사/저장':'일부 저장 실패'} · 중단 시 다시 실행하면 이어집니다`;
-      // Rendering the entire table after every 5 coins becomes expensive on a phone.
-      if((i+batch.length)%25===0||i+batch.length===total)
-        paint(all,i+batch.length,total,{available_markets:cohort.available_markets});
+      resultsByBatch[batchNo]=r.results;
+      finished+=batch.length;
+      $('progress').max=total;$('progress').value=finished;
+      $('status').textContent=`전체 KRW ${finished}/${total}개 검사 · 원본 저장 ${saved}개 · 5개씩 ${FULL_SCAN_CONCURRENCY}묶음 동시 처리 · 중단 시 다시 실행하면 이어집니다`;
+      // Large tables are expensive to rerender on phones; refresh every 50 coins.
+      if(finished-lastPainted>=50||finished===total){
+        paint(resultsByBatch.flatMap(x=>x||[]),finished,total,
+              {available_markets:cohort.available_markets});
+        lastPainted=finished;
+      }
       await snapshotStore('put',allMetaKey(date),{
         schema:SNAP_SCHEMA,key:allMetaKey(date),date,total,saved,
         created:cohort.created,updated:new Date().toLocaleString('ko-KR')});
     }
-    paint(all,total,total,{available_markets:cohort.available_markets});
+
+    // Only two browser requests at once. Stop scheduling after an error,
+    // but let in-flight batches finish saving their raw candles safely.
+    async function worker(){
+      while(!firstError&&nextBatch<batches.length){
+        const batchNo=nextBatch++;
+        try{await runBatch(batchNo);}
+        catch(e){if(!firstError)firstError=e;}
+      }
+    }
+    await Promise.all(Array.from({length:Math.min(FULL_SCAN_CONCURRENCY,batches.length)},worker));
+    const all=resultsByBatch.flatMap(x=>x||[]);
+    paint(all,finished,total,{available_markets:cohort.available_markets});
+    if(firstError)throw firstError;
     const errors=all.filter(x=>x.error).length;
     const valid=all.filter(x=>!x.error&&x.windows>0).length;
-    const completed=(saved===total&&errors===0&&failures===0);
+    const completed=(saved===total&&errors===0&&failures===0&&finished===total);
     $('status').textContent=(completed?'✅ 완료':'⚠️ 검사 종료')+` · 전체 ${total}개 · 유효 ${valid}개 · 오류 ${errors}개 · 원본 고정 ${saved}/${total}개`;
     if(completed){
       const avgB=h=>{const n=all.reduce((t,x)=>t+x.strategies.B.samples[h],0);
@@ -1000,7 +1030,7 @@ async function runAllBacktest(){
         `<tr><td>${x.date}</td><td>${x.scope}</td><td>${fmt(x.valid)}</td><td>${fmt(x.a)}</td><td>${fmt(x.b)}</td><td>${pct(x.b1)}</td><td>${pct(x.b3)}</td><td>${pct(x.b24)}</td></tr>`).join('');
     }
   }catch(e){
-    paint(all,all.length,total||1,{});
+    paint(resultsByBatch.flatMap(x=>x||[]),finished,total||1,{});
     $('status').textContent=`⚠️ ${e.message} · 저장 완료된 코인은 보존됩니다. 같은 날짜로 분석 시작을 다시 누르면 이어집니다.`;
   }finally{
     running=false;$('start').disabled=false;
@@ -1674,7 +1704,7 @@ def register_daytrade_review(app, deps):
             if not set(names).issubset(allowed):
                 raise ValueError("현재 상장되지 않은 KRW 마켓이 포함되었습니다")
             capture = request.args.get("capture", "0") == "1"
-            with ThreadPoolExecutor(max_workers=3) as pool:
+            with ThreadPoolExecutor(max_workers=5) as pool:
                 futures = {pool.submit(evaluate_market, name, date, fee, None, capture): name
                            for name in names}
                 result_by_market = {}
