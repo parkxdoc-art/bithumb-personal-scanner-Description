@@ -18,6 +18,88 @@ MAX_GAP_FILL_BARS = 6  # up to 30 minutes without trades
 MAX_SYNTHETIC_BARS_PER_WINDOW = 24  # max 4.2% of a 48h sample
 MARKET_PATTERN = re.compile(r"^KRW-[A-Z0-9]+$")
 
+# Analytical thresholds on NET proceeds after entry and exit fees.
+# These are evaluation markers, NOT live order instructions or new BUY gates.
+TP_NET_PCT = 2.0
+SL_NET_PCT = -1.0
+TOUCH_HOURS = 6
+TOUCH_KEYS = ("tp_first", "sl_first", "same_bar", "gap_unknown", "none")
+
+
+def _net_pct(price, entry, fee):
+    return ((price / entry) * (1 - fee) / (1 + fee) - 1) * 100
+
+
+def analyze_trade_quality(history, future, entry, fee):
+    """Explain an already-produced BUY signal using strictly preceding/future data.
+
+    The signal is determined elsewhere. Do not use the future diagnostics
+    for BUY decisions. Filled candles cannot establish a target/stop touch.
+    """
+    close = float(history[-1]["trade_price"])
+    before = {}
+    for label, n in (("15m", 3), ("30m", 6), ("60m", 12)):
+        past = float(history[-1-n]["trade_price"])
+        before[label] = round(100 * (close / past - 1), 3) if past > 0 else None
+    volumes = [float(c["candle_acc_trade_volume"]) for c in history[-21:-1]]
+    vbase = sum(volumes) / len(volumes)
+    vlast = float(history[-1]["candle_acc_trade_volume"])
+    vr = round(vlast / vbase, 2) if vbase > 0 else None
+    gap_before = sum(bool(c.get("_gap_fill")) for c in history[-80:])
+
+    excursions = {}
+    for h in (1, 3, 6):
+        sample = future[:12*h]
+        observed = [c for c in sample if not c.get("_gap_fill")]
+        if observed:
+            max_high = max(float(c["high_price"]) for c in observed)
+            min_low = min(float(c["low_price"]) for c in observed)
+            excursions[f"{h}h"] = {
+                "max_up_pct": round((max_high / entry - 1) * 100, 3),
+                "max_down_pct": round((min_low / entry - 1) * 100, 3),
+                "gap_bars": len(sample) - len(observed),
+            }
+        else:
+            excursions[f"{h}h"] = {
+                "max_up_pct": None, "max_down_pct": None,
+                "gap_bars": len(sample),
+            }
+
+    # Convert NET target/stop into raw intrabar price barriers.
+    tp_price = entry * (1 + TP_NET_PCT / 100) * (1 + fee) / (1 - fee)
+    sl_price = entry * (1 + SL_NET_PCT / 100) * (1 + fee) / (1 - fee)
+    first_tp_min = first_sl_min = None
+    outcome = "none"
+    first_touch_min = None
+    passed_unknown_gap = False
+    for idx, candle in enumerate(future[:12*TOUCH_HOURS], 1):
+        if candle.get("_gap_fill"):
+            passed_unknown_gap = True
+            continue
+        hit_tp = float(candle["high_price"]) >= tp_price
+        hit_sl = float(candle["low_price"]) <= sl_price
+        if hit_tp and first_tp_min is None:
+            first_tp_min = idx * 5
+        if hit_sl and first_sl_min is None:
+            first_sl_min = idx * 5
+        if outcome == "none" and (hit_tp or hit_sl):
+            first_touch_min = idx * 5
+            if passed_unknown_gap:
+                outcome = "gap_unknown"
+            elif hit_tp and hit_sl:
+                outcome = "same_bar"
+            else:
+                outcome = "tp_first" if hit_tp else "sl_first"
+    if outcome == "none" and passed_unknown_gap:
+        outcome = "gap_unknown"
+    return {
+        "before_pct": before, "volume_ratio_20": vr,
+        "gap_before_80": gap_before,
+        "excursions": excursions, "first_touch": outcome,
+        "first_touch_minutes": first_touch_min,
+        "tp_first_minutes": first_tp_min, "sl_first_minutes": first_sl_min,
+    }
+
 PAGE = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -41,6 +123,11 @@ tr{border-bottom:1px solid #293750}td,th{text-align:left;padding:9px;font-size:1
 strong.green{color:#5ee0aa}strong.yellow{color:#ffd77d}
 .warn{color:#ffd77d}.error{color:#ff9aa6}#status{min-height:30px}
 progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
+.eventcard{margin:10px 0;padding:12px;background:#111b31;border:1px solid #344562;border-radius:10px}
+.eventcard>div{margin-top:6px;font-size:13px;line-height:1.55}
+.eventcard strong{color:#cfe0ff}.muted{color:#a9b7d2}.tiny{font-size:12px;color:#a9b7d2}
+#touchSummary{line-height:1.8;white-space:pre-wrap}
+
 @media(min-width:750px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
 <a href="/">← 빗썸 실시간 스캐너로 돌아가기</a>
@@ -77,14 +164,27 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 <div id="diag" class="warn">결과 대기 중</div>
 </section>
 <section><h2>코인별 결과</h2><div class="tablewrap"><table><thead><tr><th>코인</th><th>유효 구간</th><th>A BUY</th><th>B BUY</th><th>상태</th></tr></thead><tbody id="coinRows"></tbody></table></div></section>
+<section><h2>6시간 익절·손절 선도달 분석</h2>
+<p>순수익 +2% 목표와 -1% 손절 기준(선택 수수료 양방향 포함). 다음 봉 시가 진입 가정입니다. 두 가격을 같은 5분봉에서 모두 터치하면 순서를 알 수 없으므로 '동일봉 불명'으로, 도달 전 누락 캔들이 있으면 '공백 불명'으로 분리합니다. 실제 주문 체결과 같지 않습니다.</p>
+<div id="touchSummary">결과 대기 중</div>
+</section>
+<section><h2>BUY별 진입 품질 · 진입 후 움직임</h2>
+<small>진입 전 15·30·60분 수익률, 직전 봉 거래량/이전 20봉 평균, 6시간 중 실제 봉의 고가·저가 기준 최대 상승/하락을 비교합니다. 미래 최대치와 선도달 정보는 신호 시점에 알 수 없으므로 검증에만 사용합니다.</small>
+<div id="qualityCards">결과 대기 중</div>
+</section>
+<section><h2>날짜별 검증 비교</h2>
+<small>이 화면에서 날짜를 바꿔 검사하면 결과가 쌓입니다. 브라우저를 새로고침하면 기록은 사라지며, 서로 다른 코인 목록/수수료는 직접 비교에 주의하세요.</small>
+<div class="tablewrap"><table><thead><tr><th>날짜</th><th>코인/수수료</th><th>유효 코인</th><th>A BUY</th><th>B BUY</th><th>B 1h 평균</th><th>B 3h 평균</th><th>B 24h 평균</th></tr></thead><tbody id="dateRows"></tbody></table></div>
+</section>
 <section><h2>발생 신호 예시</h2><div id="events">결과 대기 중</div></section>
 <section><h2>검증 범위에 대한 주의</h2><p>
-하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
+하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
 </p></section>
 </main><script>
 const $ = id => document.getElementById(id);
 const horizons = ['1h','3h','6h','12h','24h'];
 let running = false;
+const dateHistory = new Map();
 const fmt = x => x == null ? '—' : Number(x).toLocaleString('ko-KR');
 const pct = x => x == null ? '—' : Number(x).toFixed(2) + '%';
 function paint(all, done, total, rankInfo) {
@@ -127,6 +227,43 @@ function paint(all, done, total, rankInfo) {
   }
   $('events').textContent=ev.length?ev.slice(0,30).join('\n'):'아직 BUY 신호 예시가 없습니다.';
   $('events').style.whiteSpace='pre-line';
+  // New fields are evaluation diagnostics; they do not change A/B signals.
+  const touchNames={tp_first:'익절 먼저',sl_first:'손절 먼저',same_bar:'동일봉 불명',gap_unknown:'공백 불명',none:'6h 둘 다 미도달'};
+  const sum={};
+  for(const strategy of ['A','B']) {
+    const t={tp_first:0,sl_first:0,same_bar:0,gap_unknown:0,none:0};
+    for(const x of complete) {
+      const source=x.strategies[strategy].touch_counts||{};
+      for(const k of Object.keys(t)) t[k] += source[k]||0;
+    }
+    sum[strategy]=`${strategy}: `+Object.keys(t).map(k=>`${touchNames[k]} ${fmt(t[k])}`).join(' · ');
+  }
+  $('touchSummary').textContent=sum.A+'\n'+sum.B;
+  const details=[];
+  for(const x of complete) for(const strategy of ['A','B']) {
+    for(const e of x.strategies[strategy].examples) details.push({strategy,e});
+  }
+  details.sort((a,b)=>a.e.time.localeCompare(b.e.time));
+  const root=$('qualityCards');root.replaceChildren();
+  if(!details.length)root.textContent='아직 분석할 BUY 신호가 없습니다.';
+  for(const {strategy,e} of details.slice(0,40)) {
+    const q=e.quality;if(!q)continue;
+    const card=document.createElement('div');card.className='eventcard';
+    function line(value, title){const v=document.createElement('div');v.textContent=value;if(title){const b=document.createElement('strong');b.textContent=title+' ';v.prepend(b);}card.appendChild(v);}
+    line(`${strategy} · ${e.market} · ${e.time}`, '신호');
+    const bp=q.before_pct;
+    line(`15분 ${pct(bp['15m'])} · 30분 ${pct(bp['30m'])} · 60분 ${pct(bp['60m'])} · 거래량 ${q.volume_ratio_20==null?'—':q.volume_ratio_20+'배'}`, '진입 전');
+    line(`1시간 ${pct(e.net['1h'])} · 3시간 ${pct(e.net['3h'])} · 24시간 ${pct(e.net['24h'])}`, '종가 평가(보정 가능)');
+    const moves=q.excursions['6h'];
+    for(const key of ['1h','3h','6h']){
+      const m=q.excursions[key];
+      line(`최대 상승 ${pct(m.max_up_pct)} · 최대 하락 ${pct(m.max_down_pct)} (실제 봉의 고가·저가, 수수료 전)`, key+' 움직임');
+    }
+    line(`${touchNames[q.first_touch]}${q.first_touch_minutes==null?'':' · 최초 터치 '+q.first_touch_minutes+'분'} (목표 순수익 +2% / 손절 -1%)`, '익절·손절');
+    if(q.gap_before_80 || moves.gap_bars)line(`과거 80봉 보정 ${q.gap_before_80}개 / 이후 6시간 보정 ${moves.gap_bars}개 · 해석 주의`, '데이터 품질');
+    root.appendChild(card);
+  }
+  if(details.length>40){const note=document.createElement('small');note.textContent=`신호 ${fmt(details.length)}건 중 첫 40건만 표시`;root.appendChild(note);}
   $('progress').max=total||1;$('progress').value=done;
 }
 async function startBacktest(){
@@ -156,6 +293,19 @@ async function startBacktest(){
     const errors=all.filter(x=>x.error).length;
     const valid=all.filter(x=>!x.error && x.windows>0).length;
     $('status').textContent=`완료 · ${all.length}개 조회, 유효 코인 ${valid}개, ${errors}개 조회/계산 오류. A와 B를 비교하세요.`;
+    if(!errors){
+      const totalSignals=kind=>all.reduce((s,x)=>s+x.strategies[kind].signals,0);
+      const avgB=h=>{
+        const n=all.reduce((s,x)=>s+x.strategies.B.samples[h],0);
+        const sm=all.reduce((s,x)=>s+x.strategies.B.return_sums[h],0);
+        return n?sm/n:null;
+      };
+      dateHistory.set(date, {date, scope:`${limit}개 / 편도 ${fee}%`,valid,
+          a:totalSignals('A'),b:totalSignals('B'),
+          b1:avgB('1h'),b3:avgB('3h'),b24:avgB('24h')});
+      $('dateRows').innerHTML=Array.from(dateHistory.values()).sort((a,b)=>a.date.localeCompare(b.date)).map(x=>
+        `<tr><td>${x.date}</td><td>${x.scope}</td><td>${fmt(x.valid)}</td><td>${fmt(x.a)}</td><td>${fmt(x.b)}</td><td>${pct(x.b1)}</td><td>${pct(x.b3)}</td><td>${pct(x.b24)}</td></tr>`).join('');
+    }
   } catch(e) {
     $('status').textContent='⚠️ 중단: '+e.message+' · 이미 받은 결과는 아래에 남겨두었습니다.';
   } finally {
@@ -274,6 +424,7 @@ def register_daytrade_review(app, deps):
     def empty_strategy():
         return {"signals": 0, "samples": EMPTY.copy(),
                 "return_sums": EMPTY.copy(), "positive": EMPTY.copy(),
+                "touch_counts": {k: 0 for k in TOUCH_KEYS},
                 "examples": []}
 
     def evaluate_market(market, date, fee):
@@ -379,6 +530,10 @@ def register_daytrade_review(app, deps):
                     if entry <= 0 or not isfinite(entry):
                         continue
                     result = output["strategies"][strategy]
+                    # Only after the signal decision: no future-data leakage
+                    # into A/B replay or the liquid/price BUY gates.
+                    quality = analyze_trade_quality(history, future, entry, fee)
+                    result["touch_counts"][quality["first_touch"]] += 1
                     net = {}
                     for h in HOURS:
                         exit_price = float(future[12 * h - 1]["trade_price"])
@@ -394,10 +549,10 @@ def register_daytrade_review(app, deps):
                         net[key] = round(ret, 3)
                     result["signals"] += 1
                     last_event[strategy] = at
-                    if len(result["examples"]) < 3:
+                    if len(result["examples"]) < 12:
                         result["examples"].append({
                             "market": market, "time": at.strftime("%m-%d %H:%M"),
-                            "entry": entry, "net": net,
+                            "entry": entry, "net": net, "quality": quality,
                         })
             if output["windows"] == 0:
                 output["coverage_reason"] = (f"원본 {coverage['actual']}봉 / 보정 {coverage['filled']}봉 / "
