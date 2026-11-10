@@ -1,4 +1,4 @@
-"""Gap-aware day-trading A/B backtest dashboard. No change to live BUY."""
+"""V5: gap-aware A/B backtest with raw-price TP/SL scenario comparison. No live BUY changes."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -24,6 +24,17 @@ TP_NET_PCT = 2.0
 SL_NET_PCT = -1.0
 TOUCH_HOURS = 6
 TOUCH_KEYS = ("tp_first", "sl_first", "same_bar", "gap_unknown", "none")
+
+# Independent V5 hypothetical exit scenarios. TP and SL percentages below
+# are RAW price moves from next-bar OPEN, not net returns after commissions.
+# All are measured over six hours; they NEVER change entry signals.
+EXIT_SCENARIOS = (
+    ("p2_s1", 2.0, 1.0),
+    ("p2_s15", 2.0, 1.5),
+    ("p3_s15", 3.0, 1.5),
+    ("p3_s2", 3.0, 2.0),
+)
+EXIT_OUTCOMES = ("tp_first", "sl_first", "same_bar", "gap_unknown", "time_exit")
 
 
 def _net_pct(price, entry, fee):
@@ -100,10 +111,72 @@ def analyze_trade_quality(history, future, entry, fee):
         "tp_first_minutes": first_tp_min, "sl_first_minutes": first_sl_min,
     }
 
+
+
+def analyze_exit_scenarios(future, entry, fee):
+    """Check four hypothetical RAW-price targets/stops on observed OHLC only.
+
+    The next bar opens at the assumed entry price. A missing bar prior to
+    any observed hit makes the first-hit order unknowable. A bar hitting both
+    bounds is ambiguous. Unknown cases NEVER receive an invented P&L.
+    When no level is hit in 72 observed 5m bars, exit at bar 72 close.
+    This is a backtest diagnostic, not an order execution simulator.
+    """
+    if len(future) < 12 * TOUCH_HOURS:
+        raise ValueError("6시간 미래 캔들이 부족합니다")
+    if not isfinite(entry) or entry <= 0:
+        raise ValueError("진입가 오류")
+
+    results = {}
+    for key, take_pct, stop_pct in EXIT_SCENARIOS:
+        tp_price = entry * (1 + take_pct / 100)
+        sl_price = entry * (1 - stop_pct / 100)
+        had_gap = False
+        status = None
+        first_min = None
+        exit_price = None
+        for idx, candle in enumerate(future[:12 * TOUCH_HOURS], start=1):
+            if candle.get("_gap_fill"):
+                had_gap = True
+                continue
+            high = float(candle["high_price"])
+            low = float(candle["low_price"])
+            if not isfinite(high) or not isfinite(low) or high < low or low <= 0:
+                raise ValueError("고가·저가 데이터 오류")
+            hit_tp, hit_sl = high >= tp_price, low <= sl_price
+            if not (hit_tp or hit_sl):
+                continue
+            first_min = idx * 5
+            if had_gap:
+                status = "gap_unknown"
+            elif hit_tp and hit_sl:
+                status = "same_bar"
+            elif hit_tp:
+                status, exit_price = "tp_first", tp_price
+            else:
+                status, exit_price = "sl_first", sl_price
+            break
+        if status is None:
+            if had_gap:
+                status = "gap_unknown"
+            else:
+                status = "time_exit"
+                exit_price = float(future[12 * TOUCH_HOURS - 1]["trade_price"])
+                if not isfinite(exit_price) or exit_price <= 0:
+                    raise ValueError("6시간 종가 데이터 오류")
+                first_min = 12 * TOUCH_HOURS * 5
+
+        net_return = _net_pct(exit_price, entry, fee) if exit_price is not None else None
+        results[key] = {
+            "status": status, "minutes": first_min,
+            "net_pct": round(net_return, 3) if net_return is not None else None,
+        }
+    return results
+
 PAGE = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>단타 A/B 백테스트 | 빗썸 스캐너</title>
+<title>단타 A/B 백테스트 V5 | 빗썸 스캐너</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;color:#edf3ff;padding:16px}
@@ -131,7 +204,7 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 @media(min-width:750px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
 <a href="/">← 빗썸 실시간 스캐너로 돌아가기</a>
-<h1>📊 단타 A/B 검증판</h1>
+<h1>📊 단타 A/B 검증판 · V5</h1>
 <p>기존 BUY(A)와 피보나치(B)를 같은 과거 5분봉에서 비교합니다. 실시간 주문 기능은 없습니다.</p>
 <section><h2>백테스트 설정</h2>
 <div class="controls">
@@ -168,6 +241,12 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 <p>순수익 +2% 목표와 -1% 손절 기준(선택 수수료 양방향 포함). 다음 봉 시가 진입 가정입니다. 두 가격을 같은 5분봉에서 모두 터치하면 순서를 알 수 없으므로 '동일봉 불명'으로, 도달 전 누락 캔들이 있으면 '공백 불명'으로 분리합니다. 실제 주문 체결과 같지 않습니다.</p>
 <div id="touchSummary">결과 대기 중</div>
 </section>
+<section><h2>V5 · 6시간 가격 기준 손익비 4종 비교</h2>
+<p>기존 V4의 <b>순수익 목표 +2% / 손절 -1%</b>와 달리, 아래 4개는 <b>매수가 대비 실제 가격 변동률</b> 기준입니다. 동일한 A/B BUY에서 가정한 다음 5분봉 시가로 진입하여, 6시간 내 먼저 닿은 목표·손절 가격에 청산한 것으로 계산합니다. 어느 쪽도 닿지 않으면 6시간 종가 청산을 가정합니다.</p>
+<p>표의 평균 순수익률은 선택한 양방향 수수료를 반영하며, <b>동일봉 동시 터치·먼저 지나간 누락봉</b>은 수익률과 성공률 계산에서 제외합니다. 실제 지정가·시장가 체결, 갭 슬리피지, 호가잔량은 반영하지 못합니다.</p>
+<div class="tablewrap"><table><thead><tr><th>전략</th><th>가격 익절/손절</th><th>익절 먼저</th><th>손절 먼저</th><th>동일봉 불명</th><th>공백 불명</th><th>6h 종가청산</th><th>판정가능</th><th>평균 순수익률</th><th>수익 비율</th></tr></thead><tbody id="scenarioRows"></tbody></table></div>
+<small id="scenarioNotice">결과 대기 중</small>
+</section>
 <section><h2>BUY별 진입 품질 · 진입 후 움직임</h2>
 <small>진입 전 15·30·60분 수익률, 직전 봉 거래량/이전 20봉 평균, 6시간 중 실제 봉의 고가·저가 기준 최대 상승/하락을 비교합니다. 미래 최대치와 선도달 정보는 신호 시점에 알 수 없으므로 검증에만 사용합니다.</small>
 <div id="qualityCards">결과 대기 중</div>
@@ -178,7 +257,7 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 </section>
 <section><h2>발생 신호 예시</h2><div id="events">결과 대기 중</div></section>
 <section><h2>검증 범위에 대한 주의</h2><p>
-하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
+하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V5 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
 </p></section>
 </main><script>
 const $ = id => document.getElementById(id);
@@ -239,6 +318,28 @@ function paint(all, done, total, rankInfo) {
     sum[strategy]=`${strategy}: `+Object.keys(t).map(k=>`${touchNames[k]} ${fmt(t[k])}`).join(' · ');
   }
   $('touchSummary').textContent=sum.A+'\n'+sum.B;
+  const scenarioDefs=[
+    {id:'p2_s1',label:'+2% / -1%'},
+    {id:'p2_s15',label:'+2% / -1.5%'},
+    {id:'p3_s15',label:'+3% / -1.5%'},
+    {id:'p3_s2',label:'+3% / -2%'}
+  ];
+  const scenarioResults=[];
+  for(const strategy of ['A','B']) for(const scenario of scenarioDefs){
+    const counts={tp_first:0,sl_first:0,same_bar:0,gap_unknown:0,time_exit:0};
+    let resolved=0, netSum=0, wins=0;
+    for(const x of complete){
+      const rec=(x.strategies[strategy].scenarios||{})[scenario.id];
+      if(!rec)continue;
+      for(const status in counts)counts[status]+=rec.counts[status]||0;
+      resolved+=rec.resolved||0;
+      netSum+=rec.net_sum||0;
+      wins+=rec.positive||0;
+    }
+    scenarioResults.push(`<tr><td>${strategy}</td><td>${scenario.label}</td><td>${fmt(counts.tp_first)}</td><td>${fmt(counts.sl_first)}</td><td>${fmt(counts.same_bar)}</td><td>${fmt(counts.gap_unknown)}</td><td>${fmt(counts.time_exit)}</td><td>${fmt(resolved)}</td><td>${pct(resolved?netSum/resolved:null)}</td><td>${pct(resolved?100*wins/resolved:null)}</td></tr>`);
+  }
+  $('scenarioRows').innerHTML=scenarioResults.join('');
+  $('scenarioNotice').textContent='판정가능 = 익절/손절 선도달 또는 6시간 종가 청산. 불명 사례는 평균·수익 비율에서 제외하며, 한 날짜·중복 종목의 결과만으로 전략 우열을 확정하지 않습니다.';
   const details=[];
   for(const x of complete) for(const strategy of ['A','B']) {
     for(const e of x.strategies[strategy].examples) details.push({strategy,e});
@@ -260,6 +361,11 @@ function paint(all, done, total, rankInfo) {
       line(`최대 상승 ${pct(m.max_up_pct)} · 최대 하락 ${pct(m.max_down_pct)} (실제 봉의 고가·저가, 수수료 전)`, key+' 움직임');
     }
     line(`${touchNames[q.first_touch]}${q.first_touch_minutes==null?'':' · 최초 터치 '+q.first_touch_minutes+'분'} (목표 순수익 +2% / 손절 -1%)`, '익절·손절');
+    const scenarioNames={tp_first:'익절 먼저',sl_first:'손절 먼저',same_bar:'동일봉 불명',gap_unknown:'공백 불명',time_exit:'6h 종가청산'};
+    for(const d of scenarioDefs){
+      const res=e.scenarios&&e.scenarios[d.id];
+      if(res)line(`${d.label} → ${scenarioNames[res.status]||res.status}${res.minutes==null?'':' · '+res.minutes+'분'} · 순수익 ${pct(res.net_pct)}`, 'V5 가격기준');
+    }
     if(q.gap_before_80 || moves.gap_bars)line(`과거 80봉 보정 ${q.gap_before_80}개 / 이후 6시간 보정 ${moves.gap_bars}개 · 해석 주의`, '데이터 품질');
     root.appendChild(card);
   }
@@ -425,6 +531,10 @@ def register_daytrade_review(app, deps):
         return {"signals": 0, "samples": EMPTY.copy(),
                 "return_sums": EMPTY.copy(), "positive": EMPTY.copy(),
                 "touch_counts": {k: 0 for k in TOUCH_KEYS},
+                "scenarios": {key: {
+                    "counts": {kind: 0 for kind in EXIT_OUTCOMES},
+                    "resolved": 0, "net_sum": 0.0, "positive": 0,
+                } for key, _, _ in EXIT_SCENARIOS},
                 "examples": []}
 
     def evaluate_market(market, date, fee):
@@ -534,6 +644,14 @@ def register_daytrade_review(app, deps):
                     # into A/B replay or the liquid/price BUY gates.
                     quality = analyze_trade_quality(history, future, entry, fee)
                     result["touch_counts"][quality["first_touch"]] += 1
+                    scenarios = analyze_exit_scenarios(future, entry, fee)
+                    for scenario_id, test in scenarios.items():
+                        agg = result["scenarios"][scenario_id]
+                        agg["counts"][test["status"]] += 1
+                        if test["net_pct"] is not None:
+                            agg["resolved"] += 1
+                            agg["net_sum"] += test["net_pct"]
+                            agg["positive"] += int(test["net_pct"] > 0)
                     net = {}
                     for h in HOURS:
                         exit_price = float(future[12 * h - 1]["trade_price"])
@@ -553,6 +671,7 @@ def register_daytrade_review(app, deps):
                         result["examples"].append({
                             "market": market, "time": at.strftime("%m-%d %H:%M"),
                             "entry": entry, "net": net, "quality": quality,
+                            "scenarios": scenarios,
                         })
             if output["windows"] == 0:
                 output["coverage_reason"] = (f"원본 {coverage['actual']}봉 / 보정 {coverage['filled']}봉 / "
