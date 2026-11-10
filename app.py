@@ -167,6 +167,19 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 
 <div class="panel">
 <h2>스캔 설정</h2>
+<div style="margin:10px 0 14px;">
+  <a href="/backtest-daytrade"
+     style="display:inline-block;
+            padding:10px 12px;
+            background:#1b2943;
+            border:1px solid #354765;
+            color:#edf3ff;
+            border-radius:9px;
+            text-decoration:none;
+            font-weight:700;">
+    📊 단타 A/B 검증판 열기
+  </a>
+</div>
 <div class="controls">
   <div class="field"><label for="tf">캔들 주기</label><select id="tf"><option value="1">1분</option><option value="3">3분</option><option value="5" selected>5분</option><option value="10">10분</option><option value="30">30분</option></select></div>
   <div class="field"><label for="limit">검색 코인 수</label><select id="limit"><option>20</option><option selected>40</option><option>80</option></select></div>
@@ -3987,6 +4000,7 @@ def scan():
                         "updated":f"{datetime.now(KST):%H:%M:%S} KST · {time.perf_counter()-scan_start:.1f}초"})
     except Exception as e:
         return jsonify({"error":str(e)}), 502
-
+from daytrade_review import register_daytrade_review
+register_daytrade_review(app, globals())
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")))
