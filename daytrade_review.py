@@ -1,7 +1,7 @@
-"""V10.1: faster full-KRW backtests in resumable concurrent 5-market batches.
+"""V10.2: preserve historical backtest calculation results alongside raw candles.
 
-All V9 strategy logic is unchanged. Existing 10/30/50 snapshots remain untouched.
-The full-universe option stores original raw candles in separate IndexedDB chunks.
+All A/B and V5-V9 strategy logic is unchanged. Existing 10/30/50 snapshots remain untouched.
+The full-universe option stores raw candles and versioned calculation caches in separate IndexedDB records.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -892,6 +892,26 @@ const ALL_KIND='all';
 const ALL_MARKET_CAP=1000;
 const allChunkKey=(day,i)=>`allchunk|${day}|${i}`;
 const allMetaKey=day=>`allmeta|${day}`;
+// V10.2: cache only analyses that used the identical raw source, date and fee.
+// Increment the engine version on ANY future change to the strategy computation.
+// Keep raw candles in the existing immutable per-batch records. Raw exports exclude
+// these computed outputs, and importing new source invalidates by SHA-256 digest.
+const FULL_RESULT_ENGINE='v10.2-v10.1-identical-strategies-1';
+const allResultKey=(date,fee,start)=>`allresult|${FULL_RESULT_ENGINE}|${date}|${fee}|${start}`;
+async function allRawDigest(chunk){
+  if(!window.crypto||!window.crypto.subtle)return null;
+  const bytes=new TextEncoder().encode(JSON.stringify(chunk.rawByMarket));
+  const hash=new Uint8Array(await window.crypto.subtle.digest('SHA-256',bytes));
+  return Array.from(hash,x=>x.toString(16).padStart(2,'0')).join('');
+}
+function validSavedResults(data,date,fee,task,hash){
+  return !!(data&&data.engine===FULL_RESULT_ENGINE&&data.date===date&&
+      data.fee===fee&&data.hash===hash&&hash&&
+      Array.isArray(data.results)&&data.results.length===task.markets.length&&
+      data.results.every((r,i)=>r&&r.market===task.markets[i]&&
+         !Object.prototype.hasOwnProperty.call(r,'_raw_candles')));
+}
+
 function validateAllCohort(c){
   if(!c||c.schema!==SNAP_SCHEMA||c.limit!==ALL_KIND||!Array.isArray(c.markets)||
      c.markets.length<1||c.markets.length>ALL_MARKET_CAP||
@@ -934,7 +954,7 @@ async function runAllBacktest(){
   for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=true;
   $('coinRows').innerHTML='';
   const date=$('day').value,fee=$('fee').value;
-  let total=0,saved=0,failures=0,finished=0,lastPainted=0;
+  let total=0,saved=0,failures=0,finished=0,lastPainted=0,cacheHits=0;
   const resultsByBatch=[];
   try{
     const cohort=await getAllCohort();
@@ -950,47 +970,68 @@ async function runAllBacktest(){
       const task=batches[batchNo];
       const batch=task.markets,key=allChunkKey(date,task.start);
       let chunk=await snapshotStore('get',key);
-      let resp;
+      let r=null,rawHash=null,wasCached=false;
       if(chunk){
         validateAllChunk(chunk,date,batch);
-        resp=await fetch('/api/daytrade-replay',{
-          method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
-          body:JSON.stringify({schema:SNAP_SCHEMA,date,fee,
-              snapshots:batch.map(market=>({market,rows:chunk.rawByMarket[market]}))})
-        });
-      }else{
-        const qs=new URLSearchParams({date,markets:batch.join(','),fee,capture:'1'});
-        resp=await fetch('/api/daytrade-batch?'+qs.toString(),{cache:'no-store'});
-      }
-      if(!resp.ok)throw new Error(`코인 ${task.start+1}~${task.start+batch.length} 응답 오류(${resp.status})`);
-      const r=await resp.json();
-      if(!r.ok||!Array.isArray(r.results)||r.results.length!==batch.length)
-        throw new Error(r.error||'분석 응답이 불완전합니다');
-      // Strictly verify response ordering/identity before saving data or results.
-      if(r.results.some((x,j)=>!x||x.market!==batch[j]))
-        throw new Error('응답 코인 순서가 일치하지 않습니다');
-      if(!chunk){
-        const rawByMarket={};
-        for(const item of r.results){
-          if(Object.prototype.hasOwnProperty.call(item,'_raw_candles')){
-            rawByMarket[item.market]=item._raw_candles;
-            delete item._raw_candles;
+        rawHash=await allRawDigest(chunk);
+        if(rawHash){
+          const cached=await snapshotStore('get',allResultKey(date,fee,task.start));
+          if(validSavedResults(cached,date,fee,task,rawHash)){
+            r={ok:true,results:cached.results};
+            wasCached=true;
           }
         }
-        if(batch.every(m=>Array.isArray(rawByMarket[m]))){
-          chunk={schema:SNAP_SCHEMA,key,date,markets:batch.slice(),rawByMarket};
-          validateAllChunk(chunk,date,batch);
-          // Save raw candles BEFORE counting the batch as complete.
-          await snapshotStore('put',key,chunk);
+      }
+      if(!r){
+        let resp;
+        if(chunk){
+          resp=await fetch('/api/daytrade-replay',{
+            method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
+            body:JSON.stringify({schema:SNAP_SCHEMA,date,fee,
+                snapshots:batch.map(market=>({market,rows:chunk.rawByMarket[market]}))})
+          });
         }else{
-          failures+=batch.length;
+          const qs=new URLSearchParams({date,markets:batch.join(','),fee,capture:'1'});
+          resp=await fetch('/api/daytrade-batch?'+qs.toString(),{cache:'no-store'});
+        }
+        if(!resp.ok)throw new Error(`코인 ${task.start+1}~${task.start+batch.length} 응답 오류(${resp.status})`);
+        r=await resp.json();
+        if(!r.ok||!Array.isArray(r.results)||r.results.length!==batch.length)
+          throw new Error(r.error||'분석 응답이 불완전합니다');
+        if(r.results.some((x,j)=>!x||x.market!==batch[j]))
+          throw new Error('응답 코인 순서가 일치하지 않습니다');
+        if(!chunk){
+          const rawByMarket={};
+          for(const item of r.results){
+            if(Object.prototype.hasOwnProperty.call(item,'_raw_candles')){
+              rawByMarket[item.market]=item._raw_candles;
+              delete item._raw_candles;
+            }
+          }
+          if(batch.every(m=>Array.isArray(rawByMarket[m]))){
+            chunk={schema:SNAP_SCHEMA,key,date,markets:batch.slice(),rawByMarket};
+            validateAllChunk(chunk,date,batch);
+            // Original RAW data is saved before its derived calculation result.
+            await snapshotStore('put',key,chunk);
+            rawHash=await allRawDigest(chunk);
+          }else{
+            failures+=batch.length;
+          }
+        }
+        if(chunk&&rawHash){
+          // Version+source+date+fee guard: reused results are analytically identical.
+          await snapshotStore('put',allResultKey(date,fee,task.start),{
+            key:allResultKey(date,fee,task.start),engine:FULL_RESULT_ENGINE,
+            date,fee,hash:rawHash,results:r.results
+          });
         }
       }
+      if(wasCached)cacheHits+=batch.length;
       if(chunk)saved+=batch.length;
       resultsByBatch[batchNo]=r.results;
       finished+=batch.length;
       $('progress').max=total;$('progress').value=finished;
-      $('status').textContent=`전체 KRW ${finished}/${total}개 검사 · 원본 저장 ${saved}개 · 5개씩 ${FULL_SCAN_CONCURRENCY}묶음 동시 처리 · 중단 시 다시 실행하면 이어집니다`;
+      $('status').textContent=`전체 KRW ${finished}/${total}개 검사 · 원본 저장 ${saved}개 · 계산 재사용 ${cacheHits}개 · 중단 시 이어서 검사 가능합니다`;
       // Large tables are expensive to rerender on phones; refresh every 50 coins.
       if(finished-lastPainted>=50||finished===total){
         paint(resultsByBatch.flatMap(x=>x||[]),finished,total,
@@ -1018,7 +1059,7 @@ async function runAllBacktest(){
     const errors=all.filter(x=>x.error).length;
     const valid=all.filter(x=>!x.error&&x.windows>0).length;
     const completed=(saved===total&&errors===0&&failures===0&&finished===total);
-    $('status').textContent=(completed?'✅ 완료':'⚠️ 검사 종료')+` · 전체 ${total}개 · 유효 ${valid}개 · 오류 ${errors}개 · 원본 고정 ${saved}/${total}개`;
+    $('status').textContent=(completed?'✅ 완료':'⚠️ 검사 종료')+` · 전체 ${total}개 · 유효 ${valid}개 · 오류 ${errors}개 · 원본 고정 ${saved}/${total}개 · 계산 재사용 ${cacheHits}개`;
     if(completed){
       const avgB=h=>{const n=all.reduce((t,x)=>t+x.strategies.B.samples[h],0);
         const sum=all.reduce((t,x)=>t+x.strategies.B.return_sums[h],0);return n?sum/n:null;};
