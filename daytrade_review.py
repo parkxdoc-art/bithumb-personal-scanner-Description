@@ -1,7 +1,7 @@
-"""V9: evaluate support retention and rebound strength on V7 pullback entries.
+"""V10: scan the full active Bithumb KRW universe in resumable 5-market batches.
 
-Preserves V8 raw snapshots and A/B, V5, V6, V7 historical evaluation logic.
-V9 only filters the SAME V7 -1% entry point; it cannot delay until a later winner.
+All V9 strategy logic is unchanged. Existing 10/30/50 snapshots remain untouched.
+The full-universe option stores original raw candles in separate IndexedDB chunks.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -543,7 +543,7 @@ button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px
 @media(min-width:750px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
 <a href="/">← 빗썸 실시간 스캐너로 돌아가기</a>
-<h1>📊 단타 A/B 검증판 · V9</h1>
+<h1>📊 단타 A/B 검증판 · V10</h1>
 <p>기존 BUY(A)와 피보나치(B)를 같은 과거 5분봉에서 비교합니다. 실시간 주문 기능은 없습니다.</p>
 <section><h2>백테스트 설정</h2>
 <div class="controls">
@@ -551,14 +551,14 @@ button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px
 <option>2026-11-08</option><option>2026-11-07</option><option>2026-11-04</option><option>2026-11-01</option>
 </select></div>
 <div class="field"><label for="limit">코인 수</label><select id="limit">
-<option value="10">10개</option><option value="30" selected>30개</option><option value="50">50개</option>
+<option value="10">10개</option><option value="30" selected>30개</option><option value="50">50개</option><option value="all">전체 KRW (5개씩 검사)</option>
 </select></div>
 <div class="field"><label for="fee">매수·매도 각각 수수료</label><select id="fee">
 <option value="0.25" selected>0.25%</option><option value="0.04">0.04%</option><option value="0">0%</option>
 </select></div>
 <button id="start" type="button">A/B 분석 시작</button>
 </div>
-<small>첫 검사에서 고른 KRW 코인 목록은 <b>같은 코인 수(10·30·50개)의 모든 검사 날짜에 공통 고정</b>합니다. 각 날짜의 <b>실제 원본 5분봉은 날짜별로 한 번만 저장</b>하고 재사용합니다. 첫 코인 선정은 현재 거래대금 기준이므로 과거 시점 선정 편향은 남습니다.</small>
+<small>10·30·50개는 현재 거래대금 상위 코인, <b>전체 KRW</b>는 현재 상장된 모든 KRW 코인을 선택합니다. 각 코인 수의 목록은 모든 날짜에 공통 고정됩니다. 전체 모드는 <b>5개씩 검사하고 자동 저장</b>하여 중단돼도 이어서 검사할 수 있습니다. 과거 당일 상장 목록이 아닌 현재 상장 목록이므로 생존·선정 편향은 남습니다.</small>
 <div class="snapshot-tools">
   <small id="snapshotInfo">저장된 원본 데이터 확인 중…</small>
   <div class="controls">
@@ -566,7 +566,7 @@ button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px
     <button class="secondary" id="snapshotImport" type="button">📂 백업 불러오기</button>
     <button class="secondary" id="snapshotReset" type="button">↻ 이 날짜 원본만 해제</button>
     <button class="secondary" id="cohortReset" type="button">코인 목록·모든 날짜 초기화</button>
-    <input id="snapshotFile" type="file" accept=".json,application/json" hidden>
+    <input id="snapshotFile" type="file" accept=".json,.gz,application/json,application/gzip" hidden>
   </div>
 </div>
 <p id="status" role="status">설정을 고르고 분석 시작을 누르세요.</p>
@@ -620,13 +620,13 @@ button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px
 <div id="qualityCards">결과 대기 중</div>
 </section>
 <section><h2>날짜별 검증 비교</h2>
-<small>같은 브라우저의 고정 원본 5분봉을 재사용합니다(브라우저 저장 공간 삭제 시 사라질 수 있으므로 JSON 백업 권장). 여기 보이는 날짜별 결과 표 자체는 새로고침하면 초기화됩니다. 날짜마다 원래 선정된 코인 구성은 다를 수 있으므로 단순 합산에 주의하세요.</small>
+<small>같은 브라우저의 고정 원본 5분봉을 재사용합니다(브라우저 저장 공간 삭제 시 사라질 수 있으므로 JSON 백업 권장). 여기 보이는 날짜별 결과 표 자체는 새로고침하면 초기화됩니다. 같은 코인 수/전체 KRW 고정 목록을 재사용하지만, 다른 코인 수의 결과와 수수료 설정이 다른 결과는 단순 합산하지 마세요.</small>
 <div class="tablewrap"><table><thead><tr><th>날짜</th><th>코인/수수료</th><th>유효 코인</th><th>A BUY</th><th>B BUY</th><th>B 1h 평균</th><th>B 3h 평균</th><th>B 24h 평균</th></tr></thead><tbody id="dateRows"></tbody></table></div>
 </section>
 <section><h2>발생 신호 예시</h2><div id="events">결과 대기 중</div></section>
-<section><h2>V8·V9 고정 데이터 원칙</h2><p>처음 선정한 코인 목록을 같은 검사 코인 수의 <b>모든 날짜에 공통 사용</b>하고, 각 날짜의 <b>실거래 원본 캔들(보정 전)</b>을 휴대폰 브라우저 IndexedDB에 저장합니다. 저장된 날짜는 이후 빗썸 원본 캔들을 다시 요청하지 않습니다. 브라우저 데이터를 지우거나 기기를 바꾸면 별도의 JSON 백업을 불러와야 동일한 자료를 사용할 수 있습니다. 고정 자료도 캔들 누락과 현재 시점 선정 편향은 남습니다. 백업의 내용이 진짜 거래소 데이터인지는 별도로 확인해야 합니다.</p></section>
+<section><h2>V8·V9·V10 고정 데이터 원칙</h2><p>처음 선정한 코인 목록을 같은 검사 코인 수의 <b>모든 날짜에 공통 사용</b>하고, 각 날짜의 <b>실거래 원본 캔들(보정 전)</b>을 휴대폰 브라우저 IndexedDB에 저장합니다. 저장된 날짜는 이후 빗썸 원본 캔들을 다시 요청하지 않습니다. 브라우저 데이터를 지우거나 기기를 바꾸면 별도의 JSON 백업을 불러와야 동일한 자료를 사용할 수 있습니다. 고정 자료도 캔들 누락과 현재 시점 선정 편향은 남습니다. 백업의 내용이 진짜 거래소 데이터인지는 별도로 확인해야 합니다.</p></section>
 <section><h2>검증 범위에 대한 주의</h2><p>
-하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V7은 신호 이후 최대 60분 눌림·반등 확인 뒤 다음 봉 시가의 가상 진입만 비교하며, V9는 같은 -1% 눌림 진입에 임시 저점·반등 강도 검증을 추가합니다. 미진입 신호는 수익률 계산에 넣지 않습니다. V5/V6 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
+하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V7은 신호 이후 최대 60분 눌림·반등 확인 뒤 다음 봉 시가의 가상 진입만 비교하며, V9는 같은 -1% 눌림 진입에 임시 저점·반등 강도 검증을 추가합니다. 미진입 신호는 수익률 계산에 넣지 않습니다. V5/V6 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 하루 또는 소수의 BUY 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
 </p></section>
 </main><script>
 const $ = id => document.getElementById(id);
@@ -886,6 +886,185 @@ async function snapshotStore(mode, key, value){
     tx.onabort=()=>{db.close();reject(tx.error||new Error('스냅샷 작업 중단'));};
   });
 }
+// V10 full-KRW dataset: each original 5-market batch is a separate record.
+// This avoids repeatedly writing one 100MB+ snapshot on a mobile device.
+const ALL_KIND='all';
+const ALL_MARKET_CAP=1000;
+const allChunkKey=(day,i)=>`allchunk|${day}|${i}`;
+const allMetaKey=day=>`allmeta|${day}`;
+function validateAllCohort(c){
+  if(!c||c.schema!==SNAP_SCHEMA||c.limit!==ALL_KIND||!Array.isArray(c.markets)||
+     c.markets.length<1||c.markets.length>ALL_MARKET_CAP||
+     new Set(c.markets).size!==c.markets.length||
+     c.markets.some(m=>typeof m!=='string'||!/^KRW-[A-Z0-9]+$/.test(m)))
+     throw new Error('전체 KRW 코인 목록이 올바르지 않습니다');
+}
+function validateAllChunk(chunk,day,batch){
+  if(!chunk||chunk.schema!==SNAP_SCHEMA||chunk.date!==day||
+     !Array.isArray(chunk.markets)||chunk.markets.join(',')!==batch.join(',')||
+     !chunk.rawByMarket||typeof chunk.rawByMarket!=='object')
+     throw new Error('고정 원본 묶음이 올바르지 않습니다');
+  for(const m of batch){
+    const rows=chunk.rawByMarket[m];
+    if(!Array.isArray(rows)||rows.length>800||rows.some(r=>
+       !r||typeof r!=='object'||r._gap_fill||typeof r.candle_date_time_kst!=='string'))
+       throw new Error(`${m} 원본 봉이 올바르지 않습니다`);
+  }
+}
+async function getAllCohort(){
+  let cohort=await snapshotStore('get',cohortKey(ALL_KIND));
+  if(cohort){validateAllCohort(cohort);return cohort;}
+  $('status').textContent='현재 상장된 전체 KRW 코인 목록을 처음 한 번 고정하는 중…';
+  const resp=await fetch('/api/daytrade-universe?limit=all',{cache:'no-store'});
+  const data=await resp.json();
+  if(!resp.ok||!data.ok)throw new Error(data.error||'전체 코인 목록 조회 실패');
+  cohort={schema:SNAP_SCHEMA,key:cohortKey(ALL_KIND),limit:ALL_KIND,
+          markets:data.markets,available_markets:data.available_markets,
+          created:new Date().toLocaleString('ko-KR')};
+  validateAllCohort(cohort);
+  await snapshotStore('put',cohort.key,cohort);  // freeze before the first batch
+  return cohort;
+}
+async function runAllBacktest(){
+  if(running)return;
+  running=true;$('start').disabled=true;
+  for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=true;
+  $('coinRows').innerHTML='';
+  const date=$('day').value,fee=$('fee').value;
+  const all=[];
+  let total=0,saved=0,failures=0;
+  try{
+    const cohort=await getAllCohort();
+    const markets=cohort.markets;
+    total=markets.length;
+    $('progress').max=total;$('progress').value=0;
+    for(let i=0;i<total;i+=5){
+      const batch=markets.slice(i,i+5),key=allChunkKey(date,i);
+      let chunk=await snapshotStore('get',key);
+      let resp;
+      const qs=new URLSearchParams({date,markets:batch.join(','),fee,capture:'1'});
+      if(chunk){
+        validateAllChunk(chunk,date,batch);
+        resp=await fetch('/api/daytrade-replay',{
+          method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
+          body:JSON.stringify({schema:SNAP_SCHEMA,date,fee,
+              snapshots:batch.map(market=>({market,rows:chunk.rawByMarket[market]}))})
+        });
+      }else{
+        resp=await fetch('/api/daytrade-batch?'+qs.toString(),{cache:'no-store'});
+      }
+      if(!resp.ok)throw new Error(`코인 ${i+1}~${Math.min(i+5,total)} 응답 오류(${resp.status}) · 다시 시작하면 이어서 진행`);
+      const r=await resp.json();
+      if(!r.ok||!Array.isArray(r.results)||r.results.length!==batch.length)
+        throw new Error(r.error||'분석 응답이 불완전합니다 · 다시 시작하면 이어서 진행');
+      if(!chunk){
+        const rawByMarket={};
+        for(const item of r.results){
+          if(Object.prototype.hasOwnProperty.call(item,'_raw_candles')){
+            rawByMarket[item.market]=item._raw_candles;
+            delete item._raw_candles;
+          }
+        }
+        if(batch.every(m=>Array.isArray(rawByMarket[m]))){
+          chunk={schema:SNAP_SCHEMA,key,date,markets:batch.slice(),rawByMarket};
+          validateAllChunk(chunk,date,batch);
+          await snapshotStore('put',key,chunk);
+        }else{
+          failures+=batch.length;
+        }
+      }
+      if(chunk)saved+=batch.length;
+      all.push(...r.results);
+      $('progress').max=total;$('progress').value=i+batch.length;
+      $('status').textContent=`전체 KRW ${i+batch.length}/${total}개 검사 · 원본 저장 ${saved}개 · ${chunk?'고정 데이터 재검사/저장':'일부 저장 실패'} · 중단 시 다시 실행하면 이어집니다`;
+      // Rendering the entire table after every 5 coins becomes expensive on a phone.
+      if((i+batch.length)%25===0||i+batch.length===total)
+        paint(all,i+batch.length,total,{available_markets:cohort.available_markets});
+      await snapshotStore('put',allMetaKey(date),{
+        schema:SNAP_SCHEMA,key:allMetaKey(date),date,total,saved,
+        created:cohort.created,updated:new Date().toLocaleString('ko-KR')});
+    }
+    paint(all,total,total,{available_markets:cohort.available_markets});
+    const errors=all.filter(x=>x.error).length;
+    const valid=all.filter(x=>!x.error&&x.windows>0).length;
+    const completed=(saved===total&&errors===0&&failures===0);
+    $('status').textContent=(completed?'✅ 완료':'⚠️ 검사 종료')+` · 전체 ${total}개 · 유효 ${valid}개 · 오류 ${errors}개 · 원본 고정 ${saved}/${total}개`;
+    if(completed){
+      const avgB=h=>{const n=all.reduce((t,x)=>t+x.strategies.B.samples[h],0);
+        const sum=all.reduce((t,x)=>t+x.strategies.B.return_sums[h],0);return n?sum/n:null;};
+      dateHistory.set(date,{date,scope:`전체 KRW ${total}개 / 편도 ${fee}% · ${cohort.created} 선정`,valid,
+        a:all.reduce((t,x)=>t+x.strategies.A.signals,0),
+        b:all.reduce((t,x)=>t+x.strategies.B.signals,0),
+        b1:avgB('1h'),b3:avgB('3h'),b24:avgB('24h')});
+      $('dateRows').innerHTML=Array.from(dateHistory.values()).sort((a,b)=>a.date.localeCompare(b.date)).map(x=>
+        `<tr><td>${x.date}</td><td>${x.scope}</td><td>${fmt(x.valid)}</td><td>${fmt(x.a)}</td><td>${fmt(x.b)}</td><td>${pct(x.b1)}</td><td>${pct(x.b3)}</td><td>${pct(x.b24)}</td></tr>`).join('');
+    }
+  }catch(e){
+    paint(all,all.length,total||1,{});
+    $('status').textContent=`⚠️ ${e.message} · 저장 완료된 코인은 보존됩니다. 같은 날짜로 분석 시작을 다시 누르면 이어집니다.`;
+  }finally{
+    running=false;$('start').disabled=false;
+    for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=false;
+    await refreshSnapshotInfo();
+  }
+}
+// Streaming gzip backup: do not build a giant uncompressed JSON string in RAM.
+async function exportAllRaw(){
+  const date=$('day').value,cohort=await snapshotStore('get',cohortKey(ALL_KIND));
+  validateAllCohort(cohort);
+  const enc=new TextEncoder();
+  if(typeof CompressionStream==='undefined')throw new Error('이 브라우저는 압축 백업을 지원하지 않습니다');
+  const stream=new ReadableStream({
+    async start(ctrl){
+      try{
+        ctrl.enqueue(enc.encode(JSON.stringify({schema:SNAP_SCHEMA,mode:'all',date,
+          cohort,created:new Date().toISOString()}).slice(0,-1)+',"chunks":['));
+        for(let i=0;i<cohort.markets.length;i+=5){
+          const chunk=await snapshotStore('get',allChunkKey(date,i));
+          if(!chunk)throw new Error('아직 전체 검사가 완료되지 않아 백업할 수 없습니다');
+          validateAllChunk(chunk,date,cohort.markets.slice(i,i+5));
+          ctrl.enqueue(enc.encode((i?',':'')+JSON.stringify(chunk)));
+        }
+        ctrl.enqueue(enc.encode(']}'));ctrl.close();
+      }catch(e){ctrl.error(e);}
+    }
+  });
+  const blob=await new Response(stream.pipeThrough(new CompressionStream('gzip'))).blob();
+  const url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download=`daytrade_all_krw_${date}_v10.json.gz`;
+  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),10000);
+  $('status').textContent=`✅ 전체 KRW ${date} 원본 압축 백업 다운로드 요청 완료`;
+}
+async function importAllRaw(snap){
+  if(snap.schema!==SNAP_SCHEMA||snap.mode!=='all'||!SNAP_DAYS.includes(snap.date)||
+     !Array.isArray(snap.chunks))throw new Error('전체 KRW 백업 형식이 올바르지 않습니다');
+  const cohort=snap.cohort;
+  validateAllCohort(cohort);
+  if(snap.chunks.length!==Math.ceil(cohort.markets.length/5))throw new Error('백업 파일의 코인 묶음이 부족합니다');
+  const oldCohort=await snapshotStore('get',cohortKey(ALL_KIND));
+  if(oldCohort&&oldCohort.markets.join(',')!==cohort.markets.join(','))
+    throw new Error('이미 고정된 전체 KRW 목록과 다릅니다. 기존 전체 목록을 삭제하지 않고 덮어쓸 수 없습니다');
+  const existing=await snapshotStore('get',allChunkKey(snap.date,0));
+  if(existing&&!confirm(`${snap.date} 전체 KRW 고정 원본을 백업 파일 내용으로 덮어쓸까요?`))return;
+  // Validate every chunk before writing any of them.
+  for(let i=0;i<snap.chunks.length;i++){
+    const chunk=snap.chunks[i];
+    validateAllChunk(chunk,snap.date,cohort.markets.slice(i*5,i*5+5));
+  }
+  await snapshotStore('put',cohortKey(ALL_KIND),{...cohort,key:cohortKey(ALL_KIND)});
+  for(let i=0;i<snap.chunks.length;i++){
+    const chunk=snap.chunks[i];
+    chunk.key=allChunkKey(snap.date,i*5);
+    await snapshotStore('put',chunk.key,chunk);
+  }
+  await snapshotStore('put',allMetaKey(snap.date),{
+    schema:SNAP_SCHEMA,key:allMetaKey(snap.date),date:snap.date,
+    total:cohort.markets.length,saved:cohort.markets.length,
+    updated:new Date().toLocaleString('ko-KR')});
+  $('limit').value='all';$('day').value=snap.date;
+  $('status').textContent='✅ 전체 KRW 원본 압축 백업 불러오기 완료';
+  await refreshSnapshotInfo();
+}
 function validateSnapshot(snap,day,limit){
   if(!snap||snap.schema!==SNAP_SCHEMA||snap.date!==day||snap.limit!==limit||
      !Array.isArray(snap.markets)||snap.markets.length!==limit||
@@ -907,6 +1086,14 @@ function validateSnapshot(snap,day,limit){
 async function refreshSnapshotInfo(){
   const el=$('snapshotInfo');
   try{
+    if($('limit').value==='all'){
+      const cohort=await snapshotStore('get',cohortKey('all'));
+      const meta=await snapshotStore('get',allMetaKey($('day').value));
+      el.textContent=cohort
+        ?`📌 전체 KRW ${cohort.markets.length}개 고정 · ${$('day').value} 원본 ${meta?meta.saved:0}/${cohort.markets.length}개 저장 · 중단돼도 분석 시작으로 이어서 진행`
+        :'🔓 전체 KRW 목록 아직 미선정 · 첫 검사 시 목록부터 고정합니다';
+      return;
+    }
     const snap=await snapshotStore('get',snapshotKey());
     const cohort=await snapshotStore('get',cohortKey(Number($('limit').value)));
     el.textContent=snap
@@ -917,6 +1104,7 @@ async function refreshSnapshotInfo(){
   }catch(e){el.textContent='⚠️ 브라우저 데이터 저장 불가: '+e.message;}
 }
 async function startBacktest(){
+  if($('limit').value==='all')return runAllBacktest();
   if(running)return;
   running=true;$('start').disabled=true;
   for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=true;
@@ -1018,6 +1206,7 @@ $('limit').addEventListener('change',refreshSnapshotInfo);
 $('snapshotExport').addEventListener('click',async()=>{
   if(running)return;
   try{
+    if($('limit').value==='all'){await exportAllRaw();return;}
     const snap=await snapshotStore('get',snapshotKey());
     if(!snap)throw new Error('이 날짜·코인 수의 고정 데이터가 없습니다. 먼저 검사를 완료하세요.');
     validateSnapshot(snap,snap.date,snap.limit);
@@ -1032,8 +1221,15 @@ $('snapshotImport').addEventListener('click',()=>{if(!running)$('snapshotFile').
 $('snapshotFile').addEventListener('change',async()=>{
   try{
     const f=$('snapshotFile').files[0];if(!f)return;
-    if(f.size>35_000_000)throw new Error('35MB 초과 백업은 불러올 수 없습니다');
-    const snap=JSON.parse(await f.text());
+    if(f.size>40_000_000)throw new Error('40MB 초과 백업은 불러올 수 없습니다');
+    let raw;
+    if(f.name.endsWith('.gz')){
+      if(typeof DecompressionStream==='undefined')throw new Error('이 브라우저는 압축 백업 해제를 지원하지 않습니다');
+      raw=await new Response(f.stream().pipeThrough(new DecompressionStream('gzip'))).text();
+    }else raw=await f.text();
+    const snap=JSON.parse(raw);
+    if(snap.mode==='all'){await importAllRaw(snap);return;}
+    
     validateSnapshot(snap,snap.date,snap.limit);
     snap.key=`${snap.date}|${snap.limit}`;
     const old=await snapshotStore('get',snap.key);
@@ -1053,6 +1249,18 @@ $('snapshotFile').addEventListener('change',async()=>{
 });
 $('snapshotReset').addEventListener('click',async()=>{
   if(running)return;
+  if($('limit').value==='all'){
+    const day=$('day').value,cohort=await snapshotStore('get',cohortKey('all'));
+    if(!cohort)return;
+    if(!confirm(`${day} 전체 KRW ${cohort.markets.length}개 원본을 지울까요? 복구하려면 백업이 필요합니다.`))return;
+    try{
+      for(let i=0;i<cohort.markets.length;i+=5)await snapshotStore('delete',allChunkKey(day,i));
+      await snapshotStore('delete',allMetaKey(day));
+      await refreshSnapshotInfo();
+      $('status').textContent='이 날짜 전체 KRW 고정 원본만 해제했습니다.';
+    }catch(e){$('status').textContent='⚠️ 전체 고정 해제 실패: '+e.message;}
+    return;
+  }
   const key=snapshotKey();
   if(!confirm(`${key} 날짜의 원본 캔들만 삭제할까요? 같은 ${$('limit').value}개 코인 목록은 계속 고정됩니다. 백업하지 않은 캔들은 복구할 수 없습니다.`))return;
   try{await snapshotStore('delete',key);await refreshSnapshotInfo();
@@ -1061,6 +1269,22 @@ $('snapshotReset').addEventListener('click',async()=>{
 });
 $('cohortReset').addEventListener('click',async()=>{
   if(running)return;
+  if($('limit').value==='all'){
+    const cohort=await snapshotStore('get',cohortKey('all'));
+    if(!cohort)return;
+    if(!confirm(`전체 KRW ${cohort.markets.length}개 목록과 4개 날짜 모든 원본을 삭제할까요? 백업하지 않은 데이터는 복구 불가입니다.`))return;
+    try{
+      for(const day of SNAP_DAYS){
+        for(let i=0;i<cohort.markets.length;i+=5)await snapshotStore('delete',allChunkKey(day,i));
+        await snapshotStore('delete',allMetaKey(day));
+      }
+      await snapshotStore('delete',cohortKey('all'));
+      dateHistory.clear();$('dateRows').innerHTML='';
+      await refreshSnapshotInfo();
+      $('status').textContent='전체 KRW 목록·원본 초기화를 완료했습니다';
+    }catch(e){$('status').textContent='⚠️ 전체 목록 해제 실패: '+e.message;}
+    return;
+  }
   const limit=Number($('limit').value);
   if(!confirm(`${limit}개 코인 고정 목록과 4개 날짜의 원본 봉을 모두 삭제하고 다음 검사 때 코인 목록을 새로 선정할까요? 백업하지 않은 스냅샷은 복원할 수 없습니다.`))return;
   try{
@@ -1409,7 +1633,19 @@ def register_daytrade_review(app, deps):
     @app.get("/api/daytrade-universe")
     def daytrade_review_universe():
         try:
-            limit = int(request.args.get("limit", "30"))
+            limit_arg = request.args.get("limit", "30")
+            if limit_arg == "all":
+                # All currently listed KRW markets, including those with no
+                # valid ticker rank. Historical 24h >= 500m KRW remains a
+                # per-signal constraint; no liquidity rule is relaxed.
+                markets = sorted({m for m in get_markets()
+                                  if isinstance(m, str) and MARKET_PATTERN.fullmatch(m)})
+                if not 1 <= len(markets) <= 1000:
+                    raise ValueError("전체 KRW 코인 수가 정상 범위가 아닙니다")
+                return jsonify({"ok": True, "markets": markets,
+                                "available_markets": len(markets),
+                                "selection": "현재 상장 전체 KRW 코인 (과거 상장 목록 아님)"})
+            limit = int(limit_arg)
             if limit not in (10, 30, 50):
                 return jsonify({"ok": False, "error": "코인 수가 잘못되었습니다"}), 400
             markets = get_ranked()
@@ -1448,7 +1684,7 @@ def register_daytrade_review(app, deps):
                             "results": [result_by_market[name] for name in names],
                             "caveats": ["당일 00~12시 진입, 최대 24시간 추적",
                                         "과거 시점 24h 거래대금 5억 이상",
-                                        "현재 시점 거래대금으로 선정한 코인들"]})
+                                        "현재 상장 KRW 마켓 기준 선정: 과거 당시의 상장 목록은 아님"]})
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)[:160]}), 502
 
