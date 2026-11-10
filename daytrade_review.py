@@ -1,6 +1,7 @@
-"""V8: browser-persistent, replayable raw-candle snapshots for fair V7 comparisons.
+"""V9: evaluate support retention and rebound strength on V7 pullback entries.
 
-No A/B signal, entry, exit, or historical-gap policy is modified from V7.
+Preserves V8 raw snapshots and A/B, V5, V6, V7 historical evaluation logic.
+V9 only filters the SAME V7 -1% entry point; it cannot delay until a later winner.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -379,10 +380,139 @@ def add_v7_observation(summary, key, decision, immediate_scenario):
         row["same_signal_immediate_n"] += 1
         row["same_signal_immediate_sum"] += immediate_scenario["net_pct"]
 
+
+# V9: Pre-entry, test-only quality flags for the V7 -1% pullback entry.
+# "Support" is a PROVISIONAL low of the first observed dip candle, not a
+# confirmed higher-timeframe support zone or a validated double bottom.
+# Only closed candles available BEFORE the V7 entry open are inspected.
+# Neither these flags nor V7 itself can alter the original A/B BUY signals.
+V9_SUPPORT_BREAK_TOLERANCE = 0.002   # at most 0.2% under first dip low
+V9_MIN_BODY_PCT = 0.25              # confirmation candle bullish body
+V9_MIN_VOLUME_RATIO = 1.30          # completed confirmation / previous 20 raw bars
+V9_VARIANTS = (("support", "눌림 저점 지지"),
+               ("strong", "지지 + 강한 반등·거래량"))
+V9_REJECTIONS = ("v7_skip", "support_broken", "weak_rebound",
+                 "weak_volume", "volume_unknown", "data_unknown")
+
+
+def evaluate_v9_confirmation(history, future, v7_entry):
+    """Observe a V7 entry, never choose a later entry based on performance.
+
+    The V7 decision supplies its PRE-ESTABLISHED entry_index. We only read
+    future[:entry_index], i.e. data known at that entry's candle opening.
+    Outcome/exit information contained in v7_entry is intentionally ignored.
+    """
+    if v7_entry["status"] != "entered":
+        return {"support": False, "strong": False, "reason": "v7_skip",
+                "dip_low": None, "body_pct": None, "volume_ratio": None}
+    entry_index = int(v7_entry["minutes"] // 5)
+    if (entry_index < 2 or entry_index > V7_WAIT_BARS
+            or len(future) <= entry_index or not history):
+        raise ValueError("V9 진입 시각이 V7 범위를 벗어났습니다")
+    reference = float(history[-1]["trade_price"])
+    dip_limit = reference * 0.99
+    confirmation_idx = entry_index - 1
+    dip_idx = None
+    for i in range(confirmation_idx):
+        bar = future[i]
+        if bar.get("_gap_fill"):
+            return {"support": False, "strong": False, "reason": "data_unknown",
+                    "dip_low": None, "body_pct": None, "volume_ratio": None}
+        if float(bar["low_price"]) <= dip_limit:
+            dip_idx = i
+            break
+    if dip_idx is None:
+        raise ValueError("V9 V7 눌림 시각을 찾지 못했습니다")
+    first_dip = future[dip_idx]
+    dip_low = float(first_dip["low_price"])
+    dip_close = float(first_dip["trade_price"])
+    confirm = future[confirmation_idx]
+    if confirm.get("_gap_fill"):
+        return {"support": False, "strong": False, "reason": "data_unknown",
+                "dip_low": None, "body_pct": None, "volume_ratio": None}
+    # A rebound is NOT a held floor if a later raw bar breaks the first low
+    # by >0.2%, or the closed confirming candle cannot regain the dip close.
+    held = (float(confirm["trade_price"]) > dip_close and
+            all(not future[i].get("_gap_fill") and
+                float(future[i]["low_price"]) >= dip_low * (1 - V9_SUPPORT_BREAK_TOLERANCE)
+                for i in range(dip_idx + 1, confirmation_idx + 1)))
+    opening = float(confirm["opening_price"])
+    closing = float(confirm["trade_price"])
+    if not isfinite(opening) or opening <= 0 or not isfinite(closing):
+        raise ValueError("V9 확인봉 가격 오류")
+    body_pct = 100 * (closing / opening - 1)
+    # Average exactly the 20 known bars preceding the confirmation bar.
+    # Synthetic zero-volume candles would distort the activity test; mark
+    # those cases unverified instead of treating them as a pass/fail.
+    known_prior = list(history) + list(future[:confirmation_idx])
+    prior20 = known_prior[-20:]
+    volume_ratio = None
+    if (len(prior20) == 20 and
+            all(not c.get("_gap_fill") for c in prior20)):
+        amounts = [float(c["candle_acc_trade_volume"]) for c in prior20]
+        curr_vol = float(confirm["candle_acc_trade_volume"])
+        if (all(isfinite(v) and v >= 0 for v in amounts + [curr_vol])
+                and sum(amounts) > 0):
+            volume_ratio = curr_vol / (sum(amounts) / 20)
+    reason = ("support_broken" if not held else
+              "weak_rebound" if body_pct < V9_MIN_BODY_PCT else
+              "volume_unknown" if volume_ratio is None else
+              "weak_volume" if volume_ratio < V9_MIN_VOLUME_RATIO else "entered")
+    return {"support": held, "strong": reason == "entered", "reason": reason,
+            "dip_low": round(dip_low, 10), "body_pct": round(body_pct, 3),
+            "volume_ratio": round(volume_ratio, 3) if volume_ratio is not None else None}
+
+
+def new_v9_summary():
+    return {key: {
+        "signals": 0, "v7_entered": 0, "entered": 0,
+        "rejected": {name: 0 for name in V9_REJECTIONS},
+        "outcomes": {name: 0 for name in EXIT_OUTCOMES},
+        "resolvable": 0, "net_sum": 0.0, "positive": 0,
+        "wait_minutes_sum": 0, "rejected_v7_tp": 0, "rejected_v7_sl": 0,
+        "paired_v7_n": 0, "paired_v7_net_sum": 0.0,
+    } for key, _ in V9_VARIANTS}
+
+
+def add_v9_observation(summary, flags, v7_entry):
+    """Count each already-produced B signal once per fixed V9 hypothesis."""
+    for key, _label in V9_VARIANTS:
+        row = summary[key]
+        row["signals"] += 1
+        if v7_entry["status"] != "entered":
+            row["rejected"]["v7_skip"] += 1
+            continue
+        row["v7_entered"] += 1
+        admitted = flags[key]
+        if not admitted:
+            reason = "support_broken" if key == "support" else flags["reason"]
+            if flags["reason"] == "data_unknown":
+                reason = "data_unknown"
+            if reason not in row["rejected"]:
+                raise ValueError("V9 제외 사유 오류")
+            row["rejected"][reason] += 1
+            if v7_entry["scenario"]["status"] == "tp_first":
+                row["rejected_v7_tp"] += 1
+            elif v7_entry["scenario"]["status"] == "sl_first":
+                row["rejected_v7_sl"] += 1
+            continue
+        row["entered"] += 1
+        row["wait_minutes_sum"] += v7_entry["minutes"]
+        outcome = v7_entry["scenario"]
+        status = outcome["status"]
+        row["outcomes"][status] += 1
+        if outcome["net_pct"] is not None:
+            row["resolvable"] += 1
+            row["net_sum"] += outcome["net_pct"]
+            row["positive"] += int(outcome["net_pct"] > 0)
+            # Same entry and identical exit as V7 -1%: a paired identity test.
+            row["paired_v7_n"] += 1
+            row["paired_v7_net_sum"] += outcome["net_pct"]
+
 PAGE = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>단타 A/B 백테스트 V8 | 빗썸 스캐너</title>
+<title>단타 A/B 백테스트 V9 | 빗썸 스캐너</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;color:#edf3ff;padding:16px}
@@ -413,7 +543,7 @@ button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px
 @media(min-width:750px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
 <a href="/">← 빗썸 실시간 스캐너로 돌아가기</a>
-<h1>📊 단타 A/B 검증판 · V8</h1>
+<h1>📊 단타 A/B 검증판 · V9</h1>
 <p>기존 BUY(A)와 피보나치(B)를 같은 과거 5분봉에서 비교합니다. 실시간 주문 기능은 없습니다.</p>
 <section><h2>백테스트 설정</h2>
 <div class="controls">
@@ -479,6 +609,12 @@ button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px
 <div class="tablewrap"><table><thead><tr><th>진입 방식</th><th>B BUY</th><th>실제 가정 진입</th><th>미진입</th><th>미진입: 미눌림</th><th>미진입: 미반등</th><th>급락 취소</th><th>추격 방지</th><th>진입 전 공백</th><th>익절 먼저</th><th>손절 먼저</th><th>미래 판정 불명</th><th>6h 청산</th><th>판정 가능</th><th>평균 순수익률</th><th>수익 비율</th><th>평균 진입 대기</th><th>같은 신호 즉시 진입 평균</th><th>포기한 즉시진입 익절</th></tr></thead><tbody id="v7Rows"></tbody></table></div>
 <small id="v7Notice">결과 대기 중</small>
 </section>
+<section><h2>V9 · 눌림 저점 지지 + 반등 강도 (실험)</h2>
+<p><b>기존 -1% 눌림(V7) 진입과 동일한 진입 시점</b>을 사용합니다. 신호가 난 다음 보이는 첫 눌림봉의 저점을 <b>임시 지지선</b>으로 잡고, 반등 확인 전까지 저점을 0.2% 넘게 깨지 않았으며 확인봉 종가가 첫 눌림봉 종가보다 높아야 지지 통과입니다. <b>강한 반등</b>은 확인봉의 양봉 몸통이 0.25% 이상이고, 거래량이 그전 원본 20봉 평균의 1.3배 이상인 경우입니다.</p>
+<p>두 조건은 <b>실험용 가설</b>이며 확인된 추세 지지선이나 수익성 인증이 아닙니다. V7의 최초 진입 시점을 바꾸지 않고, 통과하지 못한 신호는 가상 미진입으로 처리합니다. 누락봉이 포함되면 거래량을 추정해 통과시키지 않습니다.</p>
+<div id="v9Cards">결과 대기 중</div>
+<small>V9는 수수료 반영 가격 기준 익절 +3% / 손절 -2%, 진입 후 최대 6시간으로 비교합니다. 평균은 익절·손절·6시간 종가청산 등 판정 가능한 건만 계산합니다. 같은 종목의 반복 신호와 표본이 적은 날짜는 성능을 입증하지 못합니다.</small>
+</section>
 <section><h2>BUY별 진입 품질 · 진입 후 움직임</h2>
 <small>진입 전 15·30·60분 수익률, 직전 봉 거래량/이전 20봉 평균, 6시간 중 실제 봉의 고가·저가 기준 최대 상승/하락을 비교합니다. 미래 최대치와 선도달 정보는 신호 시점에 알 수 없으므로 검증에만 사용합니다.</small>
 <div id="qualityCards">결과 대기 중</div>
@@ -488,9 +624,9 @@ button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px
 <div class="tablewrap"><table><thead><tr><th>날짜</th><th>코인/수수료</th><th>유효 코인</th><th>A BUY</th><th>B BUY</th><th>B 1h 평균</th><th>B 3h 평균</th><th>B 24h 평균</th></tr></thead><tbody id="dateRows"></tbody></table></div>
 </section>
 <section><h2>발생 신호 예시</h2><div id="events">결과 대기 중</div></section>
-<section><h2>V8 고정 데이터 원칙</h2><p>처음 선정한 코인 목록을 같은 검사 코인 수의 <b>모든 날짜에 공통 사용</b>하고, 각 날짜의 <b>실거래 원본 캔들(보정 전)</b>을 휴대폰 브라우저 IndexedDB에 저장합니다. 저장된 날짜는 이후 빗썸 원본 캔들을 다시 요청하지 않습니다. 브라우저 데이터를 지우거나 기기를 바꾸면 별도의 JSON 백업을 불러와야 동일한 자료를 사용할 수 있습니다. 고정 자료도 캔들 누락과 현재 시점 선정 편향은 남습니다. 백업의 내용이 진짜 거래소 데이터인지는 별도로 확인해야 합니다.</p></section>
+<section><h2>V8·V9 고정 데이터 원칙</h2><p>처음 선정한 코인 목록을 같은 검사 코인 수의 <b>모든 날짜에 공통 사용</b>하고, 각 날짜의 <b>실거래 원본 캔들(보정 전)</b>을 휴대폰 브라우저 IndexedDB에 저장합니다. 저장된 날짜는 이후 빗썸 원본 캔들을 다시 요청하지 않습니다. 브라우저 데이터를 지우거나 기기를 바꾸면 별도의 JSON 백업을 불러와야 동일한 자료를 사용할 수 있습니다. 고정 자료도 캔들 누락과 현재 시점 선정 편향은 남습니다. 백업의 내용이 진짜 거래소 데이터인지는 별도로 확인해야 합니다.</p></section>
 <section><h2>검증 범위에 대한 주의</h2><p>
-하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V7은 신호 이후 최대 60분 눌림·반등 확인 뒤 다음 봉 시가의 가상 진입만 비교하며, 미진입 신호는 수익률 계산에 넣지 않습니다. V5/V6 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
+하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V7은 신호 이후 최대 60분 눌림·반등 확인 뒤 다음 봉 시가의 가상 진입만 비교하며, V9는 같은 -1% 눌림 진입에 임시 저점·반등 강도 검증을 추가합니다. 미진입 신호는 수익률 계산에 넣지 않습니다. V5/V6 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
 </p></section>
 </main><script>
 const $ = id => document.getElementById(id);
@@ -629,6 +765,46 @@ function paint(all, done, total, rankInfo) {
   $('v7Rows').innerHTML=v7Out.join('');
   $('v7Notice').textContent='미진입은 수익 0% 매매로 취급하지 않고 분모에서도 제외합니다. 즉시 진입 기준과 눌림 진입은 실제로 체결된 표본이 다르므로, 같은 신호 즉시 진입 평균도 별도로 제시합니다. 손익비는 매수가 대비 가격 +3%/-2%, 수수료 반영, 실체결·슬리피지 미반영. 완성된 봉의 정보만 쓰며 미래 최고·최저가는 진입 판단에 사용하지 않습니다.';
 
+  // V9 uses the same already-determined V7 -1% entries; no re-timing.
+  // Vertical result cards avoid horizontal table scrolling on a phone.
+  const v9Root=$('v9Cards');v9Root.replaceChildren();
+  const bV7={signals:0,entered:0,resolvable:0,net_sum:0,positive:0,
+    outcomes:{tp_first:0,sl_first:0,same_bar:0,gap_unknown:0,time_exit:0}};
+  for(const x of complete){
+    const t=(x.v7||{}).dip10;if(!t)continue;
+    for(const k of ['signals','entered','resolvable','net_sum','positive'])bV7[k]+=t[k]||0;
+    for(const k of Object.keys(bV7.outcomes))bV7.outcomes[k]+=(t.outcomes||{})[k]||0;
+  }
+  const v9Defs=[['v7','기존 -1.0% 눌림 (V7)'],['support','V9 ① 눌림 저점 지지'],['strong','V9 ② 지지 + 강한 반등·거래량']];
+  for(const [key,label] of v9Defs){
+    const t=key==='v7'?bV7:{signals:0,v7_entered:0,entered:0,resolvable:0,
+      net_sum:0,positive:0,wait_minutes_sum:0,rejected_v7_tp:0,rejected_v7_sl:0,
+      rejected:{v7_skip:0,support_broken:0,weak_rebound:0,weak_volume:0,volume_unknown:0,data_unknown:0},
+      outcomes:{tp_first:0,sl_first:0,same_bar:0,gap_unknown:0,time_exit:0}};
+    if(key!=='v7')for(const x of complete){
+      const r=(x.v9||{})[key];if(!r)continue;
+      for(const f of ['signals','v7_entered','entered','resolvable','net_sum','positive','wait_minutes_sum','rejected_v7_tp','rejected_v7_sl'])t[f]+=r[f]||0;
+      for(const f in t.rejected)t.rejected[f]+=(r.rejected||{})[f]||0;
+      for(const f in t.outcomes)t.outcomes[f]+=(r.outcomes||{})[f]||0;
+    }
+    const u=t.outcomes.same_bar+t.outcomes.gap_unknown;
+    const rows=[
+      `B BUY ${fmt(t.signals)}개 · 가상 진입 ${fmt(t.entered)}개 · 미진입 ${fmt(t.signals-t.entered)}개`,
+      `익절 먼저 ${fmt(t.outcomes.tp_first)}개 · 손절 먼저 ${fmt(t.outcomes.sl_first)}개 · 결과 불명 ${fmt(u)}개 · 6시간 청산 ${fmt(t.outcomes.time_exit)}개`,
+      `판정 가능 ${fmt(t.resolvable)}개 · 평균 순수익 ${pct(t.resolvable?t.net_sum/t.resolvable:null)} · 수익 비율 ${pct(t.resolvable?100*t.positive/t.resolvable:null)}`,
+    ];
+    if(key!=='v7'){
+      rows.push(`V7 단계 미진입 ${fmt(t.rejected.v7_skip)}개 · 지지 이탈 ${fmt(t.rejected.support_broken)}개 · 반등 약함 ${fmt(t.rejected.weak_rebound)}개`);
+      if(key==='strong')rows.push(`거래량 부족 ${fmt(t.rejected.weak_volume)}개 · 거래량 판정 불가 ${fmt(t.rejected.volume_unknown)}개`);
+      rows.push(`추가 필터가 제외한 V7 익절 ${fmt(t.rejected_v7_tp)}개 · 손절 ${fmt(t.rejected_v7_sl)}개`);
+    }
+    const card=document.createElement('div');card.className='eventcard';
+    const heading=document.createElement('strong');heading.textContent=label;card.appendChild(heading);
+    for(const r of rows){const item=document.createElement('div');item.textContent=r;card.appendChild(item);}
+    v9Root.appendChild(card);
+  }
+
+
   const details=[];
   for(const x of complete) for(const strategy of ['A','B']) {
     for(const e of x.strategies[strategy].examples) details.push({strategy,e});
@@ -664,6 +840,10 @@ function paint(all, done, total, rankInfo) {
       }
     }
 
+    if(strategy==='B' && e.v9){
+      const f=e.v9, reason={entered:'통과',v7_skip:'V7 미진입',support_broken:'눌림 저점 이탈',weak_rebound:'반등 몸통 부족',weak_volume:'거래량 부족',volume_unknown:'원본 거래량 부족',data_unknown:'누락봉으로 판정 불가'};
+      line(`저점 지지 ${f.support?'통과':'제외'} · 강한 반등 ${f.strong?'통과':'제외'} · ${reason[f.reason]||f.reason} · 확인봉 몸통 ${pct(f.body_pct)} · 거래량 ${f.volume_ratio==null?'—':f.volume_ratio+'배'}`, 'V9 신호시점 실험');
+    }
     if(q.gap_before_80 || moves.gap_bars)line(`과거 80봉 보정 ${q.gap_before_80}개 / 이후 6시간 보정 ${moves.gap_bars}개 · 해석 주의`, '데이터 품질');
     root.appendChild(card);
   }
@@ -1047,6 +1227,7 @@ def register_daytrade_review(app, deps):
             "strategies": {"A": empty_strategy(), "B": empty_strategy()},
             "v6": new_v6_summary(),
             "v7": new_v7_summary(),
+            "v9": new_v9_summary(),
             "diagnostics": {name: 0 for name in (
                 "aBreakout", "aSupport", "bTrend", "bTouch", "bBounce",
                 "bVolume", "bAllPrice", "bSwing25", "bEvaluated", "liquidity", "excluded")},
@@ -1190,6 +1371,11 @@ def register_daytrade_review(app, deps):
                             add_v7_observation(output["v7"], key, decision,
                                                scenarios["p3_s2"])
                             v7_details[key] = decision
+                    # V9 is only a fixed-time quality comparison on V7 -1%.
+                    v9_flags = None
+                    if strategy == "B":
+                        v9_flags = evaluate_v9_confirmation(history, future, v7_details["dip10"])
+                        add_v9_observation(output["v9"], v9_flags, v7_details["dip10"])
                     result["signals"] += 1
                     last_event[strategy] = at
                     if len(result["examples"]) < 12:
@@ -1199,6 +1385,7 @@ def register_daytrade_review(app, deps):
                             "scenarios": scenarios,
                             "v6_gates": v6_flags,
                             "v7": v7_details,
+                            "v9": v9_flags,
                         })
             if output["windows"] == 0:
                 output["coverage_reason"] = (f"원본 {coverage['actual']}봉 / 보정 {coverage['filled']}봉 / "
@@ -1212,6 +1399,7 @@ def register_daytrade_review(app, deps):
             output["strategies"] = {"A": empty_strategy(), "B": empty_strategy()}
             output["v6"] = new_v6_summary()
             output["v7"] = new_v7_summary()
+            output["v9"] = new_v9_summary()
             return output
 
     @app.get("/backtest-daytrade")
