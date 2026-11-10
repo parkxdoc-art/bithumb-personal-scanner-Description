@@ -1,4 +1,7 @@
-"""V7: pullback/rebound entry study, preserving V6 and all preceding A/B tests."""
+"""V8: browser-persistent, replayable raw-candle snapshots for fair V7 comparisons.
+
+No A/B signal, entry, exit, or historical-gap policy is modified from V7.
+"""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -379,7 +382,7 @@ def add_v7_observation(summary, key, decision, immediate_scenario):
 PAGE = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>단타 A/B 백테스트 V7 | 빗썸 스캐너</title>
+<title>단타 A/B 백테스트 V8 | 빗썸 스캐너</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;color:#edf3ff;padding:16px}
@@ -403,11 +406,14 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 .eventcard>div{margin-top:6px;font-size:13px;line-height:1.55}
 .eventcard strong{color:#cfe0ff}.muted{color:#a9b7d2}.tiny{font-size:12px;color:#a9b7d2}
 #touchSummary{line-height:1.8;white-space:pre-wrap}
+.snapshot-tools{margin:12px 0;padding:10px;border:1px solid #344562;border-radius:8px}
+.snapshot-tools small{display:block;margin-bottom:8px}
+button.secondary{background:#203150;color:#d9e7ff;min-width:unset;font-size:12px;padding:8px}
 
 @media(min-width:750px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
 <a href="/">← 빗썸 실시간 스캐너로 돌아가기</a>
-<h1>📊 단타 A/B 검증판 · V7</h1>
+<h1>📊 단타 A/B 검증판 · V8</h1>
 <p>기존 BUY(A)와 피보나치(B)를 같은 과거 5분봉에서 비교합니다. 실시간 주문 기능은 없습니다.</p>
 <section><h2>백테스트 설정</h2>
 <div class="controls">
@@ -422,7 +428,17 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 </select></div>
 <button id="start" type="button">A/B 분석 시작</button>
 </div>
-<small>현재 상장된 KRW 코인을 현재 24시간 거래대금 순으로 선택합니다. 과거 시점의 유니버스 순위가 아니므로 선택 편향이 있습니다. 과거 거래대금 필터는 신호 시점 직전 24시간 5억 원 이상입니다.</small>
+<small>첫 검사에서 고른 KRW 코인 목록은 <b>같은 코인 수(10·30·50개)의 모든 검사 날짜에 공통 고정</b>합니다. 각 날짜의 <b>실제 원본 5분봉은 날짜별로 한 번만 저장</b>하고 재사용합니다. 첫 코인 선정은 현재 거래대금 기준이므로 과거 시점 선정 편향은 남습니다.</small>
+<div class="snapshot-tools">
+  <small id="snapshotInfo">저장된 원본 데이터 확인 중…</small>
+  <div class="controls">
+    <button class="secondary" id="snapshotExport" type="button">📥 고정 원본 백업</button>
+    <button class="secondary" id="snapshotImport" type="button">📂 백업 불러오기</button>
+    <button class="secondary" id="snapshotReset" type="button">↻ 이 날짜 원본만 해제</button>
+    <button class="secondary" id="cohortReset" type="button">코인 목록·모든 날짜 초기화</button>
+    <input id="snapshotFile" type="file" accept=".json,application/json" hidden>
+  </div>
+</div>
 <p id="status" role="status">설정을 고르고 분석 시작을 누르세요.</p>
 <progress id="progress" max="1" value="0"></progress>
 </section>
@@ -468,10 +484,11 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 <div id="qualityCards">결과 대기 중</div>
 </section>
 <section><h2>날짜별 검증 비교</h2>
-<small>이 화면에서 날짜를 바꿔 검사하면 결과가 쌓입니다. 브라우저를 새로고침하면 기록은 사라지며, 서로 다른 코인 목록/수수료는 직접 비교에 주의하세요.</small>
+<small>같은 브라우저의 고정 원본 5분봉을 재사용합니다(브라우저 저장 공간 삭제 시 사라질 수 있으므로 JSON 백업 권장). 여기 보이는 날짜별 결과 표 자체는 새로고침하면 초기화됩니다. 날짜마다 원래 선정된 코인 구성은 다를 수 있으므로 단순 합산에 주의하세요.</small>
 <div class="tablewrap"><table><thead><tr><th>날짜</th><th>코인/수수료</th><th>유효 코인</th><th>A BUY</th><th>B BUY</th><th>B 1h 평균</th><th>B 3h 평균</th><th>B 24h 평균</th></tr></thead><tbody id="dateRows"></tbody></table></div>
 </section>
 <section><h2>발생 신호 예시</h2><div id="events">결과 대기 중</div></section>
+<section><h2>V8 고정 데이터 원칙</h2><p>처음 선정한 코인 목록을 같은 검사 코인 수의 <b>모든 날짜에 공통 사용</b>하고, 각 날짜의 <b>실거래 원본 캔들(보정 전)</b>을 휴대폰 브라우저 IndexedDB에 저장합니다. 저장된 날짜는 이후 빗썸 원본 캔들을 다시 요청하지 않습니다. 브라우저 데이터를 지우거나 기기를 바꾸면 별도의 JSON 백업을 불러와야 동일한 자료를 사용할 수 있습니다. 고정 자료도 캔들 누락과 현재 시점 선정 편향은 남습니다. 백업의 내용이 진짜 거래소 데이터인지는 별도로 확인해야 합니다.</p></section>
 <section><h2>검증 범위에 대한 주의</h2><p>
 하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. V7은 신호 이후 최대 60분 눌림·반등 확인 뒤 다음 봉 시가의 가상 진입만 비교하며, 미진입 신호는 수익률 계산에 넣지 않습니다. V5/V6 손익비 비교는 6시간의 가격 기준 목표/손절이며, 수수료를 제외한 실제 체결 수익을 보장하지 않습니다. 익절/손절은 최대 6시간의 고가·저가 첫 터치 분석이며, 동일봉 안의 선후는 판별하지 못합니다. 5분봉 사이의 누락 체결과 슬리피지를 재현하지 못하므로 실전 주문 시뮬레이션이 아닙니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
 </p></section>
@@ -653,54 +670,230 @@ function paint(all, done, total, rankInfo) {
   if(details.length>40){const note=document.createElement('small');note.textContent=`신호 ${fmt(details.length)}건 중 첫 40건만 표시`;root.appendChild(note);}
   $('progress').max=total||1;$('progress').value=done;
 }
+// Browser IndexedDB stores RAW candles (not synthetic gaps, not results).
+// A user can save a JSON backup to preserve the same dataset across devices.
+const SNAP_SCHEMA='bithumb-v8-raw1';
+const DB_NAME='bithumb-daytrade-v8-snapshots';
+const DB_STORE='rawRuns';
+const SNAP_DAYS=['2026-11-01','2026-11-04','2026-11-07','2026-11-08'];
+const snapshotKey=()=>`${$('day').value}|${$('limit').value}`;
+const cohortKey=limit=>`cohort|${limit}`;
+const makeCohort=snap=>({key:cohortKey(snap.limit),schema:SNAP_SCHEMA,
+    limit:snap.limit,available_markets:snap.available_markets,
+    created:snap.created,markets:snap.markets.slice()});
+function openSnapshotDB(){
+  return new Promise((resolve,reject)=>{
+    if(!('indexedDB' in window))return reject(new Error('브라우저에 IndexedDB가 없습니다'));
+    const req=indexedDB.open(DB_NAME,1);
+    req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains(DB_STORE))req.result.createObjectStore(DB_STORE,{keyPath:'key'});};
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error||new Error('브라우저 원본 데이터 저장소 열기 실패'));
+  });
+}
+async function snapshotStore(mode, key, value){
+  const db=await openSnapshotDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction(DB_STORE, mode==='get'?'readonly':'readwrite');
+    const store=tx.objectStore(DB_STORE);
+    let req;
+    if(mode==='get')req=store.get(key);
+    else if(mode==='put')req=store.put(value);
+    else req=store.delete(key);
+    let result;
+    req.onsuccess=()=>{result=req.result;};
+    tx.oncomplete=()=>{db.close();resolve(result);};
+    tx.onerror=()=>{db.close();reject(tx.error||new Error('스냅샷 읽기·저장 실패'));};
+    tx.onabort=()=>{db.close();reject(tx.error||new Error('스냅샷 작업 중단'));};
+  });
+}
+function validateSnapshot(snap,day,limit){
+  if(!snap||snap.schema!==SNAP_SCHEMA||snap.date!==day||snap.limit!==limit||
+     !Array.isArray(snap.markets)||snap.markets.length!==limit||
+     !snap.rawByMarket||typeof snap.rawByMarket!=='object')throw new Error('저장된 데이터 형식이 맞지 않습니다');
+  if(!SNAP_DAYS.includes(day)||![10,30,50].includes(limit))throw new Error('검사 설정 오류');
+  const unique=new Set();
+  for(const market of snap.markets){
+    if(typeof market!=='string'||!/^KRW-[A-Z0-9]+$/.test(market)||unique.has(market))throw new Error('코인 목록 형식이 맞지 않습니다');
+    unique.add(market);
+    const rows=snap.rawByMarket[market];
+    if(!Array.isArray(rows)||rows.length>800)throw new Error('원본 봉 개수 오류: '+market);
+    for(const row of rows){
+      if(!row||typeof row!=='object'||row._gap_fill||typeof row.candle_date_time_kst!=='string'||
+         !['opening_price','high_price','low_price','trade_price','candle_acc_trade_price','candle_acc_trade_volume']
+           .every(k=>Number.isFinite(Number(row[k]))))throw new Error('원본 봉 데이터 오류: '+market);
+    }
+  }
+}
+async function refreshSnapshotInfo(){
+  const el=$('snapshotInfo');
+  try{
+    const snap=await snapshotStore('get',snapshotKey());
+    const cohort=await snapshotStore('get',cohortKey(Number($('limit').value)));
+    el.textContent=snap
+      ?`✅ 원본 고정 · ${snap.date} / ${snap.limit}개 · 원본 5분봉 ${fmt(snap.markets.reduce((n,m)=>n+snap.rawByMarket[m].length,0))}개 · 저장 ${snap.created} · 다시 검사해도 같은 원본`
+      :cohort
+        ?`📌 코인 목록 ${cohort.limit}개 고정됨 · ${$('day').value} 날짜 원본은 미고정 (처음 한 번 수집 후 고정)`
+        :'🔓 아직 코인 목록·날짜 원본 미고정 · 첫 검사 시 두 가지를 고정합니다.';
+  }catch(e){el.textContent='⚠️ 브라우저 데이터 저장 불가: '+e.message;}
+}
 async function startBacktest(){
   if(running)return;
   running=true;$('start').disabled=true;
+  for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=true;
   $('coinRows').innerHTML='';
   const all=[];
-  const date=$('day').value, limit=Number($('limit').value), fee=$('fee').value;
-  try {
-    $('status').textContent='KRW 코인 거래대금 순위 조회 중…';
-    const url='/api/daytrade-universe?limit='+limit;
-    const uResp=await fetch(url,{cache:'no-store'});
-    const u=await uResp.json();
-    if(!uResp.ok || !u.ok)throw new Error(u.error||'마켓 목록 오류');
-    const markets=u.markets;
-    $('status').textContent=`현재 KRW ${u.available_markets}개 중 상위 ${markets.length}개 검사 예정`;
+  const date=$('day').value,limit=Number($('limit').value),fee=$('fee').value;
+  let snap=null;
+  let markets=[];
+  let rankInfo={};
+  try{
+    const cohort=await snapshotStore('get',cohortKey(limit));
+    snap=await snapshotStore('get',snapshotKey());
+    if(snap){
+      validateSnapshot(snap,date,limit);
+      markets=snap.markets;
+      rankInfo={available_markets:snap.available_markets};
+      $('status').textContent=`✅ 이미 고정된 ${date} 원본 캔들로 재계산 · 빗썸 과거 봉 재요청 없음`;
+    }else{
+      let available;
+      if(cohort){
+        markets=cohort.markets;
+        available=cohort.available_markets;
+        if(markets.length!==limit)throw new Error('기존 코인 고정 목록이 잘못되었습니다');
+        $('status').textContent=`📌 공통 고정된 ${limit}개 코인 목록으로 ${date} 원본 5분봉 첫 수집 중…`;
+      }else{
+        $('status').textContent='코인 목록 첫 고정: 현재 KRW 거래대금 순위 조회 중…';
+        const uResp=await fetch('/api/daytrade-universe?limit='+limit,{cache:'no-store'});
+        const u=await uResp.json();
+        if(!uResp.ok||!u.ok)throw new Error(u.error||'코인 목록 조회 실패');
+        markets=u.markets;
+        if(markets.length!==limit)throw new Error('요청한 코인 수를 충족하지 않아 고정하지 않았습니다');
+        available=u.available_markets;
+      }
+      rankInfo={available_markets:available};
+      snap={schema:SNAP_SCHEMA,key:snapshotKey(),date,limit,available_markets:available,
+            created:new Date().toLocaleString('ko-KR'),source:'exchange',markets:markets.slice(),rawByMarket:{}};
+    }
+    if(cohort && snap.markets.join(',')!==cohort.markets.join(',')){
+      throw new Error('고정 코인 목록이 날짜별로 다릅니다. 해당 코인 수의 기존 고정 목록을 확인하세요.');
+    }
     for(let i=0;i<markets.length;i+=5){
       const batch=markets.slice(i,i+5);
-      $('status').textContent=`검사 중 · ${i}/${markets.length}개 완료 (${batch.join(', ')})`;
-      const qs=new URLSearchParams({date,markets:batch.join(','),fee});
-      const resp=await fetch('/api/daytrade-batch?'+qs.toString(),{cache:'no-store'});
+      $('status').textContent=`${snap&&Object.keys(snap.rawByMarket).length===markets.length?'고정 재검사':'원본 최초 고정'} · ${i}/${markets.length}개 완료 (${batch.join(', ')})`;
+      let resp;
+      if(snap.source==='exchange' && Object.keys(snap.rawByMarket).length!==markets.length){
+        const qs=new URLSearchParams({date,markets:batch.join(','),fee,capture:'1'});
+        resp=await fetch('/api/daytrade-batch?'+qs.toString(),{cache:'no-store'});
+      }else{
+        resp=await fetch('/api/daytrade-replay',{
+          method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
+          body:JSON.stringify({schema:SNAP_SCHEMA,date,fee,
+            snapshots:batch.map(market=>({market,rows:snap.rawByMarket[market]}))})
+        });
+      }
       const r=await resp.json();
-      if(!resp.ok||!r.ok)throw new Error(r.error||'분석 요청 실패');
+      if(!resp.ok||!r.ok)throw new Error(r.error||'원본 데이터 분석 요청 실패');
+      for(const item of r.results){
+        if(Object.prototype.hasOwnProperty.call(item,'_raw_candles')){
+          snap.rawByMarket[item.market]=item._raw_candles;
+          delete item._raw_candles;
+        }
+      }
       all.push(...r.results);
-      paint(all,all.length,markets.length,u);
+      paint(all,all.length,markets.length,rankInfo);
     }
     const errors=all.filter(x=>x.error).length;
-    const valid=all.filter(x=>!x.error && x.windows>0).length;
-    $('status').textContent=`완료 · ${all.length}개 조회, 유효 코인 ${valid}개, ${errors}개 조회/계산 오류. A와 B를 비교하세요.`;
+    const valid=all.filter(x=>!x.error&&x.windows>0).length;
+    if(Object.keys(snap.rawByMarket).length===markets.length && !errors){
+      validateSnapshot(snap,date,limit);
+      await snapshotStore('put',snap.key,snap);
+      if(!cohort)await snapshotStore('put',cohortKey(limit),makeCohort(snap));
+      $('status').textContent=`✅ 완료 · ${all.length}개 조회, 유효 ${valid}개 · 같은 ${limit}개 코인과 원본 데이터 고정`;
+    }else{
+      $('status').textContent=`⚠️ 완료 · ${all.length}개 조회, 유효 ${valid}개, 오류 ${errors}개 · 데이터가 완전하지 않아 고정하지 않았습니다.`;
+    }
     if(!errors){
-      const totalSignals=kind=>all.reduce((s,x)=>s+x.strategies[kind].signals,0);
+      const totalSignals=kind=>all.reduce((t,x)=>t+x.strategies[kind].signals,0);
       const avgB=h=>{
-        const n=all.reduce((s,x)=>s+x.strategies.B.samples[h],0);
-        const sm=all.reduce((s,x)=>s+x.strategies.B.return_sums[h],0);
+        const n=all.reduce((t,x)=>t+x.strategies.B.samples[h],0);
+        const sm=all.reduce((t,x)=>t+x.strategies.B.return_sums[h],0);
         return n?sm/n:null;
       };
-      dateHistory.set(date, {date, scope:`${limit}개 / 편도 ${fee}%`,valid,
+      dateHistory.set(date,{date,scope:`${limit}개 / 편도 ${fee}% · ${snap.created} 고정`,valid,
           a:totalSignals('A'),b:totalSignals('B'),
           b1:avgB('1h'),b3:avgB('3h'),b24:avgB('24h')});
       $('dateRows').innerHTML=Array.from(dateHistory.values()).sort((a,b)=>a.date.localeCompare(b.date)).map(x=>
         `<tr><td>${x.date}</td><td>${x.scope}</td><td>${fmt(x.valid)}</td><td>${fmt(x.a)}</td><td>${fmt(x.b)}</td><td>${pct(x.b1)}</td><td>${pct(x.b3)}</td><td>${pct(x.b24)}</td></tr>`).join('');
     }
-  } catch(e) {
-    $('status').textContent='⚠️ 중단: '+e.message+' · 이미 받은 결과는 아래에 남겨두었습니다.';
-  } finally {
+  }catch(e){
+    $('status').textContent='⚠️ 중단: '+e.message+' · 이미 받은 결과는 아래 남겼습니다. 미완성 원본은 고정하지 않습니다.';
+  }finally{
     running=false;$('start').disabled=false;
+    for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=false;
+    await refreshSnapshotInfo();
   }
 }
+$('day').addEventListener('change',refreshSnapshotInfo);
+$('limit').addEventListener('change',refreshSnapshotInfo);
+$('snapshotExport').addEventListener('click',async()=>{
+  if(running)return;
+  try{
+    const snap=await snapshotStore('get',snapshotKey());
+    if(!snap)throw new Error('이 날짜·코인 수의 고정 데이터가 없습니다. 먼저 검사를 완료하세요.');
+    validateSnapshot(snap,snap.date,snap.limit);
+    const blob=new Blob([JSON.stringify(snap)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);const a=document.createElement('a');
+    a.href=url;a.download=`daytrade_raw_${snap.date}_${snap.limit}_v8.json`;
+    document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),4000);
+    $('status').textContent='✅ 원본 봉 JSON 백업 다운로드를 요청했습니다. 휴대폰 다운로드 폴더를 확인하세요.';
+  }catch(e){$('status').textContent='⚠️ 백업 오류: '+e.message;}
+});
+$('snapshotImport').addEventListener('click',()=>{if(!running)$('snapshotFile').click();});
+$('snapshotFile').addEventListener('change',async()=>{
+  try{
+    const f=$('snapshotFile').files[0];if(!f)return;
+    if(f.size>35_000_000)throw new Error('35MB 초과 백업은 불러올 수 없습니다');
+    const snap=JSON.parse(await f.text());
+    validateSnapshot(snap,snap.date,snap.limit);
+    snap.key=`${snap.date}|${snap.limit}`;
+    const old=await snapshotStore('get',snap.key);
+    const cohort=await snapshotStore('get',cohortKey(snap.limit));
+    if(cohort && cohort.markets.join(',')!==snap.markets.join(',')){
+      throw new Error('다른 날짜들과 코인 목록이 다릅니다. 해당 코인 수 전체 고정을 초기화한 뒤 불러오세요.');
+    }
+    if(old && !confirm(`${snap.date} ${snap.limit}개 기존 고정 데이터를 백업 파일로 덮어쓸까요?`))return;
+    snap.source='imported';
+    await snapshotStore('put',snap.key,snap);
+    if(!cohort)await snapshotStore('put',cohortKey(snap.limit),makeCohort(snap));
+    $('day').value=snap.date;$('limit').value=String(snap.limit);
+    $('status').textContent='✅ 원본 봉 백업을 불러왔습니다. 분석 시작을 누르면 동일 원본으로 재검사합니다.';
+    await refreshSnapshotInfo();
+  }catch(e){$('status').textContent='⚠️ 불러오기 실패: '+e.message;}
+  finally{$('snapshotFile').value='';}
+});
+$('snapshotReset').addEventListener('click',async()=>{
+  if(running)return;
+  const key=snapshotKey();
+  if(!confirm(`${key} 날짜의 원본 캔들만 삭제할까요? 같은 ${$('limit').value}개 코인 목록은 계속 고정됩니다. 백업하지 않은 캔들은 복구할 수 없습니다.`))return;
+  try{await snapshotStore('delete',key);await refreshSnapshotInfo();
+      $('status').textContent='🔓 이 날짜의 원본 봉만 해제했습니다. 코인 목록은 유지한 채 다음 검사에서 새 원본을 수집합니다.';}
+  catch(e){$('status').textContent='⚠️ 고정 해제 실패: '+e.message;}
+});
+$('cohortReset').addEventListener('click',async()=>{
+  if(running)return;
+  const limit=Number($('limit').value);
+  if(!confirm(`${limit}개 코인 고정 목록과 4개 날짜의 원본 봉을 모두 삭제하고 다음 검사 때 코인 목록을 새로 선정할까요? 백업하지 않은 스냅샷은 복원할 수 없습니다.`))return;
+  try{
+    for(const date of SNAP_DAYS)await snapshotStore('delete',`${date}|${limit}`);
+    await snapshotStore('delete',cohortKey(limit));
+    dateHistory.clear();$('dateRows').innerHTML='';
+    await refreshSnapshotInfo();
+    $('status').textContent='🔓 고정 코인 목록과 해당 코인 수의 모든 날짜 데이터를 초기화했습니다.';
+  }catch(e){$('status').textContent='⚠️ 전체 초기화 실패: '+e.message;}
+});
 $('start').addEventListener('click',startBacktest);
 paint([],0,1,{});
+refreshSnapshotInfo();
 </script></body></html>"""
 
 
@@ -745,27 +938,56 @@ def register_daytrade_review(app, deps):
         stamp = datetime.fromisoformat(value)
         return stamp.replace(tzinfo=kst) if stamp.tzinfo is None else stamp.astimezone(kst)
 
-    def fetch_history(market, cutoff):
+    def fetch_history(market, cutoff, source_rows=None):
         """Read actual exchange candles; fill only short timestamp gaps for testing.
 
         Synthetic rows are explicitly tagged, zero-volume, and never treated as
         real traded entry or signal bars. Gaps longer than 30m are never filled.
         """
         by_time = {}
-        cursor = cutoff
-        for _ in range(4):
-            page = completed_rows(market, 5, cursor, count=200)
-            if not page:
-                break
-            for row in page:
-                by_time[row["candle_date_time_kst"]] = row
-            oldest = min(parse_kst(r["candle_date_time_kst"]) for r in page)
-            if oldest >= cursor:
-                raise ValueError("캔들 페이지 시간순서 오류")
-            cursor = oldest
+        if source_rows is None:
+            # First capture: retrieve actual exchange candles exactly once.
+            cursor = cutoff
+            for _ in range(4):
+                page = completed_rows(market, 5, cursor, count=200)
+                if not page:
+                    break
+                for row in page:
+                    by_time[row["candle_date_time_kst"]] = row
+                oldest = min(parse_kst(r["candle_date_time_kst"]) for r in page)
+                if oldest >= cursor:
+                    raise ValueError("캔들 페이지 시간순서 오류")
+                cursor = oldest
+        else:
+            # Subsequent replays are entirely offline from exchange history.
+            # The posted source must contain ORIGINAL observations, never filled bars.
+            if not isinstance(source_rows, list) or len(source_rows) > 800:
+                raise ValueError("고정 원본 캔들은 코인당 800개 이하여야 합니다")
+            required = ("candle_date_time_kst", "opening_price", "high_price",
+                        "low_price", "trade_price", "candle_acc_trade_price",
+                        "candle_acc_trade_volume")
+            for row in source_rows:
+                if not isinstance(row, dict) or any(field not in row for field in required):
+                    raise ValueError("고정 원본 5분봉 필수 항목이 없습니다")
+                if row.get("_gap_fill"):
+                    raise ValueError("보정 캔들은 원본 스냅샷에 포함할 수 없습니다")
+                stamp = parse_kst(row["candle_date_time_kst"])
+                if stamp >= cutoff or stamp.minute % 5 or stamp.second or stamp.microsecond:
+                    raise ValueError("스냅샷 캔들의 날짜·5분 간격이 올바르지 않습니다")
+                prices = [float(row[k]) for k in required[1:]]
+                if (not all(isfinite(v) for v in prices)
+                        or min(prices[0:4]) <= 0
+                        or min(prices[4:]) < 0
+                        or not prices[2] <= min(prices[0], prices[3])
+                        or not max(prices[0], prices[3]) <= prices[1]):
+                    raise ValueError("고정 캔들 가격·거래량 데이터 오류")
+                key = row["candle_date_time_kst"]
+                if key in by_time:
+                    raise ValueError("스냅샷 캔들 시간이 중복되었습니다")
+                by_time[key] = row
         actual = sorted(by_time.values(), key=lambda r: parse_kst(r["candle_date_time_kst"]))
         if not actual:
-            return [], {"actual": 0, "filled": 0, "unfilled_gaps": 0, "max_gap_minutes": 0}
+            return [], {"actual": 0, "filled": 0, "unfilled_gaps": 0, "max_gap_minutes": 0}, []
 
         padded = [actual[0]]
         n_filled = 0
@@ -806,7 +1028,7 @@ def register_daytrade_review(app, deps):
         return padded, {
             "actual": len(actual), "filled": n_filled,
             "unfilled_gaps": n_unfilled, "max_gap_minutes": max_gap_minutes,
-        }
+        }, actual
 
     def empty_strategy():
         return {"signals": 0, "samples": EMPTY.copy(),
@@ -818,7 +1040,7 @@ def register_daytrade_review(app, deps):
                 } for key, _, _ in EXIT_SCENARIOS},
                 "examples": []}
 
-    def evaluate_market(market, date, fee):
+    def evaluate_market(market, date, fee, source_rows=None, capture=False):
         output = {
             "market": market, "windows": 0, "coverage_reason": "", "history_rows": 0,
             "gap_filled": 0, "unfilled_gaps": 0, "max_gap_minutes": 0, "coverage_rejects": 0,
@@ -834,7 +1056,11 @@ def register_daytrade_review(app, deps):
             start = day
             end = day + timedelta(hours=12)
             cutoff = day + timedelta(days=1, hours=12)
-            rows, coverage = fetch_history(market, cutoff)
+            rows, coverage, original_rows = fetch_history(market, cutoff, source_rows)
+            if capture:
+                # Returned once to browser IndexedDB; subsequent calls pass the
+                # same actual (not synthetic) candles back for offline replay.
+                output["_raw_candles"] = original_rows
             output["history_rows"] = coverage["actual"]
             output["gap_filled"] = coverage["filled"]
             output["unfilled_gaps"] = coverage["unfilled_gaps"]
@@ -1023,8 +1249,9 @@ def register_daytrade_review(app, deps):
             allowed = set(get_markets())
             if not set(names).issubset(allowed):
                 raise ValueError("현재 상장되지 않은 KRW 마켓이 포함되었습니다")
+            capture = request.args.get("capture", "0") == "1"
             with ThreadPoolExecutor(max_workers=3) as pool:
-                futures = {pool.submit(evaluate_market, name, date, fee): name
+                futures = {pool.submit(evaluate_market, name, date, fee, None, capture): name
                            for name in names}
                 result_by_market = {}
                 for future in as_completed(futures):
@@ -1036,3 +1263,52 @@ def register_daytrade_review(app, deps):
                                         "현재 시점 거래대금으로 선정한 코인들"]})
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)[:160]}), 502
+
+
+    @app.post("/api/daytrade-replay")
+    def daytrade_review_replay():
+        """Re-evaluate previously captured raw candles (NO exchange fetches).
+
+        A replay is self-contained and is unaffected by current market ranking,
+        delisting, API rate limits, or historical candle pagination. Original
+        A/B/V5/V6/V7 logic is exactly the same evaluate_market() function.
+        """
+        try:
+            # Five markets of 800 bars each normally take much less than 8 MB.
+            if request.content_length is not None and request.content_length > 8_000_000:
+                return jsonify({"ok": False, "error": "고정 데이터 요청 크기 제한(8MB)"}), 413
+            # A reverse proxy may forward a chunked request without Content-Length.
+            if request.content_length is None and len(request.get_data(cache=True)) > 8_000_000:
+                return jsonify({"ok": False, "error": "고정 데이터 요청 크기 제한(8MB)"}), 413
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict) or payload.get("schema") != "bithumb-v8-raw1":
+                raise ValueError("V8 원본 스냅샷 형식이 아닙니다")
+            date = payload.get("date")
+            if date not in DAYS:
+                raise ValueError("지원하지 않는 날짜입니다")
+            fee_percent = float(payload.get("fee", 0.25))
+            if fee_percent not in (0.0, 0.04, 0.25):
+                raise ValueError("지원하지 않는 수수료입니다")
+            blocks = payload.get("snapshots")
+            if (not isinstance(blocks, list) or not 1 <= len(blocks) <= 5
+                    or any(not isinstance(b, dict) for b in blocks)):
+                raise ValueError("스냅샷은 요청당 1~5개 코인이어야 합니다")
+            names = [b.get("market") for b in blocks]
+            if len(set(names)) != len(names) or any(
+                    not isinstance(m, str) or not MARKET_PATTERN.fullmatch(m) for m in names):
+                raise ValueError("고정된 코인 이름이 올바르지 않습니다")
+            if any(not isinstance(b.get("rows"), list) or len(b["rows"]) > 800 for b in blocks):
+                raise ValueError("고정 원본 5분봉 개수가 올바르지 않습니다")
+            # No get_markets/get_ranked/completed_rows calls here. These records
+            # are user-saved research snapshots, not current exchange quotes.
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {pool.submit(evaluate_market, b["market"], date,
+                                       fee_percent / 100, b["rows"], False): b["market"]
+                           for b in blocks}
+                result_by_market = {}
+                for future in as_completed(futures):
+                    result_by_market[futures[future]] = future.result()
+            return jsonify({"ok": True, "date": date, "from_snapshot": True,
+                            "results": [result_by_market[name] for name in names]})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)[:160]}), 400
