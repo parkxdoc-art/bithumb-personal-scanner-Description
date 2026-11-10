@@ -63,7 +63,7 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 </section>
 <section><h2>전략 비교</h2>
 <div class="summary">
-<div class="tile"><small>평가한 코인</small><b id="count">0</b></div>
+<div class="tile"><small>조회 완료 코인</small><b id="count">0</b></div>
 <div class="tile"><small>유효 검증 구간</small><b id="windows">0</b></div>
 <div class="tile"><small>A 기존 BUY</small><b id="aCount">0</b></div>
 <div class="tile"><small>B 피보나치 BUY</small><b id="bCount">0</b></div>
@@ -89,7 +89,7 @@ function paint(all, done, total, rankInfo) {
   const complete = all.filter(x => !x.error);
   const count = complete.length;
   const windows = complete.reduce((s,x)=>s + (x.windows||0),0);
-  $('count').textContent = fmt(count) + ' / ' + fmt(total);
+  $('count').textContent = fmt(count) + ' / ' + fmt(total) + ' (유효 ' + fmt(complete.filter(x=>x.windows>0).length) + ')';
   $('windows').textContent = fmt(windows);
   const rows = [];
   const agg = {};
@@ -115,10 +115,10 @@ function paint(all, done, total, rankInfo) {
   $('aCount').textContent=fmt(agg.A);
   $('bCount').textContent=fmt(agg.B);
   $('metrics').innerHTML=rows.join('');
-  const diag={aBreakout:0,aSupport:0,bTrend:0,bTouch:0,bBounce:0,bVolume:0,bAllPrice:0,liquidity:0,excluded:0};
+  const diag={aBreakout:0,aSupport:0,bTrend:0,bTouch:0,bBounce:0,bVolume:0,bAllPrice:0,bSwing25:0,bEvaluated:0,liquidity:0,excluded:0};
   for(const x of complete){for(const k in diag) diag[k] += x.diagnostics[k] || 0;}
-  $('diag').textContent = `과거 24h 5억 통과 구간 ${fmt(diag.liquidity)}개 / 전체 ${fmt(windows)}개 · A 돌파 확인 ${fmt(diag.aBreakout)}개 / 지지 유지 ${fmt(diag.aSupport)}개 · B 상승 추세 ${fmt(diag.bTrend)}개 / 피보나치 접촉 ${fmt(diag.bTouch)}개 / 반등 ${fmt(diag.bBounce)}개 / 거래량 ${fmt(diag.bVolume)}개 / B 가격·거래량 4조건 동시 충족 ${fmt(diag.bAllPrice)}개. (각 조건은 독립 집계입니다.)`;
-  $('coinRows').innerHTML = all.map(x => `<tr><td>${x.market}</td><td>${fmt(x.windows||0)}</td><td>${x.error?'—':fmt(x.strategies.A.signals)}</td><td>${x.error?'—':fmt(x.strategies.B.signals)}</td><td>${x.error?'오류: '+String(x.error).slice(0,65):(x.windows?'정상':'연속 봉 부족')}</td></tr>`).join('');
+  $('diag').textContent = `과거 24h 5억 통과 구간 ${fmt(diag.liquidity)}개 / 전체 ${fmt(windows)}개 · A 돌파 확인 ${fmt(diag.aBreakout)}개 / 지지 유지 ${fmt(diag.aSupport)}개 · B 선행 상승폭 2.5% 통과 ${fmt(diag.bSwing25)}개 / B 상세 조건까지 도달 ${fmt(diag.bEvaluated)}개 · 상세 진단: 추세 ${fmt(diag.bTrend)}개 / 피보나치 접촉 ${fmt(diag.bTouch)}개 / 반등 ${fmt(diag.bBounce)}개 / 거래량 ${fmt(diag.bVolume)}개 / 4조건 동시 충족 ${fmt(diag.bAllPrice)}개. (각 조건은 독립 집계입니다.)`;
+  $('coinRows').innerHTML = all.map(x => `<tr><td>${x.market}</td><td>${fmt(x.windows||0)}</td><td>${x.error?'—':fmt(x.strategies.A.signals)}</td><td>${x.error?'—':fmt(x.strategies.B.signals)}</td><td>${x.error?'오류: '+String(x.error).slice(0,65):(x.windows?'정상':(x.coverage_reason||'검증 구간 없음'))}</td></tr>`).join('');
   const ev=[];
   for(const x of complete) for(const strategy of ['A','B']) for(const e of x.strategies[strategy].examples){
     ev.push(`${strategy} · ${e.market} · ${e.time} · 1h ${pct(e.net['1h'])} / 24h ${pct(e.net['24h'])}`);
@@ -152,7 +152,8 @@ async function startBacktest(){
       paint(all,all.length,markets.length,u);
     }
     const errors=all.filter(x=>x.error).length;
-    $('status').textContent=`완료 · ${all.length}개 검사, ${errors}개 조회/계산 오류. A와 B를 비교하세요.`;
+    const valid=all.filter(x=>!x.error && x.windows>0).length;
+    $('status').textContent=`완료 · ${all.length}개 조회, 유효 코인 ${valid}개, ${errors}개 조회/계산 오류. A와 B를 비교하세요.`;
   } catch(e) {
     $('status').textContent='⚠️ 중단: '+e.message+' · 이미 받은 결과는 아래에 남겨두었습니다.';
   } finally {
@@ -227,11 +228,11 @@ def register_daytrade_review(app, deps):
 
     def evaluate_market(market, date, fee):
         output = {
-            "market": market, "windows": 0,
+            "market": market, "windows": 0, "coverage_reason": "", "history_rows": 0,
             "strategies": {"A": empty_strategy(), "B": empty_strategy()},
             "diagnostics": {name: 0 for name in (
                 "aBreakout", "aSupport", "bTrend", "bTouch", "bBounce",
-                "bVolume", "bAllPrice", "liquidity", "excluded")},
+                "bVolume", "bAllPrice", "bSwing25", "bEvaluated", "liquidity", "excluded")},
         }
         try:
             day = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=kst)
@@ -239,7 +240,21 @@ def register_daytrade_review(app, deps):
             end = day + timedelta(hours=12)
             cutoff = day + timedelta(days=1, hours=12)
             rows = fetch_history(market, cutoff)
+            output["history_rows"] = len(rows)
+            # Diagnose historical coverage without altering any BUY criteria.
+            run = longest_run = 0
+            previous = None
+            for candle in rows:
+                stamp = datetime.fromisoformat(candle["candle_date_time_kst"])
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=kst)
+                else:
+                    stamp = stamp.astimezone(kst)
+                run = run + 1 if previous is not None and stamp - previous == timedelta(minutes=5) else 1
+                longest_run = max(longest_run, run)
+                previous = stamp
             if len(rows) < 576:
+                output["coverage_reason"] = f"원본 {len(rows)}봉 · 최장 연속 {longest_run}봉 (최소 576봉 필요)"
                 return output
             # 288 historical 5-minute candles + 288 strictly future candles.
             # Independent strategy replays only see the LAST 80 historical candles.
@@ -259,6 +274,14 @@ def register_daytrade_review(app, deps):
                     raise ValueError("거래대금 데이터 오류")
                 liquid = value24 >= LIQUIDITY_MIN_KRW
                 output["diagnostics"]["liquidity"] += int(liquid)
+                # Match B's existing 2.5% swing precondition on its last 80 bars.
+                # This is diagnostic only: no change to A or B signal decisions.
+                h80 = [float(c["high_price"]) for c in history[-80:]]
+                l80 = [float(c["low_price"]) for c in history[-80:]]
+                peak_idx = max(range(45, 77), key=lambda i: h80[i])
+                low_idx = min(range(peak_idx - 30, peak_idx), key=lambda i: l80[i])
+                swing_pass = l80[low_idx] > 0 and h80[peak_idx] / l80[low_idx] - 1 >= 0.025
+                output["diagnostics"]["bSwing25"] += int(swing_pass)
                 input_window = {
                     "cutoff_kst": w["cutoff_kst"],
                     "signal_rows": history[-80:],
@@ -269,6 +292,7 @@ def register_daytrade_review(app, deps):
                 if not isinstance(a, dict) or not isinstance(b, dict):
                     continue
                 diagnostics = output["diagnostics"]
+                diagnostics["bEvaluated"] += int("trend_ok" in b)
                 diagnostics["aBreakout"] += int(a.get("breakout_seen") is True)
                 diagnostics["aSupport"] += int(a.get("support_held") is True)
                 labels = ("trend_ok", "touch_ok", "bounce_ok", "volume_ok")
@@ -312,6 +336,9 @@ def register_daytrade_review(app, deps):
                             "market": market, "time": at.strftime("%m-%d %H:%M"),
                             "entry": entry, "net": net,
                         })
+            if output["windows"] == 0:
+                output["coverage_reason"] = (f"원본 {len(rows)}봉 · 최장 연속 {longest_run}봉, "
+                                             f"선택일 00~12시의 유효 구간 없음")
             return output
         except Exception as exc:
             output["error"] = f"{type(exc).__name__}: {exc}"[:180]
