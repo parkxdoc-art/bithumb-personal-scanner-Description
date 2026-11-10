@@ -1,7 +1,7 @@
-"""Add-on day-trading A/B backtest dashboard. No changes to live BUY signals."""
+"""Gap-aware day-trading A/B backtest dashboard. No change to live BUY."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from threading import Lock
 import re
@@ -14,6 +14,8 @@ HOURS = (1, 3, 6, 12, 24)
 LABELS = tuple(f"{h}h" for h in HOURS)
 EMPTY = {k: 0 for k in LABELS}
 LIQUIDITY_MIN_KRW = 500_000_000
+MAX_GAP_FILL_BARS = 6  # up to 30 minutes without trades
+MAX_SYNTHETIC_BARS_PER_WINDOW = 24  # max 4.2% of a 48h sample
 MARKET_PATTERN = re.compile(r"^KRW-[A-Z0-9]+$")
 
 PAGE = r"""<!doctype html>
@@ -77,7 +79,7 @@ progress{width:100%;height:14px;accent-color:#54b89c}ul{padding-left:20px}
 <section><h2>코인별 결과</h2><div class="tablewrap"><table><thead><tr><th>코인</th><th>유효 구간</th><th>A BUY</th><th>B BUY</th><th>상태</th></tr></thead><tbody id="coinRows"></tbody></table></div></section>
 <section><h2>발생 신호 예시</h2><div id="events">결과 대기 중</div></section>
 <section><h2>검증 범위에 대한 주의</h2><p>
-하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. 과거 24시간 연속 거래대금과 이후 24시간 연속 5분봉이 확보된 경우만 평가합니다. 거래가 드문 코인은 유효 구간 0개로 표시됩니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, A/B 신호가 0개면 성공률도 계산하지 않습니다.
+하루 중 00:00~12:00에 확인된 신호를 최대 24시간까지 추적합니다. 누락된 5분봉 중 30분 이하 공백만 직전 종가와 거래량 0으로 표시하여 시간축을 보정합니다(실제 체결 데이터가 아님). 48시간 구간에서 보정 봉이 24개를 넘거나 신호봉/매수봉이 보정 봉이면 제외합니다. 1일/30개 결과만으로 수익성을 증명할 수 없으며, 가상 가격은 실제 매매 체결을 보장하지 않습니다.
 </p></section>
 </main><script>
 const $ = id => document.getElementById(id);
@@ -117,8 +119,8 @@ function paint(all, done, total, rankInfo) {
   $('metrics').innerHTML=rows.join('');
   const diag={aBreakout:0,aSupport:0,bTrend:0,bTouch:0,bBounce:0,bVolume:0,bAllPrice:0,bSwing25:0,bEvaluated:0,liquidity:0,excluded:0};
   for(const x of complete){for(const k in diag) diag[k] += x.diagnostics[k] || 0;}
-  $('diag').textContent = `과거 24h 5억 통과 구간 ${fmt(diag.liquidity)}개 / 전체 ${fmt(windows)}개 · A 돌파 확인 ${fmt(diag.aBreakout)}개 / 지지 유지 ${fmt(diag.aSupport)}개 · B 선행 상승폭 2.5% 통과 ${fmt(diag.bSwing25)}개 / B 상세 조건까지 도달 ${fmt(diag.bEvaluated)}개 · 상세 진단: 추세 ${fmt(diag.bTrend)}개 / 피보나치 접촉 ${fmt(diag.bTouch)}개 / 반등 ${fmt(diag.bBounce)}개 / 거래량 ${fmt(diag.bVolume)}개 / 4조건 동시 충족 ${fmt(diag.bAllPrice)}개. (각 조건은 독립 집계입니다.)`;
-  $('coinRows').innerHTML = all.map(x => `<tr><td>${x.market}</td><td>${fmt(x.windows||0)}</td><td>${x.error?'—':fmt(x.strategies.A.signals)}</td><td>${x.error?'—':fmt(x.strategies.B.signals)}</td><td>${x.error?'오류: '+String(x.error).slice(0,65):(x.windows?'정상':(x.coverage_reason||'검증 구간 없음'))}</td></tr>`).join('');
+  $('diag').textContent = `누락 5분봉 시간축 보정 ${fmt(complete.reduce((s,x)=>s+(x.gap_filled||0),0))}개(코인별 조회 범위 합산) · 과거 24h 5억 통과 구간 ${fmt(diag.liquidity)}개 / 전체 ${fmt(windows)}개 · A 돌파 확인 ${fmt(diag.aBreakout)}개 / 지지 유지 ${fmt(diag.aSupport)}개 · B 선행 상승폭 2.5% 통과 ${fmt(diag.bSwing25)}개 / B 상세 조건까지 도달 ${fmt(diag.bEvaluated)}개 · 상세 진단: 추세 ${fmt(diag.bTrend)}개 / 피보나치 접촉 ${fmt(diag.bTouch)}개 / 반등 ${fmt(diag.bBounce)}개 / 거래량 ${fmt(diag.bVolume)}개 / 4조건 동시 충족 ${fmt(diag.bAllPrice)}개. (각 조건은 독립 집계입니다.)`;
+  $('coinRows').innerHTML = all.map(x => `<tr><td>${x.market}</td><td>${fmt(x.windows||0)}</td><td>${x.error?'—':fmt(x.strategies.A.signals)}</td><td>${x.error?'—':fmt(x.strategies.B.signals)}</td><td>${x.error?'오류: '+String(x.error).slice(0,65):(x.windows?'정상 · 원본 '+fmt(x.history_rows)+' / 보정 '+fmt(x.gap_filled): (x.coverage_reason||'검증 구간 없음'))}</td></tr>`).join('');
   const ev=[];
   for(const x of complete) for(const strategy of ['A','B']) for(const e of x.strategies[strategy].examples){
     ev.push(`${strategy} · ${e.market} · ${e.time} · 1h ${pct(e.net['1h'])} / 24h ${pct(e.net['24h'])}`);
@@ -202,7 +204,16 @@ def register_daytrade_review(app, deps):
             cache.update(at=time.time(), ranked=ranked)
             return ranked[:]
 
+    def parse_kst(value):
+        stamp = datetime.fromisoformat(value)
+        return stamp.replace(tzinfo=kst) if stamp.tzinfo is None else stamp.astimezone(kst)
+
     def fetch_history(market, cutoff):
+        """Read actual exchange candles; fill only short timestamp gaps for testing.
+
+        Synthetic rows are explicitly tagged, zero-volume, and never treated as
+        real traded entry or signal bars. Gaps longer than 30m are never filled.
+        """
         by_time = {}
         cursor = cutoff
         for _ in range(4):
@@ -211,15 +222,54 @@ def register_daytrade_review(app, deps):
                 break
             for row in page:
                 by_time[row["candle_date_time_kst"]] = row
-            oldest = datetime.fromisoformat(page[0]["candle_date_time_kst"])
-            if oldest.tzinfo is None:
-                oldest = oldest.replace(tzinfo=kst)
-            else:
-                oldest = oldest.astimezone(kst)
+            oldest = min(parse_kst(r["candle_date_time_kst"]) for r in page)
             if oldest >= cursor:
                 raise ValueError("캔들 페이지 시간순서 오류")
             cursor = oldest
-        return [by_time[t] for t in sorted(by_time)]
+        actual = sorted(by_time.values(), key=lambda r: parse_kst(r["candle_date_time_kst"]))
+        if not actual:
+            return [], {"actual": 0, "filled": 0, "unfilled_gaps": 0, "max_gap_minutes": 0}
+
+        padded = [actual[0]]
+        n_filled = 0
+        n_unfilled = 0
+        max_gap_minutes = 0
+        step = timedelta(minutes=5)
+        for row in actual[1:]:
+            previous = padded[-1]
+            a = parse_kst(previous["candle_date_time_kst"])
+            b = parse_kst(row["candle_date_time_kst"])
+            seconds = (b - a).total_seconds()
+            if seconds <= 0:
+                raise ValueError("과거 캔들 시간 중복 또는 역순")
+            if seconds % 300 != 0:
+                raise ValueError("5분봉 시각 정렬 오류")
+            missing = round(seconds / 300) - 1
+            if missing:
+                max_gap_minutes = max(max_gap_minutes, int(seconds / 60) - 5)
+            if 0 < missing <= MAX_GAP_FILL_BARS:
+                flat_close = float(previous["trade_price"])
+                for j in range(1, missing + 1):
+                    t = a + j * step
+                    artificial = dict(previous)
+                    artificial["candle_date_time_kst"] = t.strftime("%Y-%m-%dT%H:%M:%S")
+                    artificial["candle_date_time_utc"] = t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                    artificial["opening_price"] = flat_close
+                    artificial["high_price"] = flat_close
+                    artificial["low_price"] = flat_close
+                    artificial["trade_price"] = flat_close
+                    artificial["candle_acc_trade_price"] = 0.0
+                    artificial["candle_acc_trade_volume"] = 0.0
+                    artificial["_gap_fill"] = True
+                    padded.append(artificial)
+                    n_filled += 1
+            elif missing > MAX_GAP_FILL_BARS:
+                n_unfilled += 1
+            padded.append(row)
+        return padded, {
+            "actual": len(actual), "filled": n_filled,
+            "unfilled_gaps": n_unfilled, "max_gap_minutes": max_gap_minutes,
+        }
 
     def empty_strategy():
         return {"signals": 0, "samples": EMPTY.copy(),
@@ -229,6 +279,7 @@ def register_daytrade_review(app, deps):
     def evaluate_market(market, date, fee):
         output = {
             "market": market, "windows": 0, "coverage_reason": "", "history_rows": 0,
+            "gap_filled": 0, "unfilled_gaps": 0, "max_gap_minutes": 0, "coverage_rejects": 0,
             "strategies": {"A": empty_strategy(), "B": empty_strategy()},
             "diagnostics": {name: 0 for name in (
                 "aBreakout", "aSupport", "bTrend", "bTouch", "bBounce",
@@ -239,8 +290,11 @@ def register_daytrade_review(app, deps):
             start = day
             end = day + timedelta(hours=12)
             cutoff = day + timedelta(days=1, hours=12)
-            rows = fetch_history(market, cutoff)
-            output["history_rows"] = len(rows)
+            rows, coverage = fetch_history(market, cutoff)
+            output["history_rows"] = coverage["actual"]
+            output["gap_filled"] = coverage["filled"]
+            output["unfilled_gaps"] = coverage["unfilled_gaps"]
+            output["max_gap_minutes"] = coverage["max_gap_minutes"]
             # Diagnose historical coverage without altering any BUY criteria.
             run = longest_run = 0
             previous = None
@@ -254,7 +308,8 @@ def register_daytrade_review(app, deps):
                 longest_run = max(longest_run, run)
                 previous = stamp
             if len(rows) < 576:
-                output["coverage_reason"] = f"원본 {len(rows)}봉 · 최장 연속 {longest_run}봉 (최소 576봉 필요)"
+                output["coverage_reason"] = (f"원본 {coverage['actual']}봉 / 보정 {coverage['filled']}봉 / "
+                                             f"최장 연속 {longest_run}봉 · 최소 576봉 필요")
                 return output
             # 288 historical 5-minute candles + 288 strictly future candles.
             # Independent strategy replays only see the LAST 80 historical candles.
@@ -267,6 +322,14 @@ def register_daytrade_review(app, deps):
                 history = w["signal_rows"]
                 future = w["evaluation_rows"]
                 if len(history) != 288 or len(future) != 288:
+                    continue
+                # Avoid interpreting synthetic, non-traded candles as a real
+                # signal or a filled entry. Exclude excessively sparse history.
+                filled_in_window = sum(c.get("_gap_fill", False) for c in history + future)
+                if (filled_in_window > MAX_SYNTHETIC_BARS_PER_WINDOW
+                        or history[-1].get("_gap_fill")
+                        or future[0].get("_gap_fill")):
+                    output["coverage_rejects"] += 1
                     continue
                 output["windows"] += 1
                 value24 = sum(float(c["candle_acc_trade_price"]) for c in history)
@@ -337,8 +400,10 @@ def register_daytrade_review(app, deps):
                             "entry": entry, "net": net,
                         })
             if output["windows"] == 0:
-                output["coverage_reason"] = (f"원본 {len(rows)}봉 · 최장 연속 {longest_run}봉, "
-                                             f"선택일 00~12시의 유효 구간 없음")
+                output["coverage_reason"] = (f"원본 {coverage['actual']}봉 / 보정 {coverage['filled']}봉 / "
+                                             f"최장 연속 {longest_run}봉 / 30분 초과 공백 "
+                                             f"{coverage['unfilled_gaps']}곳 / 검증 제외 {output['coverage_rejects']}구간; "
+                                             "선택일 00~12시 유효 구간 없음")
             return output
         except Exception as exc:
             output["error"] = f"{type(exc).__name__}: {exc}"[:180]
