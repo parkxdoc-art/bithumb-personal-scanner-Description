@@ -663,7 +663,7 @@ def register_daytrade_review(app, deps):
             return jsonify({'ok':False,'error':str(e)[:140]}),400
 
 # ---------------------------------------------------------------------------
-# V11.14.1: unchanged historical strategy lab plus per-market diagnostics.
+# V11.14.2: unchanged historical strategy lab plus coverage/overlap audits.
 # The V11.13 live scanner above is deliberately unchanged. Results produced
 # below are for THREE NEW experimental 5M strategies, NOT the exact V11.13 BUY.
 # ---------------------------------------------------------------------------
@@ -914,9 +914,75 @@ def lab_evaluate_symbol(api_get, market, cfg, kst):
             "candidates": count_by["signal"], "trades": detail}
 
 
+def lab_audit_gap_with_minutes(api_get, market, cfg, kst):
+    """Spot-check ONE 5M gap using independently queried 1M candles.
+
+    Never manufacture OHLC. 1M found within a missing 5M interval is an
+    inconsistency needing manual investigation, not proof of the root cause.
+    Absence of 1M isn't proof the exchange experienced no trades.
+    This function is only called by the optional three-coin audit endpoint.
+    """
+    candles, truncated = lab_fetch_5m(api_get, market, cfg, kst)
+    day_start = datetime.combine(cfg["day"], _time.min, tzinfo=kst)
+    day_end = day_start + timedelta(days=1)
+    day_rows = [x for x in candles if day_start <= x["t"] < day_end]
+    gaps = []
+    for left, right in zip(day_rows[:-1], day_rows[1:]):
+        elapsed = int((right["t"]-left["t"]).total_seconds()//60)
+        if elapsed > 5 and elapsed % 5 == 0:
+            gaps.append((elapsed//5-1, left["t"], right["t"]))
+    result = {"market": market, "bars": len(day_rows),
+              "missing_slots": max(0, 288-len(day_rows)),
+              "longest_run": lab_longest_consecutive_5m(day_rows),
+              "gap_pairs": len(gaps), "page_limit": truncated,
+              "gap_start": None, "gap_end": None,
+              "gap_5m_slots": 0, "one_min_bars": None,
+              "one_min_range_verified": False, "assessment": "검사할 내부 공백 없음"}
+    if not gaps:
+        return result
+    # Prefer the shortest fully internal gap. Bound the separate 1M request.
+    gaps.sort(key=lambda g:(g[0], g[1]))
+    missing, left, right = gaps[0]
+    first_missing = left+timedelta(minutes=5)
+    result.update(gap_start=first_missing.strftime("%m-%d %H:%M"),
+                  gap_end=right.strftime("%m-%d %H:%M"),gap_5m_slots=missing)
+    if missing > 6:
+        result["assessment"] = "표본 공백이 30분 초과 · 추가 자동조회 생략"
+        return result
+    raw = api_get("/v1/candles/minutes/1", {
+        "market": market, "count": 200,
+        "to": right.strftime("%Y-%m-%d %H:%M:%S")})
+    if not isinstance(raw, list):
+        raise ValueError("1분봉 교차확인 API 형식 오류")
+    minutes = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        try:
+            t = local_time(row["candle_date_time_kst"], kst)
+            if t < right:
+                minutes.append(t)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not minutes:
+        result["assessment"] = "1분봉 응답 없음 · 검증 불가"
+        return result
+    observed = sorted(set(minutes))
+    in_gap = [t for t in observed if first_missing <= t < right]
+    covered = min(observed) <= first_missing
+    result.update(one_min_bars=len(in_gap), one_min_range_verified=covered)
+    if in_gap:
+        result["assessment"] = "⚠️ 누락된 5분 구간 안에 1분봉 존재 · 데이터 재확인 필요"
+    elif covered:
+        result["assessment"] = "표본 구간에 1분봉 미관측 · 무거래 가능성 (확정 아님)"
+    else:
+        result["assessment"] = "1분봉 조회범위가 공백 시작까지 닿지 않아 미판정"
+    return result
+
+
 WINRATE_PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V11.14.1 · 단타 승률 데이터 진단판</title><style>
+<title>V11.14.2 · 단타 승률 검증 데이터 점검</title><style>
 :root{color-scheme:dark;--bg:#0b1020;--panel:#171d34;--card:#11182b;--border:#33405e;--fg:#eff4ff;--muted:#aabbd7;--blue:#3564ec;--green:#4ade80}
 *{box-sizing:border-box}body{background:var(--bg);color:var(--fg);margin:0;font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
 main{max-width:1000px;margin:auto;padding:20px 14px 55px}h1{font-size:23px;line-height:1.4}h2{font-size:18px;margin:0 0 10px}.panel{border:1px solid var(--border);border-radius:15px;background:var(--panel);margin-top:14px;padding:17px}.muted,.hint{color:var(--muted);font-size:13px}.danger{color:#fca5a5}.good{color:var(--green)}
@@ -926,7 +992,7 @@ button{background:var(--blue);border:0;border-radius:9px;padding:12px 15px;color
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:8px 7px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.note{background:#11192d;border-radius:10px;padding:12px;font-size:13px;line-height:1.65}.flex{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.detail{border:1px solid var(--border);padding:12px;border-radius:10px;margin:8px 0;background:var(--card);font-size:13px}.detail b{display:block;margin-bottom:5px}.status{white-space:pre-wrap;font-size:13px;color:var(--muted)}
 @media(max-width:640px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}th,td{padding:8px 5px}}
 </style></head><body><main>
-<h1>📊 V11.14.1 · 승률 데이터 신뢰도 진단</h1><p class="muted">V11.13 실시간 스캐너와 V2 메인은 그대로 둡니다. <b>이 페이지의 A/B/C는 신규 실험 전략</b>이며 V11.13 BUY 실적이 아닙니다.</p>
+<h1>📊 V11.14.2 · 승률 데이터 신뢰도 검증</h1><p class="muted">V11.13 실시간 스캐너와 V2 메인은 그대로 둡니다. <b>이 페이지의 A/B/C는 신규 실험 전략</b>이며 V11.13 BUY 실적이 아닙니다.</p>
 <section class="panel"><h2>검증 조건</h2><div class="controls">
 <label class="field">검증 날짜 (KST)<input id="day" type="date" required></label>
 <label class="field">동일 규칙 표본 코인<select id="count"><option value="20">20개 · 빠른 예비검사</option><option value="40" selected>40개 · 비교검사</option><option value="80">80개 · 확대검사</option></select></label>
@@ -942,6 +1008,18 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px
 <section class="panel"><h2>세 가지 실험 신호 비교</h2><p class="hint">A: 5분 지지 터치·양봉 회복 | B: 이전 봉 저항 돌파 후 다음 봉 재확인 | C: 1시간 상당 상승 흐름에서 5분 눌림 후 반등. 세 신호 모두 <b>확정된 과거 5분봉만</b> 사용합니다.</p><div class="scroll" id="table"><p class="muted">검사 후 결과 표시</p></div><p class="hint">익절 선도달률 = TP / 판정 가능 거래. 순승률 = 수수료·슬리피지 차감 후 수익 거래 비율. 만기청산(TIME)도 순승률·평균손익에 포함합니다.</p></section>
 <section class="panel"><h2>데이터 신뢰도</h2><div class="statgrid" id="quality"><div class="stat">조회 전</div></div><p class="hint">동일 봉에 익절·손절 모두 닿으면 <b>손절 우선</b> 처리. 중간 봉이 빠져 결과 순서를 알 수 없으면 <b>미판정 제외</b>. 시장가 진입은 다음 봉의 시가를 가정하고 체결 보장은 없습니다.</p></section>
 <section class="panel"><h2>🔎 80개 중 왜 일부만 검증됐을까?</h2><p class="hint">종목별 수집된 5분봉 개수와 최장 연속 구간을 구분합니다. <b>승률 계산·신호·표본 구성은 V11.14와 동일</b>합니다. 거래가 없어서 봉이 비었는지, 해당 날짜에 아직 상장되지 않았는지는 이 자료만으로 확정할 수 없습니다.</p><div id="diagSummary" class="statgrid">검사 후 원인 표시</div><details style="margin-top:12px"><summary>종목별 검증 가능 여부 자세히 보기</summary><div id="diagRows" class="scroll">검사 후 표시</div></details><p class="hint">하루 288개 = 24시간×12개 5분 구간. 빈 구간에는 미상장·거래 없음·수집 데이터 누락 등 여러 원인이 있을 수 있습니다. 거래가 없던 구간의 봉을 인위적으로 만들지 않습니다.</p><button id="diagCsv" type="button" disabled>종목별 진단 CSV 저장</button></section>
+
+<section class="panel"><h2>📊 관측 밀도별 승률과 반복신호 편중</h2>
+<p class="hint">원래 고정 표본을 바꾸지 않고 <b>해당 날짜의 관측 5분봉 수</b>로 그룹을 나눕니다. 당일 봉 수는 거래대금이나 실거래 유동성과 동일하지 않습니다. 분류는 당일 데이터가 끝난 뒤 만든 <b>사후 분석</b>이므로 BUY 조건으로 사용하지 않습니다.</p>
+<div id="densityResults" class="scroll">검사 완료 후 그룹별 결과 표시</div>
+<h3 style="font-size:15px;margin-top:16px">종목·전략별 첫 거래만 따로 집계</h3>
+<p class="hint">같은 종목에서 같은 전략이 한 날짜에 여러 번 발생해도 첫 판정 거래 하나만 계산합니다. 기존 A/B/C 전체 통계는 변경하지 않습니다. 서로 다른 코인의 동시 신호는 여전히 독립이라고 보장할 수 없습니다.</p>
+<div id="firstOnlyResults" class="scroll">검사 완료 후 편중 비교 표시</div></section>
+<section class="panel"><h2>🧪 ONDO · AEON · MEGA 1분봉 교차확인</h2>
+<p class="hint">선택 날짜의 세 코인에서 <b>5분봉 내부 공백 한 곳만 표본으로 뽑아</b> 별도 1분봉 API로 확인합니다. 5분봉 전체를 재검사하거나 기존 승률을 바꾸지 않습니다. 1분봉이 안 보인다고 무거래로 확정할 수 없으며, 1분봉이 관측되면 수집 불일치를 추가 조사해야 합니다.</p>
+<button id="audit3" type="button">세 종목 공백 교차확인</button>
+<p id="auditStatus" class="status">진단 실행 전 · 선택한 날짜 기준</p>
+<div id="auditResults" class="scroll"></div></section>
 <section class="panel"><h2>다른 날짜와 누적 비교</h2><p class="hint">같은 코인 선정 규칙·손익 조건의 서로 다른 날짜만 합칩니다. 같은 날짜를 다시 돌리면 교체합니다. 기록은 현재 브라우저에만 저장됩니다.</p><div id="history" class="scroll">검사 후 표시</div><div class="flex"><button id="csv" type="button">검사 기록 CSV 저장</button><button id="clear" type="button">누적 기록 삭제</button></div></section>
 <details class="panel"><summary>최근 실험 거래 사례</summary><div id="examples">검사 후 표시</div></details>
 <section class="panel"><h2>이 결과가 뜻하지 않는 것</h2><div class="note">동일 날짜의 과거 OHLCV를 사용한 모의 성적이며 <b>실제 주문 승률이 아닙니다.</b> 평가 종목은 현재 상장된 KRW 코인을 일정 간격으로 선정하므로 과거 상장폐지 종목이 빠지는 생존자 편향이 있습니다. 신호는 미래 봉을 보지 않지만 과거 날짜를 반복해 조건을 바꾸면 과적합될 수 있습니다. 호가 잔량·지연·실제 체결·정확한 호가단위는 미반영입니다. 한 날짜 또는 소수 거래만으로 실전 승률을 주장할 수 없습니다. 같은 종목·날짜의 여러 신호는 서로 독립적인 거래 기회가 아닐 수 있습니다.</div></section>
@@ -960,6 +1038,47 @@ function statsOf(trades){const s={A:emptyStat(),B:emptyStat(),C:emptyStat()};for
 function addStats(a,b){const r={};for(const k of Object.keys(strategies)){r[k]={};for(const field of Object.keys(emptyStat()))r[k][field]=(a[k]?.[field]||0)+(b[k]?.[field]||0)}return r}
 function renderTable(stats,caption){let html=`<p class="muted">${esc(caption)}</p><table><thead><tr>${cols.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>`;
 for(const [key,label] of Object.entries(strategies)){const s=stats[key]||emptyStat(),n=s.trades;html+=`<tr><td>${esc(label)}</td><td>${n}</td><td>${s.tp}</td><td>${s.sl}</td><td>${s.time}</td><td>${n?(100*s.tp/n).toFixed(1)+'%':'—'}</td><td>${n?(100*s.wins/n).toFixed(1)+'%':'—'}</td><td>${n?(s.net/n).toFixed(2)+'%':'—'}</td></tr>`}return html+'</tbody></table><p class="hint">※ 전략별 판정 거래가 30건 미만이면 작은 표본입니다. 과거 날짜를 바꾸며 얻은 수치를 실전 보장 승률로 해석하지 마세요.</p>'}
+
+function renderCoverageSplits(){
+ const groups=[
+  ['매우 조밀 (240~288봉)',d=>Number(d.bars)>=240],
+  ['중간 (120~239봉)',d=>Number(d.bars)>=120&&Number(d.bars)<240],
+  ['희소 (0~119봉)',d=>Number(d.bars)<120]
+ ];
+ let html='<table><thead><tr><th>당일 관측 밀도</th><th>코인</th><th>검사 가능</th><th>A 거래/순승률/평균손익</th><th>B 거래/순승률/평균손익</th><th>C 거래/순승률/평균손익</th></tr></thead><tbody>';
+ for(const [label,test] of groups){
+  const ds=diagRows.filter(test),set=new Set(ds.map(d=>d.market));
+  const s=statsOf(allTrades.filter(t=>set.has(t.market)));
+  const fmt=k=>{const v=s[k];return v.trades?`${v.trades}건 / ${(100*v.wins/v.trades).toFixed(1)}% / ${(v.net/v.trades).toFixed(2)}%`:'0건 / — / —'};
+  html+=`<tr><td>${esc(label)}</td><td>${ds.length}</td><td>${ds.filter(d=>d.valid_windows>0).length}</td><td>${fmt('A')}</td><td>${fmt('B')}</td><td>${fmt('C')}</td></tr>`;
+ }
+ $('densityResults').innerHTML=html+'</tbody></table><p class="hint">※ 그룹 분류는 해당 날짜 사후 정보이며, 실제 매매 시점에 미래의 하루 봉 수를 알고 있다고 가정하지 않습니다.</p>';
+ const sorted=allTrades.slice().sort((a,b)=>String(a.time).localeCompare(String(b.time)));
+ const seen=new Set(),first=[];
+ for(const t of sorted){const key=t.market+'|'+t.strategy;if(!seen.has(key)){seen.add(key);first.push(t)}}
+ const all=statsOf(allTrades),firsts=statsOf(first);
+ let h='<table><thead><tr><th>전략</th><th>전체 거래</th><th>첫 거래만</th><th>첫 거래 순승률</th><th>첫 거래 평균 순손익</th></tr></thead><tbody>';
+ for(const [k,name] of Object.entries(strategies)){const s=firsts[k];h+=`<tr><td>${esc(name)}</td><td>${all[k].trades}</td><td>${s.trades}</td><td>${s.trades?(100*s.wins/s.trades).toFixed(1)+'%':'—'}</td><td>${s.trades?(s.net/s.trades).toFixed(2)+'%':'—'}</td></tr>`}
+ $('firstOnlyResults').innerHTML=h+'</tbody></table><p class="hint">※ 동일 코인·동일 전략·동일 날짜 기준 첫 번째 판정 거래만 사용한 진단. 30건 미만은 특히 불안정합니다.</p>';
+}
+async function auditThree(){
+ if(busy)return;
+ $('audit3').disabled=true;
+ $('auditStatus').textContent='1분봉·5분봉 공백 교차확인 중…';
+ $('auditResults').textContent='';
+ try{
+  const cfg=currentCfg();
+  const v=await getJson('/api/winrate14/audit-three',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
+  if(v.errors||!Array.isArray(v.results)||v.results.length!==3)throw Error('일부 종목 확인 실패 · 결과 확정 보류');
+  let html='<table><thead><tr><th>종목</th><th>5분봉</th><th>최장 연속</th><th>공백 사례</th><th>누락 구간의 1분봉</th><th>판단</th></tr></thead><tbody>';
+  for(const x of v.results){html+=`<tr><td>${esc(x.market)}</td><td>${x.bars}/288</td><td>${x.longest_run}봉</td><td>${x.gap_start?esc(x.gap_start)+'~'+esc(x.gap_end)+' ('+x.gap_5m_slots+'칸)':'없음'}</td><td>${x.one_min_bars==null?'미검사':x.one_min_bars+'개'}</td><td>${esc(x.assessment)}</td></tr>`}
+  $('auditResults').innerHTML=html+'</tbody></table>';
+  $('auditStatus').textContent='✅ '+cfg.date+' · 세 종목 표본 교차확인 완료. 공백 전체를 증명하는 검사는 아닙니다.';
+ }catch(e){$('auditStatus').textContent='⚠️ 교차확인 실패: '+String(e.message||e)}
+ finally{$('audit3').disabled=false}
+}
+$('audit3').addEventListener('click',auditThree);
+
 function currentCfg(){const config={date:$('day').value,count:Number($('count').value),tp:Number($('tp').value),sl:Number($('sl').value),horizon:Number($('horizon').value),fee:Number($('fee').value),slip:Number($('slip').value)};if(!config.date||config.date>yesterday())throw Error('완료된 과거 날짜를 선택하세요');if(!Number.isFinite(config.tp)||!Number.isFinite(config.sl)||!Number.isFinite(config.fee)||!Number.isFinite(config.slip)||config.tp<0.3||config.tp>10||config.sl<0.2||config.sl>8||config.fee<0||config.fee>0.5||config.slip<0||config.slip>0.5)throw Error('손익/비용 입력 범위를 확인하세요');return config}
 const keyOf=r=>JSON.stringify([r.count,r.tp,r.sl,r.horizon,r.fee,r.slip,r.sample||'']);
 function displayHistory(){const hist=readHist(),n=Number($('count').value);let selected=[];try{selected=JSON.parse(localStorage.getItem(universeKey(n))||'[]')}catch{};const cfg={count:n,tp:Number($('tp').value),sl:Number($('sl').value),horizon:Number($('horizon').value),fee:Number($('fee').value),slip:Number($('slip').value),sample:Array.isArray(selected)?selected.join('|'):''};const matching=hist.filter(x=>keyOf(x)===keyOf(cfg));let total={A:emptyStat(),B:emptyStat(),C:emptyStat()};for(const item of matching)total=addStats(total,item.stats);$('history').innerHTML=renderTable(total,`동일 설정 ${matching.length}개 날짜 누적 · 거래가 0이면 승률 표시 불가`)+(matching.length?`<p class="hint">누적 날짜: ${matching.map(x=>esc(x.date)).join(', ')}</p>`:'')}
@@ -968,9 +1087,9 @@ const universeKey=n=>`bithumb_v1114_fixed_sample_${n}`;
 async function frozenSample(n){let stored=null;try{stored=JSON.parse(localStorage.getItem(universeKey(n))||'null')}catch{};if(Array.isArray(stored)&&stored.length===n&&stored.every(x=>/^KRW-[A-Z0-9]+$/.test(x)))return stored;
 const u=await getJson('/api/winrate14/universe?count='+n);try{localStorage.setItem(universeKey(n),JSON.stringify(u.items))}catch{throw Error('비교 종목 고정 저장 실패. 브라우저 저장 기능을 확인하세요')};return u.items;}
 async function workerPool(groups,workers,fn){let i=0;let errors=[];async function work(){while(i<groups.length){const batch=groups[i++];try{await fn(batch)}catch(e){errors.push(String(e))}}}await Promise.all(Array.from({length:Math.min(workers,groups.length)},work));return errors}
-async function run(){if(busy)return;busy=true;$('run').disabled=true;$('diagCsv').disabled=true;diagRows=[];$('diagSummary').textContent='조회 중';$('diagRows').textContent='조회 중';let config,failed=0,processed=0,totalBars=0,signals=0,unresolved=0,truncated=0,eligible=0,returned=[];const start=performance.now();try{config=currentCfg();const names=await frozenSample(config.count);config.sample=names.join('|');const batches=[];for(let i=0;i<names.length;i+=2)batches.push(names.slice(i,i+2));$('progress').max=names.length;$('progress').value=0;$('status').textContent=`과거 ${config.date} · 표본 ${names.length}개 캔들 조회 중 (일반 실시간 스캔보다 오래 걸릴 수 있습니다)`;
+async function run(){if(busy)return;busy=true;$('run').disabled=true;$('diagCsv').disabled=true;diagRows=[];$('densityResults').textContent='조회 중';$('firstOnlyResults').textContent='조회 중';$('diagSummary').textContent='조회 중';$('diagRows').textContent='조회 중';let config,failed=0,processed=0,totalBars=0,signals=0,unresolved=0,truncated=0,eligible=0,returned=[];const start=performance.now();try{config=currentCfg();const names=await frozenSample(config.count);config.sample=names.join('|');const batches=[];for(let i=0;i<names.length;i+=2)batches.push(names.slice(i,i+2));$('progress').max=names.length;$('progress').value=0;$('status').textContent=`과거 ${config.date} · 표본 ${names.length}개 캔들 조회 중 (일반 실시간 스캔보다 오래 걸릴 수 있습니다)`;
 const errors=await workerPool(batches,2,async namesBatch=>{const r=await getJson('/api/winrate14/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...config,markets:namesBatch})});processed+=r.scanned;failed+=r.errors;for(const item of r.results){totalBars+=item.bars||0;signals+=item.candidates||0;unresolved+=item.missing_outcome||0;eligible+=item.valid_windows>0?1:0;truncated+=item.truncated?1:0;diagRows.push(item);returned.push(...(item.trades||[]))}$('progress').value=processed;$('status').textContent=`조회 ${processed}/${names.length}개 · 조건 발생 ${signals}건 · 판정 ${returned.length}건 · API 오류 ${failed}건`;});if(errors.length||failed||processed!==names.length)throw Error(`일부 API 실패: ${errors.length}개 배치 / ${failed}개 코인. 불완전한 데이터는 승률로 저장하지 않습니다.`);
-allTrades=returned;latest=config;const s=statsOf(allTrades);$('table').innerHTML=renderTable(s,`${esc(config.date)} · 전체 ${names.length}개 표본 · 총 ${allTrades.length}건 판정 가능 거래`);
+allTrades=returned;latest=config;renderCoverageSplits();const s=statsOf(allTrades);$('table').innerHTML=renderTable(s,`${esc(config.date)} · 전체 ${names.length}개 표본 · 총 ${allTrades.length}건 판정 가능 거래`);
 $('quality').innerHTML=[['검사 대상',names.length+'개'],['검사 가능 종목',eligible+'개'],['해당 날짜 5분봉',totalBars+'개'],['실험 신호',signals+'건'],['결과 미판정(봉 공백 등)',unresolved+'건'],['조회 5페이지 상한 도달',truncated+'개']].map(x=>metric(...x)).join('');
 const labels={NO_DAY_BARS:'당일 5분봉 0개',TOO_FEW_FETCHED:'과거 준비·미래 판정 봉 부족',NO_25_CONSECUTIVE:'연속 25봉 없음',NO_VALID_WINDOW:'연속 구간은 있으나 유효 분석창 없음',NO_A_B_C_SIGNAL:'연속봉 확보 · 진입 모양 없음',OUTCOMES_UNKNOWN:'신호 있음 · 판정 불가',TRADE_EVALUATED:'모의 거래 평가 가능'};
 const reasons={};for(const x of diagRows){const k=x.diag_code||'OTHER';reasons[k]=(reasons[k]||0)+1;}
@@ -1016,6 +1135,34 @@ def register_winrate_lab(app, deps):
                 chosen = [names[round(j*(len(names)-1)/(n-1))] for j in range(n)]
             return jsonify({"ok": True, "items": chosen, "sampled": len(chosen),
                             "all_current_markets": len(names)})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:150]}), 400
+
+    @app.post("/api/winrate14/audit-three")
+    def winrate_lab_audit_three():
+        try:
+            payload = request.get_json(silent=True)
+            cfg = lab_valid_request(payload, kst)
+            targets = ("KRW-ONDO", "KRW-AEON", "KRW-MEGA")
+            with sample_lock:
+                if sample_cache["markets"] is None:
+                    sample_cache.update(markets=sorted({m for m in get_markets()
+                        if isinstance(m, str) and MARKET_RE.fullmatch(m)}), at=time.time())
+                allowed = set(sample_cache["markets"] or [])
+            missing = [m for m in targets if m not in allowed]
+            if missing:
+                raise ValueError("현재 KRW 마켓에 없는 교차확인 종목: "+", ".join(missing))
+            results, errors = [], 0
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                tasks = {pool.submit(lab_audit_gap_with_minutes,api_get,m,cfg,kst):m
+                         for m in targets}
+                for f in as_completed(tasks):
+                    try:
+                        results.append(f.result())
+                    except Exception:
+                        errors += 1
+            return jsonify({"ok": errors == 0, "results": sorted(results,key=lambda x:x["market"]),
+                            "scanned":len(results),"errors":errors})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)[:150]}), 400
 
