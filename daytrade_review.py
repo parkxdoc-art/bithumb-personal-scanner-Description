@@ -1,12 +1,14 @@
-"""V11.3 chart-first scanner with separately ranked current, gapped and stale signals.
+"""V11.5 experimental live 4H trendline -> 5M entry scanner.
 
-All listed KRW markets are checked regardless of 24h trading value or warnings.
-V2's completed 5m-candle BUY/WATCH decisions are unchanged. Its 24h turnover
-score bonus is removed in THIS board using the existing calculate_score helper.
-Only fully CURRENT BUY/WATCH candidates receive completed 24h-candle context.
-Recent candle gaps become CAUTION; stale timestamps become STALE. Neither is a current BUY.
-No historical backtest dates, future returns, or auto orders are used.
-The existing V2 dashboard and browser snapshots remain untouched.
+Only the /backtest-daytrade experiment page is replaced. app.py and the V2
+main-page BUY logic are untouched. All KRW markets are considered, without
+turnover or warning-list exclusions. This is an experimental signal, not an order.
+
+Pass 1: fetch 80 completed 4-hour candles for *all* markets, confirm two
+  pivot lows/highs, project each line by actual timestamps to the scan time.
+Pass 2: fetch 80 completed 5-minute candles only when a valid 4H trendline
+  is within +/-6% of the ticker snapshot; check bounce / confirmed breakout.
+No look-ahead candles, future returns, or synthetic gap-fill candles are used.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,542 +22,376 @@ from flask import jsonify, render_template_string, request
 
 PAGE_SIZE = 40
 MARKET_RE = re.compile(r"^KRW-[A-Z0-9]+$")
-FRESHNESS_MAX_MINUTES = 10  # lag after the signal candle's scheduled CLOSE
-SIGNAL_CHECK_BARS = 21      # last 20 bars establish V2's volume baseline
+NEAR_4H_PCT = 6.0
+WATCH_5M_PCT = 2.5
+FRESH_5M_MINUTES = 10.0
+FRESH_4H_MINUTES = 480.0
+MIN_4H_BARS = 35
+MIN_5M_BARS = 35
 
 
-def classify_signal_freshness(result, now, kst):
-    """Validate existing V2 signal *without changing its BUY/WATCH decisions*.
-
-    Data comes from V2 scan_market's completed candle_time and recent_closes.
-    No extra exchange requests. Gapped and stale signals are retained separately.
-    """
-    def as_kst(value):
-        stamp = datetime.fromisoformat(str(value))
-        return stamp.replace(tzinfo=kst) if stamp.tzinfo is None else stamp.astimezone(kst)
-
-    def status(validity, reason="", age=None):
-        # CURRENT: fresh + continuous; GAP: fresh but incomplete history;
-        # STALE: old/invalid/uncertain candle timestamp. No signal promotion.
-        return {"validity": validity, "hold_reason": reason,
-                "age_minutes": round(age, 1) if age is not None else None}
-
-    try:
-        if now.tzinfo is None:
-            raise ValueError("검사 서버 시각에 시간대가 없습니다")
-        candle = as_kst(result.get("candle_time"))
-        if candle.minute % 5 or candle.second or candle.microsecond:
-            return status("STALE", "신호 봉의 5분 단위 시간이 올바르지 않습니다")
-        age = (now - (candle + timedelta(minutes=5))).total_seconds() / 60
-        if age < -0.5:
-            return status("STALE", "아직 완료되지 않은 신호 봉입니다", age)
-        if age > FRESHNESS_MAX_MINUTES:
-            return status("STALE", f"마지막 확정봉 종료 후 {age:.1f}분 경과 (허용 {FRESHNESS_MAX_MINUTES}분)", age)
-
-        recent = result.get("recent_closes")
-        if not isinstance(recent, list) or len(recent) < SIGNAL_CHECK_BARS:
-            return status("GAP", f"최근 연속 5분봉 {SIGNAL_CHECK_BARS}개 확인 불가", age)
-        try:
-            times = [as_kst(x["time"]) for x in recent[-SIGNAL_CHECK_BARS:]]
-        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
-            return status("GAP", "최근 봉의 시각을 확인할 수 없습니다", age)
-        if times[-1] != candle:
-            return status("GAP", "신호 봉과 최신 기록의 시간이 일치하지 않습니다", age)
-        if any(t.minute % 5 or t.second or t.microsecond for t in times):
-            return status("GAP", "최근 5분봉 시간 정렬 오류", age)
-        if any(b - a != timedelta(minutes=5) for a, b in zip(times, times[1:])):
-            return status("GAP", f"최근 {SIGNAL_CHECK_BARS}개 봉 중 거래 없는 시간 공백 있음", age)
-        return status("CURRENT", age=age)
-    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
-        return status("STALE", "신호 봉 시각 확인 불가")
+def local_time(s, kst):
+    t = datetime.fromisoformat(str(s))
+    return t.replace(tzinfo=kst) if t.tzinfo is None else t.astimezone(kst)
 
 
-
-
-def compare_resistance_pivots(api_get, market, unit, now_kst, kst):
-    """Read 80 completed candles and reproduce V2's two-pivot resistance rule.
-
-    Research only: this never assigns BUY/WATCH and cannot change V2 signals.
-    """
-    raw = api_get(f"/v1/candles/minutes/{unit}", {"market": market, "count": 80})
+def completed_candles(api_get, market, unit, count, now, kst):
+    raw = api_get(f"/v1/candles/minutes/{unit}", {"market": market, "count": count})
     if not isinstance(raw, list):
         raise ValueError("캔들 응답 형식 오류")
-    by_time = {}
-    for r in raw:
-        if not isinstance(r, dict):
+    found = {}
+    step = timedelta(minutes=unit)
+    for c in raw:
+        if not isinstance(c, dict):
             continue
-        t = datetime.fromisoformat(r["candle_date_time_kst"])
-        t = t.replace(tzinfo=kst) if t.tzinfo is None else t.astimezone(kst)
-        if t + timedelta(minutes=unit) <= now_kst:
-            by_time[t] = r  # exclude the still-forming candle
-    ordered = sorted(by_time.items())
-    bars = [r for _, r in ordered]
-    out = {"minutes": unit, "bars": len(bars), "pivots": 0,
-           "status": "데이터 부족", "trendline": None, "distance_pct": None,
-           "last_candle": ordered[-1][0].strftime("%m-%d %H:%M") if ordered else None,
-           "high1": None, "high2": None, "gap_count": 0}
-    if ordered:
-        out["gap_count"] = sum(
-            b - a != timedelta(minutes=unit)
-            for (a, _), (b, _) in zip(ordered, ordered[1:])
-        )
-        close_age = (now_kst - (ordered[-1][0] + timedelta(minutes=unit))).total_seconds() / 60
-        out["age_minutes"] = round(close_age, 1)
-    if len(bars) < 35:
+        try:
+            t = local_time(c["candle_date_time_kst"], kst)
+            prices = [float(c[key]) for key in ("opening_price", "high_price", "low_price", "trade_price")]
+            volume = float(c["candle_acc_trade_volume"])
+            if not all(isfinite(v) and v > 0 for v in prices):
+                continue
+            if not isfinite(volume) or volume < 0:
+                continue
+            if prices[2] > min(prices[0], prices[3]) or prices[1] < max(prices[0], prices[3]):
+                continue
+            if t + step <= now:
+                found[t] = c
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return sorted(found.items())
+
+
+def pivots(ordered, field, kind):
+    values = [float(r[field]) for _, r in ordered]
+    if kind == "support":
+        return [i for i in range(2, len(values) - 2)
+                if values[i] <= min(values[i-2:i]) and values[i] < min(values[i+1:i+3])]
+    return [i for i in range(2, len(values) - 2)
+            if values[i] >= max(values[i-2:i]) and values[i] > max(values[i+1:i+3])]
+
+
+def make_line(ordered, field, kind):
+    ids = pivots(ordered, field, kind)
+    if len(ids) < 2:
+        return None
+    i, j = ids[-2], ids[-1]
+    a, b = ordered[i], ordered[j]
+    p1, p2 = float(a[1][field]), float(b[1][field])
+    t1, t2 = a[0].timestamp(), b[0].timestamp()
+    if t2 <= t1:
+        return None
+    # Slopes are per elapsed second, NOT per candle index. Gaps cannot shift the line.
+    return {"p1": p1, "p2": p2, "t1": t1, "t2": t2,
+            "kind": kind, "direction": "상승" if p2 > p1 else "하락" if p2 < p1 else "수평",
+            "time1": a[0].strftime("%m-%d %H:%M"),
+            "time2": b[0].strftime("%m-%d %H:%M")}
+
+
+def line_value(line, at):
+    if not line:
+        return None
+    t1, t2 = float(line["t1"]), float(line["t2"])
+    p1, p2 = float(line["p1"]), float(line["p2"])
+    if t2 <= t1 or p1 <= 0 or p2 <= 0:
+        return None
+    value = p2 + ((p2-p1)/(t2-t1)) * (at.timestamp()-t2)
+    return value if isfinite(value) and value > 0 else None
+
+
+def analyze_4h(api_get, market, price, now, kst):
+    ordered = completed_candles(api_get, market, 240, 80, now, kst)
+    out = {"market": market, "price": price, "bars4h": len(ordered),
+           "near": False, "support": None, "resistance": None, "reason": "", "last4h": None}
+    if len(ordered) < MIN_4H_BARS:
+        out["reason"] = "4시간봉 데이터 부족"
         return out
-    highs = [float(r["high_price"]) for r in bars]
-    closes = [float(r["trade_price"]) for r in bars]
-    if not all(isfinite(v) and v > 0 for v in highs + closes):
-        raise ValueError("캔들 가격 오류")
-    # Exact V2 pivot definition: left two highs <= pivot; right two < pivot.
-    pivots = [i for i in range(2, len(highs) - 2)
-              if highs[i] >= max(highs[i-2:i]) and highs[i] > max(highs[i+1:i+3])]
-    out["pivots"] = len(pivots)
-    if len(pivots) < 2:
-        out["status"] = "고점 2개 부족"
+    out["last4h"] = ordered[-1][0].strftime("%m-%d %H:%M")
+    out["age4h"] = round((now - (ordered[-1][0] + timedelta(hours=4))).total_seconds()/60, 1)
+    if out["age4h"] > FRESH_4H_MINUTES:
+        out["reason"] = "4시간봉 최근 데이터 지연"
         return out
-    a, b = pivots[-2], pivots[-1]
-    out["high1"] = round(highs[a], 8)
-    out["high2"] = round(highs[b], 8)
-    out["time1"] = ordered[a][0].strftime("%m-%d %H:%M")
-    out["time2"] = ordered[b][0].strftime("%m-%d %H:%M")
-    out["last_close"] = round(closes[-1], 8)
-    if highs[b] >= highs[a]:
-        out["status"] = "고점 낮아지지 않음"
-        return out
-    slope = (highs[b] - highs[a]) / (b - a)
-    line_now = highs[b] + slope * ((len(bars) - 1) - b)
-    if not isfinite(line_now) or line_now <= 0:
-        out["status"] = "유효한 저항선 없음"
-        return out
-    out["trendline"] = round(line_now, 8)
-    out["distance_pct"] = round((closes[-1] / line_now - 1) * 100, 2)
-    # Match V2's 0.4% resistance tolerance. NOT a BUY calculation.
-    if closes[-1] > line_now * 1.004:
-        out["status"] = "저항선 위 (+0.4% 초과)"
-    elif closes[-1] >= line_now * 0.996:
-        out["status"] = "저항선 근접 (±0.4%)"
+    for kind, field in (("support", "low_price"), ("resistance", "high_price")):
+        line = make_line(ordered, field, kind)
+        v = line_value(line, now)
+        if line and v:
+            line["now"] = round(v, 10)
+            line["distance_pct"] = round((price / v - 1)*100, 3)
+            out[kind] = line
+    if not out["support"] and not out["resistance"]:
+        out["reason"] = "확정된 고점·저점 두 개 부족"
     else:
-        out["status"] = "저항선 아래"
+        out["near"] = any(abs(x["distance_pct"]) <= NEAR_4H_PCT
+                          for x in (out["support"], out["resistance"]) if x)
+        out["reason"] = "5분봉 확인 대상" if out["near"] else "4시간 추세선과 거리 멂"
     return out
+
+
+def five_minute_entry(api_get, htf, now, kst):
+    market = htf["market"]
+    rows = completed_candles(api_get, market, 5, 80, now, kst)
+    out = {"market": market, "status": "NONE", "setup": "", "note": "",
+           "price": None, "volume_ratio": None, "age_minutes": None,
+           "bars5m": len(rows), "htf": htf}
+    if len(rows) < MIN_5M_BARS:
+        out.update(status="SKIP", note="5분봉 데이터 부족")
+        return out
+    t = [x[0] for x in rows]
+    c = [float(x[1]["trade_price"]) for x in rows]
+    o = [float(x[1]["opening_price"]) for x in rows]
+    l = [float(x[1]["low_price"]) for x in rows]
+    v = [float(x[1]["candle_acc_trade_volume"]) for x in rows]
+    out["price"] = c[-1]
+    out["signal_time"] = t[-1].strftime("%Y-%m-%d %H:%M")
+    age = (now - (t[-1] + timedelta(minutes=5))).total_seconds()/60
+    out["age_minutes"] = round(age, 1)
+    baseline = sum(v[-21:-1])/20
+    out["volume_ratio"] = round(v[-1]/baseline, 2) if baseline > 0 else None
+    recent_continuous = all(b-a == timedelta(minutes=5) for a, b in zip(t[-21:-1], t[-20:]))
+    if age > FRESH_5M_MINUTES or age < -0.5:
+        freshness = "STALE"
+    elif not recent_continuous:
+        freshness = "GAP"
+    else:
+        freshness = "CURRENT"
+
+    options = []
+    for kind, label in (("support", "4시간 지지선"), ("resistance", "4시간 저항선")):
+        line = htf.get(kind)
+        if not line:
+            continue
+        lv = [line_value(line, ti) for ti in t[-5:]]
+        if any(q is None for q in lv):
+            continue
+        x = [c[i] for i in range(-5, 0)]
+        lows = [l[i] for i in range(-5, 0)]
+        opens = [o[i] for i in range(-5, 0)]
+        distance = (x[-1]/lv[-1]-1)*100
+        # Nearby is observational. A BUY requires specific confirmed 5m behavior.
+        near = abs(distance) <= WATCH_5M_PCT
+        if kind == "support":
+            touch = any(lows[i] <= lv[i]*1.005 and lows[i] >= lv[i]*0.985 for i in (-2, -1))
+            bounce = (line["direction"] in ("상승", "수평") and touch
+                      and x[-1] >= lv[-1]*1.001 and x[-1] > opens[-1]
+                      and x[-1] > x[-2] and 0 <= distance <= 2.5)
+            if bounce:
+                options.append(("BUY", "지지 반등", distance, line, label))
+            elif near:
+                options.append(("WATCH", "지지선 접근", distance, line, label))
+        else:
+            # At least two consecutive confirmed 5m closes above an HTF resistance,
+            # with the first breakout occurring within the last three 5m bars.
+            crossed_recently = any(x[i-1] <= lv[i-1]*1.001 and x[i] > lv[i]*1.003
+                                   for i in (-3, -2, -1))
+            breakout = (crossed_recently and x[-2] > lv[-2]*1.002
+                        and x[-1] > lv[-1]*1.002 and 0.2 <= distance <= 3.0)
+            if breakout:
+                options.append(("BUY", "저항 돌파", distance, line, label))
+            elif near or (0 < distance <= 3.0):
+                options.append(("WATCH", "저항선 접근/돌파 관찰", distance, line, label))
+    if not options:
+        return out
+    options.sort(key=lambda y: (0 if y[0] == "BUY" else 1, abs(y[2])))
+    status, setup, dist, line, label = options[0]
+    out.update(status=status if freshness == "CURRENT" else freshness,
+               original_signal=status, setup=setup,
+               note=f"{label} · 5분봉 {setup}",
+               distance_pct=round(dist, 2), line_price=round(line_value(line, t[-1]), 10),
+               line_direction=line["direction"], source_kind=line["kind"],
+               pivot1=f"{line['time1']} / {line['p1']:.8g}",
+               pivot2=f"{line['time2']} / {line['p2']:.8g}")
+    if freshness == "STALE":
+        out["note"] += " · 최근 확정봉 오래됨"
+    elif freshness == "GAP":
+        out["note"] += " · 최근 21개 5분봉 공백"
+    return out
+
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>빗썸 · 실시간 24시간 BUY / 관심 후보</title>
+<title>V11.5 · 4시간 추세선 + 5분 진입 실험</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#141c2f;--border:#2b3855;--text:#eef3ff;--sub:#a9b8d4;--buy:#4ade80;--watch:#fbbf24}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,"Noto Sans KR",sans-serif}
-main{max-width:1020px;margin:auto;padding:20px 14px 60px}h1{font-size:22px;margin:0 0 6px}h2{font-size:18px;margin:0 0 14px}
-p{margin:4px 0 12px}.muted{font-size:13px;color:var(--sub)}.panel{border:1px solid var(--border);border-radius:15px;background:var(--panel);padding:17px;margin-top:16px}
-button{padding:12px 18px;border-radius:9px;background:#315de7;border:0;color:white;font-size:15px;font-weight:750;cursor:pointer}
-button:disabled{opacity:.55;cursor:default}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{border:1px solid var(--border);border-radius:10px;padding:12px}.metric b{display:block;font-size:23px}.buy{color:var(--buy)}.watch{color:var(--watch)}
-.progress{width:100%;height:11px;margin-top:10px}#status{margin-top:10px;white-space:pre-wrap;overflow-wrap:anywhere}
-.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.item{border:1px solid var(--border);border-radius:12px;padding:14px;background:#10182a}
-.item.buycard{border-color:#28664c}.item.watchcard{border-color:#665527}.item.gapcard{border-color:#ca8a04}.gap{color:#fcd34d}.item.stalecard{border-color:#64536a;opacity:.9}.stale{color:#d8b4fe}.item h3{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px;margin:0 0 8px}.pill{border-radius:7px;padding:3px 7px;font-size:12px;background:#1e3351}
-.item .details{font-size:13px;white-space:pre-line}.item .context{margin-top:10px;padding-top:9px;border-top:1px solid var(--border);font-size:12px;white-space:pre-line;color:var(--sub)}
-section{margin-top:18px}.empty{font-size:13px;color:var(--sub)}.foot{font-size:12px;color:var(--sub);margin-top:18px}
-.tfrow{padding:6px 0;border-top:1px solid var(--border);font-size:12px}.tfrow:first-child{border-top:0}.tfrow b{display:inline-block;min-width:56px}.tfwarn{color:#fbbf24}.tfok{color:#4ade80}#tfPanel select{background:#0d1527;color:var(--text);padding:10px;border:1px solid var(--border);border-radius:8px;margin-right:6px}#tfPanel .list{grid-template-columns:repeat(2,minmax(0,1fr))}@media(max-width:650px){ #tfPanel .list{grid-template-columns:1fr}}
-a{color:#a9caff}summary{cursor:pointer;font-weight:750;font-size:16px}@media(max-width:650px){.list{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric b{font-size:20px}h1{font-size:20px}}
+:root{color-scheme:dark;--bg:#0b1020;--panel:#141c2f;--border:#30405d;--text:#edf3ff;--sub:#a8b9d3;--green:#4ade80;--yellow:#fbbf24}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:20px 14px 60px}h1{font-size:22px;margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}
+p{margin:5px 0 12px}.muted{font-size:13px;color:var(--sub)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:15px;padding:17px;margin-top:14px}
+button{background:#315de7;color:white;border:0;border-radius:9px;padding:12px 18px;font:inherit;font-weight:750;cursor:pointer}button:disabled{opacity:.5}a{color:#aecaff}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{border:1px solid var(--border);border-radius:10px;padding:10px;min-width:0}.metric b{display:block;font-size:23px}.buy{color:var(--green)}.watch{color:var(--yellow)}.subtle{color:#d8b4fe}
+progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.item{background:#10182a;border:1px solid var(--border);padding:14px;border-radius:12px;overflow-wrap:anywhere}.item.buycard{border-color:#2a7954}.item.watchcard{border-color:#756027}.item h3{display:flex;justify-content:space-between;gap:8px;font-size:16px;margin:0 0 8px}.pill{font-size:12px;border-radius:7px;background:#1d314e;padding:2px 7px}.details{white-space:pre-line;font-size:13px}details summary{cursor:pointer;font-weight:750}#timing{margin-top:8px}
+@media(max-width:680px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.list{grid-template-columns:1fr}}
 </style></head><body><main>
-<h1>⚡ 빗썸 실시간 BUY · 관심 후보</h1>
-<p class="muted">V11.3 · 검사 시점 기준 · KRW 전체 코인 · 거래대금 제한 없음 · V2 확정 5분봉 신호 · 후보의 직전 24시간 확인</p>
-<div class="panel"><button id="run" type="button">지금 전체 검색</button> <a href="/">V2 메인 화면</a>
-<p class="muted">거래대금 제한 없이 전체 KRW를 검사합니다. 마지막 봉이 10분 이내이고 최근 21개 5분봉이 연속이면 현재 BUY/WATCH, 최신이지만 봉 공백이 있으면 관찰 주의, 오래된 신호는 따로 보관합니다. 거래량 1.5배 미만 WATCH에는 주의 표시를 붙입니다.</p>
+<h1>📈 4시간 추세선 → 5분봉 진입 후보</h1>
+<p class="muted">V11.5 실험판 · 전체 KRW · 거래대금 제한 없음 · 거래유의종목 포함 · V2 메인은 그대로</p>
+<div class="panel"><button id="run">지금 전체 검색</button> <a href="/">기존 V2 메인</a>
+<p class="muted">4시간봉 고점·저점 두 개로 만든 추세선을 5분봉에 그대로 투영합니다. 상승 지지선 반등 또는 저항선 돌파를 찾고, 최근 확정봉과 연속성을 확인합니다. 거래량은 참고만 하며 BUY 필수 조건이 아닙니다.</p>
 <div class="metrics">
-  <div class="metric"><span class="muted">전체 / 검사 대상</span><b id="all">—</b></div>
-  <div class="metric"><span class="muted">BUY</span><b id="buys" class="buy">—</b></div>
-  <div class="metric"><span class="muted">관심 WATCH</span><b id="watches" class="watch">—</b></div>
-  <div class="metric"><span class="muted">캔들 공백 주의</span><b id="gaps" class="gap">—</b></div>
-  <div class="metric"><span class="muted">오래된 신호</span><b id="stales" class="stale">—</b></div>
+<div class="metric"><span class="muted">전체 / 4시간봉 검사</span><b id="all">—</b></div>
+<div class="metric"><span class="muted">5분봉 정밀 확인</span><b id="near">—</b></div>
+<div class="metric"><span class="muted">BUY</span><b class="buy" id="buys">—</b></div>
+<div class="metric"><span class="muted">WATCH</span><b class="watch" id="watches">—</b></div>
 </div>
-<progress class="progress" id="progress" max="1" value="0"></progress>
-<div class="muted" id="status" role="status" aria-live="polite">검색 버튼을 누르면 거래대금과 관계없이 전체 KRW 코인의 차트 신호를 확인합니다.</div>
-<div class="muted" id="timing"></div>
+<progress id="progress" value="0" max="1"></progress>
+<div id="status" class="muted">검색 버튼을 누르면 4시간봉 전체 검사부터 진행합니다.</div>
+<div id="timing" class="muted"></div>
 </div>
-<section class="panel"><h2 class="buy">BUY · 진입 조건 충족</h2><div class="list" id="buyList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
-<section class="panel"><h2 class="watch">WATCH · 추가 확인 필요</h2><div class="list" id="watchList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
-<section class="panel" id="tfPanel"><h2>🧪 5분봉 · 1시간봉 · 4시간봉 고점 비교 실험</h2>
-<p class="muted">기존 검색 완료 후 후보 중 점수 상위 종목만 추가 조회합니다. 3개 시간봉 모두 <b>최근 확정봉 최대 80개</b>에서 V2와 동일한 고점 두 개·하향 저항선 규칙을 적용합니다. 실험 결과는 BUY/WATCH를 변경하지 않습니다.</p>
-<label for="tfCount">비교할 종목 수 </label><select id="tfCount"><option value="5">상위 5개</option><option value="10" selected>상위 10개</option><option value="20">상위 20개</option></select>
-<button id="tfRun" type="button" disabled>시간봉 3종 비교하기</button>
-<div class="muted" id="tfStatus">먼저 '지금 전체 검색'을 완료해 주세요.</div>
-<div id="tfResult" class="list" style="margin-top:12px"></div>
-</section>
-<section class="panel"><h2 class="gap">⚠️ 캔들 공백 주의 · 관찰 후보</h2><p class="muted">마지막 신호는 최근 것이지만 5분봉이 연속되지 않았습니다. 원래 V2가 BUY였어도 확정 BUY로 표시하지 않습니다. 시간 공백이 생기는 저유동성 코인도 여기에서 관찰할 수 있습니다.</p><div class="list" id="gapList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
-<details class="panel" id="stalePanel"><summary class="stale">⚠️ 오래된 신호 · 접어서 보관 <span id="staleSummary"></span></summary><p class="muted">마지막 봉이 오래됐거나 신호 시각이 올바르지 않습니다. 매수 신호로 취급하지 마세요. 공백 주의와 오래된 신호는 속도를 위해 추가 24시간 조회를 생략합니다.</p><div class="list" id="staleList"></div></details>
-<p class="foot">매매 권유나 주문 기능이 아닙니다. BUY는 V2 기술 조건과 최신/연속 캔들 검사를 모두 통과했다는 뜻이지 수익 보장은 아닙니다. 거래대금 제한이 없으므로 유동성이 낮은 종목은 호가 차이·체결 지연에 특히 주의하세요. 직전 24시간 캔들 분석은 보조 정보이며, 기존 V2 원신호는 유지하되 최신성/공백 여부에 따라 표시 그룹만 구분합니다. 24시간 자료는 완료된 5분봉만 사용합니다.</p>
+<section class="panel"><h2 class="buy">실험 BUY 후보 · 4시간 추세선 기준</h2><div class="list" id="buyList"><p class="muted">검색 전</p></div></section>
+<section class="panel"><h2 class="watch">WATCH · 추세선 접근 후보</h2><div class="list" id="watchList"><p class="muted">검색 전</p></div></section>
+<details class="panel" id="holdPanel"><summary class="subtle">⚠️ 신호 시간/캔들 공백 주의 <span id="holdCount"></span></summary><p class="muted">마지막 5분봉이 오래됐거나 최근 21개 봉이 연속되지 않은 후보야. 현재 BUY로 표시하지 않아.</p><div id="holdList" class="list"></div></details>
+<p class="muted">실험용 기술 신호로 매수 권유나 수익 보장이 아니야. 고점·저점은 양옆 2개 확정 4시간봉으로 확인하며 미래 데이터를 사용하지 않아. 추세선 밖으로 강한 돌파 후 멀어진 종목은 추격 방지를 위해 후보에서 빠질 수 있어.</p>
 </main><script>
-const $ = id => document.getElementById(id);
-const quote = x => String(x ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const won = v => Number(v).toLocaleString('ko-KR',{maximumFractionDigits:6})+'원';
-let working=false;
-const ctxByMarket=new Map();
-const signalByMarket=new Map();
-function signalValidity(x){
-  const original=['CURRENT','GAP','STALE'].includes(x.validity)?x.validity:'STALE';
-  if(original!=='CURRENT')return original;
-  const c=ctxByMarket.get(x.market);
-  // Reconcile completed candles fetched after the first pass. Never upgrade a
-  // stale signal; only downgrade a current one if recent data contradicts it.
-  if(c&&!c.error&&c.fresh===false)return 'STALE';
-  return 'CURRENT';
-}
-function signalHoldReason(x){
-  if(x.validity!=='CURRENT')return x.hold_reason||'캔들 시각/연속성 확인 불가';
-  const c=ctxByMarket.get(x.market);
-  return c&&!c.error&&!c.fresh?'24시간 교차 확인에서 최신 5분봉이 확인되지 않았습니다':'';
-}
-function sorted(kind){
-  const all=[...signalByMarket.values()];
-  const subset=all.filter(x=>{
-    const v=signalValidity(x);
-    return kind==='GAP'?v==='GAP':kind==='STALE'?v==='STALE':v==='CURRENT'&&x.signal===kind;
-  });
-  return subset.sort((a,b)=>Number(b.score||0)-Number(a.score||0)||Number(b.vol_ratio||0)-Number(a.vol_ratio||0)||a.market.localeCompare(b.market));
-}
-function paint(){
-  const buy=sorted('BUY'),watch=sorted('WATCH'),gap=sorted('GAP'),stale=sorted('STALE');
-  $('buys').textContent=buy.length;$('watches').textContent=watch.length;
-  $('gaps').textContent=gap.length;$('stales').textContent=stale.length;
-  $('staleSummary').textContent=`(${stale.length}개)`;
-  function card(x,category='CURRENT'){
-    const c=ctxByMarket.get(x.market),p=Number(x.price),r=Number(x.vol_ratio);
-    const current=category==='CURRENT';
-    const context=!current&&!c?'⚠️ 추가 24시간 조회 생략 · 차트 시간/연속성만 표시':
-      !c?'⏳ 직전 24시간 5분봉 확인 대기':c.error?'⚠️ 24시간 조회 실패: '+quote(c.error):
-      `직전 24시간 완성 5분봉 ${c.bars}/288개 (${c.coverage_pct}%)`+
-      `\n24시간 고가 ${won(c.high)} · 저가 ${won(c.low)}`+
-      `\n24시간 시가→종가 ${c.change_pct>0?'+':''}${c.change_pct}%`+
-      `\n마지막 봉 ${quote(c.last_candle)} · ${c.fresh?'정상':'⚠️ 최근 봉 지연/누락'}`+
-      (c.complete?'':'\n⚠️ 24시간 연속 봉 부족 — 보조 분석만 표시');
-    const name=category==='GAP'?'공백 주의 (기존 '+quote(x.signal)+')':
-      category==='STALE'?'오래된 신호 (기존 '+quote(x.signal)+')':quote(x.signal);
-    const caution=current?'':'\n⚠️ '+quote(signalHoldReason(x))+(x.signal==='BUY'?'\n기존 BUY는 시간 검증 미통과로 진입 확정 보류':'');
-    const volumeWarn=x.signal==='WATCH'&&(!Number.isFinite(r)||r<1.5)?'\n⚠️ 거래량 1.5배 미만 — 매수세 추가 확인 필요':'';
-    const age=x.age_minutes==null?'시각 확인 불가':Number(x.age_minutes).toFixed(1)+'분';
-    const cardType=category==='GAP'?'gapcard':category==='STALE'?'stalecard':x.signal==='BUY'?'buycard':'watchcard';
-    const badgeColor=category==='GAP'?'gap':category==='STALE'?'stale':x.signal==='BUY'?'buy':'watch';
-    return `<article class="item ${cardType}"><h3><span>${quote(x.market)}</span><span class="pill ${badgeColor}">${name}</span></h3>`+
-      `<div class="details">확정 5분봉 종가 ${won(p)}`+
-      `\n거래량 ${Number.isFinite(r)?r.toFixed(2)+'배':'—'} · 점수 ${Number(x.score||0)}${volumeWarn}`+
-      `\n신호 봉 ${quote(x.candle_time)} · 봉 종료 후 ${age}`+
-      `\n${quote(x.resistance)} · ${quote(x.note)}${caution}</div><div class="context">${context}</div></article>`;
-  }
-  $('buyList').innerHTML=buy.length?buy.map(x=>card(x)).join(''):'<div class="empty">현재 확인된 BUY 없음</div>';
-  $('watchList').innerHTML=watch.length?watch.map(x=>card(x)).join(''):'<div class="empty">현재 확인된 WATCH 없음</div>';
-  $('gapList').innerHTML=gap.length?gap.map(x=>card(x,'GAP')).join(''):'<div class="empty">캔들 공백 주의 후보 없음</div>';
-  // Avoid rebuilding a large collapsed list on every batch update.
-  $('staleList').innerHTML=$('stalePanel').open?(stale.length?stale.map(x=>card(x,'STALE')).join(''):'<div class="empty">오래된 신호 없음</div>'):'';
-}
-async function post(path,payload,ms=70000){
-  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),ms);
-  try{
-    const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),signal:controller.signal,cache:'no-store'});
-    const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||`HTTP ${r.status}`);return j;
-  }finally{clearTimeout(timer);}
-}
-async function pool(batches,concurrency,fn){
-  let next=0,errors=[];
-  async function worker(){while(next<batches.length){const i=next++;try{await fn(batches[i],i);}catch(e){errors.push(e);}}}
-  await Promise.all(Array.from({length:Math.min(concurrency,batches.length)},worker));return errors;
-}
-async function scan(){
- if(working)return;working=true;$('run').disabled=true;
- signalByMarket.clear();ctxByMarket.clear();paint();$('all').textContent='—';$('timing').textContent='';
- $('tfRun').disabled=true;tfCompareResults.clear();$('tfResult').innerHTML='';$('tfStatus').textContent='전체 검색 완료 후 비교할 수 있습니다.';
- $('status').textContent='전체 KRW 코인 목록 조회 중…';$('progress').value=0;$('progress').max=1;
- const started=performance.now();let failed=0,contextFailures=0;
- try{
-  const res=await fetch('/api/live24/universe',{cache:'no-store'});
-  const u=await res.json();if(!res.ok||!u.ok)throw new Error(u.error||'전체 코인 목록 조회 실패');
-  const items=u.eligible;$('all').textContent=`${u.total} / ${items.length}`;
-  const packs=[];for(let i=0;i<items.length;i+=40)packs.push(items.slice(i,i+40));
-  let scanned=0,evaluated=0,skipped=0;$('progress').max=Math.max(items.length,1);
-  const errs=await pool(packs,3,async(batch)=>{
-    const r=await post('/api/live24/scan',{items:batch});
-    scanned+=r.scanned;evaluated+=r.evaluated;skipped+=r.skipped;failed+=r.errors;
-    for(const x of r.candidates)signalByMarket.set(x.market,x);
-    $('progress').value=scanned;
-    $('status').textContent=`V2 차트 검색 ${scanned}/${items.length}개 · 차트 유효 ${evaluated} · 봉 부족 ${skipped} · BUY ${sorted('BUY').length} · WATCH ${sorted('WATCH').length} · 공백 주의 ${sorted('GAP').length} · 오래된 신호 ${sorted('STALE').length}`;
-    paint();
-  });
-  const secs=((performance.now()-started)/1000).toFixed(1);
-  $('timing').textContent=`전체 차트 1차 검색 ${secs}초 · 검사 ${scanned}/${items.length}개 · 차트 유효 ${evaluated}개 · 봉 부족 ${skipped}개 · 검사 시작 ${quote(u.snapshot_at)} · 서버 오류 ${failed}건 · 묶음 오류 ${errs.length}건`;
-  if(errs.length)$('status').textContent=`⚠️ 일부 묶음 검색 실패: ${errs[0].message} · 남은 결과만 표시 중`;
-  else $('status').textContent=`✅ 1차 후보 검색 완료 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개 · 현재 후보 24시간 캔들 확인 중…`;
-  const picks=[...sorted('BUY'),...sorted('WATCH')];
-  const blocks=[];for(let i=0;i<picks.length;i+=5)blocks.push(picks.slice(i,i+5).map(x=>x.market));
-  let checked=0;
-  const ctxErrs=await pool(blocks,2,async markets=>{
-    const r=await post('/api/live24/context',{markets},70000);
-    for(const x of r.results){ctxByMarket.set(x.market,x);if(x.error)contextFailures++;}
-    checked+=markets.length;paint();
-    $('status').textContent=`✅ 최신 BUY/WATCH 24시간 확인 ${checked}/${picks.length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개`;
-  });
-  const totalSec=((performance.now()-started)/1000).toFixed(1);
-  $('status').textContent=ctxErrs.length||contextFailures||failed||errs.length?
-    `⚠️ 일부 자료 확인 실패 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개 · 원본 오류 ${failed}, 묶음 오류 ${errs.length}, 24시간 오류 ${ctxErrs.length+contextFailures}`:
-    `✅ 완료 · 전체 ${scanned}/${items.length}개 검사 · 유효 ${evaluated}개 · 봉 부족 ${skipped}개 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개 · 24시간 캔들 확인 ${checked}개`;
-  $('timing').textContent+=` · 24시간 확인 포함 전체 ${totalSec}초`;
- }catch(e){$('status').textContent='⚠️ 검색 중단: '+e.message+' · 이미 확인된 후보는 화면에 유지됩니다.';}
- finally{working=false;$('run').disabled=false;$('tfRun').disabled=!signalByMarket.size||comparingTF;}
-}
-
-let comparingTF=false;
-const tfCompareResults=new Map();
-const tfLabels={'5':'5분봉','60':'1시간봉','240':'4시간봉'};
-function paintTF(markets){
-  $('tfResult').innerHTML=markets.map(market=>{
-    const x=signalByMarket.get(market),data=tfCompareResults.get(market);
-    if(!data)return `<div class="item"><b>${quote(market)}</b><div class="muted">비교 대기 중…</div></div>`;
-    function row(unit){
-      const o=data.frames[unit];
-      if(o.error)return `<div class="tfrow"><b>${tfLabels[unit]}</b><span class="tfwarn">조회 실패: ${quote(o.error)}</span></div>`;
-      const gap=o.gap_count?` · 중간 공백 ${o.gap_count}곳`:'';
-      const highs=o.high1!=null?` · 고점 ${won(o.high1)} → ${won(o.high2)}`:'';
-      const line=o.trendline!=null?` · 저항선 ${won(o.trendline)} · 거리 ${Number(o.distance_pct)>0?'+':''}${o.distance_pct}%`:'';
-      const stale=o.age_minutes>Number(unit)+5?' · ⚠️ 최근 봉 지연':'';
-      return `<div class="tfrow"><b>${tfLabels[unit]}</b> ${quote(o.status)} (${o.bars}봉)`+highs+line+`<div class="muted">최근 확정봉 ${quote(o.last_candle||'없음')}${gap}${stale}</div></div>`;
-    }
-    return `<div class="item"><b>${quote(market)}</b> · 기존 ${quote(x?.signal||'미확인')}`+
-      `<div class="muted">시간봉별 하향 저항선 비교 (BUY 판정 아님)</div>`+
-      ['5','60','240'].map(row).join('')+`</div>`;
-  }).join('');
-}
-async function runTfCompare(){
-  if(working||comparingTF)return;
-  const selected=[...sorted('BUY'),...sorted('WATCH'),...sorted('GAP')].slice(0,Number($('tfCount').value));
-  if(!selected.length){$('tfStatus').textContent='현재 비교할 최신 후보가 없습니다.';return;}
-  const names=selected.map(x=>x.market);
-  comparingTF=true;$('tfRun').disabled=true;
-  tfCompareResults.clear();paintTF(names);
-  let done=0;
-  $('tfStatus').textContent=`상위 ${names.length}개 종목의 5분·1시간·4시간 고점 비교 중…`;
-  const errors=await pool(names,2,async market=>{
-    const r=await post('/api/live24/tfcompare',{market},45000);
-    tfCompareResults.set(market,r);done++;
-    $('tfStatus').textContent=`비교 ${done}/${names.length}개 완료`;
-    paintTF(names);
-  });
-  $('tfStatus').textContent=errors.length?`⚠️ ${done}/${names.length}개 비교 · 요청 실패 ${errors.length}건 (${errors[0].message})`:
-    `✅ ${done}개 후보의 5분·1시간·4시간 고점 비교 완료 · 기존 BUY/WATCH는 변경하지 않았습니다.`;
-  comparingTF=false;$('tfRun').disabled=false;
-}
-$('tfRun').addEventListener('click',runTfCompare);
-$('run').addEventListener('click',scan);
-$('stalePanel').addEventListener('toggle',paint);
+const $=id=>document.getElementById(id);
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const won=v=>Number(v).toLocaleString('ko-KR',{maximumFractionDigits:8})+'원';
+const resultMap=new Map();let running=false;let showMore=false;
+function entries(status){return [...resultMap.values()].filter(x=>status==='HOLD'?['STALE','GAP'].includes(x.status):x.status===status)
+ .sort((a,b)=>Math.abs(Number(a.distance_pct||99))-Math.abs(Number(b.distance_pct||99))||a.market.localeCompare(b.market));}
+function card(x){const h=x.htf||{},l=x.source_kind==='support'?h.support:h.resistance;
+const lineText=l?`${l.kind==='support'?'4시간 저점–저점':'4시간 고점→고점'} (${esc(l.direction)})\n고점/저점 1: ${esc(x.pivot1)}\n고점/저점 2: ${esc(x.pivot2)}`:'';
+const r=x.volume_ratio==null?'확인 불가':Number(x.volume_ratio).toFixed(2)+'배';
+return `<article class="item ${x.status==='BUY'?'buycard':'watchcard'}"><h3><span>${esc(x.market)}</span><span class="pill ${x.status==='BUY'?'buy':'watch'}">${esc(x.status==='BUY'?'BUY':x.status==='WATCH'?'WATCH':'확인 보류')}</span></h3>`+
+`<div class="details">${esc(x.setup)} · ${esc(x.note)}\n확정 5분봉 ${esc(x.signal_time)} · 종료 후 ${esc(x.age_minutes)}분\n5분봉 종가 ${won(x.price)} · 추세선 ${won(x.line_price)} · 거리 ${x.distance_pct>0?'+':''}${esc(x.distance_pct)}%\n거래량 ${esc(r)} (참고용)\n${lineText}</div></article>`;}
+function paint(){const b=entries('BUY'),w=entries('WATCH'),h=entries('HOLD');$('buys').textContent=b.length;$('watches').textContent=w.length;$('holdCount').textContent=`(${h.length}개)`;
+$('buyList').innerHTML=b.length?b.map(card).join(''):'<p class="muted">현재 확정 BUY 없음</p>';
+$('watchList').innerHTML=w.length?(showMore?w:w.slice(0,20)).map(card).join('')+(w.length>20?`<button type="button" id="moreBtn">${showMore?'접기':`나머지 ${w.length-20}개 더 보기`}</button>`:''):'<p class="muted">현재 WATCH 없음</p>';
+const more=$('moreBtn');if(more)more.addEventListener('click',()=>{showMore=!showMore;paint();});
+$('holdList').innerHTML=$('holdPanel').open?(h.length?h.map(card).join(''):'<p class="muted">확인 보류 없음</p>'):'';}
+async function post(path,items){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),75000);
+try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items}),signal:controller.signal,cache:'no-store'});
+const j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||`HTTP ${r.status}`);return j;}finally{clearTimeout(timer);}}
+async function pool(packs,limit,fn){let idx=0;const errs=[];async function worker(){while(idx<packs.length){const i=idx++;try{await fn(packs[i]);}catch(e){errs.push(e.message||String(e));}}}
+await Promise.all(Array.from({length:Math.min(limit,packs.length)},worker));return errs;}
+async function scan(){if(running)return;running=true;$('run').disabled=true;resultMap.clear();showMore=false;paint();$('all').textContent='—';$('near').textContent='—';$('timing').textContent='';$('progress').value=0;
+const started=performance.now();let lineErrors=0,entryErrors=0;try{
+const resp=await fetch('/api/line45/universe',{cache:'no-store'});const u=await resp.json();if(!resp.ok||!u.ok)throw Error(u.error||'시장 목록 조회 실패');
+const items=u.items;const packs=[];for(let i=0;i<items.length;i+=40)packs.push(items.slice(i,i+40));
+$('progress').max=items.length;$('all').textContent=`0 / ${items.length}`;const near=[];let scanned=0,valid=0,noLines=0;
+$('status').textContent='1단계 · 전체 4시간봉 고점·저점 추세선 분석 중…';
+const errors1=await pool(packs,3,async batch=>{const r=await post('/api/line45/lines',batch);
+scanned+=r.scanned;lineErrors+=r.errors;for(const x of r.results){if(x.near)near.push(x);if(x.support||x.resistance)valid++;else noLines++;}
+$('all').textContent=`${scanned} / ${items.length}`;$('progress').value=scanned;
+$('status').textContent=`1단계 · 4시간봉 ${scanned}/${items.length}개 · 추세선 있는 종목 ${valid}개 · 5분봉 확인 대상 ${near.length}개`;});
+const t1=((performance.now()-started)/1000).toFixed(1);if(errors1.length||lineErrors)throw Error(`4시간봉 일부 조회 실패: ${lineErrors}개 / 요청 ${errors1.length}건. 불완전한 검사이므로 결과 확정하지 않음`);
+$('near').textContent=near.length;$('status').textContent=`2단계 · 4시간선 근처 ${near.length}개 종목의 5분봉 반등·돌파 확인 중…`;
+const packs2=[];for(let i=0;i<near.length;i+=40)packs2.push(near.slice(i,i+40));let checked=0,skipped=0;
+const errors2=await pool(packs2,3,async batch=>{const r=await post('/api/line45/entries',batch);checked+=r.scanned;entryErrors+=r.errors;skipped+=r.skipped;
+for(const x of r.results){if(['BUY','WATCH','GAP','STALE'].includes(x.status))resultMap.set(x.market,x);}paint();
+$('status').textContent=`2단계 · 5분봉 ${checked}/${near.length}개 · BUY ${entries('BUY').length} · WATCH ${entries('WATCH').length}`;});
+paint();const total=((performance.now()-started)/1000).toFixed(1);
+$('timing').textContent=`4시간봉 전체 ${t1}초 · 5분봉 포함 전체 ${total}초 · 시작 ${esc(u.snapshot_at)} · 추세선 없음 ${noLines}개 · 5분봉 부족 ${skipped}개`;
+$('status').textContent=(errors2.length||entryErrors?'⚠️ 일부 실패 · ':'✅ 완료 · ')+`전체 ${scanned}/${items.length} · 5분봉 확인 ${checked}/${near.length} · BUY ${entries('BUY').length} · WATCH ${entries('WATCH').length} · 보류 ${entries('HOLD').length} · 오류 ${lineErrors+entryErrors+errors2.length}건`;
+}catch(e){$('status').textContent='⚠️ 검색 중단: '+e.message+' · 표시된 내용은 불완전할 수 있어.';}
+finally{running=false;$('run').disabled=false;}}
+$('run').addEventListener('click',scan);$('holdPanel').addEventListener('toggle',paint);
 </script></body></html>'''
 
 
 def register_daytrade_review(app, deps):
-    """Drop-in replacement: app.py still imports register_daytrade_review."""
-    api_get = deps["api_get"]
-    get_markets = deps["get_markets"]
-    scan_market = deps["scan_market"]
-    calculate_score = deps["calculate_score"]  # Board score without turnover bonus.
-    kst = deps["KST"]
-    ticker_cache = {"at": 0.0, "markets": None, "eligible": None, "total": 0, "snapshot_at": ""}
-    ticker_lock = Lock()
+    api_get, get_markets, kst = deps["api_get"], deps["get_markets"], deps["KST"]
+    universe_cache = {"at": 0, "data": None}
+    universe_lock = Lock()
 
     @app.get("/backtest-daytrade")
-    def live24_review_page():
+    def line45_page():
         return render_template_string(PAGE)
 
-    @app.get("/api/live24/universe")
-    def live24_universe():
+    @app.get("/api/line45/universe")
+    def line45_universe():
         try:
-            # The full ticker snapshot is refreshed once, then frozen for the run.
-            with ticker_lock:
-                if ticker_cache["eligible"] is not None and time.time() - ticker_cache["at"] < 30:
-                    return jsonify({"ok": True, "total": ticker_cache["total"],
-                                    "eligible": ticker_cache["eligible"],
-                                    "snapshot_at": ticker_cache["snapshot_at"]})
-                markets = sorted({m for m in get_markets() if MARKET_RE.fullmatch(m)})
+            with universe_lock:
+                if universe_cache["data"] and time.time() - universe_cache["at"] < 30:
+                    return jsonify(universe_cache["data"])
+                markets = sorted({x for x in get_markets()
+                                  if isinstance(x, str) and MARKET_RE.fullmatch(x)})
                 if not markets:
-                    raise ValueError("KRW 거래 목록이 비어 있습니다")
-                tickers = {}
-                for start in range(0, len(markets), 50):
-                    raw = api_get("/v1/ticker", {"markets": ",".join(markets[start:start+50])})
+                    raise ValueError("KRW 코인 목록이 비었습니다")
+                ticker_data = {}
+                market_set = set(markets)
+                for i in range(0, len(markets), 50):
+                    raw = api_get("/v1/ticker", {"markets": ",".join(markets[i:i+50])})
                     if not isinstance(raw, list):
-                        raise ValueError("24시간 티커 데이터가 올바르지 않습니다")
-                    for t in raw:
-                        if isinstance(t, dict) and t.get("market") in markets:
-                            tickers[t["market"]] = t
-                if len(tickers) != len(markets):
-                    raise ValueError(f"티커 누락 {len(markets)-len(tickers)}개: 전체 검색을 시작하지 않았습니다")
-                eligible = []
+                        raise ValueError("시세 데이터 형식 오류")
+                    for x in raw:
+                        if isinstance(x, dict) and x.get("market") in market_set:
+                            ticker_data[x["market"]] = x
+                if len(ticker_data) != len(markets):
+                    raise ValueError("전체 KRW 시세가 누락되어 검사를 시작하지 않았습니다")
+                items = []
                 for market in markets:
-                    t = tickers[market]
                     try:
-                        value = float(t.get("acc_trade_price_24h"))
-                        change = float(t.get("signed_change_rate", 0))
-                    except (TypeError, ValueError):
-                        raise ValueError(f"{market} 티커 숫자 데이터 오류")
-                    if not isfinite(value) or value < 0 or not isfinite(change):
-                        raise ValueError(f"{market} 티커 숫자 데이터 오류")
-                    eligible.append({"market": market,
-                                     "ticker": {"market": market, "acc_trade_price_24h": value,
-                                                "signed_change_rate": change}})
-                # Do not rank scan batches by trading value; check every market.
-                eligible.sort(key=lambda x: x["market"])
-                snapshot_at = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S KST")
-                ticker_cache.update(at=time.time(), markets=markets, eligible=eligible,
-                                    total=len(markets), snapshot_at=snapshot_at)
-                return jsonify({"ok": True, "total": len(markets),
-                                "eligible": eligible, "snapshot_at": snapshot_at})
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc)[:160]}), 502
+                        price = float(ticker_data[market]["trade_price"])
+                    except (KeyError, ValueError, TypeError):
+                        raise ValueError(market+" 현재가 확인 불가")
+                    if not isfinite(price) or price <= 0:
+                        raise ValueError(market+" 현재가 오류")
+                    items.append({"market": market, "price": price})
+                data = {"ok": True, "items": items, "total": len(items),
+                        "snapshot_at": datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S KST")}
+                universe_cache.update(at=time.time(), data=data)
+                return jsonify(data)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:160]}), 502
 
-    @app.post("/api/live24/scan")
-    def live24_scan_batch():
+    @app.post("/api/line45/lines")
+    def line45_lines():
+        payload = request.get_json(silent=True)
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not 1 <= len(items) <= PAGE_SIZE:
+            return jsonify({"ok": False, "error": "요청 코인 수는 1~40개여야 합니다"}), 400
         try:
-            payload = request.get_json(silent=True)
-            items = payload.get("items") if isinstance(payload, dict) else None
-            if not isinstance(items, list) or not 1 <= len(items) <= PAGE_SIZE:
-                raise ValueError("한 번에 1~40개씩 요청하세요")
-            names = []
-            for item in items:
-                if not isinstance(item, dict) or not isinstance(item.get("ticker"), dict):
-                    raise ValueError("티커 목록 형식 오류")
-                market = item.get("market")
-                t = item["ticker"]
-                if (not isinstance(market, str) or not MARKET_RE.fullmatch(market)
-                        or t.get("market") != market):
-                    raise ValueError("코인 이름 오류")
-                try:
-                    val = float(t.get("acc_trade_price_24h", 0))
-                    chg = float(t.get("signed_change_rate", 0))
-                except (TypeError, ValueError):
-                    raise ValueError("티커 수치 오류")
-                if not isfinite(val) or val < 0 or not isfinite(chg):
-                    raise ValueError("티커 수치 오류")
-                names.append(market)
-            if len(set(names)) != len(names):
-                raise ValueError("중복 코인")
-
-            candidates = []
-            errors = 0
-            evaluated = 0
-            skipped = 0
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                tasks = [executor.submit(scan_market, x["market"], 5, 1.5, 2.0, x["ticker"])
-                         for x in items]
-                for task in as_completed(tasks):
-                    try:
-                        result = task.result()
-                        if result is None:
-                            # A low-trade coin can have fewer than 35 completed
-                            # candles. Do not misreport that as a chart pass.
-                            skipped += 1
-                            continue
-                        evaluated += 1
-                        if result.get("signal") in ("BUY", "WATCH"):
-                            # V2's score rewards turnover; this board ranks on
-                            # price/MA5/chart volume/signal ONLY. Signal itself
-                            # stays exactly as returned by the V2 scanner.
-                            result["score"] = calculate_score(
-                                result.get("change", 0), result.get("ma5_info"),
-                                result.get("vol_ratio"), None,
-                                result.get("signal"), 2.0)
-                            result.update(classify_signal_freshness(result, datetime.now(kst), kst))
-                            candidates.append(result)
-                    except Exception:
-                        errors += 1
-            return jsonify({"ok": True, "scanned": len(items),
-                            "evaluated": evaluated, "skipped": skipped,
-                            "errors": errors, "candidates": candidates})
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc)[:160]}), 400
-
-    def context_one(market, anchor):
-        # Anchor to last *completed* 5-minute candle, never today's forming candle.
-        begin = anchor - timedelta(hours=24)
-        raw_by_time = {}
-        cursor = None
-        for page in range(2):
-            params = {"market": market, "count": 200 if page == 0 else 120}
-            if cursor:
-                params["to"] = cursor
-            raw = api_get("/v1/candles/minutes/5", params)
-            if not isinstance(raw, list):
-                raise ValueError("5분봉 응답 형식 오류")
-            if not raw:
-                break
-            earliest = None
-            for row in raw:
-                if not isinstance(row, dict):
-                    continue
-                stamp = datetime.fromisoformat(row["candle_date_time_kst"])
-                stamp = stamp.replace(tzinfo=kst) if stamp.tzinfo is None else stamp.astimezone(kst)
-                earliest = stamp if earliest is None or stamp < earliest else earliest
-                if begin <= stamp < anchor:
-                    raw_by_time[stamp] = row
-            if earliest is None or earliest < begin:
-                break
-            cursor = earliest.strftime("%Y-%m-%dT%H:%M:%S")
-        times = sorted(raw_by_time)
-        if not times:
-            return {"market": market, "error": "직전 24시간 완성된 5분봉 없음"}
-        bars = [raw_by_time[t] for t in times]
-        high = max(float(r["high_price"]) for r in bars)
-        low = min(float(r["low_price"]) for r in bars)
-        opening = float(bars[0]["opening_price"])
-        closing = float(bars[-1]["trade_price"])
-        if not all(isfinite(v) and v > 0 for v in (high, low, opening, closing)):
-            raise ValueError("캔들 가격 오류")
-        last_end = times[-1] + timedelta(minutes=5)
-        complete = len(times) == 288 and times[0] == begin and last_end == anchor
-        fresh = (anchor-last_end) <= timedelta(minutes=10)
-        return {"market": market, "bars": len(times),
-                "coverage_pct": round(100*len(times)/288, 1),
-                "high": high, "low": low, "change_pct": round(100*(closing/opening-1), 2),
-                "last_candle": times[-1].strftime("%m-%d %H:%M"),
-                "complete": complete, "fresh": fresh}
-
-    @app.post("/api/live24/context")
-    def live24_context():
-        try:
-            payload = request.get_json(silent=True)
-            markets = payload.get("markets") if isinstance(payload, dict) else None
-            if (not isinstance(markets, list) or not 1 <= len(markets) <= 5
-                    or any(not isinstance(x, str) or not MARKET_RE.fullmatch(x) for x in markets)
-                    or len(set(markets)) != len(markets)):
-                raise ValueError("1~5개 코인을 지정하세요")
-            now = datetime.now(kst)
-            anchor = now.replace(minute=(now.minute//5)*5, second=0, microsecond=0)
+            names = [x.get("market") for x in items if isinstance(x, dict)]
+            if len(names) != len(items) or len(set(names)) != len(names) or any(
+                    not isinstance(m, str) or not MARKET_RE.fullmatch(m) for m in names):
+                raise ValueError("코인 목록 형식 오류")
             results = []
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                tasks = {pool.submit(context_one, m, anchor): m for m in markets}
-                for future in as_completed(tasks):
-                    market = tasks[future]
-                    try:
-                        results.append(future.result())
-                    except Exception as exc:
-                        results.append({"market": market, "error": type(exc).__name__})
-            return jsonify({"ok": True, "results": results})
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc)[:160]}), 400
-
-    @app.post("/api/live24/tfcompare")
-    def live24_timeframe_comparison():
-        """Optional per-coin research; main V11.3 scan remains untouched."""
-        try:
-            payload = request.get_json(silent=True)
-            market = payload.get("market") if isinstance(payload, dict) else None
-            if not isinstance(market, str) or not MARKET_RE.fullmatch(market):
-                return jsonify({"ok": False, "error": "올바른 KRW 코인 이름이 아닙니다"}), 400
-            if market not in set(get_markets()):
-                return jsonify({"ok": False, "error": "현재 상장된 KRW 코인이 아닙니다"}), 400
+            errors = 0
             now = datetime.now(kst)
-            frames = {}
-            # 5m baseline, 1h, 4h -- one 80-bar fetch per timeframe.
-            for unit in (5, 60, 240):
-                try:
-                    frames[str(unit)] = compare_resistance_pivots(
-                        api_get, market, unit, now, kst)
-                except Exception as exc:
-                    frames[str(unit)] = {"minutes": unit, "error": type(exc).__name__}
-            return jsonify({"ok": True, "market": market, "frames": frames,
-                            "note": "실험용 저항선 비교이며 BUY/WATCH 판단을 변경하지 않습니다"})
-        except Exception as exc:
-            return jsonify({"ok": False, "error": type(exc).__name__}), 500
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                tasks = {pool.submit(analyze_4h, api_get, x["market"], float(x["price"]), now, kst): x["market"]
+                         for x in items}
+                for f in as_completed(tasks):
+                    market = tasks[f]
+                    try:
+                        results.append(f.result())
+                    except Exception as e:
+                        errors += 1
+                        results.append({"market": market, "near": False, "error": type(e).__name__})
+            return jsonify({"ok": True, "scanned": len(items), "errors": errors, "results": results})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:160]}), 400
+
+    @app.post("/api/line45/entries")
+    def line45_entries():
+        payload = request.get_json(silent=True)
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not 1 <= len(items) <= PAGE_SIZE:
+            return jsonify({"ok": False, "error": "요청 코인 수는 1~40개여야 합니다"}), 400
+        try:
+            names = [x.get("market") for x in items if isinstance(x, dict)]
+            if len(names) != len(items) or len(set(names)) != len(names) or any(
+                    not isinstance(m, str) or not MARKET_RE.fullmatch(m) for m in names):
+                raise ValueError("코인 목록 형식 오류")
+            for x in items:
+                if not x.get("near") or not isinstance(x.get("price"), (float, int)):
+                    raise ValueError("4시간 추세선 자료가 없습니다")
+                for kind in ("support", "resistance"):
+                    z = x.get(kind)
+                    if z is not None and not all(key in z for key in ("t1", "t2", "p1", "p2", "kind")):
+                        raise ValueError("추세선 정보 형식 오류")
+            now = datetime.now(kst)
+            results = []
+            errors = 0
+            skipped = 0
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                tasks = {pool.submit(five_minute_entry, api_get, x, now, kst): x["market"] for x in items}
+                for f in as_completed(tasks):
+                    market = tasks[f]
+                    try:
+                        x = f.result()
+                        results.append(x)
+                        skipped += int(x["status"] == "SKIP")
+                    except Exception as e:
+                        errors += 1
+                        results.append({"market": market, "status": "ERROR", "error": type(e).__name__})
+            return jsonify({"ok": True, "scanned": len(items), "skipped": skipped,
+                            "errors": errors, "results": results})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:160]}), 400
