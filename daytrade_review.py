@@ -1,10 +1,10 @@
-"""V11.2 chart-first scanner with fresh, continuous 5-minute signal checks.
+"""V11.3 chart-first scanner with separately ranked current, gapped and stale signals.
 
 All listed KRW markets are checked regardless of 24h trading value or warnings.
 V2's completed 5m-candle BUY/WATCH decisions are unchanged. Its 24h turnover
 score bonus is removed in THIS board using the existing calculate_score helper.
-Only current BUY/WATCH candidates receive completed 24h-candle context.
-Stale or gapped V2 signals remain visible as HOLD, never as current BUY.
+Only fully CURRENT BUY/WATCH candidates receive completed 24h-candle context.
+Recent candle gaps become CAUTION; stale timestamps become STALE. Neither is a current BUY.
 No historical backtest dates, future returns, or auto orders are used.
 The existing V2 dashboard and browser snapshots remain untouched.
 """
@@ -28,14 +28,16 @@ def classify_signal_freshness(result, now, kst):
     """Validate existing V2 signal *without changing its BUY/WATCH decisions*.
 
     Data comes from V2 scan_market's completed candle_time and recent_closes.
-    No extra exchange requests. Missing periods remain HOLD, not excluded.
+    No extra exchange requests. Gapped and stale signals are retained separately.
     """
     def as_kst(value):
         stamp = datetime.fromisoformat(str(value))
         return stamp.replace(tzinfo=kst) if stamp.tzinfo is None else stamp.astimezone(kst)
 
-    def hold(reason, age=None):
-        return {"validity": "HOLD", "hold_reason": reason,
+    def status(validity, reason="", age=None):
+        # CURRENT: fresh + continuous; GAP: fresh but incomplete history;
+        # STALE: old/invalid/uncertain candle timestamp. No signal promotion.
+        return {"validity": validity, "hold_reason": reason,
                 "age_minutes": round(age, 1) if age is not None else None}
 
     try:
@@ -43,26 +45,29 @@ def classify_signal_freshness(result, now, kst):
             raise ValueError("검사 서버 시각에 시간대가 없습니다")
         candle = as_kst(result.get("candle_time"))
         if candle.minute % 5 or candle.second or candle.microsecond:
-            return hold("신호 봉의 5분 단위 시간이 올바르지 않습니다")
+            return status("STALE", "신호 봉의 5분 단위 시간이 올바르지 않습니다")
         age = (now - (candle + timedelta(minutes=5))).total_seconds() / 60
         if age < -0.5:
-            return hold("아직 완료되지 않은 신호 봉입니다", age)
+            return status("STALE", "아직 완료되지 않은 신호 봉입니다", age)
         if age > FRESHNESS_MAX_MINUTES:
-            return hold(f"마지막 확정봉 종료 후 {age:.1f}분 경과 (허용 {FRESHNESS_MAX_MINUTES}분)", age)
+            return status("STALE", f"마지막 확정봉 종료 후 {age:.1f}분 경과 (허용 {FRESHNESS_MAX_MINUTES}분)", age)
 
         recent = result.get("recent_closes")
         if not isinstance(recent, list) or len(recent) < SIGNAL_CHECK_BARS:
-            return hold(f"최근 연속 5분봉 {SIGNAL_CHECK_BARS}개 확인 불가", age)
-        times = [as_kst(x["time"]) for x in recent[-SIGNAL_CHECK_BARS:]]
+            return status("GAP", f"최근 연속 5분봉 {SIGNAL_CHECK_BARS}개 확인 불가", age)
+        try:
+            times = [as_kst(x["time"]) for x in recent[-SIGNAL_CHECK_BARS:]]
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            return status("GAP", "최근 봉의 시각을 확인할 수 없습니다", age)
         if times[-1] != candle:
-            return hold("신호 봉과 최신 기록의 시간이 일치하지 않습니다", age)
+            return status("GAP", "신호 봉과 최신 기록의 시간이 일치하지 않습니다", age)
         if any(t.minute % 5 or t.second or t.microsecond for t in times):
-            return hold("최근 5분봉 시간 정렬 오류", age)
+            return status("GAP", "최근 5분봉 시간 정렬 오류", age)
         if any(b - a != timedelta(minutes=5) for a, b in zip(times, times[1:])):
-            return hold(f"최근 {SIGNAL_CHECK_BARS}개 봉 중 거래 없는 시간 공백 있음", age)
-        return {"validity": "CURRENT", "hold_reason": "", "age_minutes": round(age, 1)}
+            return status("GAP", f"최근 {SIGNAL_CHECK_BARS}개 봉 중 거래 없는 시간 공백 있음", age)
+        return status("CURRENT", age=age)
     except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
-        return hold("신호 봉 시각/연속성 확인 불가")
+        return status("STALE", "신호 봉 시각 확인 불가")
 
 
 PAGE = r'''<!doctype html>
@@ -77,20 +82,21 @@ button{padding:12px 18px;border-radius:9px;background:#315de7;border:0;color:whi
 button:disabled{opacity:.55;cursor:default}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{border:1px solid var(--border);border-radius:10px;padding:12px}.metric b{display:block;font-size:23px}.buy{color:var(--buy)}.watch{color:var(--watch)}
 .progress{width:100%;height:11px;margin-top:10px}#status{margin-top:10px;white-space:pre-wrap;overflow-wrap:anywhere}
 .list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.item{border:1px solid var(--border);border-radius:12px;padding:14px;background:#10182a}
-.item.buycard{border-color:#28664c}.item.watchcard{border-color:#665527}.item.holdcard{border-color:#64536a;opacity:.9}.hold{color:#d8b4fe}.item h3{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px;margin:0 0 8px}.pill{border-radius:7px;padding:3px 7px;font-size:12px;background:#1e3351}
+.item.buycard{border-color:#28664c}.item.watchcard{border-color:#665527}.item.gapcard{border-color:#ca8a04}.gap{color:#fcd34d}.item.stalecard{border-color:#64536a;opacity:.9}.stale{color:#d8b4fe}.item h3{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px;margin:0 0 8px}.pill{border-radius:7px;padding:3px 7px;font-size:12px;background:#1e3351}
 .item .details{font-size:13px;white-space:pre-line}.item .context{margin-top:10px;padding-top:9px;border-top:1px solid var(--border);font-size:12px;white-space:pre-line;color:var(--sub)}
 section{margin-top:18px}.empty{font-size:13px;color:var(--sub)}.foot{font-size:12px;color:var(--sub);margin-top:18px}
 a{color:#a9caff}summary{cursor:pointer;font-weight:750;font-size:16px}@media(max-width:650px){.list{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric b{font-size:20px}h1{font-size:20px}}
 </style></head><body><main>
 <h1>⚡ 빗썸 실시간 BUY · 관심 후보</h1>
-<p class="muted">V11.2 · 검사 시점 기준 · KRW 전체 코인 · 거래대금 제한 없음 · V2 확정 5분봉 신호 · 후보의 직전 24시간 확인</p>
+<p class="muted">V11.3 · 검사 시점 기준 · KRW 전체 코인 · 거래대금 제한 없음 · V2 확정 5분봉 신호 · 후보의 직전 24시간 확인</p>
 <div class="panel"><button id="run" type="button">지금 전체 검색</button> <a href="/">V2 메인 화면</a>
-<p class="muted">V2 BUY/WATCH 차트 조건과 거래대금 무제한은 유지합니다. 최근 21개 5분봉이 연속이고 신호 봉이 10분 이내일 때만 현재 후보로 표시합니다. 부족한 신호는 삭제하지 않고 보류에 남깁니다.</p>
+<p class="muted">거래대금 제한 없이 전체 KRW를 검사합니다. 마지막 봉이 10분 이내이고 최근 21개 5분봉이 연속이면 현재 BUY/WATCH, 최신이지만 봉 공백이 있으면 관찰 주의, 오래된 신호는 따로 보관합니다. 거래량 1.5배 미만 WATCH에는 주의 표시를 붙입니다.</p>
 <div class="metrics">
   <div class="metric"><span class="muted">전체 / 검사 대상</span><b id="all">—</b></div>
   <div class="metric"><span class="muted">BUY</span><b id="buys" class="buy">—</b></div>
   <div class="metric"><span class="muted">관심 WATCH</span><b id="watches" class="watch">—</b></div>
-  <div class="metric"><span class="muted">확인 보류</span><b id="holds" class="hold">—</b></div>
+  <div class="metric"><span class="muted">캔들 공백 주의</span><b id="gaps" class="gap">—</b></div>
+  <div class="metric"><span class="muted">오래된 신호</span><b id="stales" class="stale">—</b></div>
 </div>
 <progress class="progress" id="progress" max="1" value="0"></progress>
 <div class="muted" id="status" role="status" aria-live="polite">검색 버튼을 누르면 거래대금과 관계없이 전체 KRW 코인의 차트 신호를 확인합니다.</div>
@@ -98,8 +104,9 @@ a{color:#a9caff}summary{cursor:pointer;font-weight:750;font-size:16px}@media(max
 </div>
 <section class="panel"><h2 class="buy">BUY · 진입 조건 충족</h2><div class="list" id="buyList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
 <section class="panel"><h2 class="watch">WATCH · 추가 확인 필요</h2><div class="list" id="watchList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
-<details class="panel" id="holdPanel"><summary class="hold">⚠️ 오래된 신호 / 캔들 공백 — 확인 보류 <span id="holdSummary"></span></summary><p class="muted">V2 차트 신호가 감지됐지만 최신성이나 연속성이 확인되지 않았습니다. 매수 신호로 취급하지 마세요. 보류 종목은 추가 24시간 조회를 생략합니다.</p><div class="list" id="holdList"></div></details>
-<p class="foot">매매 권유나 주문 기능이 아닙니다. BUY는 V2 기술 조건과 최신/연속 캔들 검사를 모두 통과했다는 뜻이지 수익 보장은 아닙니다. 거래대금 제한이 없으므로 유동성이 낮은 종목은 호가 차이·체결 지연에 특히 주의하세요. 직전 24시간 캔들 분석은 보조 정보로, BUY 판단을 소급 변경하지 않습니다. 24시간 자료는 완료된 5분봉만 사용합니다.</p>
+<section class="panel"><h2 class="gap">⚠️ 캔들 공백 주의 · 관찰 후보</h2><p class="muted">마지막 신호는 최근 것이지만 5분봉이 연속되지 않았습니다. 원래 V2가 BUY였어도 확정 BUY로 표시하지 않습니다. 시간 공백이 생기는 저유동성 코인도 여기에서 관찰할 수 있습니다.</p><div class="list" id="gapList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
+<details class="panel" id="stalePanel"><summary class="stale">⚠️ 오래된 신호 · 접어서 보관 <span id="staleSummary"></span></summary><p class="muted">마지막 봉이 오래됐거나 신호 시각이 올바르지 않습니다. 매수 신호로 취급하지 마세요. 공백 주의와 오래된 신호는 속도를 위해 추가 24시간 조회를 생략합니다.</p><div class="list" id="staleList"></div></details>
+<p class="foot">매매 권유나 주문 기능이 아닙니다. BUY는 V2 기술 조건과 최신/연속 캔들 검사를 모두 통과했다는 뜻이지 수익 보장은 아닙니다. 거래대금 제한이 없으므로 유동성이 낮은 종목은 호가 차이·체결 지연에 특히 주의하세요. 직전 24시간 캔들 분석은 보조 정보이며, 기존 V2 원신호는 유지하되 최신성/공백 여부에 따라 표시 그룹만 구분합니다. 24시간 자료는 완료된 5분봉만 사용합니다.</p>
 </main><script>
 const $ = id => document.getElementById(id);
 const quote = x => String(x ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -108,47 +115,60 @@ let working=false;
 const ctxByMarket=new Map();
 const signalByMarket=new Map();
 function signalValidity(x){
+  const original=['CURRENT','GAP','STALE'].includes(x.validity)?x.validity:'STALE';
+  if(original!=='CURRENT')return original;
   const c=ctxByMarket.get(x.market);
-  if(x.validity!=='CURRENT')return 'HOLD';
-  if(c&&!c.error&&c.fresh===false)return 'HOLD';
+  // Reconcile completed candles fetched after the first pass. Never upgrade a
+  // stale signal; only downgrade a current one if recent data contradicts it.
+  if(c&&!c.error&&c.fresh===false)return 'STALE';
   return 'CURRENT';
 }
 function signalHoldReason(x){
-  if(x.validity!=='CURRENT')return x.hold_reason||'시간/연속성 미확인';
+  if(x.validity!=='CURRENT')return x.hold_reason||'캔들 시각/연속성 확인 불가';
   const c=ctxByMarket.get(x.market);
   return c&&!c.error&&!c.fresh?'24시간 교차 확인에서 최신 5분봉이 확인되지 않았습니다':'';
 }
 function sorted(kind){
   const all=[...signalByMarket.values()];
-  const subset=all.filter(x=>kind==='HOLD'?signalValidity(x)==='HOLD':signalValidity(x)==='CURRENT'&&x.signal===kind);
+  const subset=all.filter(x=>{
+    const v=signalValidity(x);
+    return kind==='GAP'?v==='GAP':kind==='STALE'?v==='STALE':v==='CURRENT'&&x.signal===kind;
+  });
   return subset.sort((a,b)=>Number(b.score||0)-Number(a.score||0)||Number(b.vol_ratio||0)-Number(a.vol_ratio||0)||a.market.localeCompare(b.market));
 }
 function paint(){
-  const buy=sorted('BUY'),watch=sorted('WATCH'),hold=sorted('HOLD');
+  const buy=sorted('BUY'),watch=sorted('WATCH'),gap=sorted('GAP'),stale=sorted('STALE');
   $('buys').textContent=buy.length;$('watches').textContent=watch.length;
-  $('holds').textContent=hold.length;$('holdSummary').textContent=`(${hold.length}개)`;
-  function card(x,held=false){
+  $('gaps').textContent=gap.length;$('stales').textContent=stale.length;
+  $('staleSummary').textContent=`(${stale.length}개)`;
+  function card(x,category='CURRENT'){
     const c=ctxByMarket.get(x.market),p=Number(x.price),r=Number(x.vol_ratio);
-    const context=held&&!c?'⚠️ 최신/연속봉 확인 보류 · 추가 24시간 조회 생략':
+    const current=category==='CURRENT';
+    const context=!current&&!c?'⚠️ 추가 24시간 조회 생략 · 차트 시간/연속성만 표시':
       !c?'⏳ 직전 24시간 5분봉 확인 대기':c.error?'⚠️ 24시간 조회 실패: '+quote(c.error):
       `직전 24시간 완성 5분봉 ${c.bars}/288개 (${c.coverage_pct}%)`+
       `\n24시간 고가 ${won(c.high)} · 저가 ${won(c.low)}`+
       `\n24시간 시가→종가 ${c.change_pct>0?'+':''}${c.change_pct}%`+
       `\n마지막 봉 ${quote(c.last_candle)} · ${c.fresh?'정상':'⚠️ 최근 봉 지연/누락'}`+
       (c.complete?'':'\n⚠️ 24시간 연속 봉 부족 — 보조 분석만 표시');
-    const name=held?'확인 보류 (기존 '+quote(x.signal)+')':quote(x.signal);
-    const caution=held?'\n⚠️ '+quote(signalHoldReason(x)):'';
+    const name=category==='GAP'?'공백 주의 (기존 '+quote(x.signal)+')':
+      category==='STALE'?'오래된 신호 (기존 '+quote(x.signal)+')':quote(x.signal);
+    const caution=current?'':'\n⚠️ '+quote(signalHoldReason(x))+(x.signal==='BUY'?'\n기존 BUY는 시간 검증 미통과로 진입 확정 보류':'');
+    const volumeWarn=x.signal==='WATCH'&&(!Number.isFinite(r)||r<1.5)?'\n⚠️ 거래량 1.5배 미만 — 매수세 추가 확인 필요':'';
     const age=x.age_minutes==null?'시각 확인 불가':Number(x.age_minutes).toFixed(1)+'분';
-    return `<article class="item ${held?'holdcard':x.signal==='BUY'?'buycard':'watchcard'}"><h3><span>${quote(x.market)}</span><span class="pill ${held?'hold':x.signal==='BUY'?'buy':'watch'}">${name}</span></h3>`+
+    const cardType=category==='GAP'?'gapcard':category==='STALE'?'stalecard':x.signal==='BUY'?'buycard':'watchcard';
+    const badgeColor=category==='GAP'?'gap':category==='STALE'?'stale':x.signal==='BUY'?'buy':'watch';
+    return `<article class="item ${cardType}"><h3><span>${quote(x.market)}</span><span class="pill ${badgeColor}">${name}</span></h3>`+
       `<div class="details">확정 5분봉 종가 ${won(p)}`+
-      `\n거래량 ${Number.isFinite(r)?r.toFixed(2)+'배':'—'} · 점수 ${Number(x.score||0)}`+
+      `\n거래량 ${Number.isFinite(r)?r.toFixed(2)+'배':'—'} · 점수 ${Number(x.score||0)}${volumeWarn}`+
       `\n신호 봉 ${quote(x.candle_time)} · 봉 종료 후 ${age}`+
       `\n${quote(x.resistance)} · ${quote(x.note)}${caution}</div><div class="context">${context}</div></article>`;
   }
   $('buyList').innerHTML=buy.length?buy.map(x=>card(x)).join(''):'<div class="empty">현재 확인된 BUY 없음</div>';
   $('watchList').innerHTML=watch.length?watch.map(x=>card(x)).join(''):'<div class="empty">현재 확인된 WATCH 없음</div>';
+  $('gapList').innerHTML=gap.length?gap.map(x=>card(x,'GAP')).join(''):'<div class="empty">캔들 공백 주의 후보 없음</div>';
   // Avoid rebuilding a large collapsed list on every batch update.
-  $('holdList').innerHTML=$('holdPanel').open?(hold.length?hold.map(x=>card(x,true)).join(''):'<div class="empty">확인 보류 신호 없음</div>'):'';
+  $('staleList').innerHTML=$('stalePanel').open?(stale.length?stale.map(x=>card(x,'STALE')).join(''):'<div class="empty">오래된 신호 없음</div>'):'';
 }
 async function post(path,payload,ms=70000){
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),ms);
@@ -178,13 +198,13 @@ async function scan(){
     scanned+=r.scanned;evaluated+=r.evaluated;skipped+=r.skipped;failed+=r.errors;
     for(const x of r.candidates)signalByMarket.set(x.market,x);
     $('progress').value=scanned;
-    $('status').textContent=`V2 차트 검색 ${scanned}/${items.length}개 · 차트 유효 ${evaluated} · 봉 부족 ${skipped} · BUY ${sorted('BUY').length} · WATCH ${sorted('WATCH').length} · 보류 ${sorted('HOLD').length}`;
+    $('status').textContent=`V2 차트 검색 ${scanned}/${items.length}개 · 차트 유효 ${evaluated} · 봉 부족 ${skipped} · BUY ${sorted('BUY').length} · WATCH ${sorted('WATCH').length} · 공백 주의 ${sorted('GAP').length} · 오래된 신호 ${sorted('STALE').length}`;
     paint();
   });
   const secs=((performance.now()-started)/1000).toFixed(1);
   $('timing').textContent=`전체 차트 1차 검색 ${secs}초 · 검사 ${scanned}/${items.length}개 · 차트 유효 ${evaluated}개 · 봉 부족 ${skipped}개 · 검사 시작 ${quote(u.snapshot_at)} · 서버 오류 ${failed}건 · 묶음 오류 ${errs.length}건`;
   if(errs.length)$('status').textContent=`⚠️ 일부 묶음 검색 실패: ${errs[0].message} · 남은 결과만 표시 중`;
-  else $('status').textContent=`✅ 1차 후보 검색 완료 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 확인 보류 ${sorted('HOLD').length}개 · 현재 후보 24시간 캔들 확인 중…`;
+  else $('status').textContent=`✅ 1차 후보 검색 완료 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개 · 현재 후보 24시간 캔들 확인 중…`;
   const picks=[...sorted('BUY'),...sorted('WATCH')];
   const blocks=[];for(let i=0;i<picks.length;i+=5)blocks.push(picks.slice(i,i+5).map(x=>x.market));
   let checked=0;
@@ -192,18 +212,18 @@ async function scan(){
     const r=await post('/api/live24/context',{markets},70000);
     for(const x of r.results){ctxByMarket.set(x.market,x);if(x.error)contextFailures++;}
     checked+=markets.length;paint();
-    $('status').textContent=`✅ 최신 BUY/WATCH 24시간 확인 ${checked}/${picks.length}개 · 보류 ${sorted('HOLD').length}개`;
+    $('status').textContent=`✅ 최신 BUY/WATCH 24시간 확인 ${checked}/${picks.length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개`;
   });
   const totalSec=((performance.now()-started)/1000).toFixed(1);
   $('status').textContent=ctxErrs.length||contextFailures||failed||errs.length?
-    `⚠️ 일부 자료 확인 실패 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 보류 ${sorted('HOLD').length}개 · 원본 오류 ${failed}, 묶음 오류 ${errs.length}, 24시간 오류 ${ctxErrs.length+contextFailures}`:
-    `✅ 완료 · 전체 ${scanned}/${items.length}개 검사 · 유효 ${evaluated}개 · 봉 부족 ${skipped}개 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 보류 ${sorted('HOLD').length}개 · 24시간 캔들 확인 ${checked}개`;
+    `⚠️ 일부 자료 확인 실패 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개 · 원본 오류 ${failed}, 묶음 오류 ${errs.length}, 24시간 오류 ${ctxErrs.length+contextFailures}`:
+    `✅ 완료 · 전체 ${scanned}/${items.length}개 검사 · 유효 ${evaluated}개 · 봉 부족 ${skipped}개 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개 · 24시간 캔들 확인 ${checked}개`;
   $('timing').textContent+=` · 24시간 확인 포함 전체 ${totalSec}초`;
  }catch(e){$('status').textContent='⚠️ 검색 중단: '+e.message+' · 이미 확인된 후보는 화면에 유지됩니다.';}
  finally{working=false;$('run').disabled=false;}
 }
 $('run').addEventListener('click',scan);
-$('holdPanel').addEventListener('toggle',paint);
+$('stalePanel').addEventListener('toggle',paint);
 </script></body></html>'''
 
 
