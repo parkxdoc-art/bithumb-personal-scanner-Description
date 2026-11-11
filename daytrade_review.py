@@ -515,7 +515,7 @@ progress{width:100%;height:13px;margin:14px 0 6px}.line{display:flex;align-items
 </style></head><body><main>
 <h1>🎯 5분봉 움직임 → 1시간 흐름 → 4시간 구조</h1>
 <p class="muted">V11.13 실험판 · 빗썸 KRW 전체 · 거래대금 하한 없음 · 유의종목 포함 · V2 메인 변경 없음</p>
-<section class="panel"><button id="run">지금 전체 검색</button>　<a href="/">기존 V2 메인</a>
+<section class="panel"><button id="run">지금 전체 검색</button>　<a href="/">기존 V2 메인</a>　<a href="/backtest-winrate">📊 단타 승률 검증실</a>
 <p class="muted">최근 거래가 있는 5분봉부터 후보를 찾습니다. 가장 최근 3개 5분봉 연속과 지난 30분 실제 봉 5개 이상을 확인하며, 더 오래된 봉 공백은 경고로만 표시합니다. 5분봉 후보 중 점수 상위 최대 80개만 1시간봉·4시간봉 추가 검증하므로 <b>검증하지 못한 후보 개수</b>를 반드시 함께 표시합니다. BUY에는 기존 거래량·손절 위험·위쪽 저항 3%·참고 손익비 조건을 적용합니다. 3~5% 상승을 보장하지 않습니다.</p>
 <div class="metrics">
 <div class="metric"><small>전체 / 5분봉 검사</small><b id="all">—</b></div>
@@ -661,3 +661,351 @@ def register_daytrade_review(app, deps):
             return jsonify({'ok':True,'scanned':len(items),'errors':errors,'results':results})
         except Exception as e:
             return jsonify({'ok':False,'error':str(e)[:140]}),400
+
+# ---------------------------------------------------------------------------
+# V11.14: historical short-trade win-rate research lab.
+# The V11.13 live scanner above is deliberately unchanged. Results produced
+# below are for THREE NEW experimental 5M strategies, NOT the exact V11.13 BUY.
+# ---------------------------------------------------------------------------
+from datetime import date as _date, time as _time
+from collections import defaultdict as _defaultdict
+
+LAB_SIGNAL_NAMES = {"A": "A · 5분 지지 반등", "B": "B · 저항 돌파·재확인", "C": "C · 1시간 상승 흐름·눌림"}
+LAB_WARMUP_BARS = 26
+LAB_MAX_PAGES = 5
+LAB_MIN_CONTIGUOUS = 25
+LAB_MAX_HORIZON = 24   # 120 minutes / five-minute candle
+
+
+def lab_valid_request(raw, kst):
+    if not isinstance(raw, dict):
+        raise ValueError("검사 설정 형식 오류")
+    try:
+        day = _date.fromisoformat(raw["date"])
+        tp = float(raw.get("tp", 1.5))
+        sl = float(raw.get("sl", 1.0))
+        horizon = int(raw.get("horizon", 60))
+        fee = float(raw.get("fee", 0.04))
+        slip = float(raw.get("slip", 0.05))
+    except (KeyError, ValueError, TypeError, OverflowError):
+        raise ValueError("날짜/손익 설정 값이 올바르지 않습니다")
+    today = datetime.now(kst).date()
+    if not (today - timedelta(days=60) <= day < today):
+        raise ValueError("완전히 종료된 최근 60일 중 하루만 선택하세요")
+    if not (0.3 <= tp <= 10 and 0.2 <= sl <= 8 and
+            horizon in (30, 60, 120) and 0 <= fee <= 0.5 and 0 <= slip <= 0.5 and
+            all(isfinite(x) for x in (tp, sl, fee, slip))):
+        raise ValueError("익절·손절·시간·비용 설정 범위 오류")
+    return {"day": day, "tp": tp, "sl": sl, "horizon": horizon,
+            "fee": fee, "slip": slip, "bars": horizon // 5}
+
+
+def lab_fetch_5m(api_get, market, cfg, kst):
+    """Page backwards with KST-exclusive `to`; never fabricate missing bars.
+
+    For date D, include 4h prehistory and at least 2h following D to evaluate
+    trades whose last signal is at D 23:55. Return only observed 5M OHLCV.
+    """
+    begin = datetime.combine(cfg["day"], _time.min, tzinfo=kst) - timedelta(hours=4)
+    end = datetime.combine(cfg["day"] + timedelta(days=1), _time.min, tzinfo=kst) + timedelta(hours=2, minutes=5)
+    cursor = end
+    observed = {}
+    truncated = True
+    for _ in range(LAB_MAX_PAGES):
+        raw = api_get("/v1/candles/minutes/5", {
+            "market": market, "count": 200,
+            "to": cursor.strftime("%Y-%m-%d %H:%M:%S")})
+        if not isinstance(raw, list):
+            raise ValueError("과거 5분봉 API 응답 오류")
+        oldest = None
+        for bar in raw:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                ts = local_time(bar["candle_date_time_kst"], kst)
+                op, hi, lo, cl = (float(bar[k]) for k in
+                                  ("opening_price", "high_price", "low_price", "trade_price"))
+                vol = float(bar["candle_acc_trade_volume"])
+                if not (all(isfinite(x) and x > 0 for x in (op, hi, lo, cl))
+                        and isfinite(vol) and vol >= 0
+                        and lo <= min(op, cl) and hi >= max(op, cl) and lo <= hi):
+                    continue
+                if oldest is None or ts < oldest:
+                    oldest = ts
+                if begin <= ts < end:
+                    observed[ts] = {"t": ts, "o": op, "h": hi, "l": lo, "c": cl, "v": vol}
+            except (TypeError, ValueError, KeyError, OverflowError):
+                continue
+        if oldest is None:
+            truncated = False
+            break
+        if oldest <= begin or len(raw) < 200:
+            truncated = False
+            break
+        # Exclusive pagination; do not skip the oldest bar or repeat a page.
+        if oldest >= cursor:
+            raise ValueError("과거 봉 페이지가 전진하지 않습니다")
+        cursor = oldest
+    return [observed[t] for t in sorted(observed)], truncated
+
+
+def lab_contiguous(rows, first, last):
+    """All observed bars in the requested [first,last] range are 5m apart."""
+    if first < 0 or last >= len(rows):
+        return False
+    return all(rows[j]["t"] - rows[j-1]["t"] == timedelta(minutes=5)
+               for j in range(first+1, last+1))
+
+
+def lab_signals(rows, i):
+    """Signal definitions use data <= index i ONLY; no entry/outcome prices."""
+    c = rows[i]
+    past = rows[i-20:i]
+    mean_volume = sum(v["v"] for v in past) / 20
+    if mean_volume <= 0:
+        return []
+    vr = c["v"] / mean_volume
+    span = max(1e-12, c["h"]-c["l"])
+    bull = c["c"] > c["o"] and (c["c"]-c["o"]) / span >= 0.30
+    prior = rows[i-12:i]
+    support = min(x["l"] for x in prior)
+    # A: same-candle support touch + bullish reclaim. 5M confirmed at close.
+    a = (bull and vr >= 0.95 and c["l"] <= support*1.004 and
+         c["c"] >= support*1.003 and c["c"] > rows[i-1]["c"])
+
+    # B: previous candle was a new 12-bar breakout, current bar retests the
+    # breakout level and closes back above it. Current and prev are completed.
+    threshold = max(x["h"] for x in rows[i-14:i-1])
+    prev = rows[i-1]
+    pv = prev["v"] / mean_volume
+    b = (bull and prev["c"] >= threshold*1.002 and
+         rows[i-2]["c"] <= threshold*1.002 and
+         threshold*0.996 <= c["l"] <= threshold*1.006 and c["c"] >= threshold*1.003 and
+         max(vr, pv) >= 1.20 and vr >= 0.70)
+
+    # C: approximate the 1-hour flow solely from 24 previously COMPLETED 5M
+    # bars (two consecutive one-hour blocks). Reclaim of the prior 10-bar MA.
+    ma_old = sum(x["c"] for x in rows[i-24:i-12])/12
+    ma_recent = sum(x["c"] for x in rows[i-12:i])/12
+    ma10 = sum(x["c"] for x in rows[i-10:i])/10
+    fast = sum(x["c"] for x in rows[i-6:i])/6
+    fast_old = sum(x["c"] for x in rows[i-7:i-1])/6
+    csetup = (bull and vr >= 0.9 and ma_recent >= ma_old*1.003 and
+              fast >= fast_old and c["l"] <= ma10*1.005 and
+              c["c"] >= ma10*1.001 and c["c"] >= rows[i-1]["c"])
+    return [s for s, flag in (("A", a), ("B", b), ("C", csetup)) if flag]
+
+
+def lab_outcome(rows, index, cfg):
+    """Market entry at NEXT observed 5M opening; conservative OHLC priority.
+
+    Missing future candle => UNKNOWN, not TIME/SL/TP. If both levels are hit
+    in one five-minute bar, SL is assumed first. Fee and slippage charged on
+    both entry and exit. No fill certainty or tick rounding is claimed.
+    """
+    n = cfg["bars"]
+    if index + n >= len(rows):
+        return {"outcome": "UNKNOWN", "reason": "이후 봉 부족"}
+    if not lab_contiguous(rows, index, index+n):
+        return {"outcome": "UNKNOWN", "reason": "진입 후 봉 공백"}
+    entry = rows[index+1]["o"]
+    target = entry*(1+cfg["tp"]/100)
+    stop = entry*(1-cfg["sl"]/100)
+    outcome, exit_price, elapsed = "TIME", rows[index+n]["c"], n*5
+    for j in range(index+1, index+n+1):
+        r = rows[j]
+        stop_hit = r["l"] <= stop
+        target_hit = r["h"] >= target
+        if stop_hit:  # worst case for same-candle ambiguity
+            # If a 5M bar opens already below stop, assume the WORSE open fill.
+            realized_stop = min(stop, r["o"])
+            outcome, exit_price, elapsed = "SL", realized_stop, (j-index)*5
+            break
+        if target_hit:
+            outcome, exit_price, elapsed = "TP", target, (j-index)*5
+            break
+    cost_in = entry*(1 + (cfg["fee"]+cfg["slip"])/100)
+    revenue_out = exit_price*(1-(cfg["fee"]+cfg["slip"])/100)
+    net = (revenue_out/cost_in - 1)*100
+    return {"outcome": outcome, "entry": round(entry, 10),
+            "exit": round(exit_price, 10), "net_pct": round(net, 4),
+            "minutes": elapsed}
+
+
+def lab_evaluate_symbol(api_get, market, cfg, kst):
+    candles, truncated = lab_fetch_5m(api_get, market, cfg, kst)
+    day_start = datetime.combine(cfg["day"], _time.min, tzinfo=kst)
+    day_end = day_start + timedelta(days=1)
+    count_by = _defaultdict(int)
+    detail = []
+    cooldown = {name: -1 for name in LAB_SIGNAL_NAMES}
+    contiguous_windows = 0
+    observed_day = sum(day_start <= x["t"] < day_end for x in candles)
+    if len(candles) < LAB_WARMUP_BARS + cfg["bars"]:
+        return {"market": market, "bars": observed_day, "truncated": truncated,
+                "candidates": 0, "valid_windows": 0, "missing_outcome": 0, "trades": []}
+    for i in range(LAB_WARMUP_BARS, len(candles)-1):
+        t = candles[i]["t"]
+        if not day_start <= t < day_end:
+            continue
+        if not lab_contiguous(candles, i-24, i):
+            continue
+        contiguous_windows += 1
+        sigs = lab_signals(candles, i)
+        for name in sigs:
+            if i < cooldown[name]:
+                continue
+            cooldown[name] = i + cfg["bars"]
+            count_by["signal"] += 1
+            outcome = lab_outcome(candles, i, cfg)
+            if outcome["outcome"] == "UNKNOWN":
+                count_by["missing"] += 1
+                continue
+            detail.append({"market": market, "strategy": name,
+                           "time": (t+timedelta(minutes=5)).strftime("%m-%d %H:%M"),
+                           "signal_close": round(candles[i]["c"], 10), **outcome})
+    return {"market": market, "bars": observed_day, "truncated": truncated,
+            "candidates": count_by["signal"], "valid_windows": contiguous_windows,
+            "missing_outcome": count_by["missing"], "trades": detail}
+
+
+WINRATE_PAGE = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14 · 단타 실험 신호 승률 검증실</title><style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#171d34;--card:#11182b;--border:#33405e;--fg:#eff4ff;--muted:#aabbd7;--blue:#3564ec;--green:#4ade80}
+*{box-sizing:border-box}body{background:var(--bg);color:var(--fg);margin:0;font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1000px;margin:auto;padding:20px 14px 55px}h1{font-size:23px;line-height:1.4}h2{font-size:18px;margin:0 0 10px}.panel{border:1px solid var(--border);border-radius:15px;background:var(--panel);margin-top:14px;padding:17px}.muted,.hint{color:var(--muted);font-size:13px}.danger{color:#fca5a5}.good{color:var(--green)}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--muted)}
+input,select,button{font:inherit}input,select{background:#10182a;border:1px solid var(--border);border-radius:8px;color:var(--fg);padding:10px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;padding:12px 15px;color:#fff;font-weight:800;cursor:pointer}button:disabled{opacity:.45}a{color:#b5cfff}progress{width:100%;height:13px;margin-top:12px}.statgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px}.stat strong{display:block;font-size:20px}.stat small{color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:8px 7px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.note{background:#11192d;border-radius:10px;padding:12px;font-size:13px;line-height:1.65}.flex{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.detail{border:1px solid var(--border);padding:12px;border-radius:10px;margin:8px 0;background:var(--card);font-size:13px}.detail b{display:block;margin-bottom:5px}.status{white-space:pre-wrap;font-size:13px;color:var(--muted)}
+@media(max-width:640px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}th,td{padding:8px 5px}}
+</style></head><body><main>
+<h1>📊 V11.14 · 단타 승률 검증실</h1><p class="muted">V11.13 실시간 스캐너와 V2 메인은 그대로 둡니다. <b>이 페이지의 A/B/C는 신규 실험 전략</b>이며 V11.13 BUY 실적이 아닙니다.</p>
+<section class="panel"><h2>검증 조건</h2><div class="controls">
+<label class="field">검증 날짜 (KST)<input id="day" type="date" required></label>
+<label class="field">동일 규칙 표본 코인<select id="count"><option value="20">20개 · 빠른 예비검사</option><option value="40" selected>40개 · 비교검사</option><option value="80">80개 · 확대검사</option></select></label>
+<label class="field">익절 목표 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 기준 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">종료 시한<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">매수·매도 각각 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
+<label class="field">매수·매도 각각 슬리피지 가정 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
+</div><p class="hint">수수료 0.04%는 입력 예시이며 실제 계정 수수료를 확인해 바꿀 수 있습니다. 슬리피지는 모의 가정입니다. 과거 완료된 날짜 하루씩 검사합니다.</p>
+<div class="flex"><button id="run">선택 날짜 승률 검사</button><a href="/backtest-daytrade">V11.13 실시간 스캐너</a><a href="/">V2 메인</a></div>
+<p class="hint">처음 실행한 종목 표본을 이 브라우저에 고정합니다. 다른 날짜도 동일 코인으로 검사합니다. <button id="resetUniverse" type="button" style="background:#34425f;padding:6px 10px;font-size:12px">표본 고정 해제</button></p>
+<progress id="progress" value="0" max="100"></progress><p class="status" id="status">실행 전 · 실제 승률 데이터 없음</p></section>
+<section class="panel"><h2>세 가지 실험 신호 비교</h2><p class="hint">A: 5분 지지 터치·양봉 회복 | B: 이전 봉 저항 돌파 후 다음 봉 재확인 | C: 1시간 상당 상승 흐름에서 5분 눌림 후 반등. 세 신호 모두 <b>확정된 과거 5분봉만</b> 사용합니다.</p><div class="scroll" id="table"><p class="muted">검사 후 결과 표시</p></div><p class="hint">익절 선도달률 = TP / 판정 가능 거래. 순승률 = 수수료·슬리피지 차감 후 수익 거래 비율. 만기청산(TIME)도 순승률·평균손익에 포함합니다.</p></section>
+<section class="panel"><h2>데이터 신뢰도</h2><div class="statgrid" id="quality"><div class="stat">조회 전</div></div><p class="hint">동일 봉에 익절·손절 모두 닿으면 <b>손절 우선</b> 처리. 중간 봉이 빠져 결과 순서를 알 수 없으면 <b>미판정 제외</b>. 시장가 진입은 다음 봉의 시가를 가정하고 체결 보장은 없습니다.</p></section>
+<section class="panel"><h2>다른 날짜와 누적 비교</h2><p class="hint">같은 코인 선정 규칙·손익 조건의 서로 다른 날짜만 합칩니다. 같은 날짜를 다시 돌리면 교체합니다. 기록은 현재 브라우저에만 저장됩니다.</p><div id="history" class="scroll">검사 후 표시</div><div class="flex"><button id="csv" type="button">검사 기록 CSV 저장</button><button id="clear" type="button">누적 기록 삭제</button></div></section>
+<details class="panel"><summary>최근 실험 거래 사례</summary><div id="examples">검사 후 표시</div></details>
+<section class="panel"><h2>이 결과가 뜻하지 않는 것</h2><div class="note">동일 날짜의 과거 OHLCV를 사용한 모의 성적이며 <b>실제 주문 승률이 아닙니다.</b> 평가 종목은 현재 상장된 KRW 코인을 일정 간격으로 선정하므로 과거 상장폐지 종목이 빠지는 생존자 편향이 있습니다. 신호는 미래 봉을 보지 않지만 과거 날짜를 반복해 조건을 바꾸면 과적합될 수 있습니다. 호가 잔량·지연·실제 체결·정확한 호가단위는 미반영입니다. 한 날짜 또는 소수 거래만으로 실전 승률을 주장할 수 없습니다. 같은 종목·날짜의 여러 신호는 서로 독립적인 거래 기회가 아닐 수 있습니다.</div></section>
+</main><script>
+const $=id=>document.getElementById(id),esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const metric=(a,b)=>`<div class="stat"><small>${esc(a)}</small><strong>${esc(b)}</strong></div>`;
+const strategies={A:'A 지지 반등',B:'B 돌파·재확인',C:'C 1H 흐름·눌림'};
+const storageKey='bithumb_v1114_winrate_history';let allTrades=[],busy=false,latest=null;
+function readHist(){try{const x=JSON.parse(localStorage.getItem(storageKey)||'[]');return Array.isArray(x)?x:[]}catch{return []}}
+function writeHist(a){try{localStorage.setItem(storageKey,JSON.stringify(a.slice(-120)));return true}catch{return false}}
+const dateInSeoul=(dt)=>{const ps=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(dt);const g=k=>ps.find(p=>p.type===k)?.value;return `${g('year')}-${g('month')}-${g('day')}`};
+const yesterday=()=>dateInSeoul(new Date(Date.now()-86400000));$('day').value=yesterday();$('day').max=yesterday();
+const cols=['전략','거래','익절','손절','시간종료','익절 선도달','순승률','평균 순손익'];
+const emptyStat=()=>({trades:0,tp:0,sl:0,time:0,wins:0,net:0});
+function statsOf(trades){const s={A:emptyStat(),B:emptyStat(),C:emptyStat()};for(const x of trades){if(!s[x.strategy])continue;const t=s[x.strategy];t.trades++;t.net+=x.net_pct;t.wins+=x.net_pct>0?1:0;if(x.outcome==='TP')t.tp++;else if(x.outcome==='SL')t.sl++;else t.time++}return s}
+function addStats(a,b){const r={};for(const k of Object.keys(strategies)){r[k]={};for(const field of Object.keys(emptyStat()))r[k][field]=(a[k]?.[field]||0)+(b[k]?.[field]||0)}return r}
+function renderTable(stats,caption){let html=`<p class="muted">${esc(caption)}</p><table><thead><tr>${cols.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>`;
+for(const [key,label] of Object.entries(strategies)){const s=stats[key]||emptyStat(),n=s.trades;html+=`<tr><td>${esc(label)}</td><td>${n}</td><td>${s.tp}</td><td>${s.sl}</td><td>${s.time}</td><td>${n?(100*s.tp/n).toFixed(1)+'%':'—'}</td><td>${n?(100*s.wins/n).toFixed(1)+'%':'—'}</td><td>${n?(s.net/n).toFixed(2)+'%':'—'}</td></tr>`}return html+'</tbody></table><p class="hint">※ 전략별 판정 거래가 30건 미만이면 작은 표본입니다. 과거 날짜를 바꾸며 얻은 수치를 실전 보장 승률로 해석하지 마세요.</p>'}
+function currentCfg(){const config={date:$('day').value,count:Number($('count').value),tp:Number($('tp').value),sl:Number($('sl').value),horizon:Number($('horizon').value),fee:Number($('fee').value),slip:Number($('slip').value)};if(!config.date||config.date>yesterday())throw Error('완료된 과거 날짜를 선택하세요');if(!Number.isFinite(config.tp)||!Number.isFinite(config.sl)||!Number.isFinite(config.fee)||!Number.isFinite(config.slip)||config.tp<0.3||config.tp>10||config.sl<0.2||config.sl>8||config.fee<0||config.fee>0.5||config.slip<0||config.slip>0.5)throw Error('손익/비용 입력 범위를 확인하세요');return config}
+const keyOf=r=>JSON.stringify([r.count,r.tp,r.sl,r.horizon,r.fee,r.slip,r.sample||'']);
+function displayHistory(){const hist=readHist(),n=Number($('count').value);let selected=[];try{selected=JSON.parse(localStorage.getItem(universeKey(n))||'[]')}catch{};const cfg={count:n,tp:Number($('tp').value),sl:Number($('sl').value),horizon:Number($('horizon').value),fee:Number($('fee').value),slip:Number($('slip').value),sample:Array.isArray(selected)?selected.join('|'):''};const matching=hist.filter(x=>keyOf(x)===keyOf(cfg));let total={A:emptyStat(),B:emptyStat(),C:emptyStat()};for(const item of matching)total=addStats(total,item.stats);$('history').innerHTML=renderTable(total,`동일 설정 ${matching.length}개 날짜 누적 · 거래가 0이면 승률 표시 불가`)+(matching.length?`<p class="hint">누적 날짜: ${matching.map(x=>esc(x.date)).join(', ')}</p>`:'')}
+async function getJson(url,opts){const c=new AbortController(),timer=setTimeout(()=>c.abort(),120000);try{const r=await fetch(url,{...opts,signal:c.signal,cache:'no-store'}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||`HTTP ${r.status}`);return v}finally{clearTimeout(timer)}}
+const universeKey=n=>`bithumb_v1114_fixed_sample_${n}`;
+async function frozenSample(n){let stored=null;try{stored=JSON.parse(localStorage.getItem(universeKey(n))||'null')}catch{};if(Array.isArray(stored)&&stored.length===n&&stored.every(x=>/^KRW-[A-Z0-9]+$/.test(x)))return stored;
+const u=await getJson('/api/winrate14/universe?count='+n);try{localStorage.setItem(universeKey(n),JSON.stringify(u.items))}catch{throw Error('비교 종목 고정 저장 실패. 브라우저 저장 기능을 확인하세요')};return u.items;}
+async function workerPool(groups,workers,fn){let i=0;let errors=[];async function work(){while(i<groups.length){const batch=groups[i++];try{await fn(batch)}catch(e){errors.push(String(e))}}}await Promise.all(Array.from({length:Math.min(workers,groups.length)},work));return errors}
+async function run(){if(busy)return;busy=true;$('run').disabled=true;let config,failed=0,processed=0,totalBars=0,signals=0,unresolved=0,truncated=0,eligible=0,returned=[];const start=performance.now();try{config=currentCfg();const names=await frozenSample(config.count);config.sample=names.join('|');const batches=[];for(let i=0;i<names.length;i+=2)batches.push(names.slice(i,i+2));$('progress').max=names.length;$('progress').value=0;$('status').textContent=`과거 ${config.date} · 표본 ${names.length}개 캔들 조회 중 (일반 실시간 스캔보다 오래 걸릴 수 있습니다)`;
+const errors=await workerPool(batches,2,async namesBatch=>{const r=await getJson('/api/winrate14/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...config,markets:namesBatch})});processed+=r.scanned;failed+=r.errors;for(const item of r.results){totalBars+=item.bars||0;signals+=item.candidates||0;unresolved+=item.missing_outcome||0;eligible+=item.valid_windows>0?1:0;truncated+=item.truncated?1:0;returned.push(...(item.trades||[]))}$('progress').value=processed;$('status').textContent=`조회 ${processed}/${names.length}개 · 조건 발생 ${signals}건 · 판정 ${returned.length}건 · API 오류 ${failed}건`;});if(errors.length||failed||processed!==names.length)throw Error(`일부 API 실패: ${errors.length}개 배치 / ${failed}개 코인. 불완전한 데이터는 승률로 저장하지 않습니다.`);
+allTrades=returned;latest=config;const s=statsOf(allTrades);$('table').innerHTML=renderTable(s,`${esc(config.date)} · 전체 ${names.length}개 표본 · 총 ${allTrades.length}건 판정 가능 거래`);
+$('quality').innerHTML=[['검사 대상',names.length+'개'],['검사 가능 종목',eligible+'개'],['해당 날짜 5분봉',totalBars+'개'],['실험 신호',signals+'건'],['결과 미판정(봉 공백 등)',unresolved+'건'],['조회 5페이지 상한 도달',truncated+'개']].map(x=>metric(...x)).join('');
+$('examples').innerHTML=allTrades.length?allTrades.slice(0,40).map(x=>`<div class="detail"><b>${esc(x.market)} · ${esc(strategies[x.strategy])} · ${esc(x.outcome)}</b>신호 확정 ${esc(x.time)} · 진입 ${esc(x.entry)}원 · 청산 ${esc(x.exit)}원 · 순손익 ${Number(x.net_pct).toFixed(2)}% · 보유 ${x.minutes}분</div>`).join(''):'<p class="muted">검증된 거래가 없습니다. 0% 승률로 취급하지 마세요.</p>';
+const hist=readHist().filter(x=>!(x.date===config.date&&keyOf(x)===keyOf(config)));hist.push({...config,stats:s,recorded:new Date().toISOString()});const stored=writeHist(hist);displayHistory();const sec=((performance.now()-start)/1000).toFixed(1);$('status').textContent=`✅ ${config.date} · ${processed}개 표본 · ${sec}초 · 판정 가능 ${allTrades.length}거래 · 미판정 ${unresolved}건${stored?'':' · 브라우저 기록 저장 실패'}. 실전 승률로 오해하지 마세요.`;
+}catch(e){$('status').textContent='⚠️ 검증 실패 · '+String(e.message||e)+' · 일부 결과로 승률을 계산하지 않습니다.';$('table').textContent='미완료 · 신뢰 가능한 승률 없음'}finally{busy=false;$('run').disabled=false}}
+$('run').addEventListener('click',run);$('csv').onclick=()=>{const rows=readHist(),head=['date','count','tp','sl','horizon','fee','slip','strategy','trades','tp_count','sl_count','time_count','wins','net_pct_sum'];const lines=[head.join(',')];for(const r of rows)for(const id of Object.keys(strategies)){const s=r.stats[id]||emptyStat();lines.push([r.date,r.count,r.tp,r.sl,r.horizon,r.fee,r.slip,id,s.trades,s.tp,s.sl,s.time,s.wins,s.net].join(','))}const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='bithumb_winrate_lab_v1114.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+$('resetUniverse').onclick=()=>{if(confirm('현재 코인 표본 고정을 해제할까요? 이후 날짜 비교는 새 표본으로 따로 집계됩니다.')){for(const n of [20,40,80])localStorage.removeItem(universeKey(n));latest=null;displayHistory()}};
+$('clear').onclick=()=>{if(confirm('이 브라우저의 V11.14 누적 통계만 삭제할까요?')){try{localStorage.removeItem(storageKey);displayHistory()}catch{alert('브라우저 저장소 삭제 실패')}}};for(const id of ['count','tp','sl','horizon','fee','slip'])$(id).addEventListener('change',displayHistory);displayHistory();
+</script></body></html>'''
+
+
+def register_winrate_lab(app, deps):
+    api_get, get_markets, kst = deps["api_get"], deps["get_markets"], deps["KST"]
+    sample_cache = {"at": 0, "markets": None}
+    sample_lock = Lock()
+
+    @app.get("/backtest-winrate")
+    def winrate_lab_page_1114():
+        return render_template_string(WINRATE_PAGE)
+
+    @app.get("/api/winrate14/universe")
+    def winrate_lab_universe_1114():
+        try:
+            n = int(request.args.get("count", "40"))
+            if n not in (20, 40, 80):
+                raise ValueError("표본은 20/40/80개만 선택할 수 있습니다")
+            with sample_lock:
+                if sample_cache["markets"] is None or time.time()-sample_cache["at"]>600:
+                    names = sorted({m for m in get_markets() if isinstance(m, str) and MARKET_RE.fullmatch(m)})
+                    if not names:
+                        raise ValueError("KRW 종목 목록이 비었습니다")
+                    sample_cache.update(markets=names, at=time.time())
+                names = sample_cache["markets"]
+            if len(names) <= n:
+                chosen = names
+            else:
+                # Deterministic equal-rank sampling across all CURRENT listings.
+                chosen = [names[round(j*(len(names)-1)/(n-1))] for j in range(n)]
+            return jsonify({"ok": True, "items": chosen, "sampled": len(chosen),
+                            "all_current_markets": len(names)})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:150]}), 400
+
+    @app.post("/api/winrate14/evaluate")
+    def winrate_lab_evaluate_1114():
+        try:
+            payload = request.get_json(silent=True)
+            cfg = lab_valid_request(payload, kst)
+            markets = payload.get("markets") if isinstance(payload, dict) else None
+            if (not isinstance(markets, list) or not 1 <= len(markets) <= 2 or
+                    len(set(markets)) != len(markets) or
+                    any(not isinstance(m, str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError("종목은 한 번에 최대 2개만 검증합니다")
+            # Universe was retrieved through /universe first; reuse the cache
+            # instead of querying all listings for EVERY two-market batch.
+            with sample_lock:
+                if sample_cache["markets"] is None:
+                    sample_cache.update(markets=sorted({m for m in get_markets()
+                        if isinstance(m, str) and MARKET_RE.fullmatch(m)}), at=time.time())
+                allowed = set(sample_cache["markets"] or [])
+            if not allowed:
+                raise ValueError("KRW 종목 목록을 확인할 수 없습니다")
+            if any(m not in allowed for m in markets):
+                raise ValueError("현재 빗썸 KRW 목록에 없는 종목입니다")
+            results = []
+            errors = 0
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {pool.submit(lab_evaluate_symbol, api_get, market, cfg, kst): market
+                           for market in markets}
+                for f in as_completed(futures):
+                    try:
+                        results.append(f.result())
+                    except Exception:
+                        errors += 1
+            return jsonify({"ok": True, "scanned": len(markets), "results": results, "errors": errors})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:150]}), 400
+
+
+# Preserve the entire existing V11.13 registration and add independent routes.
+_v1113_register_daytrade_review = register_daytrade_review
+
+def register_daytrade_review(app, deps):
+    _v1113_register_daytrade_review(app, deps)
+    register_winrate_lab(app, deps)
