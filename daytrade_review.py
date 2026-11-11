@@ -1,4 +1,4 @@
-"""V10.2: preserve historical backtest calculation results alongside raw candles.
+"""V2-based optimization: faster equivalent window construction and timed full-market backtests.
 
 All A/B and V5-V9 strategy logic is unchanged. Existing 10/30/50 snapshots remain untouched.
 The full-universe option stores raw candles and versioned calculation caches in separate IndexedDB records.
@@ -945,21 +945,25 @@ async function getAllCohort(){
   await snapshotStore('put',cohort.key,cohort);  // freeze before the first batch
   return cohort;
 }
-// V10.1: two 5-market batches in flight, each saved as soon as it completes.
-// This changes scheduling only; candle history and all strategies are unchanged.
-const FULL_SCAN_CONCURRENCY=2;
+// V2-style three concurrent browser batches for a fully frozen raw dataset.
+// Keep first-time historical capture at two batches to limit exchange requests.
+const FULL_SCAN_CONCURRENCY=3;
 async function runAllBacktest(){
   if(running)return;
   running=true;$('start').disabled=true;
   for(const name of ['snapshotExport','snapshotImport','snapshotReset','cohortReset'])$(name).disabled=true;
   $('coinRows').innerHTML='';
   const date=$('day').value,fee=$('fee').value;
+  const beganAt=performance.now();
   let total=0,saved=0,failures=0,finished=0,lastPainted=0,cacheHits=0;
+  let newlyFetched=0,replayed=0,historyMs=0,analysisMs=0,measured=0;
   const resultsByBatch=[];
   try{
     const cohort=await getAllCohort();
     const markets=cohort.markets;
     total=markets.length;
+    const previousMeta=await snapshotStore('get',allMetaKey(date));
+    const workers=previousMeta&&previousMeta.saved===total?FULL_SCAN_CONCURRENCY:2;
     const batches=[];
     for(let i=0;i<total;i+=5)batches.push({start:i,markets:markets.slice(i,i+5)});
     $('progress').max=total;$('progress').value=0;
@@ -970,6 +974,7 @@ async function runAllBacktest(){
       const task=batches[batchNo];
       const batch=task.markets,key=allChunkKey(date,task.start);
       let chunk=await snapshotStore('get',key);
+      const hadChunk=Boolean(chunk);
       let r=null,rawHash=null,wasCached=false;
       if(chunk){
         validateAllChunk(chunk,date,batch);
@@ -1027,11 +1032,21 @@ async function runAllBacktest(){
         }
       }
       if(wasCached)cacheHits+=batch.length;
+      else {
+        if(hadChunk)replayed+=batch.length;else newlyFetched+=batch.length;
+        for(const item of r.results){
+          if(item._timing_ms){
+            historyMs+=Number(item._timing_ms.history)||0;
+            analysisMs+=Number(item._timing_ms.analysis)||0;
+            measured++;
+          }
+        }
+      }
       if(chunk)saved+=batch.length;
       resultsByBatch[batchNo]=r.results;
       finished+=batch.length;
       $('progress').max=total;$('progress').value=finished;
-      $('status').textContent=`전체 KRW ${finished}/${total}개 검사 · 원본 저장 ${saved}개 · 계산 재사용 ${cacheHits}개 · 중단 시 이어서 검사 가능합니다`;
+      $('status').textContent=`전체 KRW ${finished}/${total}개 · 원본 저장 ${saved}개 · 계산 재사용 ${cacheHits}개 · 경과 ${((performance.now()-beganAt)/1000).toFixed(1)}초`;
       // Large tables are expensive to rerender on phones; refresh every 50 coins.
       if(finished-lastPainted>=50||finished===total){
         paint(resultsByBatch.flatMap(x=>x||[]),finished,total,
@@ -1043,8 +1058,8 @@ async function runAllBacktest(){
         created:cohort.created,updated:new Date().toLocaleString('ko-KR')});
     }
 
-    // Only two browser requests at once. Stop scheduling after an error,
-    // but let in-flight batches finish saving their raw candles safely.
+    // Keep up to three frozen-data batches in flight (two for a cold capture).
+    // Stop scheduling after an error; preserve in-flight saved candles.
     async function worker(){
       while(!firstError&&nextBatch<batches.length){
         const batchNo=nextBatch++;
@@ -1052,14 +1067,16 @@ async function runAllBacktest(){
         catch(e){if(!firstError)firstError=e;}
       }
     }
-    await Promise.all(Array.from({length:Math.min(FULL_SCAN_CONCURRENCY,batches.length)},worker));
+    await Promise.all(Array.from({length:Math.min(workers,batches.length)},worker));
     const all=resultsByBatch.flatMap(x=>x||[]);
     paint(all,finished,total,{available_markets:cohort.available_markets});
     if(firstError)throw firstError;
     const errors=all.filter(x=>x.error).length;
     const valid=all.filter(x=>!x.error&&x.windows>0).length;
     const completed=(saved===total&&errors===0&&failures===0&&finished===total);
-    $('status').textContent=(completed?'✅ 완료':'⚠️ 검사 종료')+` · 전체 ${total}개 · 유효 ${valid}개 · 오류 ${errors}개 · 원본 고정 ${saved}/${total}개 · 계산 재사용 ${cacheHits}개`;
+    const elapsed=((performance.now()-beganAt)/1000).toFixed(1);
+    const serverTimes=measured?` · 서버측 코인별 합산 원본수집/정리 ${(historyMs/1000).toFixed(1)}초, 분석 ${(analysisMs/1000).toFixed(1)}초 (${measured}개)`:'';
+    $('status').textContent=(completed?'✅ 완료':'⚠️ 검사 종료')+` · 실제 경과 ${elapsed}초 · 전체 ${total}개 · 유효 ${valid}개 · 오류 ${errors}개 · 원본 ${saved}/${total}개 · 계산 재사용 ${cacheHits}개 · 신규수집 ${newlyFetched}개 · 재분석 ${replayed}개${serverTimes}`;
     if(completed){
       const avgB=h=>{const n=all.reduce((t,x)=>t+x.strategies.B.samples[h],0);
         const sum=all.reduce((t,x)=>t+x.strategies.B.return_sums[h],0);return n?sum/n:null;};
@@ -1372,6 +1389,49 @@ refreshSnapshotInfo();
 </script></body></html>"""
 
 
+
+def make_windows_linear(rows, minute=5, lookback=288, forward_bars=288):
+    """Equivalent to app.make_backtest_windows; O(N) gap checking, not O(N*window).
+
+    Every output still contains exactly the same 288 historical and 288 future
+    real/synthetic candle references; no strategy or result thresholds change.
+    """
+    if not isinstance(rows, list) or minute <= 0 or lookback < 35 or forward_bars < 1:
+        return []
+    valid = []
+    for candle in rows:
+        if not isinstance(candle, dict):
+            continue
+        try:
+            stamp = datetime.fromisoformat(candle["candle_date_time_kst"])
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone(timedelta(hours=9)))
+            else:
+                stamp = stamp.astimezone(timezone(timedelta(hours=9)))
+            valid.append((stamp, candle))
+        except (KeyError, TypeError, ValueError):
+            continue
+    valid.sort(key=lambda entry: entry[0])
+    required = lookback + forward_bars
+    if len(valid) < required:
+        return []
+    delta = timedelta(minutes=minute)
+    windows = []
+    run = 0
+    for end_idx in range(len(valid)):
+        run = run + 1 if end_idx and valid[end_idx][0] - valid[end_idx - 1][0] == delta else 1
+        if end_idx + 1 < required or run < required:
+            continue
+        cutoff_idx = end_idx - forward_bars
+        first_idx = cutoff_idx - lookback + 1
+        windows.append({
+            "cutoff_kst": valid[cutoff_idx][0] + delta,
+            "signal_rows": [c for _, c in valid[first_idx:cutoff_idx + 1]],
+            "evaluation_rows": [c for _, c in valid[cutoff_idx + 1:end_idx + 1]],
+        })
+    return windows
+
+
 def register_daytrade_review(app, deps):
     """Register three additive routes using existing app.py helpers."""
     api_get = deps["api_get"]
@@ -1516,6 +1576,8 @@ def register_daytrade_review(app, deps):
                 "examples": []}
 
     def evaluate_market(market, date, fee, source_rows=None, capture=False):
+        started_at = time.perf_counter()
+        loaded_at = None
         output = {
             "market": market, "windows": 0, "coverage_reason": "", "history_rows": 0,
             "gap_filled": 0, "unfilled_gaps": 0, "max_gap_minutes": 0, "coverage_rejects": 0,
@@ -1533,6 +1595,7 @@ def register_daytrade_review(app, deps):
             end = day + timedelta(hours=12)
             cutoff = day + timedelta(days=1, hours=12)
             rows, coverage, original_rows = fetch_history(market, cutoff, source_rows)
+            loaded_at = time.perf_counter()
             if capture:
                 # Returned once to browser IndexedDB; subsequent calls pass the
                 # same actual (not synthetic) candles back for offline replay.
@@ -1559,7 +1622,11 @@ def register_daytrade_review(app, deps):
                 return output
             # 288 historical 5-minute candles + 288 strictly future candles.
             # Independent strategy replays only see the LAST 80 historical candles.
-            windows = make_windows(rows, minute=5, lookback=288, forward_bars=288)
+            windows = make_windows_linear(rows, minute=5, lookback=288, forward_bars=288)
+            row_pos = {id(row): i for i, row in enumerate(rows)}
+            gap_prefix = [0]
+            for row in rows:
+                gap_prefix.append(gap_prefix[-1] + int(bool(row.get("_gap_fill"))))
             last_event = {"A": None, "B": None}
             for w in windows:
                 at = w["cutoff_kst"].astimezone(kst)
@@ -1571,7 +1638,11 @@ def register_daytrade_review(app, deps):
                     continue
                 # Avoid interpreting synthetic, non-traded candles as a real
                 # signal or a filled entry. Exclude excessively sparse history.
-                filled_in_window = sum(c.get("_gap_fill", False) for c in history + future)
+                left = row_pos.get(id(history[0]))
+                right = row_pos.get(id(future[-1]))
+                filled_in_window = (gap_prefix[right + 1] - gap_prefix[left]
+                                    if left is not None and right is not None
+                                    else sum(c.get("_gap_fill", False) for c in history + future))
                 if (filled_in_window > MAX_SYNTHETIC_BARS_PER_WINDOW
                         or history[-1].get("_gap_fill")
                         or future[0].get("_gap_fill")):
@@ -1696,6 +1767,13 @@ def register_daytrade_review(app, deps):
             output["v7"] = new_v7_summary()
             output["v9"] = new_v9_summary()
             return output
+        finally:
+            finished_at = time.perf_counter()
+            loading_end = loaded_at if loaded_at is not None else finished_at
+            output["_timing_ms"] = {
+                "history": round((loading_end - started_at) * 1000, 1),
+                "analysis": round((finished_at - loading_end) * 1000, 1),
+            }
 
     @app.get("/backtest-daytrade")
     def daytrade_review_page():
