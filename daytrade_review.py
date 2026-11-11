@@ -1,28 +1,16 @@
-"""V11.12 readiness stages + separate 5M candle diagnostics. Unchanged BUY rules.
+"""V11.13 experiment: 5-minute activity -> 1-hour flow + 4-hour structure.
 
-Only the /backtest-daytrade experiment page is replaced. app.py and the V2
-main-page BUY logic are untouched. All KRW markets are considered, without
-turnover or warning-list exclusions. This is an experimental signal, not an order.
-
-Pass 1: fetch 80 completed 4H candles for all markets; use the SAME data
-  for horizontal support/resistance zones and timestamp-based rising support /
-  falling resistance lines. No extra 4H API requests.
-Pass 2: fetch 80 completed 5M candles for markets near EITHER 4H level.
-  On actionable 5M BUY/WATCH shapes only, fetch 80 completed 1H candles
-  to rate trend; a strongly falling or unavailable 1H flow holds BUY to WATCH.
-  This staged API order minimizes requests; decision uses all three timeframes.
-Before displaying BUY, require 5M price action/volume and a minimum gross
-price buffer to the next confirmed 4H resistance versus a defined stop.
-BUY requires at least 3% measured gross space below the nearest identified 4H resistance.
-Only the highest-ranked 3 confirmed BUY / near-entry WATCH setups are
-spotlighted; users manually log up to 3 trades per Seoul day in local storage.
-V11.12 retains reason-code diagnostics and separately counts last-candle delay
-and missing intermediate 5M bars. WATCH is annotated with approach, tested,
-and quality-check stages; none of these promote a candidate to BUY.
-No BUY gate is relaxed and no additional API requests are introduced.
-The scanner cannot place orders or enforce real exchange trading limits.
-This is a strict observational gate, not a validated profitability model.
-No look-ahead candles, future returns, or synthetic gap-fill candles are used.
+Standalone, read-only scanner. Only /backtest-daytrade and /api/flow513/*
+are registered; app.py and the V2 scanner are untouched.
+- Scan all Bithumb KRW markets' 80 most recent completed 5-minute candles.
+- Recent activity/pattern screening uses the last 3 consecutive candles and a
+  real-time 5-minute close, NOT 21 consecutive candles. Older missing intervals
+  remain visible in diagnostics; absent candles are NEVER synthesized.
+- Verify only the best 80 screen-positive markets, keeping the cap and unverified
+  count explicit. Use completed 1-hour and 4-hour bars as of the signal close.
+- No buy when 1-hour is high risk, 4-hour data unavailable, overhead resistance
+  unverified, or volume/pattern/risk/reward criteria fail.
+- No order placement, no trade execution, no demonstrated win rate.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -355,609 +343,321 @@ def evaluate_entry_quality(entry, stop, overhead, strong_candle,
             "next_resistance": round(next_resistance, 10) if next_resistance else None}
 
 
-def five_minute_entry(api_get, htf, now, kst):
-    market = htf["market"]
+
+# The 5M-first flow uses no minimum KRW turnover and never auto excludes warnings.
+SHORTLIST_LIMIT = 80
+MIN_SCREEN_5M_BARS = 25
+MIN_ACTIVE_CANDLES_30M = 5
+MAX_SIGNAL_AGE_MIN = 10.0
+MAX_FINAL_AGE_MIN = 10.0
+MOTION_LOOKBACK_BARS = 18
+
+
+def screen_5m(api_get, market, now, kst):
+    """Price movement first. No synthetic candles, no future candles.
+
+    The older 21-candle continuity constraint is deliberately NOT a BUY gate.
+    Freshness, last 3 consecutive bars, and >=5 traded 5M intervals in the
+    past 30min are mandatory for *screen-positive* candidates. Repeated bars
+    with no actual trades cannot pass.
+    """
     rows = completed_candles(api_get, market, 5, 80, now, kst)
-    out = {"market": market, "status": "NONE", "setup": "", "note": "",
-           "price": None, "volume_ratio": None, "age_minutes": None,
-           "bars5m": len(rows), "htf": htf, "quality": None,
-           "hour1": None, "source_type": "horizontal", "confluence": False,
-           "stage": "NONE", "stage_note": "", "candle_health": None}
-    if len(rows) < MIN_5M_BARS:
-        out.update(status="SKIP", stage="DATA_HOLD", note="5분봉 데이터 부족")
-        return out
-    ts = [x[0] for x in rows]
-    close = [float(x[1]["trade_price"]) for x in rows]
-    opening = [float(x[1]["opening_price"]) for x in rows]
-    highs = [float(x[1]["high_price"]) for x in rows]
-    lows = [float(x[1]["low_price"]) for x in rows]
-    volumes = [float(x[1]["candle_acc_trade_volume"]) for x in rows]
-    out["price"] = close[-1]
-    out["signal_time"] = ts[-1].strftime("%Y-%m-%d %H:%M")
-    age = (now - (ts[-1] + timedelta(minutes=5))).total_seconds()/60
-    out["age_minutes"] = round(age, 1)
-    baseline = sum(volumes[-21:-1])/20
-    vol_now = volumes[-1]/baseline if baseline > 0 else None
-    vol_prior = volumes[-2]/baseline if baseline > 0 else None
-    out["volume_ratio"] = round(vol_now, 2) if vol_now is not None else None
-    # A missing 5M candle can be a no-trade interval; do not silently
-    # manufacture candles. Diagnose latest-bar delay and internal gaps
-    # independently, even when the same coin has BOTH problems.
-    trailing = ts[-21:]
-    gap_steps = [int(round((b-a).total_seconds() / 300)) - 1
-                 for a,b in zip(trailing[:-1], trailing[1:])
-                 if b-a != timedelta(minutes=5)]
-    recent_continuous = not gap_steps
-    stale = age > FRESH_5M_MINUTES or age < -0.5
-    out["candle_health"] = {
-        "stale": stale, "gap": not recent_continuous,
-        "latest_delay_minutes": round(age, 1),
-        "missing_intervals": len(gap_steps),
-        "missing_5m_bars": sum(max(0, n) for n in gap_steps),
-        "clock_issue": age < -0.5,
-    }
-    # Keep the V11.11 exclusion priority exactly as it was.
-    freshness = ("STALE" if stale else "GAP" if not recent_continuous else "CURRENT")
-    candle_range = highs[-1] - lows[-1]
-    body_share = ((close[-1] - opening[-1])/candle_range
-                  if candle_range > 0 else 0)
-    upper_wick_share = ((highs[-1] - close[-1])/candle_range
-                        if candle_range > 0 else 1)
-    strong_green = (close[-1] > opening[-1] and
-                    body_share >= MIN_BULLISH_BODY_SHARE and
-                    upper_wick_share <= MAX_UPPER_WICK_SHARE)
+    info = {"market": market, "screen": "NONE", "pattern": "",
+            "price": None, "volume_ratio": None, "score": 0,
+            "age_minutes": None, "last3_continuous": False,
+            "gap21": False, "missing21": 0, "active30": 0,
+            "bars5m": len(rows), "signal_time": None,
+            "signal_end": None, "stage": "NONE", "reason": ""}
+    if len(rows) < MIN_SCREEN_5M_BARS:
+        info.update(screen="DATA", reason="5분봉 최소 데이터 부족")
+        return info
+    times = [t for t, _ in rows]
+    p = [float(r["trade_price"]) for _, r in rows]
+    o = [float(r["opening_price"]) for _, r in rows]
+    hi = [float(r["high_price"]) for _, r in rows]
+    lo = [float(r["low_price"]) for _, r in rows]
+    volumes = [float(r["candle_acc_trade_volume"]) for _, r in rows]
+    last = times[-1]
+    end = last + timedelta(minutes=5)
+    age = (now - end).total_seconds() / 60
+    recent3 = all(times[i] - times[i-1] == timedelta(minutes=5) for i in (-2, -1))
+    active30 = sum(end - timedelta(minutes=30) <= t <= last and v>0 for t,v in zip(times,volumes))
+    gaps21 = [(times[i] - times[i-1]).total_seconds()/300 - 1
+              for i in range(-20, 0) if times[i] - times[i-1] != timedelta(minutes=5)]
+    baseline = sum(volumes[-21:-1]) / 20
+    vr = volumes[-1] / baseline if baseline > 0 else 0.0
+    bar_range = hi[-1] - lo[-1]
+    bullish = p[-1] > o[-1]
+    body_share = (p[-1]-o[-1])/bar_range if bar_range > 0 else 0.0
+    wick_share = (hi[-1]-p[-1])/bar_range if bar_range > 0 else 1.0
+    strong = bullish and body_share >= MIN_BULLISH_BODY_SHARE and wick_share <= MAX_UPPER_WICK_SHARE
+    info.update(price=p[-1], volume_ratio=round(vr, 3), signal_time=last.strftime('%Y-%m-%d %H:%M'),
+                signal_end=end.strftime('%Y-%m-%d %H:%M'), age_minutes=round(age, 2),
+                last3_continuous=recent3, gap21=bool(gaps21), missing21=sum(max(0,round(n)) for n in gaps21),
+                active30=active30, strong_candle=strong, body_share=round(body_share, 3),
+                wick_share=round(wick_share, 3), stage="NONE")
+    if age < -0.5 or age > MAX_SIGNAL_AGE_MIN:
+        info.update(screen="STALE", reason="최종 확정 5분봉 지연")
+        return info
+    if not recent3 or any(v <= 0 for v in volumes[-3:]):
+        info.update(screen="GAP3", reason="가장 최근 3개 5분봉의 거래·시간 불연속")
+        return info
+    if active30 < MIN_ACTIVE_CANDLES_30M:
+        info.update(screen="QUIET", reason="최근 30분 내 실제 5분봉 부족")
+        return info
 
-    # A falling 4H diagonal resistance may be nearer than the 4H horizontal
-    # resistance zone. Count it as potential overhead before BUY approval.
-    overhead = list(htf.get("overhead") or [])
-    diag_res = htf.get("diag_resistance")
-    diagonal_res_level = trendline_value(diag_res, ts[-1]) if diag_res else None
-    if diagonal_res_level and diagonal_res_level > close[-1] * 1.0001:
-        overhead.append({"low": diagonal_res_level, "high": diagonal_res_level,
-                         "touches": 2})
-
-    options = []
-    for kind, label in (("support", "4시간 수평 지지대"),
-                        ("resistance", "4시간 수평 저항대")):
-        zone = htf.get(kind)
-        if not zone:
-            continue
-        lo, hi = float(zone["low"]), float(zone["high"])
-        # Never compute a new zone from five-minute candles.
-        distance = (close[-1] / hi - 1)*100
-        if kind == "support":
-            touched = any(lo*0.998 <= lows[k] <= hi*1.002 for k in (-3,-2,-1))
-            held = all(close[k] >= lo*0.996 for k in (-3,-2))
-            bounce = (touched and held and close[-1] >= hi*1.001 and
-                      close[-1] > opening[-1] and close[-1] > close[-2] and
-                      0.10 <= distance <= MAX_BUY_SUPPORT_PCT)
-            if bounce:
-                stop = lo * (1 - STOP_PAD_PCT / 100)
-                quality = evaluate_entry_quality(
-                    close[-1], stop, overhead, strong_green,
-                    vol_now is not None and vol_now >= MIN_BUY_VOL_RATIO,
-                    True  # Touch and close-over-zone are already verified.
-                )
-                if quality["passed"]:
-                    options.append(("BUY", "수평 지지 반등 · 매수세 확인", distance, zone, label, quality, "BUY", "horizontal"))
-                else:
-                    options.append(("WATCH", "지지 반등 모양 · 진입 조건 보류", distance, zone, label, quality, "BUY", "horizontal"))
-            elif lo*0.998 <= close[-1] <= hi*(1+WATCH_SUPPORT_PCT/100):
-                options.append(("WATCH", "수평 지지대 접근 · 반등 대기", distance, zone, label, None, "WATCH", "horizontal"))
-            elif lo*(1-SUPPORT_RECLAIM_PCT/100) <= close[-1] < lo*0.998:
-                options.append(("RECLAIM", "수평 지지대 이탈 · 재진입 대기", distance, zone, label, None, "RECLAIM", "horizontal"))
-        else:
-            crossed = any(close[k-1] <= hi*1.001 and close[k] >= hi*1.002
-                          for k in (-3,-2))
-            confirmed = close[-2] >= hi*1.001 and close[-1] >= hi*1.001
-            breakout = crossed and confirmed and 0.10 <= distance <= MAX_BUY_BREAKOUT_PCT
-            if breakout:
-                # Breakout should be followed by a candle testing former
-                # resistance as support; two closes above alone aren't enough.
-                retested = any(hi*0.995 <= lows[k] <= hi*1.004 and
-                               close[k] >= hi*1.001 for k in (-2,-1))
-                volume_ok = (vol_now is not None and vol_prior is not None and
-                             max(vol_now, vol_prior) >= MIN_BUY_VOL_RATIO and
-                             vol_now >= MIN_CONFIRM_VOL_RATIO)
-                stop = hi * (1 - STOP_PAD_PCT / 100)
-                quality = evaluate_entry_quality(
-                    close[-1], stop, overhead, strong_green,
-                    volume_ok, retested
-                )
-                if quality["passed"]:
-                    options.append(("BUY", "수평 저항 돌파 · 재확인 완료", distance, zone, label, quality, "BUY", "horizontal"))
-                else:
-                    options.append(("WATCH", "저항 돌파 모양 · 진입 조건 보류", distance, zone, label, quality, "BUY", "horizontal"))
-            elif lo*(1-WATCH_RESISTANCE_PCT/100) <= close[-1] <= hi*1.006:
-                options.append(("WATCH", "수평 저항대 접근 · 돌파 관찰", distance, zone, label, None, "WATCH", "horizontal"))
-    # Project the ORIGINAL 4H diagonal line into each completed 5M candle.
-    # Confluence is a ranking clue, not another mandatory BUY gate.
-    for kind, label in (("support", "4시간 상승 추세 지지선"),
-                        ("resistance", "4시간 하락 추세 저항선")):
-        line = htf.get("diag_"+kind)
-        if not line:
-            continue
-        levels = [trendline_value(line, x) for x in ts[-5:]]
-        if any(x is None for x in levels):
-            continue
-        recent = levels[-1]
-        zone = trendline_as_zone(line, ts[-1])
-        distance = (close[-1] / recent - 1)*100
-        if kind == "support":
-            touched = any(levels[k]*0.991 <= lows[k] <= levels[k]*1.004
-                          for k in (-3,-2,-1))
-            held = all(close[k] >= levels[k]*0.995 for k in (-3,-2))
-            bounce = (touched and held and close[-1] >= recent*1.001 and
-                      close[-1] > opening[-1] and close[-1] > close[-2] and
-                      0.10 <= distance <= MAX_BUY_SUPPORT_PCT)
-            if bounce:
-                stop = recent * (1 - STOP_PAD_PCT/100)
-                quality = evaluate_entry_quality(close[-1], stop, overhead,
-                         strong_green, vol_now is not None and vol_now>=MIN_BUY_VOL_RATIO, True)
-                status = "BUY" if quality["passed"] else "WATCH"
-                setup = "상승 추세선 지지 반등 · 매수세 확인" if quality["passed"] else "추세 지지 반등 모양 · 진입 조건 보류"
-                options.append((status,setup,distance,zone,label,quality,"BUY","trend"))
-            elif 0 <= distance <= WATCH_SUPPORT_PCT:
-                options.append(("WATCH","상승 지지선 접근 · 반등 대기",distance,zone,label,None,"WATCH","trend"))
-            elif -SUPPORT_RECLAIM_PCT <= distance < 0:
-                options.append(("RECLAIM","추세 지지 이탈 · 회복 대기",distance,zone,label,None,"RECLAIM","trend"))
-        else:
-            crossed = any(close[k-1] <= levels[k-1]*1.001 and
-                          close[k] >= levels[k]*1.003 for k in (-3,-2))
-            confirmed = close[-2] >= levels[-2]*1.001 and close[-1] >= levels[-1]*1.001
-            breakout = crossed and confirmed and 0.10 <= distance <= MAX_BUY_BREAKOUT_PCT
-            if breakout:
-                retested = any(levels[k]*0.995 <= lows[k] <= levels[k]*1.004 and
-                               close[k] >= levels[k]*1.001 for k in (-2,-1))
-                volume_ok = (vol_now is not None and vol_prior is not None and
-                             max(vol_now, vol_prior)>=MIN_BUY_VOL_RATIO and
-                             vol_now>=MIN_CONFIRM_VOL_RATIO)
-                stop = recent * (1 - STOP_PAD_PCT/100)
-                quality = evaluate_entry_quality(close[-1], stop, overhead,
-                                                 strong_green, volume_ok, retested)
-                status = "BUY" if quality["passed"] else "WATCH"
-                setup = "하락 추세 저항 돌파 · 재확인 완료" if quality["passed"] else "추세 저항 돌파 모양 · 진입 조건 보류"
-                options.append((status,setup,distance,zone,label,quality,"BUY","trend"))
-            elif -WATCH_RESISTANCE_PCT <= distance <= WATCH_RESISTANCE_PCT:
-                options.append(("WATCH","하락 저항선 접근 · 돌파 관찰",distance,zone,label,None,"WATCH","trend"))
-
-    if not options:
-        return out
-    # Prefer confirmed BUY, then the best near-entry setup; preserve broken
-    # support as a separate RECLAIM, even when only one candidate exists.
-    priority = {"BUY":0, "WATCH":1, "RECLAIM":2}
-    options.sort(key=lambda y:(priority[y[0]], 0 if y[6] == "BUY" else 1,
-                               0 if y[3]["kind"] in htf.get("confluence_kinds",[]) else 1,
-                               abs(y[2])))
-    status, setup, dist, zone, label, quality, pattern_signal, source_type = options[0]
-    # V11.12 stage is descriptive ONLY. It never changes the BUY gates.
-    # A verified touch/probe must be based on observed completed 5M highs/lows.
-    tested = False
-    if pattern_signal == "WATCH" and status == "WATCH":
-        if source_type == "horizontal":
-            zlo, zhi = float(zone["low"]), float(zone["high"])
-            if zone["kind"] == "support":
-                tested = any(zlo*0.998 <= lows[k] <= zhi*1.004
-                             for k in (-3, -2, -1))
-            else:
-                tested = max(highs[-3:]) >= zlo*0.998
-        else:
-            source_line = htf.get("diag_" + zone["kind"])
-            levels3 = [trendline_value(source_line, t) for t in ts[-3:]] if source_line else []
-            if len(levels3) == 3 and all(v is not None for v in levels3):
-                if zone["kind"] == "support":
-                    tested = any(level*0.991 <= low <= level*1.004
-                                 for level, low in zip(levels3, lows[-3:]))
-                else:
-                    tested = any(high >= level*0.998
-                                 for level, high in zip(levels3, highs[-3:]))
-    # Reduce 1H API calls dramatically: only candidates with a current 5M
-    # shape receive 1H verification. The three timeframes are still all used
-    # to approve BUY. A strong downtrend or incomplete 1H data is caution,
-    # while neutral / early turn are NOT automatically rejected.
-    hour1 = None
-    if freshness == "CURRENT" and status in ("BUY", "WATCH"):
-        try:
-            hour1 = one_hour_flow(api_get, market, now, kst)
-        except Exception:
-            hour1 = {"state":"확인 불가", "risk": True, "reason":"1시간봉 조회 오류"}
-        if status == "BUY" and hour1["risk"]:
-            status = "WATCH"
-            quality = dict(quality or {})
-            quality["passed"] = False
-            quality["reasons"] = list(quality.get("reasons") or []) + [hour1["reason"]]
-            quality["reason_codes"] = list(quality.get("reason_codes") or []) + ["hour1"]
-            setup += " · 1시간봉 위험으로 진입 보류"
-    reason_codes = list((quality or {}).get("reason_codes") or [])
-    near_quality = (status == "WATCH" and pattern_signal == "BUY" and
-                    len(reason_codes) == 1 and
-                    "hour1" not in reason_codes and
-                    quality.get("risk_pct") is not None and
-                    MIN_STOP_RISK_PCT <= quality["risk_pct"] <= MAX_STOP_RISK_PCT and
-                    quality.get("room_pct") is not None and
-                    quality["room_pct"] >= MIN_GROSS_ROOM_PCT and
-                    quality.get("rr") is not None and
-                    quality["rr"] >= MIN_GROSS_RR)
-    if freshness != "CURRENT":
-        stage, stage_note = "DATA_HOLD", "봉 지연 또는 중간 공백 · BUY 불가"
-    elif status == "BUY":
-        stage, stage_note = "BUY", "모든 기존 BUY 조건 충족"
-    elif status == "RECLAIM":
-        stage, stage_note = "RECLAIM", "지지선 회복 확인 전"
-    elif near_quality:
-        stage, stage_note = "NEAR", "BUY 모양 확인 · 품질 조건 1개 미충족"
-    elif pattern_signal == "BUY":
-        stage, stage_note = "CHECK", "BUY 모양 확인 · 복수 품질 조건 미충족 또는 1시간봉 위험"
-    elif tested:
-        stage, stage_note = "READY", "최근 5분봉에서 지지 터치 또는 저항 시험 감지 · 반등/돌파 미확정"
+    # Price levels below are formed using ONLY past completed 5M candles.
+    last_high = max(hi[-MOTION_LOOKBACK_BARS:-3])
+    last_low = min(lo[-MOTION_LOOKBACK_BARS:-3])
+    if last_high <= 0 or last_low <= 0:
+        return info
+    bounced = (min(lo[-3:]) <= last_low * 1.006 and
+               p[-1] > p[-2] and bullish and p[-1] >= last_low * 1.002)
+    broke = (p[-1] >= last_high * 1.002 and
+             (p[-2] <= last_high * 1.003 or p[-3] <= last_high * 1.003))
+    recheck = (p[-1] >= last_high * 1.001 and
+               p[-2] >= last_high * 1.001 and
+               min(lo[-2:]) <= last_high * 1.005)
+    touch_support = min(lo[-3:]) <= last_low * 1.009
+    near_breakout = p[-1] >= last_high * 0.992 and p[-1] <= last_high * 1.022
+    # Scan strong initial 5M movement even before an exact local-level test.
+    momentum = (p[-1] / p[-4] - 1) * 100
+    active_momentum = bullish and momentum >= 0.35 and vr >= 1.1
+    stop_rebound = min(lo[-3:]) * (1 - STOP_PAD_PCT/100)
+    stop_breakout = min(min(lo[-2:]), last_high) * (1 - STOP_PAD_PCT/100)
+    if bounced:
+        pattern, stage, stop = "5분봉 지지 반등", "CONFIRMED", stop_rebound
+        retested = True
+    elif broke and recheck and bullish:
+        pattern, stage, stop = "5분봉 저항 돌파·재확인", "CONFIRMED", stop_breakout
+        retested = True
+    elif broke or (near_breakout and bullish and p[-1] >= p[-2]*1.001 and vr >= 1.0):
+        pattern, stage, stop = "5분봉 저항 접근·돌파 시도", "READY", stop_breakout
+        retested = bool(recheck)
+    elif touch_support and bullish and p[-1] > p[-2]:
+        pattern, stage, stop = "5분봉 지지 터치·반등 대기", "READY", stop_rebound
+        retested = False
+    elif active_momentum:
+        pattern, stage, stop = "5분봉 상승 움직임 관찰", "READY", stop_rebound
+        retested = False
     else:
-        stage, stage_note = "APPROACH", "4시간 가격대 접근 · 5분봉 진입 시도 아직 미확인"
-    out.update(status=status if freshness == "CURRENT" else freshness,
-               stage=stage, stage_note=stage_note,
-               original_signal=status, pattern_signal=pattern_signal,
-               setup=setup, quality=quality, hour1=hour1,
-               source_type=source_type,
-               confluence=zone["kind"] in htf.get("confluence_kinds",[]),
-               note=f"{label} · 5분봉 {setup}",
-               distance_pct=round(dist,2), zone_center=zone["mid"],
-               zone_low=zone["low"],zone_high=zone["high"],
-               zone_touches=zone["touches"],source_kind=zone["kind"],
-               pivot1=f"{zone['time1']} / {zone['p1']:.8g}",
-               pivot2=f"{zone['time2']} / {zone['p2']:.8g}")
-    if freshness == "STALE":
-        out["note"] += " · 최신 확정봉 지연"
-    if not recent_continuous:
-        out["note"] += " · 최근 21개 5분봉 사이 공백"
-    return out
+        info.update(screen="NONE", reason="최근 5분봉 진입 준비 모양 없음")
+        return info
+    score = (100 if stage == "CONFIRMED" else 55)
+    score += min(20, vr*5) + min(10,max(0,momentum)*2)
+    score += (4 if not info['gap21'] else 0)
+    info.update(screen="CANDIDATE", stage=stage, pattern=pattern,
+                stop=round(stop, 10), retested=retested,
+                momentum_pct=round(momentum, 3), score=round(score, 2),
+                reason="5분봉 후보 · 1H/4H 미검증")
+    return info
 
 
-PAGE = r'''<!doctype html>
+def confirm_candidate(api_get, item, kst):
+    """Verify 1H and 4H as of 5M signal close; no look-ahead from 4H."""
+    market = item['market']
+    signal_end = local_time(item['signal_end'], kst)
+    # Executed serially to avoid overloading public API; parallel across coins.
+    oneh = one_hour_flow(api_get, market, signal_end, kst)
+    htf = analyze_4h(api_get, market, item['price'], signal_end, kst)
+    safety_reasons = []
+    if oneh.get('risk'):
+        safety_reasons.append('1시간봉 위험·자료 부족: '+oneh.get('reason',''))
+    if htf.get('bars4h',0) < MIN_4H_BARS or not htf.get('last4h') or htf.get('age4h',9999)>FRESH_4H_MINUTES:
+        safety_reasons.append('4시간봉 유효 데이터 부족')
+    if not any(htf.get(k) for k in ('support','resistance','diag_support','diag_resistance')):
+        safety_reasons.append('4시간봉 지지·저항 구조 확인 불가')
+    price = float(item['price'])
+    overhead = list(htf.get('overhead') or [])
+    line = htf.get('diag_resistance')
+    lvl = trendline_value(line, signal_end) if line else None
+    if lvl is not None and lvl > price*1.0001:
+        overhead.append({'low':lvl,'high':lvl,'touches':2})
+    quality = evaluate_entry_quality(price, float(item['stop']), overhead,
+                bool(item.get('strong_candle')),
+                float(item.get('volume_ratio') or 0) >= MIN_BUY_VOL_RATIO,
+                bool(item.get('retested')))
+    reasons = list(quality['reasons'])+safety_reasons
+    if item['stage']!='CONFIRMED':
+        reasons.insert(0,'5분봉 반등·돌파 미확정')
+    if not item['last3_continuous'] or item['active30']<MIN_ACTIVE_CANDLES_30M:
+        reasons.insert(0,'가장 최근 거래 연속성 부족')
+    status = 'BUY' if not reasons else 'WATCH'
+    if status == 'BUY':
+        stage = 'BUY'
+    elif item['stage'] == 'CONFIRMED':
+        stage = 'QUALITY_HOLD'
+    else:
+        stage = 'READY'
+    bonus = 6 if htf.get('confluence_kinds') else 0
+    oneh_score = {'상승 흐름':10,'상승 전환 시도':7,'중립·약세 관찰':0}.get(oneh.get('state'),-15)
+    result = dict(item)
+    result.update(status=status,stage=stage,hour1=oneh,htf=htf,quality=quality,
+                  reasons=reasons,score=round(item['score']+bonus+oneh_score,2),
+                  confluence=bool(htf.get('confluence_kinds')))
+    return result
+
+
+PAGE = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V11.12 · 4H 수평+추세선 / 1H 흐름 / 5M 진입 · 단계·공백 진단</title>
+<title>V11.13 · 5분봉 우선 단타 후보 스캐너</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#141c2f;--border:#30405d;--text:#edf3ff;--sub:#a8b9d3;--green:#4ade80;--yellow:#fbbf24}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
-main{max-width:1050px;margin:auto;padding:20px 14px 60px}h1{font-size:22px;margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}
-p{margin:5px 0 12px}.muted{font-size:13px;color:var(--sub)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:15px;padding:17px;margin-top:14px}
-button{background:#315de7;color:white;border:0;border-radius:9px;padding:12px 18px;font:inherit;font-weight:750;cursor:pointer}button:disabled{opacity:.5}a{color:#aecaff}
-.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{border:1px solid var(--border);border-radius:10px;padding:10px;min-width:0}.metric b{display:block;font-size:23px}.buy{color:var(--green)}.watch{color:var(--yellow)}.subtle{color:#d8b4fe}
-progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.item{background:#10182a;border:1px solid var(--border);padding:14px;border-radius:12px;overflow-wrap:anywhere}.item.buycard{border-color:#2a7954}.item.watchcard{border-color:#756027}.item h3{display:flex;justify-content:space-between;gap:8px;font-size:16px;margin:0 0 8px}.pill{font-size:12px;border-radius:7px;background:#1d314e;padding:2px 7px}.details{white-space:pre-line;font-size:13px}details summary{cursor:pointer;font-weight:750}#timing{margin-top:8px}.emphasis{font-weight:800}.recordnote{font-size:12px;color:var(--sub)}.focuscard{border-color:#486d9a}.focuscard.good{border-color:#2a7954}.focuscard h3{margin:0 0 6px;font-size:16px}.manualBar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.manualBar button{font-size:13px;padding:8px 12px;background:#44526f}.manualBar button:disabled{opacity:.4}.dailycount{font-size:24px;font-weight:800}.smallhint{font-size:12px;color:var(--sub)}.diaggrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:12px}.diagrow{border:1px solid var(--border);border-radius:10px;padding:10px}.diagrow span{display:block;color:var(--sub);font-size:12px}.diagrow b{font-size:21px}.unknownnote{color:#fbbf24}.stagerow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stagebox{border:1px solid var(--border);border-radius:10px;padding:10px}.stagebox span{color:var(--sub);display:block;font-size:12px}.stagebox b{font-size:23px}.stagelabel{color:#a8d1fa;font-weight:700}
-@media(max-width:680px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.list{grid-template-columns:1fr}.stagerow{grid-template-columns:repeat(2,minmax(0,1fr))}}
+:root{color-scheme:dark;--bg:#0b1020;--panel:#171d34;--card:#101728;--border:#33405e;--muted:#acb9d3;--fg:#f0f4ff;--blue:#315de7;--green:#4ade80;--orange:#f9c05a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1000px;margin:auto;padding:20px 14px 55px}h1{font-size:23px;line-height:1.35;margin:0 0 9px}h2{font-size:18px;margin:0 0 10px}h3{font-size:16px;margin:0 0 7px;overflow-wrap:anywhere}
+p{margin:7px 0}.muted,small{color:var(--muted);font-size:13px}.panel{background:var(--panel);border:1px solid var(--border);padding:16px;border-radius:16px;margin-top:15px}
+button{background:var(--blue);border:0;border-radius:10px;color:white;padding:12px 18px;font-weight:800;font-size:15px;cursor:pointer}button:disabled{opacity:.45}a{color:#b3c7ff}
+.metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.metric{border:1px solid var(--border);padding:10px;border-radius:10px}.metric b{display:block;font-size:21px}.metric small{display:block;font-size:11px}
+.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.item{padding:13px;border:1px solid var(--border);background:var(--card);border-radius:12px;overflow-wrap:anywhere}.item.buy{border-color:#328f67}.item.watch{border-color:#866f38}
+.cardtext{font-size:13px;white-space:pre-line}.buylabel{color:var(--green)}.watchlabel{color:var(--orange)}.status{white-space:pre-wrap;font-size:13px;color:var(--muted)}.sub{color:var(--muted);font-size:12px}
+progress{width:100%;height:13px;margin:14px 0 6px}.line{display:flex;align-items:center;gap:8px;flex-wrap:wrap}details summary{cursor:pointer;font-weight:700}.bar{margin-top:9px;display:flex;flex-wrap:wrap;gap:9px;align-items:center}.bar button{padding:8px 12px;background:#3d4d70;font-size:13px}
+@media(max-width:680px){.list{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style></head><body><main>
-<h1>🎯 4시간 수평·추세선 + 1시간 흐름 + 5분 진입</h1>
-<p class="muted">V11.12 3중 시간봉 · 진입 단계·공백 진단 실험판 · KRW 전체 · 거래대금 제한 없음 · 유의종목 포함 · V2 메인 변경 없음</p>
-<div class="panel"><button id="run">지금 전체 검색</button> <a href="/">기존 V2 메인</a>
-<p class="muted">4시간봉 수평 가격대(±2%)와 기울어진 추세선(±1%) 둘 다 찾고, 5분봉 진입 모양을 포착한 후보만 1시간봉 흐름을 추가 확인합니다. 1시간봉 강한 하락·데이터 부족이면 BUY를 보류하지만 중립/전환 시도는 탈락시키지 않습니다. <b>위쪽 4시간 저항까지 최소 3%의 이론적 공간</b>, 짧은 구조적 손절, 거래량과 재확인을 통과한 BUY를 우선 표시합니다. 조건이 부족하면 WATCH로 남깁니다. 3~5% 상승이나 이익은 보장되지 않습니다.</p>
+<h1>🎯 5분봉 움직임 → 1시간 흐름 → 4시간 구조</h1>
+<p class="muted">V11.13 실험판 · 빗썸 KRW 전체 · 거래대금 하한 없음 · 유의종목 포함 · V2 메인 변경 없음</p>
+<section class="panel"><button id="run">지금 전체 검색</button>　<a href="/">기존 V2 메인</a>
+<p class="muted">최근 거래가 있는 5분봉부터 후보를 찾습니다. 가장 최근 3개 5분봉 연속과 지난 30분 실제 봉 5개 이상을 확인하며, 더 오래된 봉 공백은 경고로만 표시합니다. 5분봉 후보 중 점수 상위 최대 80개만 1시간봉·4시간봉 추가 검증하므로 <b>검증하지 못한 후보 개수</b>를 반드시 함께 표시합니다. BUY에는 기존 거래량·손절 위험·위쪽 저항 3%·참고 손익비 조건을 적용합니다. 3~5% 상승을 보장하지 않습니다.</p>
 <div class="metrics">
-<div class="metric"><span class="muted">전체 / 4시간봉 검사</span><b id="all">—</b></div>
-<div class="metric"><span class="muted">5분봉 정밀 확인</span><b id="near">—</b></div>
-<div class="metric"><span class="muted">BUY</span><b class="buy" id="buys">—</b></div>
-<div class="metric"><span class="muted">WATCH</span><b class="watch" id="watches">—</b></div>
-<div class="metric"><span class="muted">지지 이탈 주의</span><b class="subtle" id="reclaims">—</b></div>
+<div class="metric"><small>전체 / 5분봉 검사</small><b id="all">—</b></div>
+<div class="metric"><small>최근 거래·5분봉 유효</small><b id="active">—</b></div>
+<div class="metric"><small>1H·4H 확인</small><b id="verify">—</b></div>
+<div class="metric"><small>확정 BUY</small><b id="buyCount" class="buylabel">—</b></div>
+<div class="metric"><small>WATCH</small><b id="watchCount" class="watchlabel">—</b></div>
+<div class="metric"><small>추가 검증 제외</small><b id="notChecked">—</b></div>
 </div>
-<progress id="progress" value="0" max="1"></progress>
-<div id="status" class="muted">검색 버튼을 누르면 4시간봉 전체 검사부터 진행합니다.</div>
-<div id="timing" class="muted"></div>
-</div>
-<section class="panel"><h2>⭐ 오늘 집중할 최대 3개 · 단계별 우선</h2><p class="muted">BUY → 진입 임박 → 최근 터치·돌파 시도가 확인된 진입 준비 순서로 선별합니다. 모든 단계에서 신호가 최신이고 1시간봉 위험이 없어야 합니다. 준비/임박은 매수 신호가 아니며 억지로 세 개를 채우지 않습니다.</p><div class="list" id="focusList"><p class="muted">검색 완료 후 표시됩니다.</p></div></section>
-<section class="panel"><h2>📍 V11.12 · 진입 진행 단계</h2><p class="muted">WATCH를 가격대 접근 / 5분봉 터치·돌파 시도 / BUY 모양 확인·진입 검증으로 구분합니다. 중간 단계는 신호의 미래 성공을 뜻하지 않습니다. 기존 BUY 판단에는 영향을 주지 않습니다.</p><div class="stagerow" id="stageGrid"><p class="muted">검색 완료 후 표시됩니다.</p></div></section>
-<section class="panel"><h2>📝 오늘 수동 거래 기록</h2><div class="manualBar"><span class="dailycount" id="tradeCount">0 / 3회</span><button type="button" id="manualOne">거래 1회 직접 기록</button><button type="button" id="undoTrade">마지막 기록 취소</button></div><p class="recordnote" id="tradeHistory">실제 거래를 했다면 BUY 후보의 기록 버튼을 직접 눌러 주세요.</p><p class="smallhint">기록은 현재 브라우저에만 저장됩니다. 앱을 닫아도 같은 브라우저에 남지만, 다른 기기·브라우저와 공유되지 않습니다. 하루 3회는 사용자 원칙으로, 빗썸 주문을 막는 기능이 아닙니다.</p></section>
-<section class="panel"><h2>🔍 V11.12 · BUY 차단·캔들 상태 진단</h2>
-<p class="muted">5분봉에서 진입 모양이 나온 <b>현재 WATCH</b>의 BUY 미통과 이유를 셉니다. 한 종목이 여러 조건에서 미통과할 수 있어 합계는 종목 수보다 클 수 있습니다. 일반 접근 WATCH, 오래된 신호·공백은 별도 집계합니다.</p>
-<div class="diaggrid" id="diagGrid"><p class="muted">검색 완료 후 진단이 표시됩니다.</p></div>
-<p class="smallhint" id="diagDetails">최근 5분봉 지연과 최근 21개 봉 사이 빈 구간은 각각 계산합니다. 두 문제가 동시에 존재하면 양쪽에 중복으로 집계합니다. 거래 없는 시간에는 거래소가 봉을 만들지 않을 수 있으며, 실제 API 장애라는 뜻은 아닙니다. 기존 BUY 기준 유지.</p>
+<progress id="progress" value="0" max="100"></progress><div id="status" class="status">검색 버튼을 눌러 시작하세요.</div><div id="timing" class="status"></div>
 </section>
-<section class="panel"><h2 class="buy">실험 BUY 후보 · 5분봉 정밀 검증 통과</h2><div class="list" id="buyList"><p class="muted">검색 전</p></div></section>
-<details class="panel" id="unknownPanel"><summary class="unknownnote">⚠️ 위쪽 4시간봉 저항 미확인 · 별도 관찰 <span id="unknownCount">(0개)</span></summary>
-<p class="muted">5분봉 반등·돌파 모양은 나왔지만 관측된 위쪽 저항이 없어 최소 3% 공간을 검증하지 못한 WATCH입니다. <b>BUY로 승격하지 않습니다.</b> 기존 저항 탐색 범위 밖에 있는 것일 수도 있고, 실제 저항이 없다는 증거가 아닙니다. 다른 미충족 조건도 함께 표시합니다.</p>
-<div class="list" id="unknownList"></div></details>
-<section class="panel"><h2 class="watch">WATCH · 일반 가격대 접근 후보</h2><p class="muted">전체 WATCH 개수에는 위쪽 저항 미확인 관찰 후보도 포함되어 있습니다.</p><div class="list" id="watchList"><p class="muted">검색 전</p></div></section>
-<details class="panel" id="reclaimPanel"><summary class="subtle">⚠️ 지지선 이탈 · 회복 대기 <span id="reclaimCount"></span></summary><p class="muted">4시간 수평 지지대 아래에 있어 아직 지지가 확인되지 않았습니다. 가격대를 회복하기 전에는 BUY로 취급하지 않습니다.</p><div id="reclaimList" class="list"></div></details>
-<details class="panel" id="holdPanel"><summary class="subtle">⚠️ 마지막 봉 지연 / 중간 봉 공백 보류 <span id="holdCount"></span></summary><p class="muted">확인된 관찰 후보 중 최근 확정봉이 오래됐거나 최근 21개 5분봉 사이에 빈 구간이 있습니다. 아래 카드에서 지연 시간과 중간 빈 구간 수를 각각 확인할 수 있습니다. 둘 다 있는 종목도 BUY가 아닙니다.</p><div id="holdList" class="list"></div></details>
-<p class="muted">실험용 신호이며 매수 권유나 수익 보장이 아닙니다. 진입 참고가는 최신 확정 5분봉 종가이며 실제 체결가가 아닙니다. 3~5%는 관찰 목표 움직임으로, 예측·확정 익절가가 아닙니다. 표시하는 손절 기준·위쪽 저항까지의 거리는 수수료·호가 차이·슬리피지를 뺀 순수익을 뜻하지 않습니다. 위쪽 저항이 확인되지 않으면 BUY로 표시하지 않고 별도 관찰로 분리합니다. 진단은 승률 예측이 아닙니다. 미래 봉은 사용하지 않습니다.</p>
+<section class="panel"><h2>⭐ 집중 관찰 최대 3개</h2><p class="muted">BUY → 5분봉 진입 모양 확인·품질 보류 → 터치·돌파 준비 순서. BUY가 아닌 후보를 매수 신호처럼 표시하지 않습니다.</p><div class="list" id="focus">완료 후 표시</div></section>
+<section class="panel"><h2>🧪 진입 단계·검증 결과</h2><div class="metrics" id="stages">완료 후 표시</div></section>
+<section class="panel"><h2>📉 5분봉 상태 진단</h2><div class="metrics" id="health">완료 후 표시</div><p class="muted">오래된 5분봉 공백은 합성하지 않습니다. 가장 최근 3개 봉이 연결되고 최근 30분 실제 거래가 확인되면, 그보다 오래된 21개 구간의 공백은 BUY를 무조건 차단하지 않습니다.</p></section>
+<section class="panel"><h2>📝 오늘 수동 거래 기록</h2><div class="bar"><strong id="tradeN">0 / 3회</strong><button id="record">거래 1회 직접 기록</button><button id="undo">마지막 기록 취소</button></div><p class="muted">브라우저에만 저장됩니다. 주문을 실행하거나 거래소 주문 횟수를 차단하지 않습니다.</p></section>
+<section class="panel"><h2 class="buylabel">BUY · 1H·4H 검증 통과</h2><div class="list" id="buys">검색 전</div></section>
+<section class="panel"><h2 class="watchlabel">WATCH · 진입 준비·보류</h2><div class="list" id="watches">검색 전</div></section>
+<details class="panel"><summary>⚠️ 5분봉 단계에서 제외·보류된 종목 현황</summary><div id="diagnosis">검사 전</div></details>
+<p class="muted">실험용 기술적 신호이며 투자 권유나 자동 주문 기능이 아닙니다. 확인된 4시간봉 저항이 없다고 무제한 상승 가능하다고 가정하지 않습니다. 수수료·슬리피지를 제외한 실제 손익과 다릅니다.</p>
 </main><script>
-const $=id=>document.getElementById(id);
-const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const won=v=>Number(v).toLocaleString('ko-KR',{maximumFractionDigits:8})+'원';
-const resultMap=new Map();let running=false;let showMore=false;let scanFinished=false;
-let noPatternCount=0;let entrySkipped=0;let total4hNear=0;
-let candleStats={late:0,gap:0,both:0,missing:0,clock:0,checked:0};
-const DIAG_KEYS=[['candle','5분봉 양봉·윗꼬리 부족'],['volume','매수 거래량 부족'],['retest','돌파 재확인 부족'],['stop','손절 위험 기준 미달'],['overhead_unknown','위쪽 저항 미확인'],['room','확인된 저항까지 3% 미만'],['rr','참고 손익비 부족'],['hour1','1시간봉 위험·자료 문제']];
-function qualityCodes(x){return Array.isArray(x.quality?.reason_codes)?x.quality.reason_codes:[];}
-function unknownOverhead(x){return x.status==='WATCH'&&x.pattern_signal==='BUY'&&qualityCodes(x).includes('overhead_unknown');}
-function renderDiagnostics(){
- const all=[...resultMap.values()];
- const blocked=all.filter(x=>x.status==='WATCH'&&x.pattern_signal==='BUY'&&x.quality);
- const count={};for(const [key] of DIAG_KEYS)count[key]=0;
- for(const x of blocked)for(const code of new Set(qualityCodes(x)))if(Object.hasOwn(count,code))count[code]++;
- const nearOnly=all.filter(x=>x.status==='WATCH'&&x.pattern_signal!=='BUY').length;
- const held=all.filter(x=>['STALE','GAP'].includes(x.status)).length;
- const boxes=[['최근 확정 5분봉 지연',candleStats.late],['최근 21개 봉 사이 공백',candleStats.gap],['지연과 공백 둘 다',candleStats.both],['빈 5분봉 추정 개수 합계',candleStats.missing],['시계 차이·미래시각',candleStats.clock],['5분봉 후보 조건 해당 없음',noPatternCount],['진입 모양 없이 접근 WATCH',nearOnly],['진입 모양 있으나 BUY 보류',blocked.length],['신선도 문제로 보류된 관심 후보',held], ...DIAG_KEYS.map(([key,label])=>[label,count[key]])];
- $('diagGrid').innerHTML=boxes.map(([label,n])=>`<div class="diagrow"><span>${esc(label)}</span><b>${n}개</b></div>`).join('');
- $('diagDetails').textContent=`5분봉 요청 ${total4hNear}개 · 상태 측정 ${candleStats.checked}개 · 5분봉 부족 ${entrySkipped}개. 최근 확정봉 지연과 중간 봉 공백은 동시에 발생할 수 있으므로 중복 집계합니다. 빈 봉은 거래 미발생 때문일 수도 있습니다. BUY·거래대금 기준은 변경하지 않았습니다.`;
-}
-
-function renderStages(){
- const list=[...resultMap.values()];
- const counts={BUY:0,NEAR:0,CHECK:0,READY:0,APPROACH:0,DATA_HOLD:0,RECLAIM:0};
- for(const x of list)if(Object.prototype.hasOwnProperty.call(counts,x.stage))counts[x.stage]++;
- const rows=[['BUY 확정',counts.BUY],['진입 임박 · 한 조건',counts.NEAR],['진입 모양 · 검증 보류',counts.CHECK],['진입 준비 · 터치/시도',counts.READY],['가격대 접근 WATCH',counts.APPROACH],['봉 상태 보류 후보',counts.DATA_HOLD],['지지 이탈·회복 대기',counts.RECLAIM]];
- $('stageGrid').innerHTML=rows.map(([name,n])=>`<div class="stagebox"><span>${esc(name)}</span><b>${n}개</b></div>`).join('');
-}
-
-const DAILY_LIMIT=3;
-function kstToday(){
-  const parts=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
-  const v=k=>parts.find(x=>x.type===k)?.value||'';
-  return `${v('year')}-${v('month')}-${v('day')}`;
-}
-function tradeKey(){return 'bithumb_v119_manual_'+kstToday();}
-function readTrades(){try{const x=JSON.parse(localStorage.getItem(tradeKey())||'[]');return Array.isArray(x)?x.slice(0,DAILY_LIMIT):[]}catch(e){return []}}
-function saveTrades(rows){try{localStorage.setItem(tradeKey(),JSON.stringify(rows));return true}catch(e){$('tradeHistory').textContent='⚠️ 브라우저 기록 저장이 차단되어 수동 기록을 저장하지 못했습니다.';return false}}
-function paintTrades(){
-  const records=readTrades();$('tradeCount').textContent=`${records.length} / ${DAILY_LIMIT}회`;
-  $('undoTrade').disabled=records.length===0;$('manualOne').disabled=records.length>=DAILY_LIMIT;
-  $('tradeHistory').textContent=records.length?records.map((x,i)=>`${i+1}회 · ${x.market} · ${x.when}${x.price==null?'':' · 기록 가격 '+won(x.price)}`).join(' / '):'실제 거래가 있었다면 BUY 후보의 수동 기록 버튼을 눌러 주세요.';
-}
-function signalStillFresh(x){
-  const ts=Date.parse(String(x.signal_time||'').replace(' ','T')+'+09:00');
-  const age=Date.now()-(ts+5*60000);
-  return Number.isFinite(ts)&&age>=-30000&&age<=10*60000;
-}
-function spotlight(){
- const arr=[...resultMap.values()].filter(x=>{
-   if(!signalStillFresh(x)||x.candle_health?.gap||x.candle_health?.stale)return false;
-   if(x.status==='BUY')return true;
-   if(x.status!=='WATCH'||unknownOverhead(x)||x.hour1?.risk)return false;
-   if(x.stage==='NEAR')return true;
-   if(x.stage!=='READY')return false;
-   // Preparation-stage observations are NOT a BUY: keep only setups with
-   // some observed volume participation and acceptable 1H trend if present.
-   return Number(x.volume_ratio)>=1.0 &&
-     (!x.hour1 || ['상승 흐름','상승 전환 시도'].includes(x.hour1.state));
- });
- const rank=x=>x.status==='BUY'?0:x.stage==='NEAR'?1:2;
- return arr.sort((a,b)=>rank(a)-rank(b)||
-   Number(Boolean(b.confluence))-Number(Boolean(a.confluence))||
-   Number(b.volume_ratio||0)-Number(a.volume_ratio||0)||
-   Math.abs(Number(a.distance_pct))-Math.abs(Number(b.distance_pct))||
-   a.market.localeCompare(b.market)).slice(0,DAILY_LIMIT);
-}
-const MIN_ROOM_FOR_UI=3.0;
-function paintSpotlight(){
-  if(!scanFinished){$('focusList').innerHTML='<p class="muted">검색 완료 후 최종 상위 후보를 표시합니다.</p>';return;}
-  const picks=spotlight(),records=readTrades();
-  if(!picks.length){$('focusList').innerHTML='<p class="muted">현재 기준에 맞는 집중 후보가 없습니다. 하루 3번을 채우기 위해 무리할 필요는 없습니다.</p>';return;}
-  $('focusList').innerHTML=picks.map((x,i)=>{
-    const buy=x.status==='BUY',q=x.quality||{};
-    const exists=records.some(r=>r.market===x.market&&r.signal_time===x.signal_time);
-    const allowed=buy&&records.length<DAILY_LIMIT&&!exists&&signalStillFresh(x);
-    const oneAway=!buy&&x.stage==='NEAR';
-    const text=buy?'확정 BUY 조건 통과':oneAway?'진입 임박 · 품질 한 조건 미충족':'진입 준비 · 터치/돌파 시도 · BUY 아님';
-    return `<article class="item focuscard ${buy?'good':''}"><h3>${i+1}. ${esc(x.market)} · ${text}${x.confluence?' · 4H 복합선':''}</h3>`+
-      `<div class="details">확정 종가 ${won(x.price)} · 참고 손절 ${q.stop==null?'—':won(q.stop)} / 위험 ${q.risk_pct==null?'—':q.risk_pct+'%'}
-`+
-      `위쪽 4시간봉 저항까지 이론적 여유 ${q.room_pct==null?'미확인':q.room_pct+'%'} · 참고 손익비 ${q.rr==null?'—':q.rr+':1'}
-`+
-      `1시간봉 ${esc(x.hour1?.state||'확인 전')} · 근거 ${x.source_type==='trend'?'기울어진 4H 추세선':'4H 수평 가격대'}${x.confluence?' · 수평+추세선 겹침':''}
-${buy?'✅ 기존 BUY 조건 통과':oneAway?'⚠️ 마지막 확인 필요: '+esc((q.reasons||[]).join(' / ')):'⚪ 관찰만 · 반등/돌파 미확정 · 위험·상승 여력 확인 전'}</div>`+
-      (buy?`<button type="button" class="manualTrade" data-market="${esc(x.market)}" ${allowed?'':'disabled'}>${exists?'기록 완료':records.length>=DAILY_LIMIT?'오늘 3회 기록 완료':signalStillFresh(x)?'실제 진입했다면 1회 기록':'신호 만료 · 재검색'}</button>`:'')+
-      '</article>';
-  }).join('');
-}
-function entries(status){return [...resultMap.values()].filter(x=>status==='HOLD'?['STALE','GAP'].includes(x.status):x.status===status)
- .sort((a,b)=>Math.abs(Number(a.distance_pct||99))-Math.abs(Number(b.distance_pct||99))||a.market.localeCompare(b.market));}
-function stageName(s){return ({BUY:'BUY 확정',NEAR:'진입 임박',CHECK:'진입 모양·검증 보류',READY:'진입 준비',APPROACH:'가격대 접근',DATA_HOLD:'데이터 보류',RECLAIM:'지지 회복 대기'})[s]||'확인 중';}
-function card(x){const h=x.htf||{},z=x.source_kind==='support'?h.support:h.resistance;
-const zoneText=x.source_type==='trend'?
-`4시간 기울어진 ${x.source_kind==='support'?'지지 추세선':'저항 추세선'} · 5분봉 시각에 투영한 값
-추세선 형성 고점·저점 1: ${esc(x.pivot1)} · 2: ${esc(x.pivot2)}`:
-z?`${z.kind==='support'?'4시간 수평 지지대':'4시간 수평 저항대'} · 확인된 반응 ${esc(z.touches)}회
-가격대 ${won(z.low)} ~ ${won(z.high)} (중심 ${won(z.mid)})
-반응 1: ${esc(x.pivot1)} · 반응 2: ${esc(x.pivot2)}`:'';
-const r=x.volume_ratio==null?'확인 불가':Number(x.volume_ratio).toFixed(2)+'배';
-const h1=x.hour1?`\n1시간봉 ${esc(x.hour1.state)} · 3시간 변화 ${x.hour1.change_3h_pct==null?'—':esc(x.hour1.change_3h_pct)+'%'}${x.hour1.risk?' · ⚠️ '+esc(x.hour1.reason):''}`:'\n1시간봉: 5분봉 진입 모양 미확인 또는 보류로 추가 조회 생략';
-const q=x.quality;const quality=q?`
-진입 참고 손절 ${q.stop==null?'—':won(q.stop)} · 손절 거리 ${q.risk_pct==null?'—':q.risk_pct+'%'}
-위쪽 4시간 저항 ${q.next_resistance==null?'확인 불가':won(q.next_resistance)} · 가격 여유 ${q.room_pct==null?'—':q.room_pct+'%'} · 참고 손익비 ${q.rr==null?'—':q.rr+':1'}
-${q.passed?'✅ 진입 품질 조건 통과':'⚠️ BUY 보류: '+esc(q.reasons.join(' / '))}`:'';
-return `<article class="item ${x.status==='BUY'?'buycard':'watchcard'}"><h3><span>${esc(x.market)}</span><span class="pill ${x.status==='BUY'?'buy':'watch'}">${esc(x.status==='BUY'?'BUY':x.status==='WATCH'?'WATCH':x.status==='RECLAIM'?'회복 대기':'확인 보류')}</span></h3>`+
-`<div class="details">${esc(x.setup)} · ${esc(x.note)}
-${x.confluence?'⭐ 4시간 수평 가격대와 기울어진 추세선 겹침\n':''}📍 단계: ${esc(stageName(x.stage))} · ${esc(x.stage_note||'')}
-${x.candle_health?`⏱ 최근 봉 종료 후 ${x.candle_health.latest_delay_minutes}분 · 중간 공백 ${x.candle_health.missing_intervals}곳 (누락 추정 ${x.candle_health.missing_5m_bars}봉)${x.candle_health.clock_issue?' · 시각 불일치':''}\n`:''}${x.source_type==='trend'?'4시간 기울어진 추세선 기준':'4시간 수평 가격대 기준'}${h1}
-확정 5분봉 ${esc(x.signal_time)} · 종료 후 ${esc(x.age_minutes)}분
-5분봉 종가 ${won(x.price)} · ${x.source_type==='trend'?'추세선':'가격대 상단'} ${won(x.zone_high)} · 거리 ${x.distance_pct>0?'+':''}${esc(x.distance_pct)}%
-거래량 ${esc(r)}${quality}
-${zoneText}</div></article>`;}
-
-function paint(){const b=entries('BUY'),w=entries('WATCH'),r=entries('RECLAIM'),h=entries('HOLD');$('buys').textContent=b.length;$('watches').textContent=w.length;$('reclaims').textContent=r.length;$('holdCount').textContent=`(${h.length}개)`;$('reclaimCount').textContent=`(${r.length}개)`;
-$('buyList').innerHTML=b.length?b.map(card).join(''):'<p class="muted">현재 확정 BUY 없음</p>';
-const unknown=w.filter(unknownOverhead),ordinary=w.filter(x=>!unknownOverhead(x));
-$('unknownCount').textContent=`(${unknown.length}개)`;
-$('unknownList').innerHTML=$('unknownPanel').open?(unknown.length?unknown.map(card).join(''):'<p class="muted">현재 별도 관찰 후보 없음</p>'):'';
-$('watchList').innerHTML=ordinary.length?(showMore?ordinary:ordinary.slice(0,20)).map(card).join('')+(ordinary.length>20?`<button type="button" id="moreBtn">${showMore?'접기':`나머지 ${ordinary.length-20}개 더 보기`}</button>`:''):'<p class="muted">현재 일반 WATCH 없음</p>';
-const more=$('moreBtn');if(more)more.addEventListener('click',()=>{showMore=!showMore;paint();});
-$('reclaimList').innerHTML=$('reclaimPanel').open?(r.length?r.map(card).join(''):'<p class="muted">지지선 회복 대기 후보 없음</p>'):'';
-$('holdList').innerHTML=$('holdPanel').open?(h.length?h.map(card).join(''):'<p class="muted">확인 보류 없음</p>'):'';paintTrades();paintSpotlight();if(scanFinished){renderDiagnostics();renderStages();}}
-async function post(path,items){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),75000);
-try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items}),signal:controller.signal,cache:'no-store'});
-const j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||`HTTP ${r.status}`);return j;}finally{clearTimeout(timer);}}
-async function pool(packs,limit,fn){let idx=0;const errs=[];async function worker(){while(idx<packs.length){const i=idx++;try{await fn(packs[i]);}catch(e){errs.push(e.message||String(e));}}}
-await Promise.all(Array.from({length:Math.min(limit,packs.length)},worker));return errs;}
-async function scan(){if(running)return;scanFinished=false;running=true;$('run').disabled=true;resultMap.clear();showMore=false;noPatternCount=0;entrySkipped=0;total4hNear=0;candleStats={late:0,gap:0,both:0,missing:0,clock:0,checked:0};$('stageGrid').innerHTML='<p class="muted">검색 진행 중 · 완료 후 집계</p>';$('diagGrid').innerHTML='<p class="muted">검색 진행 중 · 완료 후 집계</p>';paint();$('all').textContent='—';$('near').textContent='—';$('timing').textContent='';$('progress').value=0;
-const started=performance.now();let lineErrors=0,entryErrors=0;try{
-const resp=await fetch('/api/zone45/universe',{cache:'no-store'});const u=await resp.json();if(!resp.ok||!u.ok)throw Error(u.error||'시장 목록 조회 실패');
-const items=u.items;const packs=[];for(let i=0;i<items.length;i+=40)packs.push(items.slice(i,i+40));
-$('progress').max=items.length;$('all').textContent=`0 / ${items.length}`;const near=[];let scanned=0,valid=0,noLines=0;
-$('status').textContent='1단계 · 전체 4시간봉 수평 지지·저항 가격대 분석 중…';
-const errors1=await pool(packs,3,async batch=>{const r=await post('/api/zone45/lines',batch);
-scanned+=r.scanned;lineErrors+=r.errors;for(const x of r.results){if(x.near)near.push(x);if(x.support||x.resistance)valid++;else noLines++;}
-$('all').textContent=`${scanned} / ${items.length}`;$('progress').value=scanned;
-$('status').textContent=`1단계 · 4시간봉 ${scanned}/${items.length}개 · 수평 가격대 있는 종목 ${valid}개 · 5분봉 확인 대상 ${near.length}개`;});
-const t1=((performance.now()-started)/1000).toFixed(1);if(errors1.length||lineErrors)throw Error(`4시간봉 일부 조회 실패: ${lineErrors}개 / 요청 ${errors1.length}건. 불완전한 검사이므로 결과 확정하지 않음`);
-total4hNear=near.length;$('near').textContent=near.length;$('status').textContent=`2단계 · 4시간 수평 가격대 근처 ${near.length}개 종목의 5분봉 반등·돌파 확인 중…`;
-const packs2=[];for(let i=0;i<near.length;i+=40)packs2.push(near.slice(i,i+40));let checked=0,skipped=0;
-const errors2=await pool(packs2,3,async batch=>{const r=await post('/api/zone45/entries',batch);checked+=r.scanned;entryErrors+=r.errors;skipped+=r.skipped;
-entrySkipped+=r.skipped;
-for(const x of r.results){
- if(x.status==='NONE')noPatternCount++;
- const ch=x.candle_health;
- if(ch){candleStats.checked++;if(ch.stale)candleStats.late++;if(ch.gap)candleStats.gap++;if(ch.stale&&ch.gap)candleStats.both++;if(ch.clock_issue)candleStats.clock++;candleStats.missing+=Number(ch.missing_5m_bars||0);}
- if(['BUY','WATCH','RECLAIM','GAP','STALE'].includes(x.status))resultMap.set(x.market,x);
-}paint();
-$('status').textContent=`2단계 · 5분봉 ${checked}/${near.length}개 · BUY ${entries('BUY').length} · WATCH ${entries('WATCH').length} · 지지 이탈 ${entries('RECLAIM').length}`;});
-scanFinished=!(errors2.length||entryErrors||checked!==near.length);paint();const total=((performance.now()-started)/1000).toFixed(1);
-$('timing').textContent=`4시간봉 전체 ${t1}초 · 5분봉·대상 후보 1시간봉 포함 전체 ${total}초 · 시작 ${esc(u.snapshot_at)} · 가격대 없음 ${noLines}개 · 5분봉 부족 ${skipped}개`;
-$('status').textContent=(errors2.length||entryErrors?'⚠️ 일부 실패 · ':'✅ 완료 · ')+`전체 ${scanned}/${items.length} · 5분봉 확인 ${checked}/${near.length} · BUY ${entries('BUY').length} · WATCH ${entries('WATCH').length} · 지지 이탈 ${entries('RECLAIM').length} · 시간/공백 보류 ${entries('HOLD').length} · 오류 ${lineErrors+entryErrors+errors2.length}건`;
-}catch(e){$('status').textContent='⚠️ 검색 중단: '+e.message+' · 표시된 내용은 불완전할 수 있어.';$('diagGrid').innerHTML='<p class="muted">검사가 완료되지 않아 차단 원인을 집계하지 않았습니다.</p>';$('stageGrid').innerHTML='<p class="muted">검사 미완료 · 단계 집계 보류</p>';}
-finally{running=false;$('run').disabled=false;}}
-$('run').addEventListener('click',scan);$('holdPanel').addEventListener('toggle',paint);$('reclaimPanel').addEventListener('toggle',paint);$('unknownPanel').addEventListener('toggle',paint);
-$('focusList').addEventListener('click',event=>{
-  const btn=event.target.closest('button.manualTrade');if(!btn)return;
-  const x=resultMap.get(btn.dataset.market);if(!scanFinished||!x||x.status!=='BUY'||!signalStillFresh(x))return;
-  const records=readTrades();if(records.length>=DAILY_LIMIT||records.some(r=>r.market===x.market&&r.signal_time===x.signal_time))return;
-  records.push({market:x.market,signal_time:x.signal_time,price:x.price,when:new Intl.DateTimeFormat('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'}).format(new Date())});
-  if(saveTrades(records))paint();
-});
-$('manualOne').addEventListener('click',()=>{const a=readTrades();if(a.length>=DAILY_LIMIT)return;a.push({market:'수동 거래',price:null,when:new Intl.DateTimeFormat('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'}).format(new Date())});if(saveTrades(a))paint();});
-$('undoTrade').addEventListener('click',()=>{const a=readTrades();if(!a.length)return;a.pop();if(saveTrades(a))paint();});
-paintTrades();
-</script></body></html>'''
+const $=x=>document.getElementById(x),esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const won=x=>x==null?'—':Number(x).toLocaleString('ko-KR',{maximumFractionDigits:8})+'원';
+const LIMIT=3;let running=false,complete=false;let rows=[],stats={};
+const day=()=>{const p=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());const v=k=>p.find(x=>x.type===k)?.value||'';return `${v('year')}-${v('month')}-${v('day')}`;};
+const key=()=>`bithumb_v119_manual_${day()}`; // Retain V11.9-V11.12 daily logs
+function logs(){try{const r=JSON.parse(localStorage.getItem(key())||'[]');return Array.isArray(r)?r:[]}catch{return []}}
+function paintLogs(){const a=logs();$('tradeN').textContent=`${a.length} / 3회`;$('record').disabled=a.length>=LIMIT;$('undo').disabled=!a.length;}
+$('record').onclick=()=>{const a=logs();if(a.length<LIMIT){a.push({market:'수동 거래',price:null,when:new Intl.DateTimeFormat('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'}).format(new Date())});try{localStorage.setItem(key(),JSON.stringify(a));paintLogs();}catch(e){alert('수동 거래 기록 저장 실패: 브라우저 저장 공간을 확인하세요.');}}};
+$('undo').onclick=()=>{const a=logs();if(a.length){a.pop();try{localStorage.setItem(key(),JSON.stringify(a));paintLogs();}catch(e){alert('기록 취소 저장 실패');}}};
+const metric=(n,v)=>`<div class="metric"><small>${esc(n)}</small><b>${esc(v)}</b></div>`;
+function textCard(r){const q=r.quality||{},h=r.htf||{},one=r.hour1||{};
+const why=(r.reasons||[]).join(' / '),oldGap=r.gap21?' · ⚠️ 이전 구간 봉 공백':'',known=q.room_pct==null?'미확인':q.room_pct+'%';
+return `<article class="item ${r.status==='BUY'?'buy':'watch'}"><h3>${esc(r.market)} · ${r.status==='BUY'?'✅ BUY':'⚠️ WATCH'}</h3><div class="cardtext">${esc(r.pattern)} · ${esc(r.stage)}
+확정 5분봉 ${esc(r.signal_time)} · 종가 ${won(r.price)} · 거래량 ${esc(r.volume_ratio)}배${esc(oldGap)}
+1시간봉 ${esc(one.state||'확인 전')} · 4시간봉 ${h.near?'가격대 근처':'구조 확인'}${r.confluence?' · 복합선 겹침':''}
+진입 참고 손절 ${won(q.stop)} · 위험 ${q.risk_pct==null?'미확인':q.risk_pct+'%'}
+다음 확인된 4시간 저항 ${won(q.next_resistance)} · 위쪽 공간 ${esc(known)} · 참고 손익비 ${q.rr==null?'—':q.rr+':1'}
+${r.status==='BUY'?'✅ 모든 실험 기준 통과':'매수 보류: '+esc(why)}</div></article>`}
+function paint(){const b=rows.filter(x=>x.status==='BUY').sort((a,b)=>b.score-a.score),w=rows.filter(x=>x.status==='WATCH').sort((a,b)=>b.score-a.score);$('buyCount').textContent=b.length;$('watchCount').textContent=w.length;
+$('buys').innerHTML=b.length?b.map(textCard).join(''):'<p class="muted">확정 BUY 없음</p>';
+$('watches').innerHTML=w.length?w.slice(0,18).map(textCard).join('')+(w.length>18?`<p class="muted">나머지 WATCH ${w.length-18}개는 상위 후보만 간결히 표시합니다.</p>`:''):'<p class="muted">WATCH 없음</p>';
+let focus=rows.slice().sort((a,b)=>(a.status==='BUY'?0:a.stage==='QUALITY_HOLD'?1:2)-(b.status==='BUY'?0:b.stage==='QUALITY_HOLD'?1:2)||b.score-a.score).slice(0,3);
+$('focus').innerHTML=focus.length?focus.map(textCard).join(''):'<p class="muted">현재 집중 후보가 없습니다. 억지로 거래할 필요는 없습니다.</p>';
+$('stages').innerHTML=[['확정 BUY',b.length],['진입 모양·품질 보류',w.filter(x=>x.stage==='QUALITY_HOLD').length],['진입 준비',w.filter(x=>x.stage==='READY').length],['1H 위험 보류',w.filter(x=>x.hour1?.risk).length]].map(([a,b])=>metric(a,b+'개')).join('');}
+async function post(url,items){const ctl=new AbortController(),tm=setTimeout(()=>ctl.abort(),75000);try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items}),cache:'no-store',signal:ctl.signal});const v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||`HTTP ${r.status}`);return v}finally{clearTimeout(tm)}}
+async function pool(packs,workers,callback){let i=0;const err=[];async function work(){while(i<packs.length){const p=packs[i++];try{await callback(p)}catch(e){err.push(String(e))}}}await Promise.all(Array.from({length:Math.min(workers,packs.length)},work));return err}
+function batches(items){const a=[];for(let i=0;i<items.length;i+=40)a.push(items.slice(i,i+40));return a}
+async function scan(){if(running)return;running=true;complete=false;rows=[];$('run').disabled=true;let errors=0;
+$('buyCount').textContent='—';$('watchCount').textContent='—';$('stages').textContent='분석 중';$('health').textContent='분석 중';$('focus').textContent='분석 중';$('buys').textContent='분석 중';$('watches').textContent='분석 중';
+const begun=performance.now();try{const uRes=await fetch('/api/flow513/universe',{cache:'no-store'}),u=await uRes.json();if(!uRes.ok||!u.ok)throw Error(u.error||'코인 목록 불러오기 실패');
+const markets=u.items,summary={STALE:0,GAP3:0,QUIET:0,DATA:0,NONE:0,CANDIDATE:0,older_gap:0,active:0},candidates=[];
+let done=0;$('progress').max=markets.length;$('progress').value=0;
+const err1=await pool(batches(markets),3,async pack=>{const r=await post('/api/flow513/screen',pack);errors+=r.errors;done+=r.scanned;for(const x of r.results){summary[x.screen]=(summary[x.screen]||0)+1;if(x.gap21)summary.older_gap++;if(x.screen==='CANDIDATE')candidates.push(x);if(x.screen!=='STALE'&&x.screen!=='DATA'&&x.screen!=='GAP3'&&x.screen!=='QUIET')summary.active++} $('all').textContent=`${done}/${markets.length}`;$('active').textContent=summary.active;$('progress').value=done;$('status').textContent=`1단계 · 5분봉 ${done}/${markets.length}개 · 진입 준비 후보 ${candidates.length}개`;});
+if(err1.length||errors||done!==markets.length)throw Error(`5분봉 1차 스캔 실패 ${errors}건, 요청 실패 ${err1.length}건`);
+const t1=(performance.now()-begun)/1000;candidates.sort((a,b)=>b.score-a.score||a.market.localeCompare(b.market));
+const selected=candidates.slice(0,80),discarded=candidates.length-selected.length;$('notChecked').textContent=discarded;$('verify').textContent=`0/${selected.length}`;
+$('health').innerHTML=[['최근 봉 지연',summary.STALE],['최근 3봉 공백',summary.GAP3],['최근 30분 거래 부족',summary.QUIET],['구간 내 오래된 공백',summary.older_gap],['5분봉 패턴 없음',summary.NONE],['진입 준비 후보',summary.CANDIDATE]].map(([k,v])=>metric(k,v+'개')).join('');
+$('diagnosis').textContent=`5분봉 후보 ${candidates.length}개 중 ${selected.length}개만 1H/4H 추가 검증. 점수 상한 때문에 보류된 후보 ${discarded}개 (BUY 아님). 최근 봉이 오래되거나 마지막 3봉이 불연속인 종목은 진입 후보로 올리지 않음.`;
+let verified=0;const err2=await pool(batches(selected),3,async pack=>{const r=await post('/api/flow513/verify',pack);errors+=r.errors;verified+=r.scanned;rows.push(...r.results.filter(x=>x.status==='WATCH'||x.status==='BUY'));$('verify').textContent=`${verified}/${selected.length}`;$('status').textContent=`2단계 · 1H/4H ${verified}/${selected.length}개 · BUY ${rows.filter(x=>x.status==='BUY').length}개`;});
+complete=!err2.length&&!errors&&verified===selected.length;if(!complete)throw Error(`1H/4H 검증 누락: ${errors}건, 요청 실패 ${err2.length}건`);
+paint();const elapsed=(performance.now()-begun)/1000;$('timing').textContent=`전체 ${elapsed.toFixed(1)}초 · 5분봉 1차 ${t1.toFixed(1)}초 · 후보 ${candidates.length}개 중 1H/4H 검증 ${verified}개 · 검증 상한 때문에 제외 ${discarded}개`;
+$('status').textContent=`✅ 완료 · 전체 ${markets.length}개 · 5분봉 후보 ${candidates.length}개 · 검증 ${verified}개 · BUY ${rows.filter(x=>x.status==='BUY').length}개 · WATCH ${rows.filter(x=>x.status==='WATCH').length}개 · 오류 0건`;
+}catch(e){$('status').textContent='⚠️ 완료되지 않음: '+e.message+' · 일부 결과로 BUY 판단하지 마세요.';$('focus').textContent='불완전한 스캔으로 집중 후보 표시 중단';$('buys').textContent='검색 미완료';$('watches').textContent='검색 미완료';}
+finally{running=false;$('run').disabled=false}}
+$('run').onclick=scan;paintLogs();
+</script></body></html>"""
 
 
 def register_daytrade_review(app, deps):
-    api_get, get_markets, kst = deps["api_get"], deps["get_markets"], deps["KST"]
-    universe_cache = {"at": 0, "data": None}
+    api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
+    universe_cache = {'at': 0.0, 'data': None}
     universe_lock = Lock()
 
-    @app.get("/backtest-daytrade")
-    def zone45_page():
+    @app.get('/backtest-daytrade')
+    def page_513():
         return render_template_string(PAGE)
 
-    @app.get("/api/zone45/universe")
-    def zone45_universe():
+    @app.get('/api/flow513/universe')
+    def universe_513():
         try:
             with universe_lock:
-                if universe_cache["data"] and time.time() - universe_cache["at"] < 30:
-                    return jsonify(universe_cache["data"])
-                markets = sorted({x for x in get_markets()
-                                  if isinstance(x, str) and MARKET_RE.fullmatch(x)})
+                if universe_cache['data'] is not None and time.time()-universe_cache['at']<30:
+                    return jsonify(universe_cache['data'])
+                markets = sorted({m for m in get_markets()
+                                  if isinstance(m,str) and MARKET_RE.fullmatch(m)})
                 if not markets:
-                    raise ValueError("KRW 코인 목록이 비었습니다")
-                ticker_data = {}
-                market_set = set(markets)
-                for i in range(0, len(markets), 50):
-                    raw = api_get("/v1/ticker", {"markets": ",".join(markets[i:i+50])})
-                    if not isinstance(raw, list):
-                        raise ValueError("시세 데이터 형식 오류")
-                    for x in raw:
-                        if isinstance(x, dict) and x.get("market") in market_set:
-                            ticker_data[x["market"]] = x
-                if len(ticker_data) != len(markets):
-                    raise ValueError("전체 KRW 시세가 누락되어 검사를 시작하지 않았습니다")
-                items = []
-                for market in markets:
-                    try:
-                        price = float(ticker_data[market]["trade_price"])
-                    except (KeyError, ValueError, TypeError):
-                        raise ValueError(market+" 현재가 확인 불가")
-                    if not isfinite(price) or price <= 0:
-                        raise ValueError(market+" 현재가 오류")
-                    items.append({"market": market, "price": price})
-                data = {"ok": True, "items": items, "total": len(items),
-                        "snapshot_at": datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S KST")}
-                universe_cache.update(at=time.time(), data=data)
+                    raise ValueError('빗썸 KRW 코인 목록이 비어 있습니다')
+                data={'ok':True,'items':markets,'total':len(markets),'start_time':datetime.now(kst).isoformat()}
+                universe_cache.update(at=time.time(),data=data)
                 return jsonify(data)
         except Exception as e:
-            return jsonify({"ok": False, "error": str(e)[:160]}), 502
+            return jsonify({'ok':False,'error':str(e)[:140]}),502
 
-    @app.post("/api/zone45/lines")
-    def zone45_lines():
-        payload = request.get_json(silent=True)
-        items = payload.get("items") if isinstance(payload, dict) else None
-        if not isinstance(items, list) or not 1 <= len(items) <= PAGE_SIZE:
-            return jsonify({"ok": False, "error": "요청 코인 수는 1~40개여야 합니다"}), 400
-        try:
-            names = [x.get("market") for x in items if isinstance(x, dict)]
-            if len(names) != len(items) or len(set(names)) != len(names) or any(
-                    not isinstance(m, str) or not MARKET_RE.fullmatch(m) for m in names):
-                raise ValueError("코인 목록 형식 오류")
-            results = []
-            errors = 0
-            now = datetime.now(kst)
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                tasks = {pool.submit(analyze_4h, api_get, x["market"], float(x["price"]), now, kst): x["market"]
-                         for x in items}
-                for f in as_completed(tasks):
-                    market = tasks[f]
-                    try:
-                        results.append(f.result())
-                    except Exception as e:
-                        errors += 1
-                        results.append({"market": market, "near": False, "error": type(e).__name__})
-            return jsonify({"ok": True, "scanned": len(items), "errors": errors, "results": results})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)[:160]}), 400
+    def valid_markets(payload):
+        items=payload.get('items') if isinstance(payload,dict) else None
+        if not isinstance(items,list) or not 1<=len(items)<=PAGE_SIZE:
+            raise ValueError('한 번에 1~40개 종목만 요청할 수 있습니다')
+        names=[x if isinstance(x,str) else x.get('market') if isinstance(x,dict) else None for x in items]
+        if any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in names) or len(set(names))!=len(names):
+            raise ValueError('코인 목록 형식 오류')
+        return items,names
 
-    @app.post("/api/zone45/entries")
-    def zone45_entries():
-        payload = request.get_json(silent=True)
-        items = payload.get("items") if isinstance(payload, dict) else None
-        if not isinstance(items, list) or not 1 <= len(items) <= PAGE_SIZE:
-            return jsonify({"ok": False, "error": "요청 코인 수는 1~40개여야 합니다"}), 400
+    @app.post('/api/flow513/screen')
+    def screen_513():
         try:
-            names = [x.get("market") for x in items if isinstance(x, dict)]
-            if len(names) != len(items) or len(set(names)) != len(names) or any(
-                    not isinstance(m, str) or not MARKET_RE.fullmatch(m) for m in names):
-                raise ValueError("코인 목록 형식 오류")
-            for x in items:
-                if not x.get("near") or not isinstance(x.get("price"), (float, int)):
-                    raise ValueError("4시간 수평 가격대 자료가 없습니다")
-                for kind in ("support", "resistance"):
-                    z = x.get(kind)
-                    if z is not None:
-                        if not isinstance(z, dict) or z.get("kind") != kind or not all(
-                                key in z for key in ("low", "high", "mid", "touches", "p1", "p2", "time1", "time2")):
-                            raise ValueError("수평 가격대 정보 형식 오류")
-                        try:
-                            lo, mid, hi = float(z["low"]), float(z["mid"]), float(z["high"])
-                            touches = int(z["touches"])
-                        except (TypeError, ValueError, OverflowError):
-                            raise ValueError("수평 가격대 값 형식 오류")
-                        if not (all(isfinite(v) for v in (lo, mid, hi)) and
-                                0 < lo <= mid <= hi and touches >= 2):
-                            raise ValueError("수평 가격대 가격/반응 오류")
-            for x in items:
-                for kind in ("support", "resistance"):
-                    ln = x.get("diag_"+kind)
-                    if ln is None:
-                        continue
-                    if not isinstance(ln, dict) or ln.get("kind") != kind or not all(
-                            key in ln for key in ("t1", "t2", "p1", "p2", "time1", "time2")):
-                        raise ValueError("4시간 추세선 정보 형식 오류")
-                    try:
-                        vals = [float(ln[k]) for k in ("t1", "t2", "p1", "p2")]
-                    except (TypeError, ValueError, OverflowError):
-                        raise ValueError("4시간 추세선 숫자 오류")
-                    if (not all(isfinite(v) for v in vals) or
-                            vals[1] <= vals[0] or vals[2] <= 0 or vals[3] <= 0):
-                        raise ValueError("4시간 추세선 값 오류")
-            now = datetime.now(kst)
-            results = []
-            errors = 0
-            skipped = 0
+            _,names=valid_markets(request.get_json(silent=True))
+            now=datetime.now(kst)
+            results=[];errors=0
             with ThreadPoolExecutor(max_workers=5) as pool:
-                tasks = {pool.submit(five_minute_entry, api_get, x, now, kst): x["market"] for x in items}
-                for f in as_completed(tasks):
-                    market = tasks[f]
-                    try:
-                        x = f.result()
-                        results.append(x)
-                        skipped += int(x["status"] == "SKIP")
-                    except Exception as e:
-                        errors += 1
-                        results.append({"market": market, "status": "ERROR", "error": type(e).__name__})
-            return jsonify({"ok": True, "scanned": len(items), "skipped": skipped,
-                            "errors": errors, "results": results})
+                futures={pool.submit(screen_5m,api_get,m,now,kst):m for m in names}
+                for f in as_completed(futures):
+                    try:results.append(f.result())
+                    except Exception: errors+=1
+            return jsonify({'ok':True,'scanned':len(names),'errors':errors,'results':results})
         except Exception as e:
-            return jsonify({"ok": False, "error": str(e)[:160]}), 400
+            return jsonify({'ok':False,'error':str(e)[:140]}),400
+
+    @app.post('/api/flow513/verify')
+    def verify_513():
+        try:
+            items,names=valid_markets(request.get_json(silent=True))
+            if any(not isinstance(x,dict) or x.get('market')!=m or
+                   x.get('screen')!='CANDIDATE' or x.get('stage') not in ('READY','CONFIRMED') or
+                   not isinstance(x.get('price'),(int,float)) or
+                   not isinstance(x.get('stop'),(int,float)) or
+                   not isinstance(x.get('score'),(int,float)) or
+                   not isinstance(x.get('signal_end'),str) for x,m in zip(items,names)):
+                raise ValueError('5분봉 후보 검증 입력 형식 오류')
+            # First-stage output is always generated on server; reject stale/malformed inputs.
+            now=datetime.now(kst)
+            for x in items:
+                signal_end=local_time(x['signal_end'],kst)
+                if not 0 <= (now-signal_end).total_seconds()/60 <= 15:
+                    raise ValueError('오래된 5분봉 후보 · 다시 검색하세요')
+                if not all(isfinite(float(x[v])) and float(x[v])>0 for v in ('price','stop')):
+                    raise ValueError('유효하지 않은 가격 데이터')
+            results=[];errors=0
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures={pool.submit(confirm_candidate,api_get,x,kst):x['market'] for x in items}
+                for f in as_completed(futures):
+                    try:results.append(f.result())
+                    except Exception:errors+=1
+            return jsonify({'ok':True,'scanned':len(items),'errors':errors,'results':results})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:140]}),400
