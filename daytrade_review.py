@@ -1,4 +1,4 @@
-"""V11.7 4H horizontal support/resistance zones -> 5M entry experiment.
+"""V11.8 4H horizontal zones -> 5M precision-entry experiment.
 
 Only the /backtest-daytrade experiment page is replaced. app.py and the V2
 main-page BUY logic are untouched. All KRW markets are considered, without
@@ -9,6 +9,9 @@ Pass 1: fetch 80 completed 4-hour candles for *all* markets, find
   swing lows/highs near the same price (not diagonal trendlines).
 Pass 2: fetch 80 completed 5-minute candles only when a valid 4H zone
   is within +/-2% of the ticker snapshot; check bounce / confirmed breakout.
+Before displaying BUY, require 5M price action/volume and a minimum gross
+price buffer to the next confirmed 4H resistance versus a defined stop.
+This is a strict observational gate, not a validated profitability model.
 No look-ahead candles, future returns, or synthetic gap-fill candles are used.
 """
 
@@ -38,6 +41,16 @@ FRESH_5M_MINUTES = 10.0
 FRESH_4H_MINUTES = 480.0
 MIN_4H_BARS = 35
 MIN_5M_BARS = 35
+# Experimental quality gates (change only this experiment, never V2 main).
+MIN_BUY_VOL_RATIO = 1.5            # Last 5M candle or breakout bar.
+MIN_CONFIRM_VOL_RATIO = 0.8        # Confirmation candle must not go silent.
+MIN_BULLISH_BODY_SHARE = 0.40      # Body / complete 5M high-low range.
+MAX_UPPER_WICK_SHARE = 0.40
+MIN_GROSS_ROOM_PCT = 1.2           # Before fees, spread or slippage.
+MIN_GROSS_RR = 1.5                # Available room / structural stop risk.
+MIN_STOP_RISK_PCT = 0.25
+MAX_STOP_RISK_PCT = 1.50
+STOP_PAD_PCT = 0.25                # Buffer under 4H zone boundary.
 
 
 def local_time(s, kst):
@@ -80,7 +93,7 @@ def pivots(ordered, field, kind):
             if values[i] >= max(values[i-2:i]) and values[i] > max(values[i+1:i+3])]
 
 
-def make_zone(ordered, field, kind, price):
+def zone_candidates(ordered, field, kind, price):
     """Find a horizontal reaction *area* confirmed by >=2 separate 4H pivots.
 
     Pivot confirmation looks only at completed 4H candles. Candidate groups
@@ -89,7 +102,7 @@ def make_zone(ordered, field, kind, price):
     """
     ids = pivots(ordered, field, kind)
     if len(ids) < 2:
-        return None
+        return []
     values = [(i, float(ordered[i][1][field])) for i in ids]
     candidates = []
     for seed_i, seed_price in values:
@@ -123,11 +136,22 @@ def make_zone(ordered, field, kind, price):
             "p1": round(chosen[0][1], 10), "p2": round(chosen[1][1], 10),
         })
     if not candidates:
-        return None
+        return []
     candidates.sort(key=lambda z: (abs(z["distance_pct"]), -z["touches"], -z["last_pivot_index"]))
-    best = candidates[0]
-    del best["last_pivot_index"]
-    return best
+    distinct = []
+    for item in candidates:
+        # Several seed pivots can describe the same band. Keep one record.
+        if any(abs(item["mid"] / x["mid"] - 1) < 0.002 for x in distinct):
+            continue
+        item = dict(item)
+        del item["last_pivot_index"]
+        distinct.append(item)
+    return distinct
+
+
+def make_zone(ordered, field, kind, price):
+    zones = zone_candidates(ordered, field, kind, price)
+    return zones[0] if zones else None
 
 
 def analyze_4h(api_get, market, price, now, kst):
@@ -144,7 +168,16 @@ def analyze_4h(api_get, market, price, now, kst):
         out["reason"] = "4시간봉 최근 데이터 지연"
         return out
     out["support"] = make_zone(ordered, "low_price", "support", price)
-    out["resistance"] = make_zone(ordered, "high_price", "resistance", price)
+    all_resistances = zone_candidates(ordered, "high_price", "resistance", price)
+    out["resistance"] = all_resistances[0] if all_resistances else None
+    # Additional confirmed 4H resistance areas above market are used to
+    # estimate headroom. All are derived from the SAME 80 fetched candles.
+    # The nearest selected resistance is not automatically the next overhead.
+    out["overhead"] = sorted(
+        ({"low": z["low"], "high": z["high"], "touches": z["touches"]}
+         for z in all_resistances if z["low"] > price * 0.99),
+        key=lambda z: z["low"]
+    )[:10]
     if not out["support"] and not out["resistance"]:
         out["reason"] = "2회 이상 확인된 수평 지지·저항 가격대 없음"
     else:
@@ -154,18 +187,65 @@ def analyze_4h(api_get, market, price, now, kst):
     return out
 
 
+def evaluate_entry_quality(entry, stop, overhead, strong_candle,
+                           volume_confirmed, retest_confirmed):
+    """Conservative research gates for a long entry; amounts are GROSS.
+
+    Missing overhead level does not mean unlimited upside. Without an observed
+    4H resistance above price, keep the setup on WATCH for verification.
+    """
+    reasons = []
+    if not strong_candle:
+        reasons.append("5분봉 양봉 몸통/윗꼬리 확인 부족")
+    if not volume_confirmed:
+        reasons.append("매수 거래량 확인 부족")
+    if not retest_confirmed:
+        reasons.append("돌파 후 지지 재확인 부족")
+    if not (isfinite(entry) and isfinite(stop) and 0 < stop < entry):
+        return {"passed": False, "reasons": reasons+["유효한 손절 기준 없음"],
+                "stop": None, "risk_pct": None, "room_pct": None,
+                "rr": None, "next_resistance": None}
+    risk_pct = (entry - stop) / entry * 100
+    if not MIN_STOP_RISK_PCT <= risk_pct <= MAX_STOP_RISK_PCT:
+        reasons.append(f"손절 거리 {risk_pct:.2f}% (허용 {MIN_STOP_RISK_PCT}~{MAX_STOP_RISK_PCT}%)")
+    levels = []
+    for z in overhead or []:
+        try:
+            upper_floor = float(z["low"])
+            if isfinite(upper_floor) and upper_floor > entry * 1.0001:
+                levels.append(upper_floor)
+        except (TypeError, ValueError, KeyError, OverflowError):
+            continue
+    next_resistance = min(levels) if levels else None
+    room_pct = (next_resistance / entry - 1)*100 if next_resistance else None
+    rr = room_pct / risk_pct if room_pct is not None and risk_pct > 0 else None
+    if next_resistance is None:
+        reasons.append("위쪽 4시간봉 저항 확인 불가")
+    else:
+        if room_pct < MIN_GROSS_ROOM_PCT:
+            reasons.append(f"위쪽 저항 여유 {room_pct:.2f}% 부족")
+        if rr < MIN_GROSS_RR:
+            reasons.append(f"참고 손익비 {rr:.2f} 미달")
+    return {"passed": not reasons, "reasons": reasons,
+            "stop": round(stop, 10), "risk_pct": round(risk_pct, 2),
+            "room_pct": round(room_pct, 2) if room_pct is not None else None,
+            "rr": round(rr, 2) if rr is not None else None,
+            "next_resistance": round(next_resistance, 10) if next_resistance else None}
+
+
 def five_minute_entry(api_get, htf, now, kst):
     market = htf["market"]
     rows = completed_candles(api_get, market, 5, 80, now, kst)
     out = {"market": market, "status": "NONE", "setup": "", "note": "",
            "price": None, "volume_ratio": None, "age_minutes": None,
-           "bars5m": len(rows), "htf": htf}
+           "bars5m": len(rows), "htf": htf, "quality": None}
     if len(rows) < MIN_5M_BARS:
         out.update(status="SKIP", note="5분봉 데이터 부족")
         return out
     ts = [x[0] for x in rows]
     close = [float(x[1]["trade_price"]) for x in rows]
     opening = [float(x[1]["opening_price"]) for x in rows]
+    highs = [float(x[1]["high_price"]) for x in rows]
     lows = [float(x[1]["low_price"]) for x in rows]
     volumes = [float(x[1]["candle_acc_trade_volume"]) for x in rows]
     out["price"] = close[-1]
@@ -173,11 +253,21 @@ def five_minute_entry(api_get, htf, now, kst):
     age = (now - (ts[-1] + timedelta(minutes=5))).total_seconds()/60
     out["age_minutes"] = round(age, 1)
     baseline = sum(volumes[-21:-1])/20
-    out["volume_ratio"] = round(volumes[-1]/baseline, 2) if baseline > 0 else None
+    vol_now = volumes[-1]/baseline if baseline > 0 else None
+    vol_prior = volumes[-2]/baseline if baseline > 0 else None
+    out["volume_ratio"] = round(vol_now, 2) if vol_now is not None else None
     recent_continuous = all(b-a == timedelta(minutes=5)
                             for a,b in zip(ts[-21:-1],ts[-20:]))
     freshness = ("STALE" if age > FRESH_5M_MINUTES or age < -0.5 else
                  "GAP" if not recent_continuous else "CURRENT")
+    candle_range = highs[-1] - lows[-1]
+    body_share = ((close[-1] - opening[-1])/candle_range
+                  if candle_range > 0 else 0)
+    upper_wick_share = ((highs[-1] - close[-1])/candle_range
+                        if candle_range > 0 else 1)
+    strong_green = (close[-1] > opening[-1] and
+                    body_share >= MIN_BULLISH_BODY_SHARE and
+                    upper_wick_share <= MAX_UPPER_WICK_SHARE)
 
     options = []
     for kind, label in (("support", "4시간 수평 지지대"),
@@ -185,42 +275,64 @@ def five_minute_entry(api_get, htf, now, kst):
         zone = htf.get(kind)
         if not zone:
             continue
-        lo, hi = zone["low"], zone["high"]
-        # The original 4H zone prices are compared with completed 5M candles.
-        # No 5M pivots are used to re-create/change the horizontal zone.
+        lo, hi = float(zone["low"]), float(zone["high"])
+        # Never compute a new zone from five-minute candles.
         distance = (close[-1] / hi - 1)*100
         if kind == "support":
-            # A zone has a band: a recent wick touches inside it, or just
-            # below/above the edge. A close must recover ABOVE the upper edge.
             touched = any(lo*0.998 <= lows[k] <= hi*1.002 for k in (-3,-2,-1))
             held = all(close[k] >= lo*0.996 for k in (-3,-2))
             bounce = (touched and held and close[-1] >= hi*1.001 and
                       close[-1] > opening[-1] and close[-1] > close[-2] and
                       0.10 <= distance <= MAX_BUY_SUPPORT_PCT)
             if bounce:
-                options.append(("BUY", "수평 지지대 터치 후 5분봉 반등", distance, zone, label))
+                stop = lo * (1 - STOP_PAD_PCT / 100)
+                quality = evaluate_entry_quality(
+                    close[-1], stop, htf.get("overhead"), strong_green,
+                    vol_now is not None and vol_now >= MIN_BUY_VOL_RATIO,
+                    True  # Touch and close-over-zone are already verified.
+                )
+                if quality["passed"]:
+                    options.append(("BUY", "수평 지지 반등 · 매수세 확인", distance, zone, label, quality, "BUY"))
+                else:
+                    options.append(("WATCH", "지지 반등 모양 · 진입 조건 보류", distance, zone, label, quality, "BUY"))
             elif lo*0.998 <= close[-1] <= hi*(1+WATCH_SUPPORT_PCT/100):
-                options.append(("WATCH", "수평 지지대 접근 · 반등 대기", distance, zone, label))
+                options.append(("WATCH", "수평 지지대 접근 · 반등 대기", distance, zone, label, None, "WATCH"))
             elif lo*(1-SUPPORT_RECLAIM_PCT/100) <= close[-1] < lo*0.998:
-                options.append(("RECLAIM", "수평 지지대 이탈 · 재진입 대기", distance, zone, label))
+                options.append(("RECLAIM", "수평 지지대 이탈 · 재진입 대기", distance, zone, label, None, "RECLAIM"))
         else:
-            # Recent crossing and two completed 5M closes above the UPPER
-            # edge of the 4H resistance zone; never chase an extended move.
             crossed = any(close[k-1] <= hi*1.001 and close[k] >= hi*1.002
                           for k in (-3,-2))
             confirmed = close[-2] >= hi*1.001 and close[-1] >= hi*1.001
             breakout = crossed and confirmed and 0.10 <= distance <= MAX_BUY_BREAKOUT_PCT
             if breakout:
-                options.append(("BUY", "수평 저항대 돌파 · 5분봉 2개 확인", distance, zone, label))
+                # Breakout should be followed by a candle testing former
+                # resistance as support; two closes above alone aren't enough.
+                retested = any(hi*0.995 <= lows[k] <= hi*1.004 and
+                               close[k] >= hi*1.001 for k in (-2,-1))
+                volume_ok = (vol_now is not None and vol_prior is not None and
+                             max(vol_now, vol_prior) >= MIN_BUY_VOL_RATIO and
+                             vol_now >= MIN_CONFIRM_VOL_RATIO)
+                stop = hi * (1 - STOP_PAD_PCT / 100)
+                quality = evaluate_entry_quality(
+                    close[-1], stop, htf.get("overhead"), strong_green,
+                    volume_ok, retested
+                )
+                if quality["passed"]:
+                    options.append(("BUY", "수평 저항 돌파 · 재확인 완료", distance, zone, label, quality, "BUY"))
+                else:
+                    options.append(("WATCH", "저항 돌파 모양 · 진입 조건 보류", distance, zone, label, quality, "BUY"))
             elif lo*(1-WATCH_RESISTANCE_PCT/100) <= close[-1] <= hi*1.006:
-                options.append(("WATCH", "수평 저항대 접근 · 돌파 관찰", distance, zone, label))
+                options.append(("WATCH", "수평 저항대 접근 · 돌파 관찰", distance, zone, label, None, "WATCH"))
     if not options:
         return out
-    priority = {"BUY":0,"WATCH":1,"RECLAIM":2}
-    options.sort(key=lambda y:(priority[y[0]],abs(y[2])))
-    status, setup, dist, zone, label = options[0]
+    # Prefer confirmed BUY, then the best near-entry setup; preserve broken
+    # support as a separate RECLAIM, even when only one candidate exists.
+    priority = {"BUY":0, "WATCH":1, "RECLAIM":2}
+    options.sort(key=lambda y:(priority[y[0]], 0 if y[6] == "BUY" else 1, abs(y[2])))
+    status, setup, dist, zone, label, quality, pattern_signal = options[0]
     out.update(status=status if freshness == "CURRENT" else freshness,
-               original_signal=status, setup=setup,
+               original_signal=status, pattern_signal=pattern_signal,
+               setup=setup, quality=quality,
                note=f"{label} · 5분봉 {setup}",
                distance_pct=round(dist,2), zone_center=zone["mid"],
                zone_low=zone["low"],zone_high=zone["high"],
@@ -236,7 +348,7 @@ def five_minute_entry(api_get, htf, now, kst):
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V11.7 · 4시간 수평 지지·저항 실험</title>
+<title>V11.8 · 4시간 수평 지지·저항 실험</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--panel:#141c2f;--border:#30405d;--text:#edf3ff;--sub:#a8b9d3;--green:#4ade80;--yellow:#fbbf24}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
@@ -248,9 +360,9 @@ progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;ove
 @media(max-width:680px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.list{grid-template-columns:1fr}}
 </style></head><body><main>
 <h1>📊 4시간 수평 지지·저항 → 5분봉 진입 후보</h1>
-<p class="muted">V11.7 수평 가격대 실험판 · KRW 전체 · 거래대금 제한 없음 · 유의종목 포함 · V2 메인 변경 없음</p>
+<p class="muted">V11.8 수평 가격대 실험판 · KRW 전체 · 거래대금 제한 없음 · 유의종목 포함 · V2 메인 변경 없음</p>
 <div class="panel"><button id="run">지금 전체 검색</button> <a href="/">기존 V2 메인</a>
-<p class="muted">4시간봉에서 2회 이상 반응한 저점·고점으로 수평 지지·저항 <b>가격대</b>를 만듭니다. ±2% 이내 종목의 5분봉에서 지지 반등 또는 저항대 돌파 후 2봉 확인을 실험합니다. 거래량은 참고용입니다.</p>
+<p class="muted">4시간봉 수평 가격대를 찾고 5분봉의 <b>지지 반등·저항 돌파 후 재확인</b>을 검사합니다. BUY에는 거래량·양봉 형태·손절 거리·위쪽 저항 여유를 추가로 요구합니다. 기준을 못 채우면 WATCH로 남깁니다.</p>
 <div class="metrics">
 <div class="metric"><span class="muted">전체 / 4시간봉 검사</span><b id="all">—</b></div>
 <div class="metric"><span class="muted">5분봉 정밀 확인</span><b id="near">—</b></div>
@@ -262,11 +374,11 @@ progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;ove
 <div id="status" class="muted">검색 버튼을 누르면 4시간봉 전체 검사부터 진행합니다.</div>
 <div id="timing" class="muted"></div>
 </div>
-<section class="panel"><h2 class="buy">실험 BUY 후보 · 4시간 수평 가격대 기준</h2><div class="list" id="buyList"><p class="muted">검색 전</p></div></section>
+<section class="panel"><h2 class="buy">실험 BUY 후보 · 5분봉 정밀 검증 통과</h2><div class="list" id="buyList"><p class="muted">검색 전</p></div></section>
 <section class="panel"><h2 class="watch">WATCH · 수평 가격대 접근 후보</h2><div class="list" id="watchList"><p class="muted">검색 전</p></div></section>
 <details class="panel" id="reclaimPanel"><summary class="subtle">⚠️ 지지선 이탈 · 회복 대기 <span id="reclaimCount"></span></summary><p class="muted">4시간 수평 지지대 아래에 있어 아직 지지가 확인되지 않았습니다. 가격대를 회복하기 전에는 BUY로 취급하지 않습니다.</p><div id="reclaimList" class="list"></div></details>
 <details class="panel" id="holdPanel"><summary class="subtle">⚠️ 신호 시간/캔들 공백 주의 <span id="holdCount"></span></summary><p class="muted">마지막 5분봉이 오래됐거나 최근 21개 봉이 연속되지 않은 후보야. 현재 BUY로 표시하지 않아.</p><div id="holdList" class="list"></div></details>
-<p class="muted">실험용 신호이며 매수 권유나 수익 보장이 아닙니다. 양옆 2개 확정 4시간봉으로 검증된 고점·저점을 두 번 이상 확인해 가격대를 만듭니다. 미래 봉은 사용하지 않으며, 미확인 돌파·지지 이탈은 BUY가 아닙니다.</p>
+<p class="muted">실험용 신호이며 매수 권유나 수익 보장이 아닙니다. 진입 참고가는 최신 확정 5분봉 종가이며 실제 체결가가 아닙니다. 표시하는 손절 기준·위쪽 저항까지의 거리는 수수료·호가 차이·슬리피지를 뺀 순수익을 뜻하지 않습니다. 위쪽 저항이 확인되지 않으면 BUY를 확정하지 않습니다. 미래 봉은 사용하지 않습니다.</p>
 </main><script>
 const $=id=>document.getElementById(id);
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -279,11 +391,15 @@ const zoneText=z?`${z.kind==='support'?'4시간 수평 지지대':'4시간 수�
 가격대 ${won(z.low)} ~ ${won(z.high)} (중심 ${won(z.mid)})
 반응 1: ${esc(x.pivot1)} · 반응 2: ${esc(x.pivot2)}`:'';
 const r=x.volume_ratio==null?'확인 불가':Number(x.volume_ratio).toFixed(2)+'배';
+const q=x.quality;const quality=q?`
+진입 참고 손절 ${q.stop==null?'—':won(q.stop)} · 손절 거리 ${q.risk_pct==null?'—':q.risk_pct+'%'}
+위쪽 4시간 저항 ${q.next_resistance==null?'확인 불가':won(q.next_resistance)} · 가격 여유 ${q.room_pct==null?'—':q.room_pct+'%'} · 참고 손익비 ${q.rr==null?'—':q.rr+':1'}
+${q.passed?'✅ 진입 품질 조건 통과':'⚠️ BUY 보류: '+esc(q.reasons.join(' / '))}`:'';
 return `<article class="item ${x.status==='BUY'?'buycard':'watchcard'}"><h3><span>${esc(x.market)}</span><span class="pill ${x.status==='BUY'?'buy':'watch'}">${esc(x.status==='BUY'?'BUY':x.status==='WATCH'?'WATCH':x.status==='RECLAIM'?'회복 대기':'확인 보류')}</span></h3>`+
 `<div class="details">${esc(x.setup)} · ${esc(x.note)}
 확정 5분봉 ${esc(x.signal_time)} · 종료 후 ${esc(x.age_minutes)}분
 5분봉 종가 ${won(x.price)} · 가격대 상단 ${won(x.zone_high)} · 거리 ${x.distance_pct>0?'+':''}${esc(x.distance_pct)}%
-거래량 ${esc(r)} (참고용)
+거래량 ${esc(r)}${quality}
 ${zoneText}</div></article>`;}
 
 function paint(){const b=entries('BUY'),w=entries('WATCH'),r=entries('RECLAIM'),h=entries('HOLD');$('buys').textContent=b.length;$('watches').textContent=w.length;$('reclaims').textContent=r.length;$('holdCount').textContent=`(${h.length}개)`;$('reclaimCount').textContent=`(${r.length}개)`;
