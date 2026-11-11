@@ -1,4 +1,4 @@
-"""V11.11 diagnostic edition: unchanged 4H / 1H / 5M BUY rules.
+"""V11.12 readiness stages + separate 5M candle diagnostics. Unchanged BUY rules.
 
 Only the /backtest-daytrade experiment page is replaced. app.py and the V2
 main-page BUY logic are untouched. All KRW markets are considered, without
@@ -16,8 +16,10 @@ price buffer to the next confirmed 4H resistance versus a defined stop.
 BUY requires at least 3% measured gross space below the nearest identified 4H resistance.
 Only the highest-ranked 3 confirmed BUY / near-entry WATCH setups are
 spotlighted; users manually log up to 3 trades per Seoul day in local storage.
-V11.11 adds reason-code diagnostics and a separate watch-only bucket for setups
-with no confirmed overhead resistance. No BUY gate is relaxed.
+V11.12 retains reason-code diagnostics and separately counts last-candle delay
+and missing intermediate 5M bars. WATCH is annotated with approach, tested,
+and quality-check stages; none of these promote a candidate to BUY.
+No BUY gate is relaxed and no additional API requests are introduced.
 The scanner cannot place orders or enforce real exchange trading limits.
 This is a strict observational gate, not a validated profitability model.
 No look-ahead candles, future returns, or synthetic gap-fill candles are used.
@@ -359,9 +361,10 @@ def five_minute_entry(api_get, htf, now, kst):
     out = {"market": market, "status": "NONE", "setup": "", "note": "",
            "price": None, "volume_ratio": None, "age_minutes": None,
            "bars5m": len(rows), "htf": htf, "quality": None,
-           "hour1": None, "source_type": "horizontal", "confluence": False}
+           "hour1": None, "source_type": "horizontal", "confluence": False,
+           "stage": "NONE", "stage_note": "", "candle_health": None}
     if len(rows) < MIN_5M_BARS:
-        out.update(status="SKIP", note="5분봉 데이터 부족")
+        out.update(status="SKIP", stage="DATA_HOLD", note="5분봉 데이터 부족")
         return out
     ts = [x[0] for x in rows]
     close = [float(x[1]["trade_price"]) for x in rows]
@@ -377,10 +380,24 @@ def five_minute_entry(api_get, htf, now, kst):
     vol_now = volumes[-1]/baseline if baseline > 0 else None
     vol_prior = volumes[-2]/baseline if baseline > 0 else None
     out["volume_ratio"] = round(vol_now, 2) if vol_now is not None else None
-    recent_continuous = all(b-a == timedelta(minutes=5)
-                            for a,b in zip(ts[-21:-1],ts[-20:]))
-    freshness = ("STALE" if age > FRESH_5M_MINUTES or age < -0.5 else
-                 "GAP" if not recent_continuous else "CURRENT")
+    # A missing 5M candle can be a no-trade interval; do not silently
+    # manufacture candles. Diagnose latest-bar delay and internal gaps
+    # independently, even when the same coin has BOTH problems.
+    trailing = ts[-21:]
+    gap_steps = [int(round((b-a).total_seconds() / 300)) - 1
+                 for a,b in zip(trailing[:-1], trailing[1:])
+                 if b-a != timedelta(minutes=5)]
+    recent_continuous = not gap_steps
+    stale = age > FRESH_5M_MINUTES or age < -0.5
+    out["candle_health"] = {
+        "stale": stale, "gap": not recent_continuous,
+        "latest_delay_minutes": round(age, 1),
+        "missing_intervals": len(gap_steps),
+        "missing_5m_bars": sum(max(0, n) for n in gap_steps),
+        "clock_issue": age < -0.5,
+    }
+    # Keep the V11.11 exclusion priority exactly as it was.
+    freshness = ("STALE" if stale else "GAP" if not recent_continuous else "CURRENT")
     candle_range = highs[-1] - lows[-1]
     body_share = ((close[-1] - opening[-1])/candle_range
                   if candle_range > 0 else 0)
@@ -513,6 +530,27 @@ def five_minute_entry(api_get, htf, now, kst):
                                0 if y[3]["kind"] in htf.get("confluence_kinds",[]) else 1,
                                abs(y[2])))
     status, setup, dist, zone, label, quality, pattern_signal, source_type = options[0]
+    # V11.12 stage is descriptive ONLY. It never changes the BUY gates.
+    # A verified touch/probe must be based on observed completed 5M highs/lows.
+    tested = False
+    if pattern_signal == "WATCH" and status == "WATCH":
+        if source_type == "horizontal":
+            zlo, zhi = float(zone["low"]), float(zone["high"])
+            if zone["kind"] == "support":
+                tested = any(zlo*0.998 <= lows[k] <= zhi*1.004
+                             for k in (-3, -2, -1))
+            else:
+                tested = max(highs[-3:]) >= zlo*0.998
+        else:
+            source_line = htf.get("diag_" + zone["kind"])
+            levels3 = [trendline_value(source_line, t) for t in ts[-3:]] if source_line else []
+            if len(levels3) == 3 and all(v is not None for v in levels3):
+                if zone["kind"] == "support":
+                    tested = any(level*0.991 <= low <= level*1.004
+                                 for level, low in zip(levels3, lows[-3:]))
+                else:
+                    tested = any(high >= level*0.998
+                                 for level, high in zip(levels3, highs[-3:]))
     # Reduce 1H API calls dramatically: only candidates with a current 5M
     # shape receive 1H verification. The three timeframes are still all used
     # to approve BUY. A strong downtrend or incomplete 1H data is caution,
@@ -530,7 +568,32 @@ def five_minute_entry(api_get, htf, now, kst):
             quality["reasons"] = list(quality.get("reasons") or []) + [hour1["reason"]]
             quality["reason_codes"] = list(quality.get("reason_codes") or []) + ["hour1"]
             setup += " · 1시간봉 위험으로 진입 보류"
+    reason_codes = list((quality or {}).get("reason_codes") or [])
+    near_quality = (status == "WATCH" and pattern_signal == "BUY" and
+                    len(reason_codes) == 1 and
+                    "hour1" not in reason_codes and
+                    quality.get("risk_pct") is not None and
+                    MIN_STOP_RISK_PCT <= quality["risk_pct"] <= MAX_STOP_RISK_PCT and
+                    quality.get("room_pct") is not None and
+                    quality["room_pct"] >= MIN_GROSS_ROOM_PCT and
+                    quality.get("rr") is not None and
+                    quality["rr"] >= MIN_GROSS_RR)
+    if freshness != "CURRENT":
+        stage, stage_note = "DATA_HOLD", "봉 지연 또는 중간 공백 · BUY 불가"
+    elif status == "BUY":
+        stage, stage_note = "BUY", "모든 기존 BUY 조건 충족"
+    elif status == "RECLAIM":
+        stage, stage_note = "RECLAIM", "지지선 회복 확인 전"
+    elif near_quality:
+        stage, stage_note = "NEAR", "BUY 모양 확인 · 품질 조건 1개 미충족"
+    elif pattern_signal == "BUY":
+        stage, stage_note = "CHECK", "BUY 모양 확인 · 복수 품질 조건 미충족 또는 1시간봉 위험"
+    elif tested:
+        stage, stage_note = "READY", "최근 5분봉에서 지지 터치 또는 저항 시험 감지 · 반등/돌파 미확정"
+    else:
+        stage, stage_note = "APPROACH", "4시간 가격대 접근 · 5분봉 진입 시도 아직 미확인"
     out.update(status=status if freshness == "CURRENT" else freshness,
+               stage=stage, stage_note=stage_note,
                original_signal=status, pattern_signal=pattern_signal,
                setup=setup, quality=quality, hour1=hour1,
                source_type=source_type,
@@ -542,15 +605,15 @@ def five_minute_entry(api_get, htf, now, kst):
                pivot1=f"{zone['time1']} / {zone['p1']:.8g}",
                pivot2=f"{zone['time2']} / {zone['p2']:.8g}")
     if freshness == "STALE":
-        out["note"] += " · 최신 확정봉 오래됨"
-    elif freshness == "GAP":
-        out["note"] += " · 최근 21개 5분봉 공백"
+        out["note"] += " · 최신 확정봉 지연"
+    if not recent_continuous:
+        out["note"] += " · 최근 21개 5분봉 사이 공백"
     return out
 
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V11.11 · 4H 수평+추세선 / 1H 흐름 / 5M 진입 · 진단</title>
+<title>V11.12 · 4H 수평+추세선 / 1H 흐름 / 5M 진입 · 단계·공백 진단</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--panel:#141c2f;--border:#30405d;--text:#edf3ff;--sub:#a8b9d3;--green:#4ade80;--yellow:#fbbf24}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
@@ -558,11 +621,11 @@ main{max-width:1050px;margin:auto;padding:20px 14px 60px}h1{font-size:22px;margi
 p{margin:5px 0 12px}.muted{font-size:13px;color:var(--sub)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:15px;padding:17px;margin-top:14px}
 button{background:#315de7;color:white;border:0;border-radius:9px;padding:12px 18px;font:inherit;font-weight:750;cursor:pointer}button:disabled{opacity:.5}a{color:#aecaff}
 .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{border:1px solid var(--border);border-radius:10px;padding:10px;min-width:0}.metric b{display:block;font-size:23px}.buy{color:var(--green)}.watch{color:var(--yellow)}.subtle{color:#d8b4fe}
-progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.item{background:#10182a;border:1px solid var(--border);padding:14px;border-radius:12px;overflow-wrap:anywhere}.item.buycard{border-color:#2a7954}.item.watchcard{border-color:#756027}.item h3{display:flex;justify-content:space-between;gap:8px;font-size:16px;margin:0 0 8px}.pill{font-size:12px;border-radius:7px;background:#1d314e;padding:2px 7px}.details{white-space:pre-line;font-size:13px}details summary{cursor:pointer;font-weight:750}#timing{margin-top:8px}.emphasis{font-weight:800}.recordnote{font-size:12px;color:var(--sub)}.focuscard{border-color:#486d9a}.focuscard.good{border-color:#2a7954}.focuscard h3{margin:0 0 6px;font-size:16px}.manualBar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.manualBar button{font-size:13px;padding:8px 12px;background:#44526f}.manualBar button:disabled{opacity:.4}.dailycount{font-size:24px;font-weight:800}.smallhint{font-size:12px;color:var(--sub)}.diaggrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:12px}.diagrow{border:1px solid var(--border);border-radius:10px;padding:10px}.diagrow span{display:block;color:var(--sub);font-size:12px}.diagrow b{font-size:21px}.unknownnote{color:#fbbf24}
-@media(max-width:680px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.list{grid-template-columns:1fr}}
+progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.item{background:#10182a;border:1px solid var(--border);padding:14px;border-radius:12px;overflow-wrap:anywhere}.item.buycard{border-color:#2a7954}.item.watchcard{border-color:#756027}.item h3{display:flex;justify-content:space-between;gap:8px;font-size:16px;margin:0 0 8px}.pill{font-size:12px;border-radius:7px;background:#1d314e;padding:2px 7px}.details{white-space:pre-line;font-size:13px}details summary{cursor:pointer;font-weight:750}#timing{margin-top:8px}.emphasis{font-weight:800}.recordnote{font-size:12px;color:var(--sub)}.focuscard{border-color:#486d9a}.focuscard.good{border-color:#2a7954}.focuscard h3{margin:0 0 6px;font-size:16px}.manualBar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.manualBar button{font-size:13px;padding:8px 12px;background:#44526f}.manualBar button:disabled{opacity:.4}.dailycount{font-size:24px;font-weight:800}.smallhint{font-size:12px;color:var(--sub)}.diaggrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:12px}.diagrow{border:1px solid var(--border);border-radius:10px;padding:10px}.diagrow span{display:block;color:var(--sub);font-size:12px}.diagrow b{font-size:21px}.unknownnote{color:#fbbf24}.stagerow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stagebox{border:1px solid var(--border);border-radius:10px;padding:10px}.stagebox span{color:var(--sub);display:block;font-size:12px}.stagebox b{font-size:23px}.stagelabel{color:#a8d1fa;font-weight:700}
+@media(max-width:680px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.list{grid-template-columns:1fr}.stagerow{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style></head><body><main>
 <h1>🎯 4시간 수평·추세선 + 1시간 흐름 + 5분 진입</h1>
-<p class="muted">V11.11 3중 시간봉 · 진단 실험판 · KRW 전체 · 거래대금 제한 없음 · 유의종목 포함 · V2 메인 변경 없음</p>
+<p class="muted">V11.12 3중 시간봉 · 진입 단계·공백 진단 실험판 · KRW 전체 · 거래대금 제한 없음 · 유의종목 포함 · V2 메인 변경 없음</p>
 <div class="panel"><button id="run">지금 전체 검색</button> <a href="/">기존 V2 메인</a>
 <p class="muted">4시간봉 수평 가격대(±2%)와 기울어진 추세선(±1%) 둘 다 찾고, 5분봉 진입 모양을 포착한 후보만 1시간봉 흐름을 추가 확인합니다. 1시간봉 강한 하락·데이터 부족이면 BUY를 보류하지만 중립/전환 시도는 탈락시키지 않습니다. <b>위쪽 4시간 저항까지 최소 3%의 이론적 공간</b>, 짧은 구조적 손절, 거래량과 재확인을 통과한 BUY를 우선 표시합니다. 조건이 부족하면 WATCH로 남깁니다. 3~5% 상승이나 이익은 보장되지 않습니다.</p>
 <div class="metrics">
@@ -576,12 +639,13 @@ progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;ove
 <div id="status" class="muted">검색 버튼을 누르면 4시간봉 전체 검사부터 진행합니다.</div>
 <div id="timing" class="muted"></div>
 </div>
-<section class="panel"><h2>⭐ 오늘 집중할 최대 3개 · 복합선 우선</h2><p class="muted">완료된 검색에서 BUY → 진입 임박 WATCH → 상승 흐름·거래량이 확인된 우선 관찰 WATCH 순서로 표시합니다. BUY가 아닌 항목은 매수 신호가 아닙니다. 개수를 억지로 세 개 채우지 않습니다.</p><div class="list" id="focusList"><p class="muted">검색 완료 후 표시됩니다.</p></div></section>
+<section class="panel"><h2>⭐ 오늘 집중할 최대 3개 · 단계별 우선</h2><p class="muted">BUY → 진입 임박 → 최근 터치·돌파 시도가 확인된 진입 준비 순서로 선별합니다. 모든 단계에서 신호가 최신이고 1시간봉 위험이 없어야 합니다. 준비/임박은 매수 신호가 아니며 억지로 세 개를 채우지 않습니다.</p><div class="list" id="focusList"><p class="muted">검색 완료 후 표시됩니다.</p></div></section>
+<section class="panel"><h2>📍 V11.12 · 진입 진행 단계</h2><p class="muted">WATCH를 가격대 접근 / 5분봉 터치·돌파 시도 / BUY 모양 확인·진입 검증으로 구분합니다. 중간 단계는 신호의 미래 성공을 뜻하지 않습니다. 기존 BUY 판단에는 영향을 주지 않습니다.</p><div class="stagerow" id="stageGrid"><p class="muted">검색 완료 후 표시됩니다.</p></div></section>
 <section class="panel"><h2>📝 오늘 수동 거래 기록</h2><div class="manualBar"><span class="dailycount" id="tradeCount">0 / 3회</span><button type="button" id="manualOne">거래 1회 직접 기록</button><button type="button" id="undoTrade">마지막 기록 취소</button></div><p class="recordnote" id="tradeHistory">실제 거래를 했다면 BUY 후보의 기록 버튼을 직접 눌러 주세요.</p><p class="smallhint">기록은 현재 브라우저에만 저장됩니다. 앱을 닫아도 같은 브라우저에 남지만, 다른 기기·브라우저와 공유되지 않습니다. 하루 3회는 사용자 원칙으로, 빗썸 주문을 막는 기능이 아닙니다.</p></section>
-<section class="panel"><h2>🔍 V11.11 · BUY 차단 원인 진단</h2>
+<section class="panel"><h2>🔍 V11.12 · BUY 차단·캔들 상태 진단</h2>
 <p class="muted">5분봉에서 진입 모양이 나온 <b>현재 WATCH</b>의 BUY 미통과 이유를 셉니다. 한 종목이 여러 조건에서 미통과할 수 있어 합계는 종목 수보다 클 수 있습니다. 일반 접근 WATCH, 오래된 신호·공백은 별도 집계합니다.</p>
 <div class="diaggrid" id="diagGrid"><p class="muted">검색 완료 후 진단이 표시됩니다.</p></div>
-<p class="smallhint" id="diagDetails">BUY 조건은 V11.10과 동일합니다. 참고: 위쪽 저항이 관측되지 않았다고 상승 여력이 3% 이상임을 뜻하지는 않습니다.</p>
+<p class="smallhint" id="diagDetails">최근 5분봉 지연과 최근 21개 봉 사이 빈 구간은 각각 계산합니다. 두 문제가 동시에 존재하면 양쪽에 중복으로 집계합니다. 거래 없는 시간에는 거래소가 봉을 만들지 않을 수 있으며, 실제 API 장애라는 뜻은 아닙니다. 기존 BUY 기준 유지.</p>
 </section>
 <section class="panel"><h2 class="buy">실험 BUY 후보 · 5분봉 정밀 검증 통과</h2><div class="list" id="buyList"><p class="muted">검색 전</p></div></section>
 <details class="panel" id="unknownPanel"><summary class="unknownnote">⚠️ 위쪽 4시간봉 저항 미확인 · 별도 관찰 <span id="unknownCount">(0개)</span></summary>
@@ -589,7 +653,7 @@ progress{width:100%;height:12px;margin-top:12px}#status{white-space:pre-wrap;ove
 <div class="list" id="unknownList"></div></details>
 <section class="panel"><h2 class="watch">WATCH · 일반 가격대 접근 후보</h2><p class="muted">전체 WATCH 개수에는 위쪽 저항 미확인 관찰 후보도 포함되어 있습니다.</p><div class="list" id="watchList"><p class="muted">검색 전</p></div></section>
 <details class="panel" id="reclaimPanel"><summary class="subtle">⚠️ 지지선 이탈 · 회복 대기 <span id="reclaimCount"></span></summary><p class="muted">4시간 수평 지지대 아래에 있어 아직 지지가 확인되지 않았습니다. 가격대를 회복하기 전에는 BUY로 취급하지 않습니다.</p><div id="reclaimList" class="list"></div></details>
-<details class="panel" id="holdPanel"><summary class="subtle">⚠️ 신호 시간/캔들 공백 주의 <span id="holdCount"></span></summary><p class="muted">마지막 5분봉이 오래됐거나 최근 21개 봉이 연속되지 않은 후보야. 현재 BUY로 표시하지 않아.</p><div id="holdList" class="list"></div></details>
+<details class="panel" id="holdPanel"><summary class="subtle">⚠️ 마지막 봉 지연 / 중간 봉 공백 보류 <span id="holdCount"></span></summary><p class="muted">확인된 관찰 후보 중 최근 확정봉이 오래됐거나 최근 21개 5분봉 사이에 빈 구간이 있습니다. 아래 카드에서 지연 시간과 중간 빈 구간 수를 각각 확인할 수 있습니다. 둘 다 있는 종목도 BUY가 아닙니다.</p><div id="holdList" class="list"></div></details>
 <p class="muted">실험용 신호이며 매수 권유나 수익 보장이 아닙니다. 진입 참고가는 최신 확정 5분봉 종가이며 실제 체결가가 아닙니다. 3~5%는 관찰 목표 움직임으로, 예측·확정 익절가가 아닙니다. 표시하는 손절 기준·위쪽 저항까지의 거리는 수수료·호가 차이·슬리피지를 뺀 순수익을 뜻하지 않습니다. 위쪽 저항이 확인되지 않으면 BUY로 표시하지 않고 별도 관찰로 분리합니다. 진단은 승률 예측이 아닙니다. 미래 봉은 사용하지 않습니다.</p>
 </main><script>
 const $=id=>document.getElementById(id);
@@ -597,6 +661,7 @@ const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const won=v=>Number(v).toLocaleString('ko-KR',{maximumFractionDigits:8})+'원';
 const resultMap=new Map();let running=false;let showMore=false;let scanFinished=false;
 let noPatternCount=0;let entrySkipped=0;let total4hNear=0;
+let candleStats={late:0,gap:0,both:0,missing:0,clock:0,checked:0};
 const DIAG_KEYS=[['candle','5분봉 양봉·윗꼬리 부족'],['volume','매수 거래량 부족'],['retest','돌파 재확인 부족'],['stop','손절 위험 기준 미달'],['overhead_unknown','위쪽 저항 미확인'],['room','확인된 저항까지 3% 미만'],['rr','참고 손익비 부족'],['hour1','1시간봉 위험·자료 문제']];
 function qualityCodes(x){return Array.isArray(x.quality?.reason_codes)?x.quality.reason_codes:[];}
 function unknownOverhead(x){return x.status==='WATCH'&&x.pattern_signal==='BUY'&&qualityCodes(x).includes('overhead_unknown');}
@@ -607,9 +672,17 @@ function renderDiagnostics(){
  for(const x of blocked)for(const code of new Set(qualityCodes(x)))if(Object.hasOwn(count,code))count[code]++;
  const nearOnly=all.filter(x=>x.status==='WATCH'&&x.pattern_signal!=='BUY').length;
  const held=all.filter(x=>['STALE','GAP'].includes(x.status)).length;
- const boxes=[['5분봉 후보 조건 해당 없음',noPatternCount],['진입 모양 없이 접근 WATCH',nearOnly],['진입 모양 있으나 BUY 보류',blocked.length],['오래된 봉·캔들 공백',held], ...DIAG_KEYS.map(([key,label])=>[label,count[key]])];
+ const boxes=[['최근 확정 5분봉 지연',candleStats.late],['최근 21개 봉 사이 공백',candleStats.gap],['지연과 공백 둘 다',candleStats.both],['빈 5분봉 추정 개수 합계',candleStats.missing],['시계 차이·미래시각',candleStats.clock],['5분봉 후보 조건 해당 없음',noPatternCount],['진입 모양 없이 접근 WATCH',nearOnly],['진입 모양 있으나 BUY 보류',blocked.length],['신선도 문제로 보류된 관심 후보',held], ...DIAG_KEYS.map(([key,label])=>[label,count[key]])];
  $('diagGrid').innerHTML=boxes.map(([label,n])=>`<div class="diagrow"><span>${esc(label)}</span><b>${n}개</b></div>`).join('');
- $('diagDetails').textContent=`4시간봉 접근 ${total4hNear}개 · 5분봉 조회 ${total4hNear}개 중 진입 모양 없음 ${noPatternCount}개 · 5분봉 데이터 부족 ${entrySkipped}개. 각 차단 사유는 중복 집계될 수 있습니다. BUY 기준과 거래대금 조건은 변경하지 않았습니다.`;
+ $('diagDetails').textContent=`5분봉 요청 ${total4hNear}개 · 상태 측정 ${candleStats.checked}개 · 5분봉 부족 ${entrySkipped}개. 최근 확정봉 지연과 중간 봉 공백은 동시에 발생할 수 있으므로 중복 집계합니다. 빈 봉은 거래 미발생 때문일 수도 있습니다. BUY·거래대금 기준은 변경하지 않았습니다.`;
+}
+
+function renderStages(){
+ const list=[...resultMap.values()];
+ const counts={BUY:0,NEAR:0,CHECK:0,READY:0,APPROACH:0,DATA_HOLD:0,RECLAIM:0};
+ for(const x of list)if(Object.prototype.hasOwnProperty.call(counts,x.stage))counts[x.stage]++;
+ const rows=[['BUY 확정',counts.BUY],['진입 임박 · 한 조건',counts.NEAR],['진입 모양 · 검증 보류',counts.CHECK],['진입 준비 · 터치/시도',counts.READY],['가격대 접근 WATCH',counts.APPROACH],['봉 상태 보류 후보',counts.DATA_HOLD],['지지 이탈·회복 대기',counts.RECLAIM]];
+ $('stageGrid').innerHTML=rows.map(([name,n])=>`<div class="stagebox"><span>${esc(name)}</span><b>${n}개</b></div>`).join('');
 }
 
 const DAILY_LIMIT=3;
@@ -632,31 +705,23 @@ function signalStillFresh(x){
   return Number.isFinite(ts)&&age>=-30000&&age<=10*60000;
 }
 function spotlight(){
-  const arr=[...resultMap.values()].filter(x=>{
-    if(x.status==='BUY')return true;
-    if(x.status!=='WATCH'||!x.hour1||x.hour1.risk||unknownOverhead(x))return false;
-    const q=x.quality;
-    const oneAway=x.pattern_signal==='BUY'&&q&&
-      Array.isArray(q.reasons)&&q.reasons.length===1&&
-      Number(q.room_pct)>=MIN_ROOM_FOR_UI&&
-      Number(q.risk_pct)>=0.25&&Number(q.risk_pct)<=1.25&&
-      Number(q.rr)>=2.0;
-    if(oneAway)return true;
-    // Observation-only: NOT an entry signal. Never fill all three by force.
-    return (x.hour1.state==='상승 흐름'||x.hour1.state==='상승 전환 시도')&&
-      Number(x.volume_ratio)>=1.2&&
-      (x.confluence||Math.abs(Number(x.distance_pct))<=0.65);
-  });
-  return arr.sort((a,b)=>{
-    const priority=x=>x.status==='BUY'?0:x.pattern_signal==='BUY'&&
-      x.quality?.reasons?.length===1&&Number(x.quality?.room_pct)>=MIN_ROOM_FOR_UI&&
-      Number(x.quality?.risk_pct)<=1.25&&Number(x.quality?.rr)>=2?1:2;
-    const sa=priority(a),sb=priority(b);
-    if(sa!==sb)return sa-sb;
-    if(Boolean(a.confluence)!==Boolean(b.confluence))return a.confluence?-1:1;
-    const qa=a.quality||{},qb=b.quality||{};
-    return Number(qb.rr||0)-Number(qa.rr||0)||Number(qb.room_pct||0)-Number(qa.room_pct||0)||Number(a.distance_pct||99)-Number(b.distance_pct||99)||a.market.localeCompare(b.market);
-  }).slice(0,DAILY_LIMIT);
+ const arr=[...resultMap.values()].filter(x=>{
+   if(!signalStillFresh(x)||x.candle_health?.gap||x.candle_health?.stale)return false;
+   if(x.status==='BUY')return true;
+   if(x.status!=='WATCH'||unknownOverhead(x)||x.hour1?.risk)return false;
+   if(x.stage==='NEAR')return true;
+   if(x.stage!=='READY')return false;
+   // Preparation-stage observations are NOT a BUY: keep only setups with
+   // some observed volume participation and acceptable 1H trend if present.
+   return Number(x.volume_ratio)>=1.0 &&
+     (!x.hour1 || ['상승 흐름','상승 전환 시도'].includes(x.hour1.state));
+ });
+ const rank=x=>x.status==='BUY'?0:x.stage==='NEAR'?1:2;
+ return arr.sort((a,b)=>rank(a)-rank(b)||
+   Number(Boolean(b.confluence))-Number(Boolean(a.confluence))||
+   Number(b.volume_ratio||0)-Number(a.volume_ratio||0)||
+   Math.abs(Number(a.distance_pct))-Math.abs(Number(b.distance_pct))||
+   a.market.localeCompare(b.market)).slice(0,DAILY_LIMIT);
 }
 const MIN_ROOM_FOR_UI=3.0;
 function paintSpotlight(){
@@ -667,22 +732,22 @@ function paintSpotlight(){
     const buy=x.status==='BUY',q=x.quality||{};
     const exists=records.some(r=>r.market===x.market&&r.signal_time===x.signal_time);
     const allowed=buy&&records.length<DAILY_LIMIT&&!exists&&signalStillFresh(x);
-    const oneAway=!buy&&x.pattern_signal==='BUY'&&q.reasons?.length===1&&
-      Number(q.room_pct)>=MIN_ROOM_FOR_UI&&Number(q.risk_pct)<=1.25&&Number(q.rr)>=2;
-    const text=buy?'확정 BUY 조건 통과':oneAway?'진입 임박 · 한 조건 미충족':'우선 관찰 · 아직 진입 신호 아님';
+    const oneAway=!buy&&x.stage==='NEAR';
+    const text=buy?'확정 BUY 조건 통과':oneAway?'진입 임박 · 품질 한 조건 미충족':'진입 준비 · 터치/돌파 시도 · BUY 아님';
     return `<article class="item focuscard ${buy?'good':''}"><h3>${i+1}. ${esc(x.market)} · ${text}${x.confluence?' · 4H 복합선':''}</h3>`+
       `<div class="details">확정 종가 ${won(x.price)} · 참고 손절 ${q.stop==null?'—':won(q.stop)} / 위험 ${q.risk_pct==null?'—':q.risk_pct+'%'}
 `+
       `위쪽 4시간봉 저항까지 이론적 여유 ${q.room_pct==null?'미확인':q.room_pct+'%'} · 참고 손익비 ${q.rr==null?'—':q.rr+':1'}
 `+
       `1시간봉 ${esc(x.hour1?.state||'확인 전')} · 근거 ${x.source_type==='trend'?'기울어진 4H 추세선':'4H 수평 가격대'}${x.confluence?' · 수평+추세선 겹침':''}
-${buy?'✅ 5분봉·1시간봉 진입 조건 통과':oneAway?'⚠️ 마지막 확인 필요: '+esc((q.reasons||[]).join(' / ')):'⚪ 관찰만: 진입 타점·상승 여력 미확인, BUY 아님'}</div>`+
+${buy?'✅ 기존 BUY 조건 통과':oneAway?'⚠️ 마지막 확인 필요: '+esc((q.reasons||[]).join(' / ')):'⚪ 관찰만 · 반등/돌파 미확정 · 위험·상승 여력 확인 전'}</div>`+
       (buy?`<button type="button" class="manualTrade" data-market="${esc(x.market)}" ${allowed?'':'disabled'}>${exists?'기록 완료':records.length>=DAILY_LIMIT?'오늘 3회 기록 완료':signalStillFresh(x)?'실제 진입했다면 1회 기록':'신호 만료 · 재검색'}</button>`:'')+
       '</article>';
   }).join('');
 }
 function entries(status){return [...resultMap.values()].filter(x=>status==='HOLD'?['STALE','GAP'].includes(x.status):x.status===status)
  .sort((a,b)=>Math.abs(Number(a.distance_pct||99))-Math.abs(Number(b.distance_pct||99))||a.market.localeCompare(b.market));}
+function stageName(s){return ({BUY:'BUY 확정',NEAR:'진입 임박',CHECK:'진입 모양·검증 보류',READY:'진입 준비',APPROACH:'가격대 접근',DATA_HOLD:'데이터 보류',RECLAIM:'지지 회복 대기'})[s]||'확인 중';}
 function card(x){const h=x.htf||{},z=x.source_kind==='support'?h.support:h.resistance;
 const zoneText=x.source_type==='trend'?
 `4시간 기울어진 ${x.source_kind==='support'?'지지 추세선':'저항 추세선'} · 5분봉 시각에 투영한 값
@@ -698,7 +763,8 @@ const q=x.quality;const quality=q?`
 ${q.passed?'✅ 진입 품질 조건 통과':'⚠️ BUY 보류: '+esc(q.reasons.join(' / '))}`:'';
 return `<article class="item ${x.status==='BUY'?'buycard':'watchcard'}"><h3><span>${esc(x.market)}</span><span class="pill ${x.status==='BUY'?'buy':'watch'}">${esc(x.status==='BUY'?'BUY':x.status==='WATCH'?'WATCH':x.status==='RECLAIM'?'회복 대기':'확인 보류')}</span></h3>`+
 `<div class="details">${esc(x.setup)} · ${esc(x.note)}
-${x.confluence?'⭐ 4시간 수평 가격대와 기울어진 추세선 겹침\n':''}${x.source_type==='trend'?'4시간 기울어진 추세선 기준':'4시간 수평 가격대 기준'}${h1}
+${x.confluence?'⭐ 4시간 수평 가격대와 기울어진 추세선 겹침\n':''}📍 단계: ${esc(stageName(x.stage))} · ${esc(x.stage_note||'')}
+${x.candle_health?`⏱ 최근 봉 종료 후 ${x.candle_health.latest_delay_minutes}분 · 중간 공백 ${x.candle_health.missing_intervals}곳 (누락 추정 ${x.candle_health.missing_5m_bars}봉)${x.candle_health.clock_issue?' · 시각 불일치':''}\n`:''}${x.source_type==='trend'?'4시간 기울어진 추세선 기준':'4시간 수평 가격대 기준'}${h1}
 확정 5분봉 ${esc(x.signal_time)} · 종료 후 ${esc(x.age_minutes)}분
 5분봉 종가 ${won(x.price)} · ${x.source_type==='trend'?'추세선':'가격대 상단'} ${won(x.zone_high)} · 거리 ${x.distance_pct>0?'+':''}${esc(x.distance_pct)}%
 거래량 ${esc(r)}${quality}
@@ -712,13 +778,13 @@ $('unknownList').innerHTML=$('unknownPanel').open?(unknown.length?unknown.map(ca
 $('watchList').innerHTML=ordinary.length?(showMore?ordinary:ordinary.slice(0,20)).map(card).join('')+(ordinary.length>20?`<button type="button" id="moreBtn">${showMore?'접기':`나머지 ${ordinary.length-20}개 더 보기`}</button>`:''):'<p class="muted">현재 일반 WATCH 없음</p>';
 const more=$('moreBtn');if(more)more.addEventListener('click',()=>{showMore=!showMore;paint();});
 $('reclaimList').innerHTML=$('reclaimPanel').open?(r.length?r.map(card).join(''):'<p class="muted">지지선 회복 대기 후보 없음</p>'):'';
-$('holdList').innerHTML=$('holdPanel').open?(h.length?h.map(card).join(''):'<p class="muted">확인 보류 없음</p>'):'';paintTrades();paintSpotlight();if(scanFinished)renderDiagnostics();}
+$('holdList').innerHTML=$('holdPanel').open?(h.length?h.map(card).join(''):'<p class="muted">확인 보류 없음</p>'):'';paintTrades();paintSpotlight();if(scanFinished){renderDiagnostics();renderStages();}}
 async function post(path,items){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),75000);
 try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items}),signal:controller.signal,cache:'no-store'});
 const j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||`HTTP ${r.status}`);return j;}finally{clearTimeout(timer);}}
 async function pool(packs,limit,fn){let idx=0;const errs=[];async function worker(){while(idx<packs.length){const i=idx++;try{await fn(packs[i]);}catch(e){errs.push(e.message||String(e));}}}
 await Promise.all(Array.from({length:Math.min(limit,packs.length)},worker));return errs;}
-async function scan(){if(running)return;scanFinished=false;running=true;$('run').disabled=true;resultMap.clear();showMore=false;noPatternCount=0;entrySkipped=0;total4hNear=0;$('diagGrid').innerHTML='<p class="muted">검색 진행 중 · 완료 후 집계</p>';paint();$('all').textContent='—';$('near').textContent='—';$('timing').textContent='';$('progress').value=0;
+async function scan(){if(running)return;scanFinished=false;running=true;$('run').disabled=true;resultMap.clear();showMore=false;noPatternCount=0;entrySkipped=0;total4hNear=0;candleStats={late:0,gap:0,both:0,missing:0,clock:0,checked:0};$('stageGrid').innerHTML='<p class="muted">검색 진행 중 · 완료 후 집계</p>';$('diagGrid').innerHTML='<p class="muted">검색 진행 중 · 완료 후 집계</p>';paint();$('all').textContent='—';$('near').textContent='—';$('timing').textContent='';$('progress').value=0;
 const started=performance.now();let lineErrors=0,entryErrors=0;try{
 const resp=await fetch('/api/zone45/universe',{cache:'no-store'});const u=await resp.json();if(!resp.ok||!u.ok)throw Error(u.error||'시장 목록 조회 실패');
 const items=u.items;const packs=[];for(let i=0;i<items.length;i+=40)packs.push(items.slice(i,i+40));
@@ -733,12 +799,17 @@ total4hNear=near.length;$('near').textContent=near.length;$('status').textConten
 const packs2=[];for(let i=0;i<near.length;i+=40)packs2.push(near.slice(i,i+40));let checked=0,skipped=0;
 const errors2=await pool(packs2,3,async batch=>{const r=await post('/api/zone45/entries',batch);checked+=r.scanned;entryErrors+=r.errors;skipped+=r.skipped;
 entrySkipped+=r.skipped;
-for(const x of r.results){if(x.status==='NONE')noPatternCount++;if(['BUY','WATCH','RECLAIM','GAP','STALE'].includes(x.status))resultMap.set(x.market,x);}paint();
+for(const x of r.results){
+ if(x.status==='NONE')noPatternCount++;
+ const ch=x.candle_health;
+ if(ch){candleStats.checked++;if(ch.stale)candleStats.late++;if(ch.gap)candleStats.gap++;if(ch.stale&&ch.gap)candleStats.both++;if(ch.clock_issue)candleStats.clock++;candleStats.missing+=Number(ch.missing_5m_bars||0);}
+ if(['BUY','WATCH','RECLAIM','GAP','STALE'].includes(x.status))resultMap.set(x.market,x);
+}paint();
 $('status').textContent=`2단계 · 5분봉 ${checked}/${near.length}개 · BUY ${entries('BUY').length} · WATCH ${entries('WATCH').length} · 지지 이탈 ${entries('RECLAIM').length}`;});
 scanFinished=!(errors2.length||entryErrors||checked!==near.length);paint();const total=((performance.now()-started)/1000).toFixed(1);
 $('timing').textContent=`4시간봉 전체 ${t1}초 · 5분봉·대상 후보 1시간봉 포함 전체 ${total}초 · 시작 ${esc(u.snapshot_at)} · 가격대 없음 ${noLines}개 · 5분봉 부족 ${skipped}개`;
 $('status').textContent=(errors2.length||entryErrors?'⚠️ 일부 실패 · ':'✅ 완료 · ')+`전체 ${scanned}/${items.length} · 5분봉 확인 ${checked}/${near.length} · BUY ${entries('BUY').length} · WATCH ${entries('WATCH').length} · 지지 이탈 ${entries('RECLAIM').length} · 시간/공백 보류 ${entries('HOLD').length} · 오류 ${lineErrors+entryErrors+errors2.length}건`;
-}catch(e){$('status').textContent='⚠️ 검색 중단: '+e.message+' · 표시된 내용은 불완전할 수 있어.';$('diagGrid').innerHTML='<p class="muted">검사가 완료되지 않아 차단 원인을 집계하지 않았습니다.</p>';}
+}catch(e){$('status').textContent='⚠️ 검색 중단: '+e.message+' · 표시된 내용은 불완전할 수 있어.';$('diagGrid').innerHTML='<p class="muted">검사가 완료되지 않아 차단 원인을 집계하지 않았습니다.</p>';$('stageGrid').innerHTML='<p class="muted">검사 미완료 · 단계 집계 보류</p>';}
 finally{running=false;$('run').disabled=false;}}
 $('run').addEventListener('click',scan);$('holdPanel').addEventListener('toggle',paint);$('reclaimPanel').addEventListener('toggle',paint);$('unknownPanel').addEventListener('toggle',paint);
 $('focusList').addEventListener('click',event=>{
