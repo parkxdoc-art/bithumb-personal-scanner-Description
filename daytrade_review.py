@@ -70,6 +70,75 @@ def classify_signal_freshness(result, now, kst):
         return status("STALE", "신호 봉 시각 확인 불가")
 
 
+
+
+def compare_resistance_pivots(api_get, market, unit, now_kst, kst):
+    """Read 80 completed candles and reproduce V2's two-pivot resistance rule.
+
+    Research only: this never assigns BUY/WATCH and cannot change V2 signals.
+    """
+    raw = api_get(f"/v1/candles/minutes/{unit}", {"market": market, "count": 80})
+    if not isinstance(raw, list):
+        raise ValueError("캔들 응답 형식 오류")
+    by_time = {}
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        t = datetime.fromisoformat(r["candle_date_time_kst"])
+        t = t.replace(tzinfo=kst) if t.tzinfo is None else t.astimezone(kst)
+        if t + timedelta(minutes=unit) <= now_kst:
+            by_time[t] = r  # exclude the still-forming candle
+    ordered = sorted(by_time.items())
+    bars = [r for _, r in ordered]
+    out = {"minutes": unit, "bars": len(bars), "pivots": 0,
+           "status": "데이터 부족", "trendline": None, "distance_pct": None,
+           "last_candle": ordered[-1][0].strftime("%m-%d %H:%M") if ordered else None,
+           "high1": None, "high2": None, "gap_count": 0}
+    if ordered:
+        out["gap_count"] = sum(
+            b - a != timedelta(minutes=unit)
+            for (a, _), (b, _) in zip(ordered, ordered[1:])
+        )
+        close_age = (now_kst - (ordered[-1][0] + timedelta(minutes=unit))).total_seconds() / 60
+        out["age_minutes"] = round(close_age, 1)
+    if len(bars) < 35:
+        return out
+    highs = [float(r["high_price"]) for r in bars]
+    closes = [float(r["trade_price"]) for r in bars]
+    if not all(isfinite(v) and v > 0 for v in highs + closes):
+        raise ValueError("캔들 가격 오류")
+    # Exact V2 pivot definition: left two highs <= pivot; right two < pivot.
+    pivots = [i for i in range(2, len(highs) - 2)
+              if highs[i] >= max(highs[i-2:i]) and highs[i] > max(highs[i+1:i+3])]
+    out["pivots"] = len(pivots)
+    if len(pivots) < 2:
+        out["status"] = "고점 2개 부족"
+        return out
+    a, b = pivots[-2], pivots[-1]
+    out["high1"] = round(highs[a], 8)
+    out["high2"] = round(highs[b], 8)
+    out["time1"] = ordered[a][0].strftime("%m-%d %H:%M")
+    out["time2"] = ordered[b][0].strftime("%m-%d %H:%M")
+    out["last_close"] = round(closes[-1], 8)
+    if highs[b] >= highs[a]:
+        out["status"] = "고점 낮아지지 않음"
+        return out
+    slope = (highs[b] - highs[a]) / (b - a)
+    line_now = highs[b] + slope * ((len(bars) - 1) - b)
+    if not isfinite(line_now) or line_now <= 0:
+        out["status"] = "유효한 저항선 없음"
+        return out
+    out["trendline"] = round(line_now, 8)
+    out["distance_pct"] = round((closes[-1] / line_now - 1) * 100, 2)
+    # Match V2's 0.4% resistance tolerance. NOT a BUY calculation.
+    if closes[-1] > line_now * 1.004:
+        out["status"] = "저항선 위 (+0.4% 초과)"
+    elif closes[-1] >= line_now * 0.996:
+        out["status"] = "저항선 근접 (±0.4%)"
+    else:
+        out["status"] = "저항선 아래"
+    return out
+
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>빗썸 · 실시간 24시간 BUY / 관심 후보</title>
@@ -85,6 +154,7 @@ button:disabled{opacity:.55;cursor:default}.metrics{display:grid;grid-template-c
 .item.buycard{border-color:#28664c}.item.watchcard{border-color:#665527}.item.gapcard{border-color:#ca8a04}.gap{color:#fcd34d}.item.stalecard{border-color:#64536a;opacity:.9}.stale{color:#d8b4fe}.item h3{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px;margin:0 0 8px}.pill{border-radius:7px;padding:3px 7px;font-size:12px;background:#1e3351}
 .item .details{font-size:13px;white-space:pre-line}.item .context{margin-top:10px;padding-top:9px;border-top:1px solid var(--border);font-size:12px;white-space:pre-line;color:var(--sub)}
 section{margin-top:18px}.empty{font-size:13px;color:var(--sub)}.foot{font-size:12px;color:var(--sub);margin-top:18px}
+.tfrow{padding:6px 0;border-top:1px solid var(--border);font-size:12px}.tfrow:first-child{border-top:0}.tfrow b{display:inline-block;min-width:56px}.tfwarn{color:#fbbf24}.tfok{color:#4ade80}#tfPanel select{background:#0d1527;color:var(--text);padding:10px;border:1px solid var(--border);border-radius:8px;margin-right:6px}#tfPanel .list{grid-template-columns:repeat(2,minmax(0,1fr))}@media(max-width:650px){#tfPanel .list{grid-template-columns:1fr}}
 a{color:#a9caff}summary{cursor:pointer;font-weight:750;font-size:16px}@media(max-width:650px){.list{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric b{font-size:20px}h1{font-size:20px}}
 </style></head><body><main>
 <h1>⚡ 빗썸 실시간 BUY · 관심 후보</h1>
@@ -104,6 +174,13 @@ a{color:#a9caff}summary{cursor:pointer;font-weight:750;font-size:16px}@media(max
 </div>
 <section class="panel"><h2 class="buy">BUY · 진입 조건 충족</h2><div class="list" id="buyList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
 <section class="panel"><h2 class="watch">WATCH · 추가 확인 필요</h2><div class="list" id="watchList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
+<section class="panel" id="tfPanel"><h2>🧪 5분봉 · 1시간봉 · 4시간봉 고점 비교 실험</h2>
+<p class="muted">기존 검색 완료 후 후보 중 점수 상위 종목만 추가 조회합니다. 3개 시간봉 모두 <b>최근 확정봉 최대 80개</b>에서 V2와 동일한 고점 두 개·하향 저항선 규칙을 적용합니다. 실험 결과는 BUY/WATCH를 변경하지 않습니다.</p>
+<label for="tfCount">비교할 종목 수 </label><select id="tfCount"><option value="5">상위 5개</option><option value="10" selected>상위 10개</option><option value="20">상위 20개</option></select>
+<button id="tfRun" type="button" disabled>시간봉 3종 비교하기</button>
+<div class="muted" id="tfStatus">먼저 '지금 전체 검색'을 완료해 주세요.</div>
+<div id="tfResult" class="list" style="margin-top:12px"></div>
+</section>
 <section class="panel"><h2 class="gap">⚠️ 캔들 공백 주의 · 관찰 후보</h2><p class="muted">마지막 신호는 최근 것이지만 5분봉이 연속되지 않았습니다. 원래 V2가 BUY였어도 확정 BUY로 표시하지 않습니다. 시간 공백이 생기는 저유동성 코인도 여기에서 관찰할 수 있습니다.</p><div class="list" id="gapList"><div class="empty">아직 검사하지 않았습니다.</div></div></section>
 <details class="panel" id="stalePanel"><summary class="stale">⚠️ 오래된 신호 · 접어서 보관 <span id="staleSummary"></span></summary><p class="muted">마지막 봉이 오래됐거나 신호 시각이 올바르지 않습니다. 매수 신호로 취급하지 마세요. 공백 주의와 오래된 신호는 속도를 위해 추가 24시간 조회를 생략합니다.</p><div class="list" id="staleList"></div></details>
 <p class="foot">매매 권유나 주문 기능이 아닙니다. BUY는 V2 기술 조건과 최신/연속 캔들 검사를 모두 통과했다는 뜻이지 수익 보장은 아닙니다. 거래대금 제한이 없으므로 유동성이 낮은 종목은 호가 차이·체결 지연에 특히 주의하세요. 직전 24시간 캔들 분석은 보조 정보이며, 기존 V2 원신호는 유지하되 최신성/공백 여부에 따라 표시 그룹만 구분합니다. 24시간 자료는 완료된 5분봉만 사용합니다.</p>
@@ -185,6 +262,7 @@ async function pool(batches,concurrency,fn){
 async function scan(){
  if(working)return;working=true;$('run').disabled=true;
  signalByMarket.clear();ctxByMarket.clear();paint();$('all').textContent='—';$('timing').textContent='';
+ $('tfRun').disabled=true;tfCompareResults.clear();$('tfResult').innerHTML='';$('tfStatus').textContent='전체 검색 완료 후 비교할 수 있습니다.';
  $('status').textContent='전체 KRW 코인 목록 조회 중…';$('progress').value=0;$('progress').max=1;
  const started=performance.now();let failed=0,contextFailures=0;
  try{
@@ -220,8 +298,50 @@ async function scan(){
     `✅ 완료 · 전체 ${scanned}/${items.length}개 검사 · 유효 ${evaluated}개 · 봉 부족 ${skipped}개 · BUY ${sorted('BUY').length}개 · WATCH ${sorted('WATCH').length}개 · 공백 주의 ${sorted('GAP').length}개 · 오래된 신호 ${sorted('STALE').length}개 · 24시간 캔들 확인 ${checked}개`;
   $('timing').textContent+=` · 24시간 확인 포함 전체 ${totalSec}초`;
  }catch(e){$('status').textContent='⚠️ 검색 중단: '+e.message+' · 이미 확인된 후보는 화면에 유지됩니다.';}
- finally{working=false;$('run').disabled=false;}
+ finally{working=false;$('run').disabled=false;$('tfRun').disabled=!signalByMarket.size||comparingTF;}
 }
+
+let comparingTF=false;
+const tfCompareResults=new Map();
+const tfLabels={'5':'5분봉','60':'1시간봉','240':'4시간봉'};
+function paintTF(markets){
+  $('tfResult').innerHTML=markets.map(market=>{
+    const x=signalByMarket.get(market),data=tfCompareResults.get(market);
+    if(!data)return `<div class="item"><b>${quote(market)}</b><div class="muted">비교 대기 중…</div></div>`;
+    function row(unit){
+      const o=data.frames[unit];
+      if(o.error)return `<div class="tfrow"><b>${tfLabels[unit]}</b><span class="tfwarn">조회 실패: ${quote(o.error)}</span></div>`;
+      const gap=o.gap_count?` · 중간 공백 ${o.gap_count}곳`:'';
+      const highs=o.high1!=null?` · 고점 ${won(o.high1)} → ${won(o.high2)}`:'';
+      const line=o.trendline!=null?` · 저항선 ${won(o.trendline)} · 거리 ${Number(o.distance_pct)>0?'+':''}${o.distance_pct}%`:'';
+      const stale=o.age_minutes>Number(unit)+5?' · ⚠️ 최근 봉 지연':'';
+      return `<div class="tfrow"><b>${tfLabels[unit]}</b> ${quote(o.status)} (${o.bars}봉)`+highs+line+`<div class="muted">최근 확정봉 ${quote(o.last_candle||'없음')}${gap}${stale}</div></div>`;
+    }
+    return `<div class="item"><b>${quote(market)}</b> · 기존 ${quote(x?.signal||'미확인')}`+
+      `<div class="muted">시간봉별 하향 저항선 비교 (BUY 판정 아님)</div>`+
+      ['5','60','240'].map(row).join('')+`</div>`;
+  }).join('');
+}
+async function runTfCompare(){
+  if(working||comparingTF)return;
+  const selected=[...sorted('BUY'),...sorted('WATCH'),...sorted('GAP')].slice(0,Number($('tfCount').value));
+  if(!selected.length){$('tfStatus').textContent='현재 비교할 최신 후보가 없습니다.';return;}
+  const names=selected.map(x=>x.market);
+  comparingTF=true;$('tfRun').disabled=true;
+  tfCompareResults.clear();paintTF(names);
+  let done=0;
+  $('tfStatus').textContent=`상위 ${names.length}개 종목의 5분·1시간·4시간 고점 비교 중…`;
+  const errors=await pool(names,2,async market=>{
+    const r=await post('/api/live24/tfcompare',{market},45000);
+    tfCompareResults.set(market,r);done++;
+    $('tfStatus').textContent=`비교 ${done}/${names.length}개 완료`;
+    paintTF(names);
+  });
+  $('tfStatus').textContent=errors.length?`⚠️ ${done}/${names.length}개 비교 · 요청 실패 ${errors.length}건 (${errors[0].message})`:
+    `✅ ${done}개 후보의 5분·1시간·4시간 고점 비교 완료 · 기존 BUY/WATCH는 변경하지 않았습니다.`;
+  comparingTF=false;$('tfRun').disabled=false;
+}
+$('tfRun').addEventListener('click',runTfCompare);
 $('run').addEventListener('click',scan);
 $('stalePanel').addEventListener('toggle',paint);
 </script></body></html>'''
@@ -415,3 +535,27 @@ def register_daytrade_review(app, deps):
             return jsonify({"ok": True, "results": results})
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)[:160]}), 400
+
+    @app.post("/api/live24/tfcompare")
+    def live24_timeframe_comparison():
+        """Optional per-coin research; main V11.3 scan remains untouched."""
+        try:
+            payload = request.get_json(silent=True)
+            market = payload.get("market") if isinstance(payload, dict) else None
+            if not isinstance(market, str) or not MARKET_RE.fullmatch(market):
+                return jsonify({"ok": False, "error": "올바른 KRW 코인 이름이 아닙니다"}), 400
+            if market not in set(get_markets()):
+                return jsonify({"ok": False, "error": "현재 상장된 KRW 코인이 아닙니다"}), 400
+            now = datetime.now(kst)
+            frames = {}
+            # 5m baseline, 1h, 4h -- one 80-bar fetch per timeframe.
+            for unit in (5, 60, 240):
+                try:
+                    frames[str(unit)] = compare_resistance_pivots(
+                        api_get, market, unit, now, kst)
+                except Exception as exc:
+                    frames[str(unit)] = {"minutes": unit, "error": type(exc).__name__}
+            return jsonify({"ok": True, "market": market, "frames": frames,
+                            "note": "실험용 저항선 비교이며 BUY/WATCH 판단을 변경하지 않습니다"})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": type(exc).__name__}), 500
