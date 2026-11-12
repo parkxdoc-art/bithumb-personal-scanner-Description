@@ -5703,3 +5703,313 @@ _v111416_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v111416_register_daytrade_review(app, deps)
     register_c5_v111417_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.18: C5 one-per-trend BUY lock + post-stop exclusion study.
+# Append only: no changes to live BUY or V11.14.17 and earlier endpoints.
+# Legacy C5 remains the exact, unchanged V11.14.17 baseline.
+# Experimental arms: TP 1.5/3/4%, SL 1%, 60m hold, 120m after SL.
+# ---------------------------------------------------------------------------
+
+C5LOCK_V111418_PLANS = (
+    ('a', 'A · 1.5% 익절 + 잠금', 1.5),
+    ('b', 'B · 3.0% 익절 + 잠금', 3.0),
+    ('c', 'C · 4.0% 익절 + 잠금', 4.0),
+)
+C5LOCK_V111418_STOP_EXCLUSION_MINUTES = 120
+
+
+def c5lock_v111418_config(raw, kst):
+    """Only day and costs are editable; all experiment rules are fixed."""
+    return c5_v111417_config(raw, kst)
+
+
+def c5lock_v111418_evaluate_symbol(api_get, market, cfg, kst):
+    """Replay raw C5 first-reclaim candidates with independent arm locks.
+
+    Eligibility is identical to V11.14.17. Signal decisions see bars <= i.
+    After taking a signal, outcomes are calculated with the unchanged historical
+    5-minute settlement routine. Their EXIT TIME only affects LATER decisions;
+    this is chronological, rather than a future-aware signal filter.
+
+    Trend reset definition, fixed before testing: 3 CONSECUTIVE DECLINING
+    SMA(5) updates on contiguous 5m bars. A wave id increments on the third.
+    One BUY per wave, no overlapping entries, SL => additional 120m lock from
+    the conservatively assumed end of the exit candle. An UNKNOWN means we
+    cannot prove the position closed; conservatively block remaining day.
+    """
+    captured = {}
+
+    def capture5(path, params):
+        raw = api_get(path, params)
+        if path == '/v1/candles/minutes/5' and isinstance(raw, list):
+            for candle in raw:
+                if not isinstance(candle, dict):
+                    continue
+                try:
+                    t = local_time(candle['candle_date_time_kst'], kst)
+                    o, h, l, c = (float(candle[k]) for k in (
+                        'opening_price', 'high_price', 'low_price', 'trade_price'))
+                    v = float(candle['candle_acc_trade_volume'])
+                    if (all(isfinite(x) and x > 0 for x in (o, h, l, c))
+                            and isfinite(v) and v >= 0
+                            and l <= min(o, c) and h >= max(o, c) and l <= h):
+                        captured[t] = {'t': t, 'o': o, 'h': h, 'l': l, 'c': c, 'v': v}
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+        return raw
+
+    old = c5_v111417_evaluate_symbol(capture5, market, cfg, kst)
+    day_start = datetime.combine(cfg['day'], _time.min, tzinfo=kst)
+    day_end = day_start + timedelta(days=1)
+    start = day_start - timedelta(hours=4)
+    end = day_end + timedelta(hours=2, minutes=5)
+    rows = [captured[t] for t in sorted(captured) if start <= t < end]
+    bars = cfg['bars']
+    step = timedelta(minutes=5)
+    states = {}
+    for key, label, tp in C5LOCK_V111418_PLANS:
+        states[key] = {
+            'label': label, 'tp': tp, 'traded_wave': None,
+            'busy_until': None, 'cooldown_until': None, 'unknown_lock': False,
+            'events': [], 'blocked_events': [],
+            'blocked_reasons': {'SAME_WAVE': 0, 'POSITION_OPEN': 0,
+                                'POST_SL_120M': 0, 'UNKNOWN_EXIT': 0},
+        }
+
+    eligible = 0
+    raw_candidates = 0
+    wave_id = 0
+    down_run = 0
+    for i in range(5, len(rows) - 1):
+        # This trend-state update sees only closes observed through i.
+        if lab_contiguous(rows, i - 5, i):
+            now_ma5 = sum(r['c'] for r in rows[i-4:i+1]) / 5
+            prev_ma5 = sum(r['c'] for r in rows[i-5:i]) / 5
+            down_run = down_run + 1 if now_ma5 < prev_ma5 else 0
+            if down_run == 3:
+                wave_id += 1
+        else:
+            down_run = 0
+
+        if i < LAB_WARMUP_BARS:
+            continue
+        t = rows[i]['t']
+        if not day_start <= t < day_end:
+            continue
+        if not lab_contiguous(rows, i - 24, i):
+            continue
+        eligible += 1
+        if not c5_v111417_signal(rows, i):
+            continue
+        raw_candidates += 1
+        signal_close = t + step
+        signal_at = t.strftime('%Y-%m-%d %H:%M')
+        entry_at = signal_close.strftime('%Y-%m-%d %H:%M')
+        features = c5_v111417_features(rows, i)
+
+        for key, label, tp in C5LOCK_V111418_PLANS:
+            state = states[key]
+            # UNKNOWN / active position and SL cooldown take priority.
+            if state['unknown_lock']:
+                block = 'UNKNOWN_EXIT'
+            elif state['busy_until'] and signal_close < state['busy_until']:
+                block = 'POSITION_OPEN'
+            elif (state['cooldown_until']
+                  and signal_close < state['cooldown_until']):
+                block = 'POST_SL_120M'
+            elif state['traded_wave'] == wave_id:
+                block = 'SAME_WAVE'
+            else:
+                block = None
+
+            if block:
+                state['blocked_reasons'][block] += 1
+                # Opportunity cost is purely descriptive, never fed into
+                # the block/entry decision. Each arm uses its OWN TP level.
+                alt_cfg = {**cfg, 'tp': tp}
+                hypothetical = lab_outcome_v11145(rows, i, alt_cfg)
+                state['blocked_events'].append({
+                    'signal_time_kst': signal_at, 'entry_time_kst': entry_at,
+                    'wave_id': wave_id, 'block_reason': block,
+                    'hypothetical_outcome': hypothetical['outcome'],
+                    'hypothetical_net_pct': hypothetical.get('net_pct'),
+                })
+                continue
+
+            arm_cfg = {**cfg, 'tp': tp}
+            result = lab_outcome_v11145(rows, i, arm_cfg)
+            event = {
+                'signal_time_kst': signal_at, 'entry_time_kst': entry_at,
+                'wave_id': wave_id, 'is_first_signal': not state['events'],
+                **result, 'features': features,
+            }
+            state['events'].append(event)
+            state['traded_wave'] = wave_id
+            if result['outcome'] == 'UNKNOWN':
+                state['unknown_lock'] = True
+            else:
+                # lab_outcome.minutes counts 5m bars from the NEXT entry
+                # candle to the exit candle. Use END of exit candle, not
+                # its opening, to avoid approving an overlapping BUY.
+                exit_close = signal_close + timedelta(minutes=result['minutes'])
+                state['busy_until'] = exit_close
+                if result['outcome'] == 'SL':
+                    state['cooldown_until'] = exit_close + timedelta(
+                        minutes=C5LOCK_V111418_STOP_EXCLUSION_MINUTES)
+
+    if eligible != old['valid_windows']:
+        raise ValueError('기존 C5와 실험 C5의 평가 가능 구간 불일치')
+
+    arms = {'base': old['c5']}
+    for key, label, tp in C5LOCK_V111418_PLANS:
+        state = states[key]
+        blocked = state['blocked_events']
+        arms[key] = {
+            'signals': len(state['events']),
+            'unknown': sum(e['outcome'] == 'UNKNOWN' for e in state['events']),
+            'events': state['events'], 'blocked_count': len(blocked),
+            'blocked_reasons': state['blocked_reasons'],
+            'blocked_judged': sum(x['hypothetical_net_pct'] is not None for x in blocked),
+            'blocked_profitable': sum(x['hypothetical_net_pct'] is not None and
+                                      x['hypothetical_net_pct'] > 0 for x in blocked),
+            'blocked_events': blocked,
+        }
+        if arms[key]['signals'] + arms[key]['blocked_count'] != raw_candidates:
+            raise ValueError('원시 C5 신호 보존 수 불일치')
+    return {
+        'market': market, 'observed_5m': old['observed_5m'],
+        'valid_windows': old['valid_windows'], 'truncated': old['truncated'],
+        'raw_candidates': raw_candidates, 'arms': arms,
+    }
+
+
+C5LOCK_V111418_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.18 · C5 중복 차단 + 익절 3·4% 검증</title>
+<style>/*INSERT_PREVIOUS_STYLE*/
+</style></head><body><main>
+<h1>🧪 V11.14.18 · C5 BUY 잠금 실험</h1>
+<p class="muted">5분봉 5이평 첫 회복 · 종목별 가상 거래 · 실전 BUY 스캐너 무변경</p>
+<section class="panel"><h2>이번 실험에서 바꾸는 것</h2>
+<div class="note"><b>기존 C5:</b> +1.5% 익절 · -1% 손절 · 최대 60분 · 종전 60분 신호 간격(변경 없음).<br>
+<b>실험 A:</b> 익절 +1.5% · <b>실험 B:</b> 익절 +3% · <b>실험 C:</b> 익절 +4%. 세 실험 모두 손절 -1%, 최대 60분.<br>
+<b>세 실험 공통 BUY 차단:</b> 같은 상승 흐름에선 첫 BUY만 허용. 상승 흐름은 <b>5이평이 연속 3개 봉 하락</b>하면 종료한 것으로 보고, 이후 새 상승 흐름의 첫 회복을 허용합니다. 포지션이 열려 있는 동안 중복 BUY 차단, <b>가상 손절 시 청산 후 120분 차단</b>. 미판정 거래는 안전하게 그날 남은 재진입 차단.<br>
+익절·손절은 수수료·슬리피지를 포함한 <b>순손익 목표가 아니라 가격 변동 기준</b>입니다. 당일 신호의 미래 5분봉으로 결과를 판정하며 같은 봉 익절·손절 동시 터치는 손절 우선입니다.</div>
+<p class="hint">주의: 익절 목표를 높이는 것 자체는 중복 신호를 줄이지 않습니다. 이번 실험은 <b>목표가 변경과 잠금 규칙이 결합</b>되어 있어 두 효과를 분리할 수 없습니다. A와 기존 C5의 비교는 잠금 효과를 보여주지만 신호 수가 달라 거래당 평균만으로 성능을 단정할 수 없습니다.</p></section>
+<section class="panel"><h2>검증 설정</h2><div class="controls">
+<label class="field">검증 날짜 (한국시간)<input id="date" type="date"></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" value="0.04" min="0" max="0.5" step="0.01"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" value="0.05" min="0" max="0.5" step="0.01"></label>
+</div>
+<div class="actions"><button id="run">전체 KRW 비교 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">이 검증만 초기화</button><button id="csv" class="secondary" disabled>V11.14.18 상세 CSV 저장</button></div>
+<progress id="progress" max="1" value="0"></progress><div id="status" class="status">검사 전</div></section>
+<section class="panel"><h2>검사 진행 상황</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>4개 전략 비교</h2><p class="hint">전체 검사 후 공개합니다. 승률은 실제 판정 거래 중 순손익이 플러스인 비율입니다.</p><div id="summary" class="scroll">전체 검사 완료 후 공개</div></section>
+<section class="panel"><h2>중복 BUY 차단 원인</h2><p class="hint">차단된 후보 수는 실제 거래가 아니며, 가상 손익은 참고용입니다. 차단한 수익 후보가 얼마나 있는지도 기록합니다.</p><div id="blockers" class="scroll">전체 검사 완료 후 공개</div></section>
+<section class="panel"><h2>종목별 성적</h2><div id="markets" class="scroll">전체 검사 완료 후 공개</div></section>
+<p class="hint">현재 KRW 상장 종목 기준의 과거 모의실험입니다. 거래 체결 가능성, 상장폐지 종목, API 봉 누락을 완벽히 반영할 수 없습니다. UNKNOWN 거래는 수익/손실에 넣지 않습니다. 청산 후 120분이 다음 날짜로 넘어가는 상태는 연계하지 않는 <b>하루 단위 독립 실험</b>입니다. 실전 전용 로직은 변경하지 않았습니다.</p>
+</main>
+<script>
+'use strict';
+const API='/api/winrate14c5lock',KEY='bithumb_v111418_c5_lock_checkpoint_v1';
+const $=id=>document.getElementById(id);
+const STRATS=[['base','기존 C5 · 1.5%'],['a','A · 1.5% + 잠금'],['b','B · 3.0% + 잠금'],['c','C · 4.0% + 잠금']];
+let state=null,running=false,stopRequested=false,storeFailed=false;
+const escapeHtml=s=>String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const asNumber=v=>(v===null||v===undefined||v==='')?NaN:Number(v);
+const pct=v=>Number.isFinite(v)?v.toFixed(3)+'%':'—';
+function kstDate(d){const p=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);const g=x=>p.find(t=>t.type===x).value;return `${g('year')}-${g('month')}-${g('day')}`;}
+const yesterday=()=>kstDate(new Date(Date.now()-86400000));
+$('date').max=yesterday();$('date').value=yesterday();
+function config(){const date=$('date').value,fee=asNumber($('fee').value),slip=asNumber($('slip').value);if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||date>yesterday())throw Error('완료된 과거 날짜만 선택해줘');if(!Number.isFinite(fee)||!Number.isFinite(slip)||fee<0||fee>0.5||slip<0||slip>0.5)throw Error('편도 비용은 0~0.5% 범위만 가능');return {date,fee,slip};}
+const signature=c=>JSON.stringify([c.date,c.fee,c.slip]);
+function load(){try{const s=JSON.parse(localStorage.getItem(KEY)||'null');if(!s||s.version!==1||!s.config||!Array.isArray(s.markets)||!s.markets.length||!s.results||typeof s.results!=='object'||s.markets.some(m=>!/^KRW-[A-Z0-9]+$/.test(m))||new Set(s.markets).size!==s.markets.length)return null;return s;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function records(){return state?state.markets.filter(m=>Object.prototype.hasOwnProperty.call(state.results,m)).map(m=>state.results[m]):[];}
+function finished(){return !!(state&&state.markets.length&&records().length===state.markets.length&&state.failed===0);}
+function events(rs,key){return rs.flatMap(r=>r.arms[key].events.map(e=>({...e,market:r.market})));}
+function stat(evs){const r={n:evs.length,unknown:0,judged:0,wins:0,tp:0,sl:0,tm:0,total:0,avg:NaN,rate:NaN};for(const e of evs){if(e.outcome==='UNKNOWN'){r.unknown++;continue;}const net=asNumber(e.net_pct);if(!Number.isFinite(net))continue;r.judged++;r.total+=net;if(net>0)r.wins++;if(e.outcome==='TP')r.tp++;else if(e.outcome==='SL')r.sl++;else if(e.outcome==='TIME')r.tm++;}if(r.judged){r.avg=r.total/r.judged;r.rate=100*r.wins/r.judged;}return r;}
+function table(rs){let body='';for(const [key,label] of STRATS){const s=stat(events(rs,key));body+=`<tr><td>${escapeHtml(label)}</td><td>${s.n}</td><td>${s.judged}</td><td>${s.unknown}</td><td>${s.wins}</td><td>${pct(s.rate)}</td><td>${pct(s.avg)}</td><td>${s.tp} / ${s.sl} / ${s.tm}</td></tr>`;}return '<table><thead><tr><th>전략</th><th>BUY</th><th>판정</th><th>미판정</th><th>수익 거래</th><th>승률</th><th>거래당 순손익</th><th>TP / SL / TIME</th></tr></thead><tbody>'+body+'</tbody></table>';}
+function card(k,v){return `<div class="stat"><small>${escapeHtml(k)}</small><strong>${escapeHtml(v)}</strong></div>`;}
+function blockers(rs){let html='<table><thead><tr><th>실험</th><th>차단 후보</th><th>포지션 중</th><th>손절 후 120분</th><th>동일 상승 흐름</th><th>미판정 잠금</th><th>차단 후보 중 수익 가능*</th><th>가상 판정 가능</th></tr></thead><tbody>';for(const [key,label] of STRATS.slice(1)){const r={SAME_WAVE:0,POSITION_OPEN:0,POST_SL_120M:0,UNKNOWN_EXIT:0};let total=0,positive=0,judged=0;for(const m of rs){const a=m.arms[key];total+=a.blocked_count;positive+=a.blocked_profitable;judged+=a.blocked_judged;for(const reason of Object.keys(r))r[reason]+=(a.blocked_reasons[reason]||0);}html+=`<tr><td>${escapeHtml(label)}</td><td>${total}</td><td>${r.POSITION_OPEN}</td><td>${r.POST_SL_120M}</td><td>${r.SAME_WAVE}</td><td>${r.UNKNOWN_EXIT}</td><td>${positive}</td><td>${judged}</td></tr>`;}return html+'</tbody></table><p class="hint">*차단 당시 강제 진입했다고 가정한 해당 실험의 가상 플러스 손익 건수. 실제 놓친 확정 이익이 아닙니다. 잠금의 효과는 수익 가능성만으로 판단하지 않습니다.</p>';}
+function markets(rs){const selected=rs.filter(r=>STRATS.some(([k])=>r.arms[k].signals>0));return selected.length?'<table><thead><tr><th>종목</th><th>원시 C5 후보</th><th>기존 C5</th><th>A BUY / 평균</th><th>B BUY / 평균</th><th>C BUY / 평균</th></tr></thead><tbody>'+selected.sort((a,b)=>a.market.localeCompare(b.market)).map(r=>{const val=k=>{const s=stat(r.arms[k].events);return s.n+' / '+pct(s.avg);};return `<tr><td>${escapeHtml(r.market)}</td><td>${r.raw_candidates}</td><td>${val('base')}</td><td>${val('a')}</td><td>${val('b')}</td><td>${val('c')}</td></tr>`;}).join('')+'</tbody></table>':'신호 없음';}
+function paint(){const rs=records(),n=rs.length,total=state?.markets.length||0,full=finished();$('progress').max=total||1;$('progress').value=n;$('csv').disabled=!full;$('coverage').innerHTML=card('검사 종목',`${n} / ${total}`)+card('연속봉 분석 가능 종목',String(rs.filter(r=>r.valid_windows>0).length))+card('원시 C5 후보',String(rs.reduce((s,r)=>s+r.raw_candidates,0)))+card('기존 C5 BUY',String(rs.reduce((s,r)=>s+r.arms.base.signals,0)));if(full){$('summary').innerHTML=table(rs);$('blockers').innerHTML=blockers(rs);$('markets').innerHTML=markets(rs);}else{for(const id of ['summary','blockers','markets'])$(id).textContent='전체 검사 완료 후 공개';}$('status').textContent=(full?'✅ 전체 KRW 검사 완료':running?'⏳ 검사 진행 중':'검사 대기 또는 일시 중지')+` · ${n}/${total}`+(state?.failed?' · ⚠️ 일부 검사 실패 (이어하기로 재시도)':'')+(full?'\n이 결과는 과거 모의 성적이며 실전 수익 보장이 아닙니다.':'\n최종 성적은 검사 완료 후 공개합니다.');}
+async function fetchJson(url,options){const ac=new AbortController(),t=setTimeout(()=>ac.abort(),115000);try{const response=await fetch(url,{...options,cache:'no-store',signal:ac.signal});const data=await response.json();if(!response.ok||!data.ok)throw Error(data.error||'HTTP '+response.status);return data;}finally{clearTimeout(t);}}
+async function init(cfg){const u=await fetchJson(API+'/universe');if(!Array.isArray(u.items)||!u.items.length)throw Error('빗썸 KRW 종목 목록을 불러올 수 없음');state={version:1,config:cfg,markets:u.items,results:{},failed:0};save();}
+function validResponse(data,market){if(data.scanned!==1||data.errors!==0||!Array.isArray(data.results)||data.results.length!==1)return false;const r=data.results[0];if(r.market!==market||!Number.isInteger(r.raw_candidates)||r.raw_candidates<0||!Number.isInteger(r.valid_windows)||r.valid_windows<0||!r.arms)return false;for(const [k] of STRATS){const a=r.arms[k];if(!a||!Number.isInteger(a.signals)||a.signals<0||!Number.isInteger(a.unknown)||a.unknown<0||!Array.isArray(a.events)||a.events.length!==a.signals||a.events.filter(e=>e.outcome==='UNKNOWN').length!==a.unknown||a.events.some(e=>!['TP','SL','TIME','UNKNOWN'].includes(e.outcome)||typeof e.signal_time_kst!=='string'||typeof e.entry_time_kst!=='string'))return false;if(k!=='base'&&(!Number.isInteger(a.blocked_count)||!Array.isArray(a.blocked_events)||a.blocked_events.length!==a.blocked_count||a.signals+a.blocked_count!==r.raw_candidates))return false;}return true;}
+async function run(){if(running)return;let cfg;try{cfg=config();}catch(e){$('status').textContent='⚠️ '+e.message;return;}if(state&&signature(cfg)!==signature(state.config)){if(!confirm('검사 설정이 달라졌어. 이 실험 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}running=true;stopRequested=false;storeFailed=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;try{if(!state)await init(cfg);state.failed=0;save();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m));let cursor=0,failed=0;async function worker(){while(!stopRequested&&!storeFailed){const market=pending[cursor++];if(!market)return;let ok=false;for(let tries=0;tries<3&&!stopRequested;tries++){try{const data=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:[market]})});if(!validResponse(data,market))throw Error('응답 데이터 검증 실패');state.results[market]=data.results[0];try{save();}catch(e){storeFailed=true;$('status').textContent='⚠️ 기기 저장공간 부족 · 검사를 중단합니다.';break;}ok=true;paint();break;}catch(e){if(tries===2){failed++;$('status').textContent='⚠️ '+market+': '+String(e.message||e);}else await new Promise(resolve=>setTimeout(resolve,1000*(tries+1)));}}if(!ok&&failed>=4){stopRequested=true;break;}}}await Promise.all([worker(),worker()]);state.failed=failed;save();paint();if(stopRequested)$('status').textContent+='\n일시 중지됨 · 다시 시작하면 남은 종목만 검사합니다.';}catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.18 검사 기록만 삭제할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(x){let s=String(x??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!finished())return;const cols=['version','date','market','strategy','tp_pct','sl_pct','horizon_minutes','post_sl_exclusion_minutes','fee_pct_side','slip_pct_side','observed_5m','valid_windows','truncated','raw_candidates','strategy_signals','strategy_unknown','strategy_blocked','status','block_reason','signal_time_kst','entry_time_kst','wave_id','is_first_signal','outcome','reason','net_pct','entry','exit','minutes','hypothetical_outcome','hypothetical_net_pct','ma5_prev','ma5_signal','ma5_slope_pct','prev_close_vs_ma5_pct','reclaim_vs_ma5_pct'];const lines=[cols.join(',')];for(const r of records())for(const [key,label] of STRATS){const a=r.arms[key],tp=key==='base'||key==='a'?1.5:key==='b'?3:4,pre={version:'V11.14.18',date:state.config.date,market:r.market,strategy:key.toUpperCase(),tp_pct:tp,sl_pct:1,horizon_minutes:60,post_sl_exclusion_minutes:key==='base'?0:120,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip,observed_5m:r.observed_5m,valid_windows:r.valid_windows,truncated:r.truncated?1:0,raw_candidates:r.raw_candidates,strategy_signals:a.signals,strategy_unknown:a.unknown,strategy_blocked:a.blocked_count||0};const seq=[...a.events.map(e=>({...e,status:'TAKEN'})),...(a.blocked_events||[]).map(e=>({...e,status:'BLOCKED'}))];for(const ev of (seq.length?seq:[{status:'NO_SIGNAL'}])){const item={...pre,...ev,...(ev.features||{})};lines.push(cols.map(c=>csvCell(item[c])).join(','));}}const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=`bithumb_C5_lock_exit_${state.config.date}_v111418.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(u),2000);};
+state=load();if(state){for(const key of ['date','fee','slip'])$(key).value=state.config[key];}paint();
+</script></body></html>
+""".replace('/*INSERT_PREVIOUS_STYLE*/', C5_V111417_PAGE.split('<style>', 1)[1].split('</style>', 1)[0])
+
+
+def register_c5lock_v111418_lab(app, deps):
+    api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
+    cache = {'markets': None, 'at': 0}
+    mutex = Lock()
+
+    def listed():
+        with mutex:
+            if cache['markets'] is None or time.time() - cache['at'] > 600:
+                names = sorted({m for m in get_markets()
+                                if isinstance(m, str) and MARKET_RE.fullmatch(m)})
+                if not names:
+                    raise ValueError('현재 KRW 종목 목록이 없습니다')
+                cache.update(markets=names, at=time.time())
+            return cache['markets']
+
+    @app.get('/backtest-winrate-c5-lock')
+    def page_c5lock_v111418():
+        return render_template_string(C5LOCK_V111418_PAGE)
+
+    @app.get('/api/winrate14c5lock/universe')
+    def universe_c5lock_v111418():
+        try:
+            names = listed()
+            return jsonify({'ok': True, 'items': names, 'count': len(names),
+                            'rule_version': 'V11.14.18',
+                            'universe_type': 'currently_listed_KRW'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+    @app.post('/api/winrate14c5lock/evaluate')
+    def evaluate_c5lock_v111418():
+        try:
+            body = request.get_json(silent=True)
+            cfg = c5lock_v111418_config(body, kst)
+            markets = body.get('markets') if isinstance(body, dict) else None
+            if (not isinstance(markets, list) or not 1 <= len(markets) <= 2
+                    or len(set(markets)) != len(markets)
+                    or any(not isinstance(m, str) or not MARKET_RE.fullmatch(m)
+                           for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사할 수 있습니다')
+            names = set(listed())
+            if any(m not in names for m in markets):
+                raise ValueError('현재 KRW 마켓 목록에 없는 종목입니다')
+            results, errors = [], []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks = {pool.submit(c5lock_v111418_evaluate_symbol,
+                                     api_get, m, cfg, kst): m for m in markets}
+                for future in as_completed(tasks):
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        errors.append({'market': tasks[future], 'error': str(exc)[:150]})
+            return jsonify({'ok': not errors, 'scanned': len(markets),
+                            'results': results, 'errors': len(errors),
+                            'error_markets': errors, 'rule_version': 'V11.14.18'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+
+_v111417_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app, deps):
+    _v111417_register_daytrade_review(app, deps)
+    register_c5lock_v111418_lab(app, deps)
