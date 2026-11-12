@@ -6330,3 +6330,250 @@ _v111418_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v111418_register_daytrade_review(app, deps)
     register_patterns_v111419_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.20: C5 pre-entry RISK FILTER OUT-OF-SAMPLE comparison lab.
+# Append-only: all previous live and research routes remain unchanged.
+# Preselected research-only thresholds from 2026-11-10/11 exploration:
+#   - prior close <= prior SMA5 * (1 - 0.0037)  (deep pullback)
+#   - signal close > signal SMA20 * (1 + 0.015) (chasing extended price)
+# These numbers were discovered on Nov 10/11; those days are IN-SAMPLE.
+# Filter only the EXISTING V11.14.17 C5 signal calendar. Do not change
+# its 60min signal cooldown, entry time, outcomes, or future opportunity set.
+# Every rejected signal retains its ORIGINAL hypothetical outcome so
+# forgone TP / gains as well as avoided SL can be audited explicitly.
+# ---------------------------------------------------------------------------
+
+C5RISK_V111420_MA5_MIN_PCT = -0.37
+C5RISK_V111420_MA20_MAX_PCT = 1.50
+C5RISK_V111420_RULES = (
+    ('base', '기존 C5 · 필터 없음'),
+    ('deep', '5이평 깊은 이탈만 제외'),
+    ('chase', '20이평 과도한 이격만 제외'),
+    ('both', '두 조건 모두 제외'),
+)
+
+
+def c5risk_v111420_rejections(features):
+    """Only pre-entry features, never outcome or a future candle."""
+    if not isinstance(features, dict):
+        return None
+    d = features.get('prior_close_vs_ma5_pct')
+    m = features.get('close_vs_ma20_pct')
+    if (not isinstance(d, (int, float)) or not isfinite(d)
+            or not isinstance(m, (int, float)) or not isfinite(m)):
+        return None
+    return (
+        d <= C5RISK_V111420_MA5_MIN_PCT,
+        m > C5RISK_V111420_MA20_MAX_PCT,
+    )
+
+
+def c5risk_v111420_filter_events(original):
+    """Partition the UNCHANGED original C5 events; no rerun/cooldown edits.
+
+    Each arm preserves original event timestamps and original outcomes exactly.
+    A blocked event remains available for 'missed TP / avoided SL' audits,
+    but never contributes to the accepted trades' P&L.
+    """
+    if not isinstance(original, dict) or not isinstance(original.get('events'), list):
+        raise ValueError('C5 원본 거래 기록 형식 오류')
+    base = original['events']
+    arms = {}
+    for key, label in C5RISK_V111420_RULES:
+        accepted, blocked = [], []
+        for event in base:
+            feature_flags = c5risk_v111420_rejections(event.get('features'))
+            if key == 'base':
+                block_reason = ''
+            elif feature_flags is None:
+                block_reason = 'FEATURE_UNAVAILABLE'
+            else:
+                deep, chase = feature_flags
+                reasons = []
+                if key in ('deep', 'both') and deep:
+                    reasons.append('DEEP_MA5')
+                if key in ('chase', 'both') and chase:
+                    reasons.append('EXTENDED_MA20')
+                block_reason = '+'.join(reasons)
+            ev = {**event, 'filter_reason': block_reason,
+                  'status': 'BLOCKED' if block_reason else 'ACCEPTED'}
+            if block_reason:
+                blocked.append(ev)
+            else:
+                accepted.append(ev)
+        if len(accepted) + len(blocked) != len(base):
+            raise ValueError('기존 C5 원본 BUY 후보 수가 변경되었습니다')
+        arms[key] = {
+            'label': label, 'signals': len(accepted),
+            'unknown': sum(e['outcome'] == 'UNKNOWN' for e in accepted),
+            'blocked_count': len(blocked),
+            'blocked_unknown': sum(e['outcome'] == 'UNKNOWN' for e in blocked),
+            'feature_missing': sum(e['filter_reason'] == 'FEATURE_UNAVAILABLE' for e in blocked),
+            'events': accepted, 'blocked_events': blocked,
+        }
+    if (arms['base']['signals'] != original['signals']
+            or arms['base']['unknown'] != original['unknown']
+            or len(arms['base']['events']) != len(base)):
+        raise ValueError('기존 C5 신호 수/미판정 수가 바뀌었습니다')
+    return arms
+
+
+def c5risk_v111420_evaluate_symbol(api_get, market, cfg, kst):
+    # Calls exact V11.14.19 evaluator: retains its original C and C5 decisions,
+    # and its strictly pre-entry measurements. One round of historical API calls.
+    original = patterns_v111419_evaluate_symbol(api_get, market, cfg, kst)
+    return {
+        'market': original['market'],
+        'observed_5m': original['observed_5m'],
+        'valid_windows': original['valid_windows'],
+        'truncated': original['truncated'],
+        'c_reference_signals': original['c']['signals'],
+        'c_reference_unknown': original['c']['unknown'],
+        'original_c5_signals': original['c5']['signals'],
+        'arms': c5risk_v111420_filter_events(original['c5']),
+    }
+
+
+C5RISK_V111420_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.20 · C5 위험 패턴 제거 독립 검증</title>
+<style>/*BASE_STYLE*/
+.notice{background:#10182d;border:1px solid #415471;padding:13px;border-radius:10px;font-size:13px;line-height:1.8}
+.warn{border-left:3px solid #ff9a93;padding:10px 12px;background:#212239;font-size:13px;line-height:1.7}
+.pill{display:inline-block;border:1px solid #52617d;padding:2px 8px;border-radius:12px;font-size:12px;margin:4px 5px 0 0}
+</style></head><body><main>
+<h1>🔎 V11.14.20 · C5 위험 패턴 제거 검증실</h1>
+<p class="muted">빗썸 KRW · 5분봉 · 과거 실험 전용 · 실전 BUY 스캐너 무변경</p>
+<section class="panel"><h2>어제 발견한 위험 패턴을 검증해 보자</h2>
+<div class="notice">
+<b>기준: 기존 C5의 BUY 시간은 절대 바꾸지 않아.</b><br>
+① <b>깊은 이탈</b>: 신호 직전 종가가 직전 5이평 대비 <b>-0.37% 이하</b>인 신호 제외<br>
+② <b>과도한 이격</b>: 신호봉 종가가 당시 20이평 대비 <b>+1.50% 초과</b>인 신호 제외<br>
+4가지 방식으로 <b>필터 없음 / ①만 / ②만 / ①+②</b> 비교.<br>
+<b>익절 +1.5%, 손절 -1.0%, 최대 60분</b> 및 비용·진입 시점 모두 동일.</div>
+<p class="hint">중요: 11월 10~11일은 조건을 발견한 <b>학습용 날짜</b>야. 결과가 좋더라도 증거가 아니고, 처음 보는 <b>11월 12일 이후</b>의 성능을 더 중요하게 봐야 해. 필터로 거절한 신호가 실제로는 익절했을 수도 있으므로 누락된 익절도 같이 세어.</p></section>
+<section class="panel"><h2>검증 설정</h2><div class="controls">
+<label class="field">검사 날짜 · 한국시간<input id="date" type="date"></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" value="0.04" min="0" max="0.5" step="0.01"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" value="0.05" min="0" max="0.5" step="0.01"></label></div>
+<div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">이 검증만 초기화</button><button id="csv" class="secondary" disabled>전체 신호·차단 사유 CSV 저장</button></div>
+<progress id="progress" max="1" value="0"></progress><div id="status" class="status">검사 전</div></section>
+<section class="panel"><h2>1. 검사 범위와 데이터 품질</h2><div id="coverage" class="stats">검사 전</div>
+<p class="hint">현재 상장된 KRW 종목의 과거 캔들을 사용하므로 상장폐지 종목은 누락될 수 있어. 충분한 연속 봉이 없는 종목, 과거 데이터 페이지 부족, 진입·청산 미판정은 따로 기록해.</p></section>
+<section class="panel"><h2>2. 네 전략의 성적 비교</h2>
+<div id="summary" class="scroll">전체 검사 완료 후 공개</div>
+<p class="hint">각 전략은 <b>동일한 기존 C5 후보 목록</b>에서 신호를 필터링해. 차단 후 새로운 BUY를 채워 넣지 않아. 판정 완료된 거래만 평균 순손익에 포함하므로 미판정 수도 같이 확인해야 해.</p></section>
+<section class="panel"><h2>3. 차단된 익절과 손절 — 놓친 기회까지 확인</h2>
+<div id="blocked" class="scroll">전체 검사 완료 후 공개</div>
+<p class="hint">차단된 결과는 기존 C5 신호를 그대로 가상 추적한 값이야. 차단된 익절·시간종료 수익은 기회 손실, 차단된 손절·시간종료 손실은 피한 손실 후보에 해당해. 서로 중복된 가상 거래도 있으니 실제 계좌 총수익으로 해석하면 안 돼.</p></section>
+<section class="panel"><h2>4. 실제로 제외한 신호의 사례</h2><div id="examples" class="scroll">전체 검사 완료 후 공개</div>
+<p class="hint">CSV에는 <b>ACCEPTED / BLOCKED</b>와 차단 사유, 원래의 TP·SL·TIME·UNKNOWN, 손익 및 BUY 이전 15가지 특징이 모두 들어 있어. 분석·검증 전용이며 실전 진입 추천이 아니야.</p></section>
+<p class="warn">⚠️ 현재 테스트는 과거 OHLC 5분봉 시뮬레이션이야. 같은 봉에 익절과 손절이 동시에 닿으면 손절 우선 처리하고, 데이터 부족은 미판정으로 남겨. 과거 날짜에서 확인된 효과가 미래 수익을 보장하지 않아.</p>
+</main><script>
+'use strict';
+const API='/api/winrate14c5risk',KEY='bithumb_v111420_c5_risk_filters_v1';
+const $=id=>document.getElementById(id),esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=v=>(v===null||v===undefined||v==='')?NaN:Number(v), pct=v=>Number.isFinite(v)?v.toFixed(3)+'%':'—';
+const STRATS=[['base','기존 C5'],['deep','5이평 깊은 이탈 제외'],['chase','20이평 이격 제외'],['both','두 조건 모두 제외']];
+const FEATURES=['pre_30m_return_pct','pre_60m_return_pct','pre_60m_range_pct','pre_peak_distance_pct','pre_6_bull_count','pre_volume_6v6_ratio','ma5_slope_pct','ma20_slope_30m_pct','ma5_vs_ma20_pct','close_vs_ma20_pct','signal_body_pct','signal_volume_ratio','signal_upper_wick_pct','signal_range_pct','prior_close_vs_ma5_pct'];
+let state=null,running=false,stopRequested=false,storeFailed=false;
+function kstDate(d){const v=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d),get=x=>v.find(p=>p.type===x).value;return `${get('year')}-${get('month')}-${get('day')}`;}
+const yesterday=()=>kstDate(new Date(Date.now()-86400000));
+$('date').max=yesterday();$('date').value=yesterday();
+function config(){const date=$('date').value,fee=num($('fee').value),slip=num($('slip').value);if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||date>yesterday())throw Error('완전히 종료된 과거 날짜만 선택해줘');if(!Number.isFinite(fee)||!Number.isFinite(slip)||fee<0||fee>0.5||slip<0||slip>0.5)throw Error('편도 비용은 각각 0~0.5%로 입력해줘');return {date,fee,slip};}
+const signature=c=>JSON.stringify([c.date,c.fee,c.slip]);
+function load(){try{const s=JSON.parse(localStorage.getItem(KEY)||'null');if(!s||s.version!==1||!s.config||!Array.isArray(s.markets)||!s.markets.length||!s.results||typeof s.results!=='object'||new Set(s.markets).size!==s.markets.length||s.markets.some(m=>!/^KRW-[A-Z0-9]+$/.test(m)))return null;return s;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function records(){return state?state.markets.filter(m=>Object.prototype.hasOwnProperty.call(state.results,m)).map(m=>state.results[m]):[];}
+function finished(){return !!(state&&state.markets.length&&records().length===state.markets.length&&state.failed===0);}
+function events(rs,key,field='events'){const out=[];for(const r of rs){const a=r.arms[key];for(const ev of (a?.[field]||[]))out.push({...ev,market:r.market});}return out;}
+function stats(evs){const judged=evs.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(num(e.net_pct))),n=judged.length,profit=judged.filter(e=>num(e.net_pct)>0).length;return {signals:evs.length,judged:n,unknown:evs.length-n,tp:judged.filter(e=>e.outcome==='TP').length,sl:judged.filter(e=>e.outcome==='SL').length,time:judged.filter(e=>e.outcome==='TIME').length,profit,loss:n-profit,winrate:n?100*profit/n:NaN,avg:n?judged.reduce((a,b)=>a+num(b.net_pct),0)/n:NaN};}
+function row(cells){return '<tr>'+cells.map(v=>`<td>${esc(v)}</td>`).join('')+'</tr>';}
+function makeTable(headers,body){return '<table><thead><tr>'+headers.map(h=>`<th>${esc(h)}</th>`).join('')+'</tr></thead><tbody>'+body+'</tbody></table>';}
+function card(name,value){return `<div class="stat"><small>${esc(name)}</small><strong>${esc(value)}</strong></div>`;}
+function paintSummary(rs){const baseline=stats(events(rs,'base'));let body='';for(const [key,name] of STRATS){const evs=events(rs,key),s=stats(evs),blocked=events(rs,key,'blocked_events');const d=Number.isFinite(s.avg)&&Number.isFinite(baseline.avg)?s.avg-baseline.avg:NaN;body+=row([name,s.signals,s.judged,s.unknown,s.profit,pct(s.winrate),pct(s.avg),pct(d),s.tp,s.sl,s.time,blocked.length]);}return makeTable(['전략','BUY','판정','미판정','수익 거래','수익 비율','평균 순손익','기존 대비(%p)','익절','손절','시간 종료','제외'],body);}
+function paintBlocked(rs){let body='';for(const [key,name] of STRATS.slice(1)){const es=events(rs,key,'blocked_events'),s=stats(es),reason={DEEP_MA5:0,EXTENDED_MA20:0,FEATURE_UNAVAILABLE:0};for(const e of es)for(const k of Object.keys(reason))if(String(e.filter_reason||'').includes(k))reason[k]++;body+=row([name,es.length,s.judged,s.unknown,s.tp,s.sl,s.time,s.profit,pct(s.avg),reason.DEEP_MA5,reason.EXTENDED_MA20,reason.FEATURE_UNAVAILABLE]);}return makeTable(['전략','제외 신호','판정 가능','미판정','놓친 익절','피한 손절','시간종료','놓친 수익 거래','제외 신호 가상 평균','5이평 이유','20이평 이유','특징 부족'],body);}
+function paintExamples(rs){const all=events(rs,'both','blocked_events'),examples=[...all.filter(e=>e.outcome==='TP').slice(0,6),...all.filter(e=>e.outcome==='SL').slice(0,6)];if(!examples.length)return '<p class="hint">제외된 익절·손절 사례 없음</p>';return makeTable(['종목','BUY 시각','원래 결과','원래 순손익','차단 이유','5이평 이탈','20이평 이격'],examples.map(e=>row([e.market,e.entry_time_kst,e.outcome,pct(num(e.net_pct)),e.filter_reason,pct(num(e.features?.prior_close_vs_ma5_pct)),pct(num(e.features?.close_vs_ma20_pct))])).join(''));}
+function paint(){const rs=records(),total=state?.markets.length||0,full=finished();$('progress').max=total||1;$('progress').value=rs.length;$('csv').disabled=!full;const base=events(rs,'base');$('coverage').innerHTML=card('검사 종목',`${rs.length} / ${total}`)+card('5분봉 연속 구간 있음',`${rs.filter(r=>r.valid_windows>0).length}개`)+card('기존 C5 신호',`${base.length}건`)+card('C5 미판정',`${stats(base).unknown}건`)+card('과거 원본 봉 제한',`${rs.filter(r=>r.truncated).length}개`)+card('기존 C 참고 신호',`${rs.reduce((v,r)=>v+r.c_reference_signals,0)}건`);
+if(full){$('summary').innerHTML=paintSummary(rs);$('blocked').innerHTML=paintBlocked(rs);$('examples').innerHTML=paintExamples(rs);}else for(const id of ['summary','blocked','examples'])$(id).textContent='전체 검사 완료 후 공개';
+$('status').textContent=(full?'✅ 전체 검사 완료':running?'⏳ 과거 5분봉 조회 중':'검사 대기 또는 중단')+` · ${rs.length}/${total}종목`+(state?.failed?' · ⚠️ 일부 요청 실패: 이어하기로 재검사 가능':'')+(full?'\n이 자료는 가상 과거 성적이며, 기준 발견 날짜(11월 10~11일)와 별도로 해석해야 해.':'\n최종 성적은 전체 종목 검사 후 공개');}
+async function fetchJson(url,options){const ac=new AbortController(),t=setTimeout(()=>ac.abort(),115000);try{const res=await fetch(url,{...options,cache:'no-store',signal:ac.signal}),data=await res.json();if(!res.ok||!data.ok)throw Error(data.error||'HTTP '+res.status);return data;}finally{clearTimeout(t);}}
+async function init(c){const u=await fetchJson(API+'/universe');if(!Array.isArray(u.items)||!u.items.length)throw Error('KRW 종목 목록을 가져오지 못했습니다');state={version:1,config:c,markets:u.items,results:{},failed:0};save();}
+function validResponse(data,market){if(data.scanned!==1||data.errors!==0||!Array.isArray(data.results)||data.results.length!==1)return false;const r=data.results[0];if(r.market!==market||!r.arms||!Number.isInteger(r.valid_windows)||r.valid_windows<0||!Number.isInteger(r.original_c5_signals))return false;const base=r.arms.base;if(!base||base.signals!==r.original_c5_signals)return false;for(const [key] of STRATS){const a=r.arms[key];if(!a||!Number.isInteger(a.signals)||!Number.isInteger(a.unknown)||!Number.isInteger(a.blocked_count)||!Array.isArray(a.events)||!Array.isArray(a.blocked_events)||a.events.length!==a.signals||a.blocked_events.length!==a.blocked_count||a.signals+a.blocked_count!==r.original_c5_signals||a.unknown!==a.events.filter(e=>e.outcome==='UNKNOWN').length)return false;if([...a.events,...a.blocked_events].some(e=>!['TP','SL','TIME','UNKNOWN'].includes(e.outcome)||!e.features||typeof e.features!=='object'||typeof e.signal_time_kst!=='string'||typeof e.entry_time_kst!=='string'))return false;}return true;}
+async function run(){if(running)return;let cfg;try{cfg=config();}catch(e){$('status').textContent='⚠️ '+e.message;return;}if(state&&signature(cfg)!==signature(state.config)){if(!confirm('설정이 달라졌어. V11.14.20 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}running=true;stopRequested=false;storeFailed=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+try{if(!state)await init(cfg);state.failed=0;save();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m));let next=0,failed=0;async function worker(){while(!stopRequested&&!storeFailed){const market=pending[next++];if(!market)return;let pass=false;for(let tries=0;tries<3&&!stopRequested;tries++){try{const d=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:[market]})});if(!validResponse(d,market))throw Error('검사 결과 형식 오류');state.results[market]=d.results[0];try{save();}catch(e){storeFailed=true;delete state.results[market];$('status').textContent='⚠️ 브라우저 저장공간 부족 · 검사가 중지됐어';break;}pass=true;paint();break;}catch(e){if(tries===2){failed++;$('status').textContent='⚠️ '+market+': '+String(e.message||e);}else await new Promise(resolve=>setTimeout(resolve,1000*(tries+1)));}}if(!pass&&failed>=4){stopRequested=true;break;}}}await Promise.all([worker(),worker()]);state.failed=failed;try{save();}catch{}paint();if(stopRequested)$('status').textContent+='\n일시 중지됨 · 시작 버튼으로 남은 종목 이어서 검사 가능';}catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.20 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(x){let s=String(x??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!finished())return;const cols=['version','date','market','strategy','status','filter_reason','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','observed_5m','valid_windows','truncated','original_c5_signals','strategy_signals','strategy_unknown','strategy_blocked','signal_time_kst','entry_time_kst','is_first_signal','outcome','exit_group','reason','net_pct','entry','exit','minutes',...FEATURES];const lines=[cols.join(',')];for(const r of records())for(const [key] of STRATS){const arm=r.arms[key],pre={version:'V11.14.20',date:state.config.date,market:r.market,strategy:key.toUpperCase(),tp_pct:1.5,sl_pct:1,horizon_minutes:60,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip,observed_5m:r.observed_5m,valid_windows:r.valid_windows,truncated:r.truncated?1:0,original_c5_signals:r.original_c5_signals,strategy_signals:arm.signals,strategy_unknown:arm.unknown,strategy_blocked:arm.blocked_count};const all=[...arm.events,...arm.blocked_events];for(const ev of (all.length?all:[{status:'NO_SIGNAL'}])){const item={...pre,...ev,...(ev.features||{})};lines.push(cols.map(c=>csvCell(item[c])).join(','));}}const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_C5_risk_filters_${state.config.date}_v111420.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);};
+state=load();if(state)for(const key of ['date','fee','slip'])$(key).value=state.config[key];paint();
+</script></body></html>
+""".replace('/*BASE_STYLE*/', C5_V111417_PAGE.split('<style>', 1)[1].split('</style>', 1)[0])
+
+
+def register_c5risk_v111420_lab(app, deps):
+    api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
+    cache = {'markets': None, 'at': 0}
+    mutex = Lock()
+
+    def listed():
+        with mutex:
+            if cache['markets'] is None or time.time() - cache['at'] > 600:
+                names = sorted({m for m in get_markets()
+                                if isinstance(m, str) and MARKET_RE.fullmatch(m)})
+                if not names:
+                    raise ValueError('현재 KRW 종목 목록이 없습니다')
+                cache.update(markets=names, at=time.time())
+            return cache['markets']
+
+    @app.get('/backtest-winrate-c5-risk')
+    def c5risk_v111420_page():
+        return render_template_string(C5RISK_V111420_PAGE)
+
+    @app.get('/api/winrate14c5risk/universe')
+    def c5risk_v111420_universe():
+        try:
+            names = listed()
+            return jsonify({'ok': True, 'items': names, 'count': len(names),
+                            'rule_version': 'V11.14.20',
+                            'universe_type': 'currently_listed_KRW'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+    @app.post('/api/winrate14c5risk/evaluate')
+    def c5risk_v111420_evaluate():
+        try:
+            raw = request.get_json(silent=True)
+            cfg = c5_v111417_config(raw, kst)
+            markets = raw.get('markets') if isinstance(raw, dict) else None
+            if (not isinstance(markets, list) or not 1 <= len(markets) <= 2
+                    or len(set(markets)) != len(markets)
+                    or any(not isinstance(m, str) or not MARKET_RE.fullmatch(m)
+                           for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사할 수 있습니다')
+            names = set(listed())
+            if any(m not in names for m in markets):
+                raise ValueError('현재 KRW 종목 목록에 없는 종목입니다')
+            results, errors = [], []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                jobs = {pool.submit(c5risk_v111420_evaluate_symbol,
+                                    api_get, m, cfg, kst): m for m in markets}
+                for f in as_completed(jobs):
+                    try:
+                        results.append(f.result())
+                    except Exception as exc:
+                        errors.append({'market': jobs[f], 'error': str(exc)[:150]})
+            return jsonify({'ok': not errors, 'scanned': len(markets),
+                            'results': results, 'errors': len(errors),
+                            'error_markets': errors, 'rule_version': 'V11.14.20'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+
+_v111419_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app, deps):
+    _v111419_register_daytrade_review(app, deps)
+    register_c5risk_v111420_lab(app, deps)
