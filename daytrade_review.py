@@ -4213,3 +4213,274 @@ _v111411_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111411_register_daytrade_review(app,deps)
     register_fib_btc_v111412_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.13: Independent C signal loss attribution / regime diagnostic lab.
+# NO new trading conditions, no changes to C entry/exit or older endpoints.
+# BTC 1h return uses the already completed, matched 5m bars at signal close.
+# Historical observed-candle gaps are diagnostic: do NOT synthesize candles
+# and do NOT assert the cause of missing API candles without trade-level proof.
+# ---------------------------------------------------------------------------
+LOSSDIAG_V111413_BTC_BAND_PCT = 0.30  # Fixed, pre-specified 1h BTC regimes
+LOSSDIAG_V111413_4H_BARS = 48
+
+
+def lossdiag_v111413_history(rows, i, truncated):
+    """Explain 4h lookback coverage using only bars at or before signal.
+
+    A 49-slot grid includes the C signal bar and the preceding 48 five-minute
+    slots. Beginning-of-data shortage and holes *within the observed range*
+    have different labels. Neither label proves zero trading vs API omission.
+    """
+    at = rows[i]['t']
+    start = at - timedelta(minutes=5*LOSSDIAG_V111413_4H_BARS)
+    expected = LOSSDIAG_V111413_4H_BARS + 1
+    observed = {r['t'] for r in rows[:i+1] if start <= r['t'] <= at}
+    missing = expected - len(observed)
+    earliest = rows[0]['t']
+    start_missing = max(0, min(expected, int((earliest-start).total_seconds()//300)))
+    internal_missing = max(0, missing-start_missing)
+    if internal_missing:
+        status, reason = 'observed_gap', '4시간 내 관측 5분봉 누락 (거래 부재/API 원인 미확정)'
+    elif start_missing and truncated:
+        status, reason = 'page_limit', '초기 기록 부족 + 조회 상한 도달 가능성'
+    elif start_missing:
+        status, reason = 'history_short', '해당 범위의 첫 관측 기록 부족 (원인 미확정)'
+    else:
+        status, reason = 'complete', '4시간 연속 관측'
+    return {'status':status, 'reason':reason,
+            'observed_slots':len(observed), 'expected_slots':expected,
+            'missing_slots':missing,'internal_missing':internal_missing,
+            'start_missing':start_missing,
+            'oldest_observed_kst':earliest.strftime('%Y-%m-%d %H:%M')}
+
+
+def lossdiag_v111413_evaluate_symbol(api_get, market, cfg, kst, btc_by_time):
+    """Exact V11.14.12 baseline C signal/cooldown/outcome. Diagnosis only."""
+    rows, truncated = vwb_v111411_fetch_5m(api_get,market,cfg,kst)
+    start = datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    end = start + timedelta(days=1)
+    day_rows = [r for r in rows if start <= r['t'] < end]
+    n, valid, signals, unknown, cooldown = cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not start <= rows[i]['t'] < end: continue
+            if not lab_contiguous(rows,i-24,i): continue
+            valid += 1
+            if i < cooldown or 'C' not in lab_signals(rows,i): continue
+            cooldown = i+n
+            signals += 1
+            out = lab_outcome_v11145(rows,i,cfg)
+            if out['outcome']=='UNKNOWN':unknown+=1
+            events.append({
+                'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+                'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                'signal_number':signals,
+                'is_first_signal':signals==1,
+                'c':out,
+                'features':lab_c_signal_features(rows,i),
+                'btc':vwb_v111411_btc_snapshot(rows,i,btc_by_time),
+                'history':lossdiag_v111413_history(rows,i,truncated)})
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_rows),
+            'day_missing_5m':max(0,288-len(day_rows)),
+            'longest_day_run':lab_longest_consecutive_5m(day_rows),
+            'valid_windows':valid,'signals':signals,'unknown':unknown,
+            'truncated':truncated,'events':events}
+
+LOSSDIAG_V111413_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.13 · C 신호 손실 원인 분석실</title><style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+h3{font-size:15px;margin:18px 0 6px}.bad{color:#ffc1c1}.good{color:#78eca1}.small{font-size:12px;color:var(--muted)}input[type=file]{max-width:100%}
+</style></head><body><main>
+<h1>🔎 V11.14.13 · C 신호 손실 원인 분석실</h1>
+<p class="muted">기존 BUY와 C 신호의 진입·익절·손절 규칙은 그대로. 신규 매매 필터가 아닌 독립 진단용 연구실입니다.</p>
+<section class="panel"><h2>이번 분석의 고정 기준</h2><div class="note">
+<b>기존 C:</b> 5분봉 확정 C 신호 → 다음 5분봉 시가 모의 진입, 기존 비용·익절·손절·보유 조건 동일.<br>
+<b>BTC 상승:</b> 신호 시각까지 확정된 BTC 최근 1시간 수익률 ≥ +0.30%.<br>
+<b>BTC 횡보:</b> -0.30% 초과, +0.30% 미만. <b>BTC 하락:</b> ≤ -0.30%. 정확히 같은 시각의 BTC·코인 5분봉을 사용합니다.<br>
+<b>첫 신호:</b> 한 종목의 검증 날짜 내 첫 C 신호. <b>반복 신호:</b> 그날 같은 종목에서 두 번째 이후 C 신호.<br>
+<b>5분봉 연속성:</b> 신호봉 포함 직전 4시간(49개 시간 슬롯) 중 실제 관측된 봉을 검사합니다. 최초 기록 부족, 조회 상한 의심, 내부 공백을 따로 분류하되 원인은 확정하지 않습니다.<br>
+<b>해석:</b> 승률보다 평균 순손익, 판정 완료 수, 서로 다른 종목 수를 함께 확인하세요. 미판정은 성과 분모에서 제외합니다. 거래 수가 적거나 반복 신호가 많은 그룹은 과신하지 마세요.
+</div></section>
+<section class="panel"><h2>기존 CSV 7일치 즉석 분석 (서버 전송 없음)</h2>
+<p class="hint">이미 받은 <b>V11.14.12 피보나치/BTC CSV를 여러 개 동시 선택</b>하면 재스캔 없이 BTC 장세·첫/반복 신호를 비교할 수 있어요. 옛 CSV로는 공백의 정확한 유형을 구분하지 못합니다. 이 기능은 별도 연구용이며 실전 스캐너를 변경하지 않습니다.</p>
+<input id="importFiles" type="file" accept=".csv,text/csv" multiple aria-label="V11.14.12 CSV 여러 개 선택">
+<p id="importStatus" class="status">파일을 선택하면 즉시 분석합니다. 같은 날짜·종목·시각의 중복 신호는 1건으로 처리합니다.</p>
+<div id="importStats">CSV 불러오기 전</div></section>
+<section class="panel"><h2>새 날짜 전체 KRW 검사</h2><div class="controls">
+<label class="field">검증 날짜 (KST)<input id="date" type="date" value="2026-11-08"></label>
+<label class="field">익절 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
+</div><div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.13 진행 기록 초기화</button><button id="csv" class="secondary" disabled>전체 손실 진단 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">완료 전에는 새 전체 검사 통계를 공개하지 않습니다. 진행 기록은 이 브라우저에만 저장됩니다. 날짜·설정을 바꾸면 이 버전의 진행 기록만 초기화합니다.</p></section>
+<section class="panel"><h2>전체 종목 관측 현황</h2><div class="stats" id="coverage">검사 전</div></section>
+<section class="panel"><h2>신호 시점 4시간 캔들 공백 진단</h2><div class="stats" id="gapStats">전체 검사 완료 후 공개</div>
+<p class="hint">'관측 공백'은 API에서 유효한 5분봉이 관측되지 않은 구간이며, 거래가 없어서인지 API/파싱 문제인지를 증명하지 않습니다. '최초 기록 부족'도 원인 미확정입니다. 생존자 편향과 과거 API 지원 범위의 제한이 있습니다.</p></section>
+<section class="panel"><h2>새 날짜 손실 원인 통계</h2><div id="liveStats">전체 검사 완료 후 공개</div></section>
+<section class="panel"><h2>기존 검증실 / 실전 스캐너</h2><p class="hint">수익성이 검증된 BUY 신호가 아니며 주문 기능이 없습니다. 이전 연구 날짜를 계속 선택해 조건을 조정하면 과적합 위험이 있습니다. 다른 날짜·시장 상황에서 새로 검증하세요.</p>
+<a href="/backtest-winrate-fib-btc">V11.14.12 피보나치/BTC</a> · <a href="/backtest-winrate-vwap-btc">V11.14.11 VWAP/BTC</a> · <a href="/backtest-winrate-htf-macd">V11.14.10 MACD</a> · <a href="/backtest-winrate-ich">V11.14.9 일목</a> · <a href="/backtest-winrate-bb">V11.14.8 볼린저</a> · <a href="/backtest-winrate-c2">V11.14.7 C2</a> · <a href="/">V2 메인</a></section>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id);
+const KEY='bithumb_c_lossdiag_v111413_checkpoint';
+const API='/api/winrate14lossdiag';
+let state=null,running=false,stopRequested=false,hardFailure=false,imports=[];
+function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+function number(v){return Number.isFinite(Number(v))?Number(v):NaN;}
+function pct(v){return Number.isFinite(v)?v.toFixed(3)+'%':'—';}
+function mean(a){return a.length?a.reduce((s,x)=>s+x,0)/a.length:NaN;}
+function config(){const o={date:$('date').value,tp:number($('tp').value),sl:number($('sl').value),horizon:number($('horizon').value),fee:number($('fee').value),slip:number($('slip').value)};
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(o.date)||!(o.tp>=0.3&&o.tp<=10&&o.sl>=0.2&&o.sl<=8&&[30,60,120].includes(o.horizon)&&o.fee>=0&&o.fee<=0.5&&o.slip>=0&&o.slip<=0.5))throw Error('날짜 또는 검사 설정을 확인하세요');return o;}
+function fingerprint(c){return JSON.stringify(c);}
+function restore(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');if(x&&x.version===13&&Array.isArray(x.markets)&&x.results&&x.config)return x;}catch{}return null;}
+function persist(){localStorage.setItem(KEY,JSON.stringify(state));}
+function configToForm(c){for(const k of ['date','tp','sl','horizon','fee','slip'])if(c[k]!=null)$(k).value=c[k];}
+function allSymbols(){return !state?[]:state.markets.filter(m=>Object.prototype.hasOwnProperty.call(state.results,m)).map(m=>state.results[m]);}
+function finished(){return !!(state&&state.failed===0&&allSymbols().length===state.markets.length);}
+function eventsOf(results,day){let a=[];for(const r of results)for(const e of r.events||[]){a.push({date:day,market:r.market,signal:e.signal_time_kst,seq:e.signal_number||0,first:!!e.is_first_signal,outcome:e.c?.outcome||'UNKNOWN',net:e.c?.outcome==='UNKNOWN'?NaN:number(e.c?.net_pct),btc_1h:e.btc?.eligible?number(e.btc.btc_1h_pct):NaN,coin_1h:e.btc?.eligible?number(e.btc.coin_1h_pct):NaN,relative:e.btc?.eligible?number(e.btc.relative_1h_pp):NaN,gap:e.history?.status||'미판정',missing:e.history?.missing_slots??null,gapDetail:e.history?.reason||'',c_entry:e.c?.entry??null,c_exit:e.c?.exit??null,minutes:e.c?.minutes??null,volume:e.features?.volume_ratio??null});}return a;}
+function regime(e){if(!Number.isFinite(e.btc_1h))return 'BTC 계산 불가';if(e.btc_1h>=0.3)return 'BTC 상승';if(e.btc_1h<=-0.3)return 'BTC 하락';return 'BTC 횡보';}
+function stats(rows){let known=rows.filter(x=>Number.isFinite(x.net)),n=known.length, wins=known.filter(x=>x.net>0).length;return {signals:rows.length,n,missing:rows.length-n,wins,wr:n?wins/n*100:NaN,avg:mean(known.map(x=>x.net)),symbols:new Set(known.map(x=>x.market)).size,tp:known.filter(x=>x.outcome==='TP').length,sl:known.filter(x=>x.outcome==='SL').length,time:known.filter(x=>x.outcome==='TIME').length};}
+function card(label,value){return `<div class="stat"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`;}
+function summaryRow(name,arr){const s=stats(arr);return `<tr><td>${escapeHtml(name)}</td><td>${s.signals}</td><td>${s.n}</td><td>${s.symbols}</td><td>${s.wins}</td><td>${pct(s.wr)}</td><td class="${s.avg<0?'bad':'good'}">${pct(s.avg)}</td><td>${s.tp}/${s.sl}/${s.time}</td><td>${s.missing}</td></tr>`;}
+function table(title,groups){return `<h3>${escapeHtml(title)}</h3><div class="scroll"><table><thead><tr><th>구분</th><th>신호</th><th>판정</th><th>종목</th><th>수익</th><th>수익비율</th><th>평균 순손익</th><th>TP/SL/TIME</th><th>미판정</th></tr></thead><tbody>${groups.map(([name,rows])=>summaryRow(name,rows)).join('')}</tbody></table></div>`;}
+function renderAnalytics(ev,target){if(!ev.length){$(target).textContent='분석할 C 신호가 없습니다.';return;}
+ const group=(pred)=>ev.filter(pred);
+ const chunks=[table('전체 및 BTC 시장 방향',[
+ ['기존 C 전체',ev],['BTC 상승 (1h ≥ +0.3%)',group(x=>regime(x)==='BTC 상승')],['BTC 횡보 (-0.3% 초과 ~ +0.3% 미만)',group(x=>regime(x)==='BTC 횡보')],['BTC 하락 (1h ≤ -0.3%)',group(x=>regime(x)==='BTC 하락')],['BTC 계산 불가',group(x=>regime(x)==='BTC 계산 불가')]]),
+ table('첫 신호 / 반복 신호', [['종목별 당일 첫 C',group(x=>x.first)],['같은 종목 당일 반복 C',group(x=>!x.first)]]),
+ table('BTC 장세 × 첫/반복', ['BTC 상승','BTC 횡보','BTC 하락','BTC 계산 불가'].flatMap(r=>[['첫 신호',true],['반복 신호',false]].map(([label,f])=>[r+' · '+label,group(x=>regime(x)===r&&x.first===f)]))),
+ table('4시간 5분봉 연속성 / 기록 부족',[['4시간 연속 관측',group(x=>x.gap==='complete')],['구간 내 관측 공백',group(x=>x.gap==='observed_gap')],['시작 기록 부족',group(x=>x.gap==='history_short')],['조회 상한 의심',group(x=>x.gap==='page_limit')],['진단 정보 없음',group(x=>x.gap==='미판정'||!x.gap)]]),
+ table('날짜별 전체 C 손익', [...new Set(ev.map(x=>x.date))].sort().map(d=>[d,group(x=>x.date===d)]))];
+ $(target).innerHTML=chunks.join('');
+}
+function paint(){let done=allSymbols(),complete=finished(),total=state?.markets.length||0,signalCount=done.reduce((s,r)=>s+(r.signals||0),0);
+ $('progress').max=total||1;$('progress').value=done.length;
+ $('coverage').innerHTML=card('검사 완료 종목',`${done.length}/${total}`)+card('기존 C 신호',signalCount+'건')+card('당일 5분봉 288개 관측',done.filter(r=>r.observed_5m===288).length+'종목')+card('조회 페이지 상한',done.filter(r=>r.truncated).length+'종목');
+ $('status').textContent=state?(complete?'✅ 전체 시장 검사 완료':(running?'⏳ 진행 중':'검사 중단 또는 미완료'))+` · ${done.length}/${total}종목 · C 신호 ${signalCount}건`+(state.failed?' · 재시도 필요한 묶음 '+state.failed:''):'검사 전';
+ if(complete){const ev=eventsOf(done,state.config.date);renderAnalytics(ev,'liveStats');const gaps=ev.filter(x=>x.gap==='observed_gap'),short=ev.filter(x=>x.gap==='history_short'),limit=ev.filter(x=>x.gap==='page_limit');$('gapStats').innerHTML=card('4시간 관측 공백 신호',gaps.length+'건')+card('최초 기록 부족 신호',short.length+'건')+card('조회 상한 의심',limit.length+'건')+card('손익 미판정',ev.filter(x=>!Number.isFinite(x.net)).length+'건');$('csv').disabled=false;}else{$('liveStats').textContent='전체 KRW 검사 완료 후에만 결과를 공개합니다.';$('gapStats').textContent='전체 검사 완료 후 공개';$('csv').disabled=true;}}
+async function call(url,opts){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),115000);try{const r=await fetch(url,{...opts,signal:controller.signal,cache:'no-store'}),data=await r.json();if(!r.ok||!data.ok)throw Error(data.error||'HTTP '+r.status);return data;}finally{clearTimeout(timer);}}
+async function init(c){const u=await call(API+'/universe');if(!Array.isArray(u.items)||!u.items.length)throw Error('KRW 종목이 없습니다');state={version:13,config:c,markets:u.items,results:{},failed:0};persist();}
+async function run(){if(running)return;let c;try{c=config();}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&fingerprint(state.config)!==fingerprint(c)){if(!confirm('검사 설정이 변경됐어. V11.14.13 이전 검사만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await init(c);state.failed=0;persist();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m)),batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,failed=0;
+ async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+ for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{const out=await call(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});if(out.errors||out.scanned!==batch.length||!Array.isArray(out.results)||out.results.length!==batch.length||out.results.some(r=>!batch.includes(r.market)||!Array.isArray(r.events)||r.events.length!==r.signals||r.events.some(e=>!e.c||!e.history||!e.btc)))throw Error('불완전한 응답');response=out;break;}catch(e){if(attempt===2){failed++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패: '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+ if(response){for(const r of response.results)state.results[r.market]=r;try{persist();}catch(e){hardFailure=true;$('status').textContent='⚠️ 브라우저 저장 공간 부족';break;}paint();}if(failed>=4){hardFailure=true;break;}}}
+ await Promise.all([worker(),worker()]);state.failed=failed;try{persist();}catch{}paint();if(stopRequested)$('status').textContent+='\n검사가 일시 중지됨. 다시 누르면 이어서 검사합니다.';if(failed)$('status').textContent+='\n누락 묶음 '+failed+'개 · 다시 실행해 재검사하세요.';
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.13 진행 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!finished())return;const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','day_missing_5m','history_truncated','c_signals','signal_time_kst','c_entry_time_kst','signal_number','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','btc_eligible','btc_reason','btc_regime','btc_1h_pct','coin_1h_pct','relative_1h_pp','history_status','history_reason','history_observed_slots','history_missing_slots','history_internal_missing','history_start_missing','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const lines=[cols.join(',')],prefix={version:'V11.14.13',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(o){lines.push(cols.map(k=>csvCell(o[k])).join(','));}
+ for(const r of allSymbols()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,day_missing_5m:r.day_missing_5m,history_truncated:r.truncated?1:0,c_signals:0});continue;}
+ if(!Array.isArray(r.events)||r.events.length!==r.signals){$('status').textContent='⚠️ CSV 이벤트 수 불일치';return;}
+ for(const e of r.events){const b=e.btc||{},c=e.c||{},h=e.history||{},f=e.features||{};const rr=b.eligible?regime({btc_1h:number(b.btc_1h_pct)}):'BTC 계산 불가';append({...prefix,market:r.market,observed_5m:r.observed_5m,day_missing_5m:r.day_missing_5m,history_truncated:r.truncated?1:0,c_signals:r.signals,signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,signal_number:e.signal_number,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,btc_eligible:b.eligible?1:0,btc_reason:b.reason,btc_regime:rr,btc_1h_pct:b.btc_1h_pct,coin_1h_pct:b.coin_1h_pct,relative_1h_pp:b.relative_1h_pp,history_status:h.status,history_reason:h.reason,history_observed_slots:h.observed_slots,history_missing_slots:h.missing_slots,history_internal_missing:h.internal_missing,history_start_missing:h.start_missing,original_volume_ratio:f.volume_ratio,original_body_pct:f.body_pct,original_pullback_pct:f.pullback_depth_pct});}}
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_LOSS_DIAG_${state.config.date}_v111413.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);};
+// Import previously exported V11.14.12 CSV(s) locally. No network/upload.
+function parseCsv(src){src=src.replace(/^\ufeff/,'');let rows=[],row=[],field='',quoted=false;for(let i=0;i<src.length;i++){const ch=src[i];if(quoted){if(ch==='"'&&src[i+1]==='"'){field+='"';i++;}else if(ch==='"')quoted=false;else field+=ch;}else{if(ch==='"')quoted=true;else if(ch===','){row.push(field);field='';}else if(ch==='\n'){row.push(field.replace(/\r$/,''));rows.push(row);row=[];field='';}else field+=ch;}}if(field.length||row.length){row.push(field.replace(/\r$/,''));rows.push(row);}if(quoted)throw Error('CSV 따옴표가 닫히지 않았습니다');return rows;}
+function parseOld(text){const raw=parseCsv(text);if(!raw.length)throw Error('빈 CSV 파일');const cols=raw.shift();for(const required of ['version','date','market','original_signal_time_kst','is_first_signal','c_outcome','c_net_pct','btc_1h_pct','fib_reason'])if(!cols.includes(required))throw Error('V11.14.12 CSV 형식이 아니야: '+required+' 누락');
+ const events=[];for(const cells of raw){if(!cells.some(Boolean))continue;const r={};for(let j=0;j<cols.length;j++)r[cols[j]]=cells[j]??'';if(!r.original_signal_time_kst)continue;if(r.version!=='V11.14.12')throw Error('V11.14.12 CSV만 가져올 수 있습니다');let g='complete';if(r.fib_eligible==='0'){g=r.fib_reason==='최근 4시간 5분봉 공백'?'observed_gap':'history_short';}
+ const validBtc=r.btc_eligible==='1'&&r.btc_1h_pct!=='';
+ const outcome=r.c_outcome||'UNKNOWN';events.push({date:r.date,market:r.market,signal:r.original_signal_time_kst,seq:0,first:r.is_first_signal==='1',outcome,net:outcome==='UNKNOWN'?NaN:number(r.c_net_pct),btc_1h:validBtc?number(r.btc_1h_pct):NaN,coin_1h:validBtc?number(r.coin_1h_pct):NaN,relative:validBtc?number(r.relative_1h_pp):NaN,gap:g,missing:null,gapDetail:r.fib_reason||''});}return events;}
+$('importFiles').onchange=async()=>{const files=Array.from($('importFiles').files||[]);if(!files.length)return;try{const all=[];for(const f of files){const data=parseOld(await f.text());all.push(...data);}const seen=new Set(),unique=[];for(const e of all){const key=[e.date,e.market,e.signal].join('|');if(!seen.has(key)){seen.add(key);unique.push(e);}}
+ imports=unique;const days=new Set(imports.map(e=>e.date));$('importStatus').textContent=`✅ ${files.length}개 파일에서 ${days.size}일 · C 신호 ${imports.length}건 불러옴 (중복 제거). 파일은 서버로 전송되지 않아.`;renderAnalytics(imports,'importStats');}catch(e){$('importStatus').textContent='⚠️ '+String(e.message||e);$('importStats').textContent='CSV 형식을 다시 확인해 줘.';}};
+state=restore();if(state)configToForm(state.config);paint();
+
+</script></body></html>"""
+
+
+
+def register_lossdiag_v111413_lab(app, deps):
+    api_get, get_markets, kst = deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'names':None,'names_at':0,'btc':{},'btc_at':{}}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['names_at']>600:
+                names=sorted({m for m in get_markets() if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 목록이 없습니다')
+                cache['names'],cache['names_at']=names,time.time()
+            return cache['names']
+
+    def btc_for_day(cfg):
+        key=cfg['day'].isoformat()
+        with mutex:
+            if key not in cache['btc'] or time.time()-cache['btc_at'].get(key,0)>1800:
+                bars,_=lab_fetch_5m(api_get,'KRW-BTC',cfg,kst)
+                if not bars:raise ValueError('BTC 5분봉 데이터가 비어 있습니다')
+                cache['btc']={key:{r['t']:r for r in bars}}
+                cache['btc_at']={key:time.time()}
+            return cache['btc'][key]
+
+    @app.get('/backtest-winrate-lossdiag')
+    def page_lossdiag_v111413():
+        return render_template_string(LOSSDIAG_V111413_PAGE)
+
+    @app.get('/api/winrate14lossdiag/universe')
+    def universe_lossdiag_v111413():
+        try:
+            items=listed()
+            return jsonify({'ok':True,'items':items,'count':len(items),
+                            'universe_type':'current_KRW_listings',
+                            'rule_version':'V11.14.13'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14lossdiag/evaluate')
+    def evaluate_lossdiag_v111413():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            if any(m not in set(listed()) for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            btc_map=btc_for_day(cfg)
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures={pool.submit(lossdiag_v111413_evaluate_symbol,
+                                     api_get,m,cfg,kst,btc_map):m for m in markets}
+                for f in as_completed(futures):
+                    try:results.append(f.result())
+                    except Exception as e:errors.append({'market':futures[f],'error':str(e)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.13'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+_v111412_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111412_register_daytrade_review(app,deps)
+    register_lossdiag_v111413_lab(app,deps)
