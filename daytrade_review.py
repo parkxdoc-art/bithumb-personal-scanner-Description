@@ -1895,4 +1895,2321 @@ def lab_outcome_v11145(rows, index, cfg):
         return {'outcome': 'UNKNOWN', 'reason': '판정 불가'}
     cost_in = entry*(1+(cfg['fee']+cfg['slip'])/100)
     revenue_out = exit_price*(1-(cfg['fee']+cfg['slip'])/100)
-    net = (r
+    net = (revenue_out/cost_in-1)*100
+    return {'outcome': outcome, 'entry': round(entry,10),
+            'exit': round(exit_price,10), 'net_pct': round(net,4),
+            'minutes': elapsed}
+
+
+def lab_cdiag_v11145_evaluate_symbol(api_get, market, cfg, kst):
+    # All C signal gates, feature snapshots and cooldown remain V11.14.4.
+    return lab_cdiag_evaluate_symbol(api_get, market, cfg, kst,
+                                     outcome_fn=lab_outcome_v11145,
+                                     require_full_horizon=False)
+
+
+def make_c_v11145_page():
+    """Reuse the V11.14.4 presentation, but isolate data and mark new rules."""
+    p = C_DIAG_PAGE
+    p = p.replace('V11.14.4', 'V11.14.5')
+    p = p.replace('bithumb_v11144_c_diagnostics_checkpoint_1',
+                  'bithumb_v11145_c_outcome_fix_checkpoint_1')
+    p = p.replace('/api/winrate14cdiag/', '/api/winrate14cfix/')
+    p = p.replace('x.version!==2', 'x.version!==3')
+    p = p.replace('state={version:2,', 'state={version:3,')
+    # Add a distinct, unambiguous explanation of the fix and its scope.
+    intro = '<section class="panel"><h2>검증 조건</h2>'
+    note = ("""<section class="panel"><h2>V11.14.5 · 판정 순서 수정</h2>
+<div class="note">이번 화면은 과거 C 진입 조건은 변경하지 않고, <b>TP/SL 도달까지의 5분봉만 연속성을 확인</b>합니다.
+먼저 익절·손절했다면 그 뒤의 봉 공백으로 결과를 미판정으로 되돌리지 않습니다.
+신호를 판단할 과거 25봉과 다음 진입봉이 있으면, 미래 보유 기간 전체의 봉이 없더라도 신호는 기록하고 판정을 시도합니다.
+반대로 <b>청산 전에 봉이 빠지면 여전히 UNKNOWN</b>입니다. 이 화면은 V11.14.4의 기존 검사 기록과 저장소를 공유하지 않습니다.
+검증 비교는 <b>2026-11-11 / 60분 / TP 1.5% / SL 1.0% / 수수료 0.04% / 슬리피지 0.05%</b>를 권장합니다.
+단일 날짜의 승률은 실전 성과나 장래 승률을 보장하지 않습니다.</div></section>
+<section class="panel"><h2>검증 조건</h2>""")
+    assert p.count(intro) == 1
+    p = p.replace(intro,note,1)
+    # New data MUST not accidentally mix with any old cached outcome labels.
+    assert "bithumb_v11145_c_outcome_fix_checkpoint_1" in p
+    assert "x.version!==3" in p and "state={version:3," in p
+    assert '/api/winrate14cdiag/' not in p
+    # V11.14.3 / 14.4 links remain accessible separately.
+    previous = '<a href="/backtest-winrate-full-c">'
+    assert previous in p
+    p = p.replace(previous, '<a href="/backtest-winrate-c-diagnostics">V11.14.4 기존 손절 분석판</a> · '+previous,1)
+    start = p.index("$('csv').onclick=()=>{")
+    end = p.index('\nstate=load();', start)
+    new_csv = r"""$('csv').onclick=()=>{
+ if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cfgCols=['rule_version','date','tp_pct','sl_pct','max_hold_minutes','fee_per_side_pct','slippage_per_side_pct'];
+ const tradeCols=['market','observed_day_5m','c_signals','unknown_c','signal_time_kst','outcome','reason','entry','exit','minutes','net_pct','is_first_signal','volume_ratio','body_pct','body_share_pct','flow_1h_proxy_pct','pullback_depth_pct','reclaim_ma10_pct','prior_15m_pct','prior_30m_pct'];
+ const lines=[[...cfgCols,...tradeCols].map(csvCell).join(',')];
+ const prefix=['V11.14.5',state.config.date,state.config.tp,state.config.sl,state.config.horizon,state.config.fee,state.config.slip];
+ function append(row){if(row.length!==tradeCols.length)throw Error('CSV 열 개수 불일치');lines.push([...prefix,...row].map(csvCell).join(','));}
+ for(const x of sampleResults()){
+  if(!x.signals){const row=Array(tradeCols.length).fill('');row[0]=x.market;row[1]=x.observed_5m;row[2]=0;row[3]=0;row[5]='NO_SIGNAL';append(row);continue;}
+  if(!Array.isArray(x.events)||x.events.length!==x.signals){$('status').textContent='⚠️ CSV 신호 보존 개수가 일치하지 않습니다. 데이터를 다시 검사하세요.';return;}
+  for(const e of x.events){const d=e.features||{};
+   append([x.market,x.observed_5m,x.signals,x.unknown,e.signal_kst,e.outcome,e.reason,e.entry,e.exit,e.minutes,e.net_pct,e.is_first_signal?1:0,d.volume_ratio,d.body_pct,d.body_share_pct,d.flow_1h_proxy_pct,d.pullback_depth_pct,d.reclaim_ma10_pct,d.prior_15m_pct,d.prior_30m_pct]);
+  }
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=u;a.download=`bithumb_full_krw_C_validated_${state.config.date}_v11145.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);
+};"""
+    p = p[:start]+new_csv+p[end:]
+    assert 'rule_version' in p and 'max_hold_minutes' in p
+    assert 'bithumb_full_krw_C_validated_' in p
+    return p
+
+
+C_VALID_PAGE = make_c_v11145_page()
+
+
+def register_c_valid_lab(app, deps):
+    api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
+    cached = {'names': None, 'at': 0}
+    mu = Lock()
+
+    def current_names():
+        with mu:
+            if cached['names'] is None or time.time()-cached['at']>600:
+                names = sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:
+                    raise ValueError('현재 빗썸 KRW 종목 목록이 비었습니다')
+                cached.update(names=names,at=time.time())
+            return cached['names']
+
+    @app.get('/backtest-winrate-c-validated')
+    def cvalid_page_11145():
+        return render_template_string(C_VALID_PAGE)
+
+    @app.get('/api/winrate14cfix/universe')
+    def cvalid_universe_11145():
+        try:
+            names=current_names()
+            return jsonify({'ok': True, 'items': names,'count': len(names),
+                            'universe_type': 'current_KRW_listings',
+                            'rule_version': 'V11.14.5'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14cfix/evaluate')
+    def cvalid_evaluate_11145():
+        try:
+            payload = request.get_json(silent=True)
+            cfg = lab_valid_request(payload,kst)
+            markets = payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                or len(markets)!=len(set(markets))
+                or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 조회할 수 있습니다')
+            allowed = set(current_names())
+            if any(m not in allowed for m in markets):
+                raise ValueError('현재 빗썸 KRW 목록에서 찾을 수 없는 종목입니다')
+            results, errors = [], []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures={pool.submit(lab_cdiag_v11145_evaluate_symbol,
+                                     api_get,m,cfg,kst):m for m in markets}
+                for fut in as_completed(futures):
+                    try:
+                        results.append(fut.result())
+                    except Exception as e:
+                        errors.append({'market':futures[fut],'error':str(e)[:120]})
+            return jsonify({'ok':not errors, 'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.5'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11144_register_daytrade_review = register_daytrade_review
+
+def register_daytrade_review(app, deps):
+    _v11144_register_daytrade_review(app, deps)
+    register_c_valid_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.6: RSI(14) and MACD(12,26,9) research on ORIGINAL C signals.
+# Comparison-only. No changes to V11.13 BUY or any V11.14.5 endpoints.
+# RSI/Wilder and MACD/SMA-seeded EMAs computed on 70 CONTIGUOUS completed
+# five-minute candles ending at the C signal candle, never future prices.
+# Hypotheses are fixed BEFORE examining results:
+#   C+RSI  : 40 <= RSI14 <= 70 and RSI14 > RSI14_previous
+#   C+MACD : histogram > 0 and histogram > preceding histogram
+#   C+both : both conditions
+# Every subset is compared to ORIGINAL C on the SAME indicator-eligible cohort.
+# ---------------------------------------------------------------------------
+
+C_IND_LOOKBACK = 70
+
+
+def cind_fetch_extended(api_get, market, cfg, kst):
+    """Fetch 12h prehistory for indicator warm-up; keep prior 4h baseline intact.
+
+    Uses the same Bithumb 5m KST-exclusive pagination and OHLCV validity as
+    lab_fetch_5m. No synthetic candles and no modifications to old fetching.
+    """
+    begin = datetime.combine(cfg['day'], _time.min, tzinfo=kst) - timedelta(hours=12)
+    end = datetime.combine(cfg['day']+timedelta(days=1), _time.min, tzinfo=kst)+timedelta(hours=2,minutes=5)
+    cursor, seen, truncated = end, {}, True
+    for _ in range(LAB_MAX_PAGES):
+        raw = api_get('/v1/candles/minutes/5', {
+            'market': market, 'count': 200,
+            'to': cursor.strftime('%Y-%m-%d %H:%M:%S')})
+        if not isinstance(raw, list):
+            raise ValueError('5분봉 응답 형식 오류')
+        oldest = None
+        for bar in raw:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                ts = local_time(bar['candle_date_time_kst'], kst)
+                op,hi,lo,cl = (float(bar[k]) for k in
+                        ('opening_price','high_price','low_price','trade_price'))
+                vol = float(bar['candle_acc_trade_volume'])
+                if not (all(isfinite(v) and v>0 for v in (op,hi,lo,cl))
+                        and isfinite(vol) and vol>=0
+                        and lo<=min(op,cl) and hi>=max(op,cl) and lo<=hi):
+                    continue
+                oldest = ts if oldest is None else min(oldest,ts)
+                if begin <= ts < end:
+                    seen[ts]={'t':ts,'o':op,'h':hi,'l':lo,'c':cl,'v':vol}
+            except (KeyError,TypeError,ValueError,OverflowError):
+                continue
+        if oldest is None:
+            truncated = False
+            break
+        if oldest<=begin or len(raw)<200:
+            truncated = False
+            break
+        if oldest >= cursor:
+            raise ValueError('분봉 페이지 진행 오류')
+        cursor=oldest
+    return [seen[k] for k in sorted(seen)], truncated
+
+
+def cind_rsi_series(closes, period=14):
+    """Wilder RSI; return last and preceding RSI. For flat prices, RSI=50."""
+    if len(closes)<period+2:
+        return None
+    diffs=[closes[j]-closes[j-1] for j in range(1,len(closes))]
+    gain=sum(max(d,0.0) for d in diffs[:period])/period
+    loss=sum(max(-d,0.0) for d in diffs[:period])/period
+    def value(g,l):
+        if l==0 and g==0: return 50.0
+        if l==0: return 100.0
+        return 100-100/(1+g/l)
+    r=value(gain,loss)
+    prev=None
+    for d in diffs[period:]:
+        prev=r
+        gain=(gain*(period-1)+max(d,0))/period
+        loss=(loss*(period-1)+max(-d,0))/period
+        r=value(gain,loss)
+    return r,prev
+
+
+def cind_macd_series(closes, fast=12, slow=26, signal=9):
+    """SMA-seeded EMA 12/26; MACD, signal and histogram current/previous."""
+    if len(closes)<slow+signal+1:
+        return None
+    a=sum(closes[:fast])/fast
+    b=sum(closes[:slow])/slow
+    ma=[]
+    af=2/(fast+1)
+    bs=2/(slow+1)
+    for idx,price in enumerate(closes):
+        if idx>=fast:
+            a=af*price+(1-af)*a
+        if idx>=slow:
+            b=bs*price+(1-bs)*b
+        if idx>=slow-1:
+            ma.append(a-b)
+    if len(ma)<signal+1:
+        return None
+    sg=sum(ma[:signal])/signal
+    k=2/(signal+1)
+    last_h=None
+    prev_h=None
+    for idx,macd in enumerate(ma):
+        if idx>=signal:
+            sg=k*macd+(1-k)*sg
+        if idx>=signal-1:
+            prev_h,last_h=last_h,macd-sg
+    return ma[-1],sg,last_h,prev_h
+
+
+def cind_indicators(extended, idx):
+    """Only already completed 5m candles through signal idx are used."""
+    if idx < C_IND_LOOKBACK-1:
+        return {'eligible':False,'reason':'70개 과거 5분봉 부족'}
+    if not lab_contiguous(extended, idx-(C_IND_LOOKBACK-1), idx):
+        return {'eligible':False,'reason':'최근 70개 5분봉 연속성 부족'}
+    prices=[r['c'] for r in extended[idx-C_IND_LOOKBACK+1:idx+1]]
+    rsi=cind_rsi_series(prices)
+    macd=cind_macd_series(prices)
+    if not rsi or not macd or rsi[1] is None or macd[3] is None:
+        return {'eligible':False,'reason':'지표 계산 불가'}
+    rv,rprev=rsi
+    m,s,h,hprev=macd
+    denom=prices[-1]
+    return {
+        'eligible':True,'reason':None,
+        'rsi14':round(rv,5), 'rsi_prev':round(rprev,5),
+        'macd_pct':round(100*m/denom,6),
+        'macd_signal_pct':round(100*s/denom,6),
+        'hist_pct':round(100*h/denom,6),
+        'hist_prev_pct':round(100*hprev/denom,6),
+        'rsi_pass':bool(40<=rv<=70 and rv>rprev),
+        'macd_pass':bool(h>0 and h>hprev),
+    }
+
+
+def cind_evaluate_symbol(api_get,market,cfg,kst):
+    """Preserve V11.14.5 C events by evaluating ONLY its original 4h slice.
+
+    Additional fetched history is used ONLY for RSI/MACD. It cannot create
+    extra C signals or change the original next-bar outcome calculation.
+    """
+    extended,truncated=cind_fetch_extended(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    base_begin=day_start-timedelta(hours=4)
+    base=[r for r in extended if r['t']>=base_begin]
+    offset=len(extended)-len(base)
+    day_bars=sum(day_start<=r['t']<day_end for r in base)
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events,trades,first=None,[],None
+    events=[]
+    if len(base)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(base)-1):
+            t=base[i]['t']
+            if not day_start<=t<day_end:
+                continue
+            if not lab_contiguous(base,i-24,i):
+                continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(base,i):
+                continue
+            cooldown=i+n
+            signals+=1
+            outcome=lab_outcome_v11145(base,i,cfg)
+            entry_time=t+timedelta(minutes=5)
+            event={
+                'time':entry_time.strftime('%m-%d %H:%M'),
+                'signal_kst':entry_time.strftime('%Y-%m-%d %H:%M'),
+                'outcome':outcome['outcome'],
+                'net_pct':outcome.get('net_pct'),
+                'entry':outcome.get('entry'),
+                'exit':outcome.get('exit'),
+                'minutes':outcome.get('minutes'),
+                'reason':outcome.get('reason'),
+                'is_first_signal':first is None,
+                'features':lab_c_signal_features(base,i),
+                'indicators':cind_indicators(extended,offset+i),
+            }
+            if first is None:
+                first={k:event[k] for k in ('time','outcome','net_pct','entry','minutes')}
+            events.append(event)
+            if event['outcome']=='UNKNOWN':
+                unknown+=1
+            else:
+                trades.append(event)
+    assert len(events)==signals and len(trades)+unknown==signals
+    return {'market':market,'observed_5m':day_bars,
+        'longest_day_run':lab_longest_consecutive_5m([r for r in base if day_start<=r['t']<day_end]),
+        'valid_windows':valid,'signals':signals,'unknown':unknown,
+        'truncated':truncated,'first_signal':first,'trades':trades,'events':events}
+
+
+def make_c_indicator_page():
+    """Reuse the tested V11.14.5 mobile workflow, add paired-cohort table."""
+    p=C_VALID_PAGE.replace('V11.14.5','V11.14.6')
+    p=p.replace('bithumb_v11145_c_outcome_fix_checkpoint_1',
+                'bithumb_v11146_rsi_macd_checkpoint_1')
+    p=p.replace('/api/winrate14cfix/','/api/winrate14cind/')
+    p=p.replace('x.version!==3','x.version!==4')
+    p=p.replace('state={version:3,','state={version:4,')
+    p=p.replace('현재 V11.14.4 진단용 진행 기록만 삭제할까요?',
+                '현재 V11.14.6 지표 비교 진행 기록만 삭제할까요?')
+    assert '/api/winrate14cfix/' not in p
+    assert 'x.version!==4' in p and 'state={version:4,' in p
+    assert 'bithumb_v11146_rsi_macd_checkpoint_1' in p
+    intro='<section class="panel"><h2>검증 조건</h2>'
+    info="""<section class="panel"><h2>V11.14.6 · RSI·MACD 가설 사전 고정</h2>
+<div class="note"><b>기존 C 신호는 동일</b>하며, RSI·MACD는 신규 BUY 신호가 아니라 C의 <b>모의 거래 필터 후보</b>입니다.
+RSI(14)는 Wilder 방식으로 <b>40~70이면서 직전 확정봉보다 상승</b>하는 경우,
+MACD(12,26,9)는 <b>히스토그램이 양수이고 직전 확정봉보다 증가</b>하는 경우로 가설을 고정했습니다.
+지표는 신호 시점까지 <b>연속 70개의 확정 5분봉</b>이 있는 경우에만 계산합니다.
+<strong>공정 비교:</strong> 지표 계산이 가능한 동일 C 신호 집단에서 C 원본 / C+RSI / C+MACD / C+두 지표를 비교합니다.
+기존 C 전체 신호에 대한 성적은 위의 종합 화면에 그대로 따로 나타납니다. 제외된 수익 기회도 표에 보입니다.
+과거 6일에 대해 이미 알고 있는 결과로 규칙을 변경하지 마세요. 아직 평가하지 않은 다른 날짜에서 확인해야 합니다.</div></section>
+<section class="panel"><h2>검증 조건</h2>"""
+    assert p.count(intro)==1
+    p=p.replace(intro,info,1)
+    insertion='<section class="panel"><h2>주의사항</h2>'
+    extra="""<section class="panel"><h2>RSI·MACD 비교 실험 (지표 계산 가능한 C 신호만)</h2>
+<div id="indicatorSummary" class="stats">전체 시장 검사 후 표시</div>
+<div id="indicatorResults" class="scroll">검사 완료 후 표시</div>
+<p class="hint">수익/손실 여부는 비용 차감 후 순손익 기준입니다. TP/SL은 개별 봉 내 보수적인 체결 가정이며 실제 체결은 보장되지 않습니다. 필터 통과 거래 수가 적으면 승률이 높아도 신뢰할 수 없습니다. 현재 전체 시장 목록을 과거에 적용하므로 상장폐지 종목이 빠지는 생존자 편향이 있습니다.</p>
+<div class="scroll" id="indicatorFirst">첫 신호만 비교: 검사 완료 후 표시</div>
+</section>
+<section class="panel"><h2>주의사항</h2>"""
+    assert p.count(insertion)==1
+    p=p.replace(insertion,extra,1)
+    foot='<a href="/backtest-winrate-c-diagnostics">V11.14.4 기존 손절 분석판</a>'
+    assert foot in p
+    p=p.replace(foot,'<a href="/backtest-winrate-c-validated">V11.14.5 기준 검사</a> · '+foot,1)
+    # Add compare calculations BEFORE paint(), and invoke after complete status.
+    anchor='function paint(){let a=sampleResults()'
+    assert p.count(anchor)==1
+    compare_js=r"""
+function renderIndicatorComparison(results){
+ const events=results.flatMap(x=>(x.events||[]).map(e=>({...e,market:x.market})));
+ const withIndicators=events.filter(x=>x.indicators?.eligible===true);
+ const decided=withIndicators.filter(x=>x.outcome!=='UNKNOWN'&&typeof x.net_pct==='number');
+ const first=decided.filter(x=>x.is_first_signal);
+ const cases=[
+  ['C 원본 (지표 공통표본)',x=>true],
+  ['C + RSI(14)',x=>x.indicators.rsi_pass===true],
+  ['C + MACD(12·26·9)',x=>x.indicators.macd_pass===true],
+  ['C + RSI + MACD',x=>x.indicators.rsi_pass===true&&x.indicators.macd_pass===true]
+ ];
+ const unavailable=events.length-withIndicators.length;
+ const missing=withIndicators.filter(x=>x.outcome==='UNKNOWN').length;
+ $('indicatorSummary').innerHTML=card('전체 C 신호',events.length+'건')+
+  card('지표 계산 가능 신호',withIndicators.length+'건')+
+  card('지표 불가능 · 비교 제외',unavailable+'건')+
+  card('지표 가능하지만 승패 미판정',missing+'건')+
+  card('동일 표본 · 판정 거래',decided.length+'건');
+ const baseline=aggregate(decided);
+ function table(data){return '<table><thead><tr><th>비교 방식</th><th>판정 거래</th><th>익절</th><th>손절</th><th>시간 종료</th><th>순승률</th><th>평균 순손익</th><th>기존 대비 기회 제외</th><th>제외한 수익 거래</th></tr></thead><tbody>'+cases.map(([label,check])=>{
+  const kept=data.filter(check),omitted=data.filter(x=>!check(x)),s=aggregate(kept);
+  return `<tr><td>${escapeHtml(label)}</td><td>${s.n}</td><td>${s.tp}</td><td>${s.sl}</td><td>${s.time}</td><td>${s.n?numPct(s.winPct):'—'}</td><td>${s.n?numPct(s.avg):'—'}</td><td>${omitted.length}</td><td>${omitted.filter(x=>x.net_pct>0).length}</td></tr>`;
+ }).join('')+'</tbody></table>';}
+ $('indicatorResults').innerHTML='<p class="hint">같은 데이터로 계산 가능한 판정 C 거래 '+decided.length+'건이 공통 모집단입니다. 전체 C '+events.length+'건을 기준으로 한 직접 비교가 아닙니다.</p>'+table(decided);
+ $('indicatorFirst').innerHTML='<p class="hint">코인별 실제 최초 C 신호 중 지표 계산 가능하며 판정된 거래만 별도 비교합니다. 최초 신호가 미판정이면 뒤의 거래로 대체하지 않습니다.</p>'+table(first);
+}
+
+"""
+    p=p.replace(anchor,compare_js+anchor,1)
+    trigger="if(complete)renderRisk(a);else for(const id of ['riskSummary','featureGroups','lossSummary','lossCases'])$(id).textContent='전체 시장 검사 완료 후 공개';"
+    assert p.count(trigger)==1
+    p=p.replace(trigger,trigger+"\n if(complete)renderIndicatorComparison(a);else { $('indicatorSummary').textContent='전체 시장 검사 완료 후 공개'; $('indicatorResults').textContent='전체 시장 검사 완료 후 공개'; $('indicatorFirst').textContent='전체 시장 검사 완료 후 공개'; }",1)
+    # Replace only V11.14.5 CSV handler with V11.14.6 expanded CSV schema.
+    start=p.index("$('csv').onclick=()=>{")
+    end=p.index('\nstate=load();',start)
+    new_csv=r"""$('csv').onclick=()=>{
+ if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const configCols=['rule_version','date','tp_pct','sl_pct','max_hold_minutes','fee_per_side_pct','slippage_per_side_pct'];
+ const detailCols=['market','observed_day_5m','c_signals','unknown_c','signal_time_kst','outcome','reason','entry','exit','minutes','net_pct','is_first_signal','volume_ratio','body_pct','body_share_pct','flow_1h_proxy_pct','pullback_depth_pct','reclaim_ma10_pct','prior_15m_pct','prior_30m_pct',
+  'ind_eligible','ind_reason','rsi14','rsi_prev','macd_pct','macd_signal_pct','hist_pct','hist_prev_pct','rsi_pass','macd_pass'];
+ const lines=[[...configCols,...detailCols].map(csvCell).join(',')];
+ const prefix=['V11.14.6',state.config.date,state.config.tp,state.config.sl,state.config.horizon,state.config.fee,state.config.slip];
+ function push(row){if(row.length!==detailCols.length)throw Error('CSV 열 개수 불일치');lines.push([...prefix,...row].map(csvCell).join(','));}
+ for(const x of sampleResults()){
+  if(!x.signals){const row=Array(detailCols.length).fill('');row[0]=x.market;row[1]=x.observed_5m;row[2]=0;row[3]=0;row[5]='NO_SIGNAL';push(row);continue;}
+  if(!Array.isArray(x.events)||x.events.length!==x.signals){$('status').textContent='⚠️ 모든 C 신호를 보존하지 못했습니다. 재검사하세요.';return;}
+  for(const e of x.events){const d=e.features||{},i=e.indicators||{};
+   push([x.market,x.observed_5m,x.signals,x.unknown,e.signal_kst,e.outcome,e.reason,e.entry,e.exit,e.minutes,e.net_pct,e.is_first_signal?1:0,d.volume_ratio,d.body_pct,d.body_share_pct,d.flow_1h_proxy_pct,d.pullback_depth_pct,d.reclaim_ma10_pct,d.prior_15m_pct,d.prior_30m_pct,
+    i.eligible?1:0,i.reason,i.rsi14,i.rsi_prev,i.macd_pct,i.macd_signal_pct,i.hist_pct,i.hist_prev_pct,i.eligible?(i.rsi_pass?1:0):'',i.eligible?(i.macd_pass?1:0):'']);
+  }
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=u;a.download=`bithumb_full_krw_C_rsi_macd_${state.config.date}_v11146.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);
+};"""
+    p=p[:start]+new_csv+p[end:]
+    assert 'renderIndicatorComparison(a)' in p and "ind_eligible" in p
+    assert '/api/winrate14cfix/' not in p
+    return p
+
+
+C_IND_PAGE=make_c_indicator_page()
+
+
+def register_c_indicator_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:
+                    raise ValueError('현재 KRW 상장 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-c-indicators')
+    def c_ind_page_11146():
+        return render_template_string(C_IND_PAGE)
+
+    @app.get('/api/winrate14cind/universe')
+    def c_ind_universe_11146():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings',
+                            'rule_version':'V11.14.6'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14cind/evaluate')
+    def c_ind_eval_11146():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            allowed=set(listed())
+            if any(m not in allowed for m in markets):
+                raise ValueError('현재 빗썸 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks={pool.submit(cind_evaluate_symbol,api_get,m,cfg,kst):m for m in markets}
+                for future in as_completed(tasks):
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        errors.append({'market':tasks[future],'error':str(e)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.6'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11145_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11145_register_daytrade_review(app,deps)
+    register_c_indicator_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.7: C vs. C2 delayed-confirmation experiment (NEW read-only endpoint).
+# Historical C, V11.14.5, RSI/MACD study, V11.13 and V2 are NOT modified.
+# C2 is evaluated ON THE EXACT preexisting C signal universe and cooldown.
+# C2 decisions use one additional completed 5M bar and enter one bar later.
+# ---------------------------------------------------------------------------
+
+
+def c2_confirmation(rows, i):
+    """After C closes at i, check next COMPLETED 5-minute candle (i+1).
+
+    Ex-ante C2 hypothesis; no target/stop/outcome or further prices involved.
+    The C signal low is an *experimental* short-term support proxy, not a
+    verified horizontal support level. A 0.2% undercut is permitted.
+    """
+    if i+1 >= len(rows):
+        return {'status':'UNKNOWN', 'reason':'다음 확인 봉 없음'}
+    if rows[i+1]['t']-rows[i]['t'] != timedelta(minutes=5):
+        return {'status':'UNKNOWN', 'reason':'확인 봉 사이 5분 공백'}
+    signal, confirm=rows[i],rows[i+1]
+    holds=confirm['l'] >= signal['l']*0.998
+    rises=confirm['c'] > signal['c']
+    bull=confirm['c'] > confirm['o']
+    if not holds:
+        return {'status':'SKIP','reason':'C 신호봉 저가 지지 유지 실패'}
+    if not rises:
+        return {'status':'SKIP','reason':'직전 C 종가 위로 재상승 실패'}
+    if not bull:
+        return {'status':'SKIP','reason':'확인 봉이 양봉 아님'}
+    return {'status':'PASS','reason':'지지 유지 + 양봉 + 종가 재상승'}
+
+
+def c2_evaluate_symbol(api_get,market,cfg,kst):
+    """Single 5m fetch, identical original C decisions and cooldown.
+
+    Baseline C enters at opening of i+1, C2 may enter at opening of i+2.
+    Both get their OWN stop/target/horizon from OWN entry opening.
+    C2 SKIP denotes no position, not a profit or loss; UNKNOWN is unscored.
+    """
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_bars=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:
+                continue
+            if not lab_contiguous(rows,i-24,i):
+                continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):
+                continue
+            cooldown=i+n  # IDENTICAL C cooldown. C2 does not replace it.
+            signals+=1
+            baseline=lab_outcome_v11145(rows,i,cfg)
+            check=c2_confirmation(rows,i)
+            if check['status']=='PASS':
+                c2=lab_outcome_v11145(rows,i+1,cfg)
+            else:
+                c2={'outcome':check['status'],'reason':check['reason']}
+            if baseline['outcome']=='UNKNOWN':unknown+=1
+            entry_t=rows[i]['t']+timedelta(minutes=5)
+            confirm_t=rows[i]['t']+timedelta(minutes=5)
+            c2_entry_t=rows[i]['t']+timedelta(minutes=10)
+            events.append({
+                'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+                'c_entry_time_kst':entry_t.strftime('%Y-%m-%d %H:%M'),
+                'c2_confirm_time_kst':confirm_t.strftime('%Y-%m-%d %H:%M'),
+                'c2_entry_time_kst':c2_entry_t.strftime('%Y-%m-%d %H:%M'),
+                'is_first_signal':signals==1,
+                'c':baseline,
+                'c2':c2,
+                'c2_check':check,
+                'features':lab_c_signal_features(rows,i),
+            })
+    return {
+        'market':market,'observed_5m':len(day_bars),
+        'longest_day_run':lab_longest_consecutive_5m(day_bars),
+        'valid_windows':valid,'signals':signals,'unknown':unknown,
+        'truncated':truncated,'events':events,
+    }
+
+
+C2_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.7 · 기존 C vs C2 지지 확인 실험</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}.good{color:var(--green)}.warn{color:var(--warn)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.7 · C vs C2 진입 구조 비교</h1>
+<p class="muted">별도 과거 모의 검증실 · C2는 실전 BUY 신호가 아닙니다. V11.13, V11.14.5, V11.14.6 및 V2 메인은 변경하지 않습니다.</p>
+<section class="panel"><h2>먼저 비교 방법부터 확인</h2>
+<div class="note"><b>기존 C:</b> 상승 흐름 → 눌림 → 첫 반등 5분봉 확정 → <b>다음 5분봉 시가 진입</b>.<br>
+<b>실험 C2:</b> 같은 첫 반등 신호 이후 <b>다음 확정 5분봉</b>에서 (① 저가가 첫 신호봉 저가보다 0.2% 넘게 낮아지지 않음, ② 양봉, ③ 종가가 첫 신호봉 종가보다 높음)을 모두 확인 → <b>그다음 5분봉 시가 진입</b>.<br>
+C2의 지지는 <b>신호봉 저가를 이용한 잠정 기준</b>이지 진짜 수평 지지선 인증이 아닙니다. C2는 조건을 못 맞추면 진입하지 않습니다.
+C와 C2는 <b>각자의 실제 모의 진입 시가</b>를 기준으로 새로 익절·손절·시간 종료를 계산합니다.
+모든 C 신호의 발생 순서와 종목별 재진입 대기 시간은 이전과 동일합니다. C2 때문에 신호를 과거로 되돌려 재선택하지 않습니다.</div>
+</section>
+<section class="panel"><h2>검증 조건</h2>
+<div class="controls">
+<label class="field">과거 날짜 (KST)<input id="date" type="date"></label>
+<label class="field">익절 목표 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 기준 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" step="0.01" value="0.04" min="0" max="0.5"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" step="0.01" value="0.05" min="0" max="0.5"></label>
+</div>
+<div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">이번 C2 진행 기록 초기화</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전 · 전체 시장 승률 없음</p>
+<p class="hint">지금 현재 상장 중인 빗썸 KRW 종목을 과거 날짜에 적용하므로 생존자 편향이 있습니다. 전체 검사 완료 전에는 최종 승률을 공개하지 않습니다. 중단 시 같은 브라우저에서 이어할 수 있습니다.</p>
+</section>
+<section class="panel"><h2>전 종목 데이터 현황</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>C vs C2 · 전체 결과</h2><div id="summary" class="stats">검사 완료 후 공개</div>
+<p class="hint">전체 C 거래 평균과 C2 통과 거래 평균은 거래 대상이 다르므로 이 둘만 보고 C2가 우수하다고 결론 내릴 수 없습니다.</p>
+<div id="allTable" class="scroll">검사 완료 후 공개</div></section>
+<section class="panel"><h2>공정 비교 A · 실제 C2 진입한 신호만 짝짓기</h2>
+<div class="note">C2가 통과했고 <b>C와 C2 모두 손익이 판정된 동일한 C 신호</b>를 골라서 두 진입 가격·손익을 비교합니다. 이 표는 한 봉 늦은 진입 효과를 확인하지만, C2가 제외한 거래의 효과는 따로 보아야 합니다.</div>
+<div id="pairTable" class="scroll">검사 완료 후 공개</div></section>
+<section class="panel"><h2>공정 비교 B · 원래 C 신호 한 건당 평균 손익</h2>
+<div class="note">같은 원래 C 신호에서 <b>C가 진입하면 실제 모의 손익</b>, <b>C2가 조건 미충족으로 진입하지 않으면 0%</b>로 계산합니다. 두 전략이 판정 가능한 신호만 사용하고, 결과 미판정은 공정 비교에서 제외합니다. 기회당 평균이며 실제 계좌 수익률·동시 보유 포트폴리오 수익률이 아닙니다.</div>
+<div id="opportunityTable" class="scroll">검사 완료 후 공개</div></section>
+<section class="panel"><h2>코인별 첫 C 신호 기준</h2><p class="hint">첫 신호가 미판정이면 두 번째 승리 거래로 대체하지 않습니다.</p>
+<div id="firstTable" class="scroll">검사 완료 후 공개</div></section>
+<section class="panel"><h2>C2 진입 보류 원인</h2><div id="reasons" class="stats">검사 완료 후 공개</div></section>
+<section class="panel"><h2>종목별 신호 비교</h2><div id="byMarket" class="scroll">검사 완료 후 공개</div>
+<div class="actions"><button id="csv" disabled>전체 C/C2 비교 CSV 저장</button></div></section>
+<section class="panel"><h2>해석 주의</h2><div class="note">완성된 5분봉 OHLC에 기반한 모의 체결입니다. 봉 내부 익절/손절이 동시에 발생하면 손절 우선, 청산 전 봉 공백은 미판정입니다. 실제 호가 스프레드, 가격 단위, 체결 가능성 및 상장폐지 종목은 반영하지 못합니다. C의 1시간 흐름은 실제 1시간봉이 아니라 과거 24개의 5분봉을 이용한 근사치입니다. 반복 신호는 독립 사례가 아닐 수 있습니다. 이미 살펴본 11월 4~11일은 C2 규칙 설정에 영향을 준 과거 기간이므로 <b>검증용 독립 표본으로 취급하지 않습니다.</b> 다른 날짜에서 평가하세요.</div>
+<p><a href="/backtest-winrate-c-indicators">V11.14.6 RSI·MACD</a> · <a href="/backtest-winrate-c-validated">V11.14.5 기존 C</a> · <a href="/backtest-daytrade">V11.13 실시간</a> · <a href="/">V2 메인</a></p></section>
+</main><script>
+const $=id=>document.getElementById(id);
+const escapeHtml=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const KEY='bithumb_v11147_c2_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+function kstDate(dt){let p=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(dt);let v=k=>p.find(x=>x.type===k).value;return `${v('year')}-${v('month')}-${v('day')}`;}
+const yesterday=()=>kstDate(new Date(Date.now()-86400000));
+$('date').max=yesterday();$('date').value=yesterday();
+function cfgOf(){let c={date:$('date').value,tp:+$('tp').value,sl:+$('sl').value,horizon:+$('horizon').value,fee:+$('fee').value,slip:+$('slip').value};
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(c.date)||c.date>yesterday())throw Error('완료된 과거 날짜를 선택하세요');
+ if(![c.tp,c.sl,c.horizon,c.fee,c.slip].every(Number.isFinite)||c.tp<0.3||c.tp>10||c.sl<0.2||c.sl>8||![30,60,120].includes(c.horizon)||c.fee<0||c.fee>0.5||c.slip<0||c.slip>0.5)throw Error('검증 설정 범위를 확인하세요');
+ return c;
+}
+const signature=c=>JSON.stringify([c.date,c.tp,c.sl,c.horizon,c.fee,c.slip]);
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');if(!x||x.version!==7||!Array.isArray(x.markets)||!x.config||!x.results||typeof x.results!=='object')return null;
+ if(x.markets.length<1||x.markets.some(m=>!/^KRW-[A-Z0-9]+$/.test(m))||new Set(x.markets).size!==x.markets.length)return null;return x;}catch{return null}}
+function setConfig(c){for(const id of ['date','tp','sl','horizon','fee','slip'])$(id).value=c[id];}
+function numPct(n){return Number.isFinite(n)?n.toFixed(3)+'%':'—';}
+function card(name,val){return `<div class="stat"><small>${escapeHtml(name)}</small><strong>${escapeHtml(val)}</strong></div>`;}
+function sampleResults(){return state?state.markets.filter(m=>Object.prototype.hasOwnProperty.call(state.results,m)).map(m=>state.results[m]):[];}
+const decided=e=>e&&['TP','SL','TIME'].includes(e.outcome)&&typeof e.net_pct==='number'&&Number.isFinite(e.net_pct);
+function aggregate(events){let n=0,tp=0,sl=0,tm=0,wins=0,net=0;for(const x of events){if(!decided(x))continue;n++;net+=x.net_pct;if(x.net_pct>0)wins++;if(x.outcome==='TP')tp++;if(x.outcome==='SL')sl++;if(x.outcome==='TIME')tm++;}
+ return {n,tp,sl,tm,wins,net,avg:n?net/n:null,win:n?100*wins/n:null};}
+function table(rows){return '<table><thead><tr><th>구분</th><th>판정 거래</th><th>익절/손절/시간종료</th><th>순승률</th><th>평균 순손익</th></tr></thead><tbody>'+rows.map(([label,e])=>{let s=aggregate(e);return `<tr><td>${escapeHtml(label)}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${numPct(s.win)}</td><td>${numPct(s.avg)}</td></tr>`;}).join('')+'</tbody></table>';}
+function flatten(results){return results.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market})));}
+function renderComparisons(results){
+ const es=flatten(results),cs=es.map(e=>e.c).filter(decided),c2=es.map(e=>e.c2).filter(decided);
+ const pair=es.filter(e=>decided(e.c)&&decided(e.c2));
+ const opportunity=es.filter(e=>decided(e.c)&&(decided(e.c2)||e.c2?.outcome==='SKIP'));
+ const first=es.filter(e=>e.is_first_signal),pairFirst=first.filter(e=>decided(e.c)&&decided(e.c2));
+ const opportunityFirst=first.filter(e=>decided(e.c)&&(decided(e.c2)||e.c2?.outcome==='SKIP'));
+ const cTotal=aggregate(cs),c2Total=aggregate(c2);
+ const pass=es.filter(e=>e.c2_check?.status==='PASS').length;
+ const skipped=es.filter(e=>e.c2?.outcome==='SKIP').length;
+ const unknownC2=es.filter(e=>e.c2?.outcome==='UNKNOWN').length;
+ $('summary').innerHTML=card('원본 C 신호',es.length+'건')+card('기존 C 판정 거래',cTotal.n+'건')+card('C2 확인봉 통과',pass+'건')+card('C2 판정 거래',c2Total.n+'건')+card('C2 진입 안 함',skipped+'건')+card('C2 미판정',unknownC2+'건')+card('C2 순승률',numPct(c2Total.win))+card('C2 거래당 평균 순손익',numPct(c2Total.avg));
+ $('allTable').innerHTML=table([['기존 C · 전체 판정',cs],['C2 · 실제 판정된 진입',c2]]);
+ $('pairTable').innerHTML='<p class="hint">같은 C 신호 '+pair.length+'건: 두 전략 모두 손익 판정이 끝난 거래만 비교합니다.</p>'+table([['기존 C · 동일 신호',pair.map(e=>e.c)],['C2 · 동일 신호',pair.map(e=>e.c2)]]);
+ function opportunityMetrics(data){const n=data.length,c=aggregate(data.map(e=>e.c)),c2Dec=aggregate(data.map(e=>e.c2));const skips=data.filter(e=>e.c2?.outcome==='SKIP').length;const c2Net=data.reduce((s,e)=>s+(decided(e.c2)?e.c2.net_pct:0),0);
+  return {n,skips,cAvg:n?c.net/n:null,c2Avg:n?c2Net/n:null,c2Entered:c2Dec.n};}
+ const o=opportunityMetrics(opportunity),of=opportunityMetrics(opportunityFirst);
+ function opportunityHTML(title,s){return `<p class="hint">${escapeHtml(title)} · 공통 판정 가능 원본 C 신호 ${s.n}건 · C2 실제 진입 ${s.c2Entered}건 · C2 미진입 ${s.skips}건</p><table><thead><tr><th>방식</th><th>원본 신호 수</th><th>원본 신호당 평균 순손익</th></tr></thead><tbody><tr><td>C · 모두 진입</td><td>${s.n}</td><td>${numPct(s.cAvg)}</td></tr><tr><td>C2 · 보류는 0%</td><td>${s.n}</td><td>${numPct(s.c2Avg)}</td></tr></tbody></table>`;}
+ $('opportunityTable').innerHTML=opportunityHTML('모든 신호',o);
+ $('firstTable').innerHTML='<p class="hint">코인별 진짜 첫 신호 '+first.length+'건. 이 가운데 모두 판정된 C2 진입 '+pairFirst.length+'건.</p>'+table([['C · C2 진입한 첫 신호만',pairFirst.map(e=>e.c)],['C2 · 같은 첫 신호만',pairFirst.map(e=>e.c2)]])+opportunityHTML('첫 신호 · 보류 포함',of);
+ const reasonMap=new Map();for(const e of es){const k=e.c2_check?.reason||'확인 실패';reasonMap.set(k,(reasonMap.get(k)||0)+1);}const parts=[...reasonMap.entries()].sort((a,b)=>b[1]-a[1]);
+ $('reasons').innerHTML=parts.map(([name,n])=>card(name,n+'건')).join('')||'신호 없음';
+ const markets=results.filter(x=>x.signals>0).sort((a,b)=>a.market.localeCompare(b.market));
+ $('byMarket').innerHTML=markets.length?'<table><thead><tr><th>코인</th><th>C 신호</th><th>C 판정</th><th>C2 통과</th><th>C2 판정</th><th>C2 보류</th></tr></thead><tbody>'+markets.map(x=>{const c=x.events.filter(e=>decided(e.c)).length,c2=x.events.filter(e=>decided(e.c2)).length,ok=x.events.filter(e=>e.c2_check?.status==='PASS').length;return `<tr><td>${escapeHtml(x.market)}</td><td>${x.signals}</td><td>${c}</td><td>${ok}</td><td>${c2}</td><td>${x.events.filter(e=>e.c2?.outcome==='SKIP').length}</td></tr>`;}).join('')+'</tbody></table>':'C 신호 없음';
+}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0;
+ $('progress').max=total||1;$('progress').value=n;
+ const signals=a.reduce((s,x)=>s+x.signals,0);
+ $('coverage').innerHTML=card('조회된 코인',`${n}/${total}`)+card('분석 가능 코인',a.filter(x=>x.valid_windows>0).length+'개')+card('C 신호',signals+'건')+card('240봉 이상',a.filter(x=>x.observed_5m>=240).length+'개')+card('120~239봉',a.filter(x=>x.observed_5m>=120&&x.observed_5m<240).length+'개')+card('0~119봉',a.filter(x=>x.observed_5m<120).length+'개')+card('과거 페이지 상한',a.filter(x=>x.truncated).length+'개');
+ const outputs=['summary','allTable','pairTable','opportunityTable','firstTable','reasons','byMarket'];
+ if(complete){renderComparisons(a);$('csv').disabled=false;}else{for(const id of outputs)$(id).textContent='전체 KRW 검사가 완료되면 공개됩니다.';$('csv').disabled=true;}
+ if(state){$('status').textContent=(complete?'✅ 전체 검사 완료':'⏳ 검사 진행 중')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 일부 배치 실패, 이어하기 필요':'')+(complete?'\nC2는 연구용 과거 시뮬레이션이며 실전 승률이 아닙니다.':'\n검사 완료 전 부분적인 승률을 표시하지 않습니다.');}else $('status').textContent='검사 전 · 전체 시장 승률 없음';
+}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal});const v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid)}}
+async function initSession(cfg){const v=await req('/api/winrate14c2/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 목록이 비었습니다');state={version:7,config:cfg,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let cfg;try{cfg=cfgOf()}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(cfg)){if(!confirm('설정/날짜가 달라졌습니다. 이전 C2 진행 기록을 지우고 새로 시작할까요?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(cfg);state.failed=0;save();paint();let pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m));
+  const batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+  async function worker(){while(!stopRequested&&!hardFailure){const b=batches[pos++];if(!b)break;let response=null;
+   for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{const v=await req('/api/winrate14c2/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:b})});
+     if(v.errors||v.scanned!==b.length||!Array.isArray(v.results)||v.results.length!==b.length||v.results.some(x=>!b.includes(x.market)||!Array.isArray(x.events)||x.events.length!==x.signals||x.events.some(e=>!e.c||!e.c2||!e.c2_check)))throw Error('불완전한 배치 응답');
+     response=v;break;}catch(e){if(attempt===2){fail++;$('status').textContent=`⚠️ ${b.join(', ')} 조회 실패: ${String(e.message||e)}. 다시 이어하기를 눌러 재검사할 수 있습니다.`;}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+   if(response){for(const x of response.results)state.results[x.market]=x;try{save()}catch{hardFailure=true;$('status').textContent='⚠️ 브라우저 저장공간 부족 · 진행 기록을 저장할 수 없습니다.';break;}paint();}
+   if(fail>=4){hardFailure=true;break;}
+  }}
+  await Promise.all([worker(),worker()]);state.failed=fail;try{save()}catch{}paint();
+  if(stopRequested&&!hardFailure)$('status').textContent+='\n일시 중지했습니다. 다시 누르면 남은 코인을 검사합니다.';
+  if(fail)$('status').textContent+=`\n실패 배치 ${fail}개 · 다음 실행에서 누락 코인을 재조회합니다.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 일부 성적을 전체 결과로 표시하지 않습니다.';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}
+}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;$('status').textContent+='\n진행 중인 요청이 끝나면 일시 중지합니다.';};
+$('reset').onclick=()=>{if(running)return;if(!confirm('현재 V11.14.7 C2 진행 기록만 삭제할까요?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','day_5m','c_signals','original_signal_time_kst','original_c_entry_time','c2_confirmation_time','c2_entry_time','first_c_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','c2_check_status','c2_check_reason','c2_outcome','c2_reason','c2_entry','c2_exit','c2_minutes','c2_net_pct','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const lines=[cols.join(',')];const prefix=['V11.14.7',state.config.date,state.config.tp,state.config.sl,state.config.horizon,state.config.fee,state.config.slip];
+ function append(row){if(row.length!==cols.length-prefix.length)throw Error('CSV 열 개수 오류');lines.push([...prefix,...row].map(csvCell).join(','));}
+ for(const x of sampleResults()){if(!x.signals){const r=Array(cols.length-prefix.length).fill('');r[0]=x.market;r[1]=x.observed_5m;r[2]=0;append(r);continue;}
+  if(!Array.isArray(x.events)||x.events.length!==x.signals){$('status').textContent='⚠️ C 신호 내역이 일부 누락되었습니다. 재검사하세요.';return;}
+  for(const e of x.events){const c=e.c||{},c2=e.c2||{},ck=e.c2_check||{},f=e.features||{};
+   append([x.market,x.observed_5m,x.signals,e.signal_time_kst,e.c_entry_time_kst,e.c2_confirm_time_kst,e.c2_entry_time_kst,e.is_first_signal?1:0,c.outcome,c.reason,c.entry,c.exit,c.minutes,c.net_pct,ck.status,ck.reason,c2.outcome,c2.reason,c2.entry,c2.exit,c2.minutes,c2.net_pct,f.volume_ratio,f.body_pct,f.pullback_depth_pct]);}
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_vs_C2_${state.config.date}_v11147.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+</script></body></html>"""
+
+
+def register_c2_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets() if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:
+                    raise ValueError('현재 빗썸 KRW 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-c2')
+    def c2_page_v11147():
+        return render_template_string(C2_PAGE)
+
+    @app.get('/api/winrate14c2/universe')
+    def c2_universe_v11147():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings','rule_version':'V11.14.7'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14c2/evaluate')
+    def c2_evaluate_v11147():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            allowed=set(listed())
+            if any(m not in allowed for m in markets):
+                raise ValueError('현재 빗썸 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks={pool.submit(c2_evaluate_symbol,api_get,m,cfg,kst):m for m in markets}
+                for future in as_completed(tasks):
+                    try:results.append(future.result())
+                    except Exception as e:errors.append({'market':tasks[future],'error':str(e)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.7'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11146_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11146_register_daytrade_review(app,deps)
+    register_c2_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.8: Independent Bollinger(20,2) entry-time-only C filter study.
+# Leaves ALL existing endpoints, C signals, cooldown, and execution untouched.
+# Hypotheses are locked BEFORE results; no after-the-fact threshold tuning.
+# ---------------------------------------------------------------------------
+
+
+def bb_v11148_snapshot(rows, i):
+    """20 closes ending at confirmed C signal i + 20 preceding closes.
+
+    Uses only 21 consecutive COMPLETED 5M candles <= i. Population SD,
+    SMA(20), upper/lower = SMA +/- 2*SD. No extra confirmation bar.
+    """
+    if i < 20 or not lab_contiguous(rows, i-20, i):
+        return {'eligible':False, 'reason':'연속 21개 확정 5분봉 부족'}
+    closes=[float(r['c']) for r in rows[i-20:i+1]]
+    prev_mid=sum(closes[:20])/20
+    mid=sum(closes[1:])/20
+    variance=sum((x-mid)**2 for x in closes[1:])/20
+    stdev=variance**0.5
+    upper=mid+2*stdev
+    lower=mid-2*stdev
+    price=closes[-1]
+    headroom=(upper/price-1)*100
+    bandwidth=(upper-lower)/mid*100 if mid>0 else 0.0
+    pct_b=(price-lower)/(upper-lower) if upper>lower else None
+    above_mid=price>mid
+    rising_mid=mid>prev_mid
+    # Frozen hypotheses: A = trend, B = no upper-band chase.
+    a=bool(above_mid and rising_mid)
+    b=bool(above_mid and headroom>=0.50)
+    return {'eligible':True, 'reason':None, 'middle':round(mid,10),
+            'upper':round(upper,10), 'lower':round(lower,10),
+            'middle_prev':round(prev_mid,10), 'headroom_pct':round(headroom,5),
+            'bandwidth_pct':round(bandwidth,5),
+            'percent_b':round(pct_b,5) if pct_b is not None else None,
+            'trend_pass':a, 'headroom_pass':b, 'both_pass':a and b}
+
+
+def bb_v11148_evaluate_symbol(api_get,market,cfg,kst):
+    """Same fetch, C universe, cooldown, and C outcomes as V11.14.7."""
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_bars=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:
+                continue
+            if not lab_contiguous(rows,i-24,i):
+                continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):
+                continue
+            cooldown=i+n
+            signals+=1
+            c=lab_outcome_v11145(rows,i,cfg)
+            if c['outcome']=='UNKNOWN':unknown+=1
+            events.append({
+                'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+                'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                'is_first_signal':signals==1,
+                'c':c,
+                'bb':bb_v11148_snapshot(rows,i),
+                'features':lab_c_signal_features(rows,i),
+            })
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_bars),
+            'longest_day_run':lab_longest_consecutive_5m(day_bars),
+            'valid_windows':valid,'signals':signals,'unknown':unknown,
+            'truncated':truncated,'events':events}
+
+
+BB_V11148_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.8 · 볼린저밴드 C 필터 연구실</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.8 · C + 볼린저밴드 비교</h1>
+<p class="muted">과거 모의 연구 전용 · V2 실전 BUY / V11.13 / C / C2 / RSI·MACD 검증실은 변경하지 않습니다.</p>
+<section class="panel"><h2>미리 고정한 비교 조건</h2>
+<div class="note">기존 C 신호, 재진입 대기 시간, <b>다음 5분봉 시가 진입</b>, 익절·손절·비용은 모두 동일합니다. 필터가 거르는 신호는 진입하지 않고 <b>0% 손익</b>으로 계산합니다.<br>
+<b>볼린저밴드:</b> 확정된 5분봉 종가 20개, SMA20 ± 2×표준편차(모집단), 신호봉까지의 자료만 사용.<br>
+<b>A · 추세:</b> 신호 종가가 중심선 위이고, 중심선이 직전 봉보다 상승.<br>
+<b>B · 상단 여유:</b> 신호 종가가 중심선 위이고, 상단 밴드까지 상승 여유가 신호 종가 기준 <b>0.50% 이상</b>.<br>
+<b>A+B:</b> 두 조건 모두 충족.<br>
+이 수치는 실전 최적값이 아닌 <b>사전 가설</b>입니다. 신호 발생 이후 가격을 필터에 사용하지 않습니다.</div></section>
+<section class="panel"><h2>검증 조건</h2>
+<div class="controls">
+<label class="field">과거 날짜 (KST)<input id="date" type="date" value="2026-11-01"></label>
+<label class="field">익절 목표 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 기준 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" step="0.01" value="0.04" min="0" max="0.5"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" step="0.01" value="0.05" min="0" max="0.5"></label>
+</div>
+<div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.8 기록 초기화</button><button id="csv" class="secondary" disabled>전체 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">전체 검사 완료 전에는 비교 결과를 공개하지 않습니다. 같은 브라우저에서 중단 후 이어 할 수 있습니다. 검증에 현재 상장 중인 KRW 종목 목록을 사용하므로 생존자 편향이 있습니다.</p>
+</section>
+<section class="panel"><h2>데이터 완성도</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>전체 신호 · 공정 비교</h2><div id="summary" class="stats">검사 완료 후 표시</div>
+<p class="hint">원본 C 전체 판정 결과와 지표 계산 가능한 공통 표본을 구분합니다. 같은 신호에서 필터가 제외한 거래를 0%로 처리한 원본 신호당 평균 손익도 보여줍니다.</p><div id="results" class="scroll">검사 완료 후 표시</div></section>
+<section class="panel"><h2>코인별 첫 신호만</h2><div id="first" class="scroll">검사 완료 후 표시</div>
+<p class="hint">한 코인에서 여러 번 발생한 신호의 영향도 확인합니다. 평균 수익률은 실제 포트폴리오 성적이 아닙니다.</p></section>
+<section class="panel"><h2>주의사항</h2><p class="hint">수수료·슬리피지 설정을 차감합니다. 동일 봉에서 익절/손절 모두 닿으면 손절 우선, 손절 갭은 불리한 체결을 반영합니다. 11월 1~3일 자료로 규칙을 고르는 경우 이 날짜의 결과를 독립 검증으로 사용하면 안 됩니다. 실제 주문 기능은 없습니다.</p>
+<a href="/backtest-winrate-c2">V11.14.7 C vs C2 검증실</a> · <a href="/backtest-winrate-c-validated">V11.14.5 기존 C 검증실</a></section>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id),KEY='bithumb_v11148_bb_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+const fields=['date','tp','sl','horizon','fee','slip'];
+function cfgOf(){const c={};for(const k of fields)c[k]=$(k).value;if(!/^20\d{2}-\d{2}-\d{2}$/.test(c.date))throw Error('날짜를 선택하세요');for(const k of fields.slice(1)){if(!Number.isFinite(Number(c[k])))throw Error('설정 값 오류: '+k);}return c;}
+function signature(c){return fields.map(k=>String(c[k])).join('|')}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?.version===8&&Array.isArray(x.markets)&&x.config&&x.results?x:null;}catch{return null;}}
+function setConfig(c){for(const k of fields)$(k).value=c[k];}
+function sampleResults(){return state?state.markets.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x)).map(x=>state.results[x]):[];}
+function card(k,v){return `<div class="stat"><small>${esc(k)}</small><strong>${esc(v)}</strong></div>`;}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmt(x){return Number.isFinite(x)?x.toFixed(3)+'%':'—';}
+function decided(e){return e?.c&&['TP','SL','TIME'].includes(e.c.outcome)&&Number.isFinite(e.c.net_pct)}
+function stat(es){const n=es.length,sum=es.reduce((s,e)=>s+e.c.net_pct,0);return{n,wins:es.filter(e=>e.c.net_pct>0).length,tp:es.filter(e=>e.c.outcome==='TP').length,sl:es.filter(e=>e.c.outcome==='SL').length,tm:es.filter(e=>e.c.outcome==='TIME').length,sum,avg:n?sum/n:NaN,win:n?100*es.filter(e=>e.c.net_pct>0).length/n:NaN};}
+function table(es){const cols=[['기존 C · 공통 표본',()=>true],['C + A · 중심선 상승',e=>e.bb.trend_pass===true],['C + B · 상단 여유',e=>e.bb.headroom_pass===true],['C + A+B',e=>e.bb.both_pass===true]];
+ const header='<table><thead><tr><th>방식</th><th>진입</th><th>익절/손절/시간</th><th>순승률</th><th>거래당 평균</th><th>원본 신호당 평균 (보류=0%)</th><th>보류 건수</th><th>보류한 수익거래</th></tr></thead><tbody>';
+ return header+cols.map(([name,test])=>{const kept=es.filter(test),removed=es.filter(e=>!test(e)),s=stat(kept);return `<tr><td>${esc(name)}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${fmt(s.win)}</td><td>${fmt(s.avg)}</td><td>${fmt(es.length?s.sum/es.length:NaN)}</td><td>${removed.length}</td><td>${removed.filter(e=>e.c.net_pct>0).length}</td></tr>`;}).join('')+'</tbody></table>';
+}
+function renderResults(a){const events=a.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market}))),base=events.filter(decided),eligible=base.filter(e=>e.bb?.eligible===true),first=eligible.filter(e=>e.is_first_signal),all=stat(base),common=stat(eligible);
+ $('summary').innerHTML=card('전체 C 발생',events.length+'건')+card('전체 C 판정',all.n+'건')+card('전체 C 평균 순손익',fmt(all.avg))+card('볼린저 계산 가능 · 판정',eligible.length+'건')+card('볼린저 계산 불가 · 판정',base.length-eligible.length+'건')+card('볼린저 공통표본 평균',fmt(common.avg));
+ $('results').innerHTML='<p class="hint">같은 원본 C 신호 '+eligible.length+'건을 대상으로 비교. 계산 불가 및 미판정은 이 표에서 제외.</p>'+table(eligible);
+ $('first').innerHTML='<p class="hint">코인별 첫 원본 C 신호 중 지표 계산 가능 + 손익 판정된 '+first.length+'건</p>'+table(first);
+}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0,signals=a.reduce((s,r)=>s+r.signals,0);
+ $('progress').max=total||1;$('progress').value=n;
+ $('coverage').innerHTML=card('조회 종목',`${n}/${total}`)+card('분석 가능 종목',a.filter(x=>x.valid_windows>0).length+'개')+card('C 신호',signals+'건')+card('데이터 240봉 이상',a.filter(x=>x.observed_5m>=240).length+'개')+card('과거 페이지 상한',a.filter(x=>x.truncated).length+'개');
+ if(complete){renderResults(a);$('csv').disabled=false;}else{$('summary').textContent='전체 KRW 검사 완료 후 표시';$('results').textContent='전체 KRW 검사 완료 후 표시';$('first').textContent='전체 KRW 검사 완료 후 표시';$('csv').disabled=true;}
+ $('status').textContent=state?(complete?'✅ 전체 검사 완료':'⏳ 진행/중단 상태')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 일부 요청 실패, 이어하기 필요':''):'검사 전 · 전체 시장 결과 없음';
+}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid)}}
+async function initSession(c){const v=await req('/api/winrate14bb/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 종목 목록이 없습니다');state={version:8,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=cfgOf()}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(c)){if(!confirm('날짜나 설정이 바뀌었습니다. V11.14.8의 이전 진행 기록만 지우고 시작할까요?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(c);state.failed=0;save();paint();let pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m));const batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+  async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+   for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{let r=await req('/api/winrate14bb/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});
+    if(r.errors||r.scanned!==batch.length||!Array.isArray(r.results)||r.results.length!==batch.length||r.results.some(x=>!batch.includes(x.market)||!Array.isArray(x.events)||x.events.length!==x.signals||x.events.some(e=>!e.c||!e.bb)))throw Error('불완전한 검사 결과');
+    response=r;break;}catch(e){if(attempt===2){fail++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패: '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+   if(response){for(const x of response.results)state.results[x.market]=x;try{save()}catch(e){hardFailure=true;$('status').textContent='⚠️ 브라우저 저장 공간 부족';break;}paint();}
+   if(fail>=4){hardFailure=true;break;}
+  }}
+  await Promise.all([worker(),worker()]);state.failed=fail;try{save()}catch{}paint();
+  if(stopRequested)$('status').textContent+='\n일시 중지했습니다. 다시 누르면 남은 종목부터 검사합니다.';
+  if(fail)$('status').textContent+=`\n실패한 묶음 ${fail}개 · 다시 실행하면 누락된 종목을 재검사합니다.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 부분 결과를 승률로 공개하지 않습니다.';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}
+}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;$('status').textContent+='\n진행 중 요청이 끝나면 중지합니다.';};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.8 볼린저 검증 기록만 초기화할까요?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','c_signals','original_signal_time_kst','c_entry_time_kst','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','bb_eligible','bb_reason','bb_middle','bb_upper','bb_lower','bb_middle_prev','bb_headroom_pct','bb_bandwidth_pct','bb_percent_b','bb_trend_pass','bb_headroom_pass','bb_both_pass','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const rows=[cols.map(csvCell).join(',')];const prefix={version:'V11.14.8',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(obj){rows.push(cols.map(k=>csvCell(obj[k])).join(','));}
+ for(const r of sampleResults()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:0});continue;}
+  if(!Array.isArray(r.events)||r.events.length!==r.signals){$('status').textContent='⚠️ CSV에 필요한 이벤트 누락';return;}
+  for(const e of r.events){const c=e.c||{},b=e.bb||{},f=e.features||{};append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:r.signals,original_signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,bb_eligible:b.eligible?1:0,bb_reason:b.reason,bb_middle:b.middle,bb_upper:b.upper,bb_lower:b.lower,bb_middle_prev:b.middle_prev,bb_headroom_pct:b.headroom_pct,bb_bandwidth_pct:b.bandwidth_pct,bb_percent_b:b.percent_b,bb_trend_pass:b.eligible?(b.trend_pass?1:0):'',bb_headroom_pass:b.eligible?(b.headroom_pass?1:0):'',bb_both_pass:b.eligible?(b.both_pass?1:0):'',original_volume_ratio:f.volume_ratio,original_body_pct:f.body_pct,original_pullback_pct:f.pullback_depth_pct});}
+ }
+ const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_BB_${state.config.date}_v11148.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+</script></body></html>"""
+
+
+def register_bb_v11148_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets() if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:
+                    raise ValueError('현재 빗썸 KRW 종목 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-bb')
+    def bb_page_v11148():
+        return render_template_string(BB_V11148_PAGE)
+
+    @app.get('/api/winrate14bb/universe')
+    def bb_universe_v11148():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings','rule_version':'V11.14.8'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14bb/evaluate')
+    def bb_evaluate_v11148():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            if any(m not in set(listed()) for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks={pool.submit(bb_v11148_evaluate_symbol,api_get,m,cfg,kst):m for m in markets}
+                for future in as_completed(tasks):
+                    try:results.append(future.result())
+                    except Exception as e:errors.append({'market':tasks[future],'error':str(e)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.8'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11147_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11147_register_daytrade_review(app,deps)
+    register_bb_v11148_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.9: C + Ichimoku 9/26/52 filter study (READ-ONLY separate route).
+# Existing V2, C, C2, Bollinger and older endpoints are not changed.
+# Signals, C cooldown, entry opening, costs & exits remain identical.
+# Future-leakage prevention: cloud plotted AT i uses spans COMPUTED at i-26.
+# ---------------------------------------------------------------------------
+
+def ich_v11149_fetch_5m(api_get, market, cfg, kst):
+    """Only for V11.14.9: fetch >= 8h history for unshifted 78-bar Ichimoku.
+
+    Same data and outcome semantics as the historic C labs, but extended prehistory.
+    No fabricated bars; no lookahead. Older labs keep their original fetch logic.
+    """
+    begin = datetime.combine(cfg["day"], _time.min, tzinfo=kst) - timedelta(hours=8)
+    end = datetime.combine(cfg["day"] + timedelta(days=1), _time.min, tzinfo=kst) + timedelta(hours=2, minutes=5)
+    cursor = end
+    observed = {}
+    truncated = True
+    for _ in range(LAB_MAX_PAGES):
+        raw = api_get("/v1/candles/minutes/5", {
+            "market": market, "count": 200,
+            "to": cursor.strftime("%Y-%m-%d %H:%M:%S")})
+        if not isinstance(raw, list):
+            raise ValueError("과거 5분봉 API 응답 오류")
+        oldest = None
+        for bar in raw:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                ts = local_time(bar["candle_date_time_kst"], kst)
+                op, hi, lo, cl = (float(bar[k]) for k in
+                                  ("opening_price", "high_price", "low_price", "trade_price"))
+                vol = float(bar["candle_acc_trade_volume"])
+                if not (all(isfinite(x) and x > 0 for x in (op, hi, lo, cl))
+                        and isfinite(vol) and vol >= 0
+                        and lo <= min(op, cl) and hi >= max(op, cl) and lo <= hi):
+                    continue
+                if oldest is None or ts < oldest:
+                    oldest = ts
+                if begin <= ts < end:
+                    observed[ts] = {"t": ts, "o": op, "h": hi, "l": lo, "c": cl, "v": vol}
+            except (TypeError, ValueError, KeyError, OverflowError):
+                continue
+        if oldest is None:
+            truncated = False
+            break
+        if oldest <= begin or len(raw) < 200:
+            truncated = False
+            break
+        # Exclusive pagination; do not skip the oldest bar or repeat a page.
+        if oldest >= cursor:
+            raise ValueError("과거 봉 페이지가 전진하지 않습니다")
+        cursor = oldest
+    return [observed[t] for t in sorted(observed)], truncated
+
+
+
+def ich_v11149_midpoint(rows, end, length):
+    """Donchian midpoint of observed HIGH/LOW over length bars ending at end."""
+    subset=rows[end-length+1:end+1]
+    return (max(r['h'] for r in subset)+min(r['l'] for r in subset))/2.0
+
+
+def ich_v11149_snapshot(rows, i):
+    """All values are known when C signal candle i CLOSES.
+
+    Tenkan 9, Kijun 26 (at i).
+    Senkou A/B *appearing* under the price at i are the values computed at
+    i-26, 26 bars BEFORE signal candle i. 52-bar Span B at i-26 requires
+    earliest i-77; require all 78 bars contiguous. Never read after i.
+    This is the historically plotted cloud, not tomorrow's forward cloud.
+    """
+    if i < 77 or not lab_contiguous(rows, i-77, i):
+        return {'eligible':False, 'reason':'일목 78개 연속 확정 5분봉 부족'}
+    tenkan=ich_v11149_midpoint(rows,i,9)
+    kijun=ich_v11149_midpoint(rows,i,26)
+    anchor=i-26
+    tenkan_anchor=ich_v11149_midpoint(rows,anchor,9)
+    kijun_anchor=ich_v11149_midpoint(rows,anchor,26)
+    senkou_a=(tenkan_anchor+kijun_anchor)/2
+    senkou_b=ich_v11149_midpoint(rows,anchor,52)
+    top=max(senkou_a,senkou_b)
+    bottom=min(senkou_a,senkou_b)
+    price=rows[i]['c']
+    above_cloud=price>top
+    line_pass=tenkan>kijun
+    thickness_pct=(top-bottom)/bottom*100 if bottom>0 else None
+    gap_pct=(price/top-1)*100 if top>0 else None
+    return {'eligible':True,'reason':None,'tenkan':round(tenkan,10),
+            'kijun':round(kijun,10),'senkou_a_now':round(senkou_a,10),
+            'senkou_b_now':round(senkou_b,10),'cloud_top':round(top,10),
+            'cloud_bottom':round(bottom,10),'price_gap_pct':round(gap_pct,5) if gap_pct is not None else None,
+            'cloud_thickness_pct':round(thickness_pct,5) if thickness_pct is not None else None,
+            'cloud_pass':bool(above_cloud),'line_pass':bool(line_pass),
+            'both_pass':bool(above_cloud and line_pass)}
+
+
+def ich_v11149_evaluate_symbol(api_get,market,cfg,kst):
+    """Replays exactly the same C events as V11.14.8; never delays entry."""
+    rows,truncated=ich_v11149_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_bars=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:
+                continue
+            if not lab_contiguous(rows,i-24,i):
+                continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):
+                continue
+            cooldown=i+n
+            signals+=1
+            c=lab_outcome_v11145(rows,i,cfg)
+            if c['outcome']=='UNKNOWN':unknown+=1
+            events.append({
+                'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+                'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                'is_first_signal':signals==1,
+                'c':c,
+                'ich':ich_v11149_snapshot(rows,i),
+                'features':lab_c_signal_features(rows,i),
+            })
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_bars),
+            'longest_day_run':lab_longest_consecutive_5m(day_bars),
+            'valid_windows':valid,'signals':signals,'unknown':unknown,
+            'truncated':truncated,'events':events}
+
+
+ICH_V11149_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.9 · 일목균형표 C 필터 연구실</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.9 · C + 일목균형표 비교</h1>
+<p class="muted">과거 모의 연구 전용 · V2 실전 BUY / V11.13 / C / C2 / RSI·MACD 검증실은 변경하지 않습니다.</p>
+<section class="panel"><h2>미리 고정한 비교 조건</h2>
+<div class="note">기존 C 신호, 재진입 대기, <b>다음 5분봉 시가 진입</b>, 익절·손절·비용은 동일합니다. 필터가 제외한 신호는 진입하지 않아 <b>0% 손익</b>으로 비교합니다.<br>
+<b>일목균형표:</b> 5분봉 기준 전환선(9), 기준선(26), 선행스팬(9·26·52, 26봉 이동)을 사용합니다. 지표 계산에는 신호 확정 시점까지의 5분봉만 사용합니다.<br>
+<b>A · 구름대 위:</b> C 신호봉 <b>종가 &gt; 현재 시점에 표시되는 구름대 상단</b>.<br>
+<b>B · 전환선 우위:</b> C 신호봉 마감 시점의 <b>전환선(9) &gt; 기준선(26)</b>.<br>
+<b>A+B:</b> 두 조건 모두 충족.<br>
+<b>중요:</b> 시점 i의 구름대는 i-26봉에 계산된 선행스팬을 사용합니다. 미래 26봉을 읽지 않습니다. 후행스팬은 이번 가설에서 사용하지 않습니다.<br>
+이는 실전 최적값이 아닌 사전 정의한 가설입니다. 이 연구실은 <b>주문을 실행하지 않습니다.</b></div></section>
+<section class="panel"><h2>검증 조건</h2>
+<div class="controls">
+<label class="field">과거 날짜 (KST)<input id="date" type="date" value="2026-11-01"></label>
+<label class="field">익절 목표 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 기준 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" step="0.01" value="0.04" min="0" max="0.5"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" step="0.01" value="0.05" min="0" max="0.5"></label>
+</div>
+<div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.9 기록 초기화</button><button id="csv" class="secondary" disabled>전체 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">전체 검사 완료 전에는 비교 결과를 공개하지 않습니다. 같은 브라우저에서 중단 후 이어 할 수 있습니다. 검증에 현재 상장 중인 KRW 종목 목록을 사용하므로 생존자 편향이 있습니다. 데이터 공백 시 일목 계산 불가 신호는 별도 집계합니다.</p>
+</section>
+<section class="panel"><h2>데이터 완성도</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>전체 신호 · 공정 비교</h2><div id="summary" class="stats">검사 완료 후 표시</div>
+<p class="hint">원본 C 전체 판정 결과와 지표 계산 가능한 공통 표본을 구분합니다. 같은 신호에서 필터가 제외한 거래를 0%로 처리한 원본 신호당 평균 손익도 보여줍니다.</p><div id="results" class="scroll">검사 완료 후 표시</div></section>
+<section class="panel"><h2>코인별 첫 신호만</h2><div id="first" class="scroll">검사 완료 후 표시</div>
+<p class="hint">한 코인에서 여러 번 발생한 신호의 영향도 확인합니다. 평균 수익률은 실제 포트폴리오 성적이 아닙니다.</p></section>
+<section class="panel"><h2>주의사항</h2><p class="hint">수수료·슬리피지 설정을 차감합니다. 동일 봉에서 익절/손절 모두 닿으면 손절 우선, 손절 갭은 불리한 체결을 반영합니다. 11월 1~3일 자료로 규칙을 고르는 경우 이 날짜의 결과를 독립 검증으로 사용하면 안 됩니다. 실제 주문 기능은 없습니다.</p>
+<a href="/backtest-winrate-c2">V11.14.7 C vs C2 검증실</a> · <a href="/backtest-winrate-c-validated">V11.14.5 기존 C 검증실</a></section>
+</main><script>
+
+'use strict';
+const $=id=>document.getElementById(id),KEY='bithumb_v11149_ich_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+const fields=['date','tp','sl','horizon','fee','slip'];
+function cfgOf(){const c={};for(const k of fields)c[k]=$(k).value;if(!/^20\d{2}-\d{2}-\d{2}$/.test(c.date))throw Error('날짜를 선택하세요');for(const k of fields.slice(1)){if(!Number.isFinite(Number(c[k])))throw Error('설정 값 오류: '+k);}return c;}
+function signature(c){return fields.map(k=>String(c[k])).join('|')}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?.version===9&&Array.isArray(x.markets)&&x.config&&x.results?x:null;}catch{return null;}}
+function setConfig(c){for(const k of fields)$(k).value=c[k];}
+function sampleResults(){return state?state.markets.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x)).map(x=>state.results[x]):[];}
+function card(k,v){return `<div class="stat"><small>${esc(k)}</small><strong>${esc(v)}</strong></div>`;}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmt(x){return Number.isFinite(x)?x.toFixed(3)+'%':'—';}
+function decided(e){return e?.c&&['TP','SL','TIME'].includes(e.c.outcome)&&Number.isFinite(e.c.net_pct)}
+function stat(es){const n=es.length,sum=es.reduce((s,e)=>s+e.c.net_pct,0);return{n,wins:es.filter(e=>e.c.net_pct>0).length,tp:es.filter(e=>e.c.outcome==='TP').length,sl:es.filter(e=>e.c.outcome==='SL').length,tm:es.filter(e=>e.c.outcome==='TIME').length,sum,avg:n?sum/n:NaN,win:n?100*es.filter(e=>e.c.net_pct>0).length/n:NaN};}
+function table(es){const cols=[['기존 C · 공통 표본',()=>true],['C + A · 구름대 위',e=>e.ich.cloud_pass===true],['C + B · 전환선 우위',e=>e.ich.line_pass===true],['C + A+B',e=>e.ich.both_pass===true]];
+ const header='<table><thead><tr><th>방식</th><th>진입</th><th>익절/손절/시간</th><th>순승률</th><th>거래당 평균</th><th>원본 신호당 평균 (보류=0%)</th><th>보류 건수</th><th>보류한 수익거래</th></tr></thead><tbody>';
+ return header+cols.map(([name,test])=>{const kept=es.filter(test),removed=es.filter(e=>!test(e)),s=stat(kept);return `<tr><td>${esc(name)}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${fmt(s.win)}</td><td>${fmt(s.avg)}</td><td>${fmt(es.length?s.sum/es.length:NaN)}</td><td>${removed.length}</td><td>${removed.filter(e=>e.c.net_pct>0).length}</td></tr>`;}).join('')+'</tbody></table>';
+}
+function renderResults(a){const events=a.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market}))),base=events.filter(decided),eligible=base.filter(e=>e.ich?.eligible===true),first=eligible.filter(e=>e.is_first_signal),all=stat(base),common=stat(eligible);
+ $('summary').innerHTML=card('전체 C 발생',events.length+'건')+card('전체 C 판정',all.n+'건')+card('전체 C 평균 순손익',fmt(all.avg))+card('일목 계산 가능 · 판정',eligible.length+'건')+card('일목 계산 불가 · 판정',base.length-eligible.length+'건')+card('일목 공통표본 평균',fmt(common.avg));
+ $('results').innerHTML='<p class="hint">같은 원본 C 신호 '+eligible.length+'건을 대상으로 비교. 계산 불가 및 미판정은 이 표에서 제외.</p>'+table(eligible);
+ $('first').innerHTML='<p class="hint">코인별 첫 원본 C 신호 중 지표 계산 가능 + 손익 판정된 '+first.length+'건</p>'+table(first);
+}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0,signals=a.reduce((s,r)=>s+r.signals,0);
+ $('progress').max=total||1;$('progress').value=n;
+ $('coverage').innerHTML=card('조회 종목',`${n}/${total}`)+card('분석 가능 종목',a.filter(x=>x.valid_windows>0).length+'개')+card('C 신호',signals+'건')+card('데이터 240봉 이상',a.filter(x=>x.observed_5m>=240).length+'개')+card('과거 페이지 상한',a.filter(x=>x.truncated).length+'개');
+ if(complete){renderResults(a);$('csv').disabled=false;}else{$('summary').textContent='전체 KRW 검사 완료 후 표시';$('results').textContent='전체 KRW 검사 완료 후 표시';$('first').textContent='전체 KRW 검사 완료 후 표시';$('csv').disabled=true;}
+ $('status').textContent=state?(complete?'✅ 전체 검사 완료':'⏳ 진행/중단 상태')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 일부 요청 실패, 이어하기 필요':''):'검사 전 · 전체 시장 결과 없음';
+}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid)}}
+async function initSession(c){const v=await req('/api/winrate14ich/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 종목 목록이 없습니다');state={version:9,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=cfgOf()}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(c)){if(!confirm('날짜나 설정이 바뀌었습니다. V11.14.9의 이전 진행 기록만 지우고 시작할까요?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(c);state.failed=0;save();paint();let pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m));const batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+  async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+   for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{let r=await req('/api/winrate14ich/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});
+    if(r.errors||r.scanned!==batch.length||!Array.isArray(r.results)||r.results.length!==batch.length||r.results.some(x=>!batch.includes(x.market)||!Array.isArray(x.events)||x.events.length!==x.signals||x.events.some(e=>!e.c||!e.ich)))throw Error('불완전한 검사 결과');
+    response=r;break;}catch(e){if(attempt===2){fail++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패: '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+   if(response){for(const x of response.results)state.results[x.market]=x;try{save()}catch(e){hardFailure=true;$('status').textContent='⚠️ 브라우저 저장 공간 부족';break;}paint();}
+   if(fail>=4){hardFailure=true;break;}
+  }}
+  await Promise.all([worker(),worker()]);state.failed=fail;try{save()}catch{}paint();
+  if(stopRequested)$('status').textContent+='\n일시 중지했습니다. 다시 누르면 남은 종목부터 검사합니다.';
+  if(fail)$('status').textContent+=`\n실패한 묶음 ${fail}개 · 다시 실행하면 누락된 종목을 재검사합니다.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 부분 결과를 승률로 공개하지 않습니다.';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}
+}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;$('status').textContent+='\n진행 중 요청이 끝나면 중지합니다.';};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.9 일목 검증 기록만 초기화할까요?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','c_signals','original_signal_time_kst','c_entry_time_kst','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','ich_eligible','ich_reason','ich_tenkan','ich_kijun','ich_senkou_a_now','ich_senkou_b_now','ich_cloud_top','ich_cloud_bottom','ich_price_gap_pct','ich_cloud_thickness_pct','ich_cloud_pass','ich_line_pass','ich_both_pass','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const rows=[cols.map(csvCell).join(',')];const prefix={version:'V11.14.9',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(obj){rows.push(cols.map(k=>csvCell(obj[k])).join(','));}
+ for(const r of sampleResults()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:0});continue;}
+  if(!Array.isArray(r.events)||r.events.length!==r.signals){$('status').textContent='⚠️ CSV에 필요한 이벤트 누락';return;}
+  for(const e of r.events){const c=e.c||{},s=e.ich||{},f=e.features||{};append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:r.signals,original_signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,ich_eligible:s.eligible?1:0,ich_reason:s.reason,ich_tenkan:s.tenkan,ich_kijun:s.kijun,ich_senkou_a_now:s.senkou_a_now,ich_senkou_b_now:s.senkou_b_now,ich_cloud_top:s.cloud_top,ich_cloud_bottom:s.cloud_bottom,ich_price_gap_pct:s.price_gap_pct,ich_cloud_thickness_pct:s.cloud_thickness_pct,ich_cloud_pass:s.eligible?(s.cloud_pass?1:0):'',ich_line_pass:s.eligible?(s.line_pass?1:0):'',ich_both_pass:s.eligible?(s.both_pass?1:0):'',original_volume_ratio:f.volume_ratio,original_body_pct:f.body_pct,original_pullback_pct:f.pullback_depth_pct});}
+ }
+ const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_ICH_${state.config.date}_v11149.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+
+</script></body></html>"""
+
+
+def register_ich_v11149_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets() if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:
+                    raise ValueError('현재 빗썸 KRW 종목 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-ich')
+    def ich_page_v11149():
+        return render_template_string(ICH_V11149_PAGE)
+
+    @app.get('/api/winrate14ich/universe')
+    def ich_universe_v11149():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings','rule_version':'V11.14.9'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14ich/evaluate')
+    def ich_evaluate_v11149():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            allowed=set(listed())
+            if any(m not in allowed for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks={pool.submit(ich_v11149_evaluate_symbol,api_get,m,cfg,kst):m for m in markets}
+                for future in as_completed(tasks):
+                    try:results.append(future.result())
+                    except Exception as e:errors.append({'market':tasks[future],'error':str(e)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.9'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11148_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11148_register_daytrade_review(app,deps)
+    register_ich_v11149_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.10: Independent higher-timeframe MACD(12,26,9) C filter experiment.
+# Backward-only daily/weekly completed candles. No future candles, no edits to
+# V2, V11.13 BUY, C signal definitions, outcomes, or previous research labs.
+# All threshold choices are preregistered hypotheses, NOT tuned performance.
+# ---------------------------------------------------------------------------
+
+HTF_V111410_MIN_BARS = 60
+HTF_V111410_RULES = {
+    'day': {'period': timedelta(days=1), 'cross_window':3, 'near_gap_pct':0.12,
+            'api_path':'/v1/candles/days'},
+    'week': {'period': timedelta(days=7), 'cross_window':2, 'near_gap_pct':0.25,
+             'api_path':'/v1/candles/weeks'},
+}
+
+
+def htf_v111410_fetch(api_get, market, cfg, kst, timeframe):
+    """Fetch OHLC candle starts before target date end; later partial candles
+    may be returned but htf_v111410_snapshot excludes them at EVERY C event.
+    Bithumb's `to` is KST exclusive, 200 candles max. No pagination necessary
+    for 130-session MACD warmup in this experiment.
+    """
+    rule=HTF_V111410_RULES[timeframe]
+    day_end=datetime.combine(cfg['day']+timedelta(days=1),_time.min,tzinfo=kst)
+    raw=api_get(rule['api_path'], {'market':market,'count':130,
+             'to':day_end.strftime('%Y-%m-%d %H:%M:%S')})
+    if not isinstance(raw,list):
+        raise ValueError('상위 시간봉 API 응답 형식 오류: '+timeframe)
+    found={}
+    for bar in raw:
+        if not isinstance(bar,dict):continue
+        try:
+            ts=local_time(bar['candle_date_time_kst'],kst)
+            op,hi,lo,cl=(float(bar[k]) for k in
+                           ('opening_price','high_price','low_price','trade_price'))
+            if not (all(isfinite(x) and x>0 for x in (op,hi,lo,cl))
+                    and lo<=min(op,cl) and hi>=max(op,cl) and lo<=hi):
+                continue
+            if ts<day_end:
+                found[ts]={'t':ts,'c':cl}
+        except (KeyError,TypeError,ValueError,OverflowError):
+            continue
+    return [found[t] for t in sorted(found)]
+
+
+def htf_v111410_macd_histogram(closes):
+    """Proper SMA-seeded 12/26 EMA and 9 EMA signal; returns last 4
+    completed MACD/signal/hist values, or None when history is short.
+    """
+    if len(closes)<HTF_V111410_MIN_BARS:return None
+    alpha_f,alpha_s,alpha_g=2/13,2/27,2/10
+    ema_f=sum(closes[:12])/12
+    ema_s=sum(closes[:26])/26
+    diffs=[]
+    for idx,price in enumerate(closes):
+        if idx>=12:ema_f=alpha_f*price+(1-alpha_f)*ema_f
+        if idx>=26:ema_s=alpha_s*price+(1-alpha_s)*ema_s
+        if idx>=25:diffs.append(ema_f-ema_s)
+    if len(diffs)<12:return None
+    ema_g=sum(diffs[:9])/9
+    out=[]
+    for idx,macd in enumerate(diffs):
+        if idx>=9:ema_g=alpha_g*macd+(1-alpha_g)*ema_g
+        if idx>=8:out.append({'macd':macd,'signal':ema_g,'hist':macd-ema_g})
+    return out
+
+
+def htf_v111410_snapshot(raw, signal_close, timeframe):
+    """Never use an uncompleted day/week candle, even if API returns it.
+    signal_close is time the original 5-minute C candle is CONFIRMED.
+    Candles after that instant cannot enter the EMA or cross calculation.
+    """
+    rule=HTF_V111410_RULES[timeframe]
+    period=rule['period']
+    available=[x for x in raw if x['t']+period<=signal_close]
+    if not available:
+        return {'eligible':False,'reason':'확정된 '+('일봉' if timeframe=='day' else '주봉')+' 없음'}
+    # A missing most-recent completed candle is not a fresh crossover signal.
+    if signal_close-(available[-1]['t']+period)>=period:
+        return {'eligible':False,'reason':'최근 확정 봉 누락'}
+    # Require 60 most recent COMPLETED uninterrupted periods; never blend over
+    # missing daily/weekly bars as if the missing bar was a flat candle.
+    start=0
+    for j in range(len(available)-1,0,-1):
+        if available[j]['t']-available[j-1]['t']!=period:
+            start=j
+            break
+    stable=available[start:]
+    if len(stable)<HTF_V111410_MIN_BARS:
+        return {'eligible':False,'reason':'연속 확정 '+('일봉' if timeframe=='day' else '주봉')+' 60개 미만',
+                'available_bars':len(stable)}
+    arr=htf_v111410_macd_histogram([x['c'] for x in stable])
+    if arr is None or len(arr)<4:return {'eligible':False,'reason':'MACD 계산 실패'}
+    curr,prev,prev2=arr[-1],arr[-2],arr[-3]
+    cross_age=None
+    window=rule['cross_window']
+    for age in range(window):
+        j=len(arr)-1-age
+        if j>0 and arr[j-1]['hist']<=0<arr[j]['hist'] and curr['hist']>0:
+            cross_age=age
+            break
+    close=stable[-1]['c']
+    hist_pct=curr['hist']/close*100
+    prior_pct=prev['hist']/close*100
+    before_pct=prev2['hist']/close*100
+    near=(curr['hist']<0 and -rule['near_gap_pct']<=hist_pct
+          and hist_pct>prior_pct>before_pct)
+    crossed=(cross_age is not None)
+    return {'eligible':True,'reason':None,
+            'latest_closed_bar_end_kst':(stable[-1]['t']+period).strftime('%Y-%m-%d %H:%M'),
+            'available_bars':len(stable),'macd_pct':round(curr['macd']/close*100,6),
+            'signal_pct':round(curr['signal']/close*100,6),
+            'hist_pct':round(hist_pct,6),'hist_prev_pct':round(prior_pct,6),
+            'hist_prev2_pct':round(before_pct,6),
+            'cross_age_bars':cross_age,'cross_pass':crossed,
+            'near_pass':bool(near),'either_pass':bool(crossed or near)}
+
+
+def htf_v111410_evaluate_symbol(api_get,market,cfg,kst):
+    """Preserve the EXACT original C 5m signal universe and C outcomes.
+    Daily and weekly lookback data are only explanatory filters at C close.
+    """
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_rows=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:continue
+            if not lab_contiguous(rows,i-24,i):continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):continue
+            cooldown=i+n
+            signals+=1
+            out=lab_outcome_v11145(rows,i,cfg)
+            if out['outcome']=='UNKNOWN':unknown+=1
+            events.append({'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+                   'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                   'is_first_signal':signals==1,'c':out,
+                   'features':lab_c_signal_features(rows,i),
+                   '_signal_close':rows[i]['t']+timedelta(minutes=5)})
+    if events:
+        daily=htf_v111410_fetch(api_get,market,cfg,kst,'day')
+        weekly=htf_v111410_fetch(api_get,market,cfg,kst,'week')
+        # Many C events per symbol are possible; run same causal snapshot each time.
+        for e in events:
+            e['htf']={'day':htf_v111410_snapshot(daily,e['_signal_close'],'day'),
+                      'week':htf_v111410_snapshot(weekly,e['_signal_close'],'week')}
+            del e['_signal_close']
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_rows),
+          'longest_day_run':lab_longest_consecutive_5m(day_rows),
+          'valid_windows':valid,'signals':signals,'unknown':unknown,
+          'truncated':truncated,'events':events}
+
+HTF_V111410_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.10 · 일봉·주봉 MACD 비교 검증실</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.10 · C + 일봉·주봉 MACD 비교</h1>
+<p class="muted">별도 과거 모의검증 · 기존 V2 BUY / C / C2 / 볼린저 / 일목 및 예전 검증실은 변경하지 않습니다.</p>
+<section class="panel"><h2>이번 연구에서 고정한 조건</h2>
+<div class="note">
+<b>기본:</b> 기존 C 신호 그대로, 다음 5분봉 시가 진입과 익절·손절·비용 동일. MACD는 C 신호가 확정되는 시점에 <b>완전히 종료된 일봉·주봉만</b> 사용합니다. 진행 중인 일/주봉은 제외합니다.<br>
+<b>일봉 D 확정:</b> MACD(12,26,9) 히스토그램이 0을 상향 돌파한 지 <b>최근 3개 확정 일봉 이내</b>이고 지금도 0 초과.<br>
+<b>일봉 D 직전:</b> 아직 MACD &lt; 시그널(히스토그램 음수)이나, 최근 2번 연속으로 차이가 줄고 히스토그램이 종가 대비 <b>-0.12% 이상 ~ 0% 미만</b>.<br>
+<b>주봉 W 확정:</b> 골든크로스가 <b>최근 2개 확정 주봉 이내</b> 발생했고 지금도 0 초과.<br>
+<b>주봉 W 직전:</b> 2주 연속 히스토그램 개선, 음수이면서 종가 대비 <b>-0.25% 이상 ~ 0% 미만</b>.<br>
+<b>각 시간대 OR:</b> 확정 또는 직전. <b>일봉 OR 주봉:</b> 각 시간대의 확정/직전 중 하나라도 통과(적어도 한쪽 계산 가능하면 평가).<br>
+<b>계산 불가:</b> 연속 확정 60개 미만이면 실패가 아닌 별도 집계. 지표 계산 불가와 손익 미판정은 공정 비교에서 제외합니다.<br>
+<i>교차 직전 기준은 사전에 정한 실험용 수치이며 미래의 교차 성공을 알고 적용한 게 아닙니다. 지난 기간으로 조정하면 새 날짜로 별도 검증해야 합니다.</i>
+</div></section>
+<section class="panel"><h2>검증 조건</h2><div class="controls">
+<label class="field">검사할 과거 날짜 (KST)<input id="date" type="date" value="2026-11-01"></label>
+<label class="field">익절 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
+</div><div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.10 기록 초기화</button><button id="csv" class="secondary" disabled>전체 MACD 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">검사가 끝나기 전에는 결과를 공개하지 않습니다. 브라우저 저장으로 이어하기 가능. 일/주봉이 추가 조회되므로 기존 C 검사보다 느릴 수 있습니다.</p></section>
+<section class="panel"><h2>전체 검사 상태</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>공정 비교 · 모든 신호</h2><div id="summary" class="stats">검사 후 공개</div>
+<p class="hint">각 필터는 해당 시간봉이 계산 가능한 원본 C 신호의 성적과 비교합니다. 계산 불가 종목은 자동으로 손실회피 성공으로 취급하지 않습니다. 보류=0%는 신호당 수치이지 포트폴리오 수익률이 아닙니다.</p><div id="results" class="scroll">검사 후 공개</div></section>
+<section class="panel"><h2>코인별 첫 C 신호만 따로 확인</h2><div id="first" class="scroll">검사 후 공개</div></section>
+<section class="panel"><h2>검증 한계</h2><p class="hint">현재 상장 중인 KRW 목록을 과거 날짜에 조회하므로 생존자 편향이 있습니다. 동일 코인 내 여러 신호는 독립 표본이 아닙니다. 고가·저가 기반 결과는 실제 체결을 보장하지 않습니다. 11/1~3 자료로 지표를 설계했다면 별도 미사용 날짜로 재검증해야 합니다. 실전 주문 기능은 없습니다.</p>
+<a href="/backtest-winrate-ich">V11.14.9 일목</a> · <a href="/backtest-winrate-bb">V11.14.8 볼린저</a> · <a href="/backtest-winrate-c2">V11.14.7 C2</a> · <a href="/">V2 메인</a></section>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id),KEY='bithumb_v111410_htfmacd_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+const fields=['date','tp','sl','horizon','fee','slip'];
+function cfgOf(){const c={};for(const k of fields)c[k]=$(k).value;if(!/^20\d{2}-\d{2}-\d{2}$/.test(c.date))throw Error('날짜를 선택해');for(const k of fields.slice(1))if(!Number.isFinite(Number(c[k])))throw Error('입력 확인: '+k);return c;}
+function signature(c){return fields.map(k=>String(c[k])).join('|')}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?.version===10&&Array.isArray(x.markets)&&x.config&&x.results?x:null}catch{return null}}
+function setConfig(c){for(const k of fields)$(k).value=c[k];}
+function sampleResults(){return state?state.markets.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x)).map(x=>state.results[x]):[];}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function card(k,v){return `<div class="stat"><small>${esc(k)}</small><strong>${esc(v)}</strong></div>`;}
+function fmt(x){return Number.isFinite(x)?x.toFixed(3)+'%':'—';}
+function decided(e){return e?.c&&['TP','SL','TIME'].includes(e.c.outcome)&&Number.isFinite(e.c.net_pct);}
+function stat(es){const n=es.length,sum=es.reduce((s,e)=>s+e.c.net_pct,0);return {n,sum,avg:n?sum/n:NaN,wins:es.filter(e=>e.c.net_pct>0).length,win:n?100*es.filter(e=>e.c.net_pct>0).length/n:NaN,tp:es.filter(e=>e.c.outcome==='TP').length,sl:es.filter(e=>e.c.outcome==='SL').length,tm:es.filter(e=>e.c.outcome==='TIME').length};}
+function eligible(e,k){if(k==='any')return e.htf?.day?.eligible===true||e.htf?.week?.eligible===true;return e.htf?.[k]?.eligible===true;}
+const plans=[
+  {cohort:'day',name:'일봉 · 기준 C',test:e=>true},
+  {cohort:'day',name:'일봉 · 골든크로스 확정',test:e=>e.htf.day.cross_pass===true},
+  {cohort:'day',name:'일봉 · 교차 직전',test:e=>e.htf.day.near_pass===true},
+  {cohort:'day',name:'일봉 · 확정 또는 직전',test:e=>e.htf.day.either_pass===true},
+  {cohort:'week',name:'주봉 · 기준 C',test:e=>true},
+  {cohort:'week',name:'주봉 · 골든크로스 확정',test:e=>e.htf.week.cross_pass===true},
+  {cohort:'week',name:'주봉 · 교차 직전',test:e=>e.htf.week.near_pass===true},
+  {cohort:'week',name:'주봉 · 확정 또는 직전',test:e=>e.htf.week.either_pass===true},
+  {cohort:'any',name:'일봉 또는 주봉 · 기준 C',test:e=>true},
+  {cohort:'any',name:'일봉 또는 주봉 충족',test:e=>(e.htf.day.eligible&&e.htf.day.either_pass)||(e.htf.week.eligible&&e.htf.week.either_pass)}
+];
+function table(base){let html='<table><thead><tr><th>방식</th><th>공통 C</th><th>진입</th><th>TP/SL/시간</th><th>순승률</th><th>진입당 평균</th><th>보류=0% 신호당 평균</th><th>제외 거래</th><th>제외한 수익거래</th></tr></thead><tbody>';
+ for(const p of plans){const es=base.filter(e=>eligible(e,p.cohort)),kept=es.filter(p.test),removed=es.filter(e=>!p.test(e)),s=stat(kept);html+=`<tr><td>${esc(p.name)}</td><td>${es.length}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${fmt(s.win)}</td><td>${fmt(s.avg)}</td><td>${fmt(es.length?s.sum/es.length:NaN)}</td><td>${removed.length}</td><td>${removed.filter(e=>e.c.net_pct>0).length}</td></tr>`;}
+ return html+'</tbody></table>';}
+function renderResults(a){const events=a.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market}))),base=events.filter(decided),day=base.filter(e=>eligible(e,'day')),week=base.filter(e=>eligible(e,'week')),both=base.filter(e=>eligible(e,'any')),all=stat(base),first=base.filter(e=>e.is_first_signal);
+ $('summary').innerHTML=card('원본 C 전체 신호',events.length+'건')+card('C 손익 판정',all.n+'건')+card('원본 C 평균',fmt(all.avg))+card('일봉 계산 가능',day.length+'건')+card('주봉 계산 가능',week.length+'건')+card('일/주 중 적어도 하나 가능',both.length+'건')+card('일봉 불가 · 판정',base.length-day.length+'건')+card('주봉 불가 · 판정',base.length-week.length+'건');
+ $('results').innerHTML=table(base);$('first').innerHTML=table(first);
+}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0,signals=a.reduce((s,r)=>s+r.signals,0);
+ $('progress').max=total||1;$('progress').value=n;
+ $('coverage').innerHTML=card('검사 진행',`${n}/${total}`)+card('C 신호',signals+'건')+card('유효 C 검색 윈도우',a.reduce((s,r)=>s+(r.valid_windows||0),0)+'개')+card('5분봉 240개 이상',a.filter(x=>x.observed_5m>=240).length+'코인')+card('과거 5분봉 상한 도달',a.filter(x=>x.truncated).length+'코인');
+ if(complete){renderResults(a);$('csv').disabled=false;}else{$('summary').textContent='전체 KRW 검사 후 공개';$('results').textContent='검사 후 공개';$('first').textContent='검사 후 공개';$('csv').disabled=true;}
+ $('status').textContent=state?(complete?'✅ 전체 검사 완료':'⏳ 진행 중 또는 중단')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 실패 묶음 재검사 필요':''):'검사 전';}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid);}}
+async function initSession(c){const v=await req('/api/winrate14htfmacd/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 목록이 없습니다');state={version:10,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=cfgOf()}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(c)){if(!confirm('날짜·설정이 변경됐어. 이 버전의 이전 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(c);state.failed=0;save();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m)),batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+ async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+ for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{const v=await req('/api/winrate14htfmacd/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});
+ if(v.errors||v.scanned!==batch.length||!Array.isArray(v.results)||v.results.length!==batch.length||v.results.some(r=>!batch.includes(r.market)||!Array.isArray(r.events)||r.events.length!==r.signals||r.events.some(e=>!e.c||!e.htf?.day||!e.htf?.week)))throw Error('불완전한 응답');
+ response=v;break;}catch(e){if(attempt===2){fail++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패 '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+ if(response){for(const x of response.results)state.results[x.market]=x;try{save()}catch(e){hardFailure=true;$('status').textContent='⚠️ 저장 공간 부족';break;}paint();}
+ if(fail>=4){hardFailure=true;break;}}}
+ await Promise.all([worker(),worker()]);state.failed=fail;try{save()}catch{}paint();if(stopRequested)$('status').textContent+='\n일시 중지. 다시 시작하면 이어서 검사합니다.';if(fail)$('status').textContent+=`\n누락 묶음 ${fail}개 · 다시 실행해 재검사하세요.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 전체 검사 전 성과 미공개';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.10 진행 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','c_signals','original_signal_time_kst','c_entry_time_kst','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','day_eligible','day_reason','day_latest_closed_kst','day_macd_pct','day_signal_pct','day_hist_pct','day_hist_prev_pct','day_hist_prev2_pct','day_cross_age','day_cross_pass','day_near_pass','day_either_pass','week_eligible','week_reason','week_latest_closed_kst','week_macd_pct','week_signal_pct','week_hist_pct','week_hist_prev_pct','week_hist_prev2_pct','week_cross_age','week_cross_pass','week_near_pass','week_either_pass','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const rows=[cols.map(csvCell).join(',')],prefix={version:'V11.14.10',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(obj){rows.push(cols.map(k=>csvCell(obj[k])).join(','));}
+ for(const r of sampleResults()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:0});continue;}
+ if(r.events.length!==r.signals){$('status').textContent='⚠️ CSV 이벤트 수 불일치';return;}
+ for(const e of r.events){const c=e.c||{},d=e.htf?.day||{},w=e.htf?.week||{},f=e.features||{};
+ const obj={...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:r.signals,original_signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,original_volume_ratio:f.volume_ratio,original_body_pct:f.body_pct,original_pullback_pct:f.pullback_depth_pct};
+ for(const [pre,s] of [['day',d],['week',w]]){obj[pre+'_eligible']=s.eligible?1:0;obj[pre+'_reason']=s.reason;obj[pre+'_latest_closed_kst']=s.latest_closed_bar_end_kst;for(const k of ['macd_pct','signal_pct','hist_pct','hist_prev_pct','hist_prev2_pct'])obj[pre+'_'+k]=s[k];obj[pre+'_cross_age']=s.cross_age_bars;for(const k of ['cross_pass','near_pass','either_pass'])obj[pre+'_'+k]=s.eligible?(s[k]?1:0):'';}
+ append(obj);}}
+ const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_HTF_MACD_${state.config.date}_v111410.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+</script></body></html>"""
+
+
+def register_htf_macd_v111410_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:raise ValueError('현재 빗썸 KRW 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-htf-macd')
+    def page_htf_macd_v111410():
+        return render_template_string(HTF_V111410_PAGE)
+
+    @app.get('/api/winrate14htfmacd/universe')
+    def universe_htf_macd_v111410():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings',
+                            'rule_version':'V11.14.10'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14htfmacd/evaluate')
+    def evaluate_htf_macd_v111410():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            if any(m not in set(listed()) for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                jobs={pool.submit(htf_v111410_evaluate_symbol,api_get,m,cfg,kst):m
+                      for m in markets}
+                for job in as_completed(jobs):
+                    try:results.append(job.result())
+                    except Exception as exc:errors.append({'market':jobs[job],
+                                                         'error':str(exc)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.10'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+_v11149_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11149_register_daytrade_review(app,deps)
+    register_htf_macd_v111410_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.11: Independent C + session VWAP and BTC context filter lab.
+# All previous routes, C entry signals and historical exit rules remain intact.
+# Only completed 5-minute candles up to original C signal close are used.
+# The source of VWAP is Bithumb cumulative quote turnover per candle, not an
+# approximate OHLC-derived price. No BUY signals or trading/orders are added.
+# ---------------------------------------------------------------------------
+
+VWAP_BTC_V111411_BTC_MIN_1H_PCT = -0.30  # prior 60m BTC return must not crash
+VWAP_BTC_V111411_REL_MIN_1H_PP = 0.50   # coin beats BTC by at least 0.5%p
+VWAP_BTC_V111411_SESSION_HOUR = 9       # KST 09:00, matches exchange daily bars
+
+
+def vwb_v111411_fetch_5m(api_get,market,cfg,kst):
+    """Same OHLCV and paging as original C history, plus optional quote turnover.
+
+    Extends the history window to previous day's 09:00 for complete KST-session
+    VWAP evaluation at the earliest signal. Missing quote turnover does not
+    discard 5m price rows, so the exact C signal universe stays unchanged.
+    """
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    begin=day_start-timedelta(hours=15)
+    end=day_start+timedelta(days=1,hours=2,minutes=5)
+    cursor=end; observed={}; truncated=True
+    for _ in range(LAB_MAX_PAGES):
+        raw=api_get('/v1/candles/minutes/5',{'market':market,'count':200,
+            'to':cursor.strftime('%Y-%m-%d %H:%M:%S')})
+        if not isinstance(raw,list):raise ValueError('과거 5분봉 API 응답 오류')
+        oldest=None
+        for bar in raw:
+            if not isinstance(bar,dict):continue
+            try:
+                ts=local_time(bar['candle_date_time_kst'],kst)
+                op,hi,lo,cl=(float(bar[k]) for k in ('opening_price','high_price','low_price','trade_price'))
+                vol=float(bar['candle_acc_trade_volume'])
+                if not (all(isfinite(x) and x>0 for x in (op,hi,lo,cl))
+                        and isfinite(vol) and vol>=0 and
+                        lo<=min(op,cl) and hi>=max(op,cl) and lo<=hi):continue
+                if oldest is None or ts<oldest:oldest=ts
+                if begin<=ts<end:
+                    quote=None
+                    try:
+                        v=float(bar['candle_acc_trade_price'])
+                        if isfinite(v) and v>=0 and (vol==0 or v>0):quote=v
+                    except (TypeError,ValueError,KeyError,OverflowError):pass
+                    observed[ts]={'t':ts,'o':op,'h':hi,'l':lo,'c':cl,'v':vol,'q':quote}
+            except (TypeError,ValueError,KeyError,OverflowError):continue
+        if oldest is None:
+            truncated=False;break
+        if oldest<=begin or len(raw)<200:
+            truncated=False;break
+        if oldest>=cursor:raise ValueError('과거 봉 페이지가 전진하지 않습니다')
+        cursor=oldest
+    return [observed[t] for t in sorted(observed)],truncated
+
+
+def vwb_v111411_vwap_snapshot(rows,i):
+    """Anchored session VWAP at C signal close using observed actual trades.
+
+    Sessions are KST 09:00 -> next day 08:55. We require at least 6 observed
+    session bars and quote turnover for each included bar. Missing periods are
+    not filled; coverage is exposed for audit. The last 15m slope only uses
+    completed bar snapshots from this same session.
+    """
+    signal=rows[i]
+    anchor=signal['t'].replace(hour=VWAP_BTC_V111411_SESSION_HOUR,minute=0,second=0,microsecond=0)
+    if signal['t']<anchor:anchor-=timedelta(days=1)
+    part=[r for r in rows[:i+1] if anchor<=r['t']<=signal['t']]
+    expected=int((signal['t']-anchor)/timedelta(minutes=5))+1
+    coverage=len(part)/expected if expected>0 else 0
+    if len(part)<6:return {'eligible':False,'reason':'당일 관측 5분봉 6개 미만','bars':len(part),'coverage_pct':round(coverage*100,2)}
+    if any(r['q'] is None for r in part):return {'eligible':False,'reason':'봉 거래대금 누락','bars':len(part),'coverage_pct':round(coverage*100,2)}
+    volumes=[];prices=[];cum_v=cum_q=0.0
+    for r in part:
+        cum_v+=r['v'];cum_q+=r['q']
+        volumes.append(cum_v);prices.append(cum_q/cum_v if cum_v>0 else None)
+    if cum_v<=0 or prices[-1] is None:return {'eligible':False,'reason':'당일 거래량 없음','bars':len(part),'coverage_pct':round(coverage*100,2)}
+    last=prices[-1]
+    above=signal['c']>last
+    # Compare against an anchored VWAP exactly 15 minutes earlier.
+    recent=part[-4:]
+    slope_eligible=(len(recent)==4 and all(recent[k]['t']-recent[k-1]['t']==timedelta(minutes=5) for k in range(1,4))
+                    and prices[-4] is not None)
+    # When 15-minute slope cannot be computed, the VWAP-A condition is still
+    # available, while VWAP-B and A+B require the slope data.
+    rising=(last>prices[-4]) if slope_eligible else None
+    return {'eligible':True,'reason':None,'bars':len(part),'coverage_pct':round(coverage*100,2),
+            'vwap':round(last,10),'distance_pct':round((signal['c']/last-1)*100,5),
+            'above_pass':bool(above),'slope_eligible':bool(slope_eligible),
+            'rising_pass':bool(rising) if slope_eligible else None,
+            'both_pass':bool(above and rising) if slope_eligible else None}
+
+
+def vwb_v111411_btc_snapshot(rows,i,btc_by_time):
+    """Use 13 contiguous completed BTC 5m candles ending at signal bar time.
+
+    BTC 1h and the coin's 1h return are both close-to-close on exactly the
+    same time window. Missing BTC candles are UNKNOWN, never false filter hits.
+    """
+    stamp=rows[i]['t']
+    times=[stamp-timedelta(minutes=5*k) for k in range(12,-1,-1)]
+    btc=[btc_by_time.get(t) for t in times]
+    if any(r is None for r in btc):return {'eligible':False,'reason':'BTC 최근 1시간 확정봉 공백'}
+    if i<12 or rows[i-12]['t']!=times[0] or not lab_contiguous(rows,i-12,i):
+        return {'eligible':False,'reason':'코인 최근 1시간 확정봉 공백'}
+    old_b=btc[0]['c'];now_b=btc[-1]['c'];old_coin=rows[i-12]['c']
+    if min(old_b,now_b,old_coin)<=0:return {'eligible':False,'reason':'수익률 계산 불가'}
+    bret=(now_b/old_b-1)*100
+    cret=(rows[i]['c']/old_coin-1)*100
+    relative=cret-bret
+    return {'eligible':True,'reason':None,'btc_1h_pct':round(bret,5),
+            'coin_1h_pct':round(cret,5),'relative_1h_pp':round(relative,5),
+            'stable_pass':bool(bret>=VWAP_BTC_V111411_BTC_MIN_1H_PCT),
+            'relative_pass':bool(relative>=VWAP_BTC_V111411_REL_MIN_1H_PP)}
+
+
+def vwb_v111411_evaluate_symbol(api_get,market,cfg,kst,btc_by_time):
+    """Original C event and exit, with simultaneous VWAP and BTC snapshots."""
+    rows,truncated=vwb_v111411_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_rows=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:continue
+            if not lab_contiguous(rows,i-24,i):continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):continue
+            cooldown=i+n
+            signals+=1
+            out=lab_outcome_v11145(rows,i,cfg)
+            if out['outcome']=='UNKNOWN':unknown+=1
+            e={'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+               'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+               'is_first_signal':signals==1,'c':out,
+               'features':lab_c_signal_features(rows,i),
+               'vwap':vwb_v111411_vwap_snapshot(rows,i),
+               'btc':vwb_v111411_btc_snapshot(rows,i,btc_by_time)}
+            events.append(e)
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_rows),
+          'longest_day_run':lab_longest_consecutive_5m(day_rows),
+          'valid_windows':valid,'signals':signals,'unknown':unknown,
+          'truncated':truncated,'events':events}
+
+VWAP_BTC_V111411_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.11 · C + VWAP · BTC 영향 비교 검증실</title><style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.11 · C + VWAP · BTC 영향 검증실</h1>
+<p class="muted">별도 과거 모의검증 · V2 실전 BUY, C/C2, 볼린저, 일목, MACD 검증실은 변경하지 않습니다.</p>
+<section class="panel"><h2>사전에 정한 비교 조건</h2>
+<div class="note">
+<b>원본 C:</b> 신호가 확정된 다음 5분봉 시가 진입·동일 익절/손절/비용. 필터를 통과해도 진입 시점을 늦추지 않습니다.<br>
+<b>VWAP A:</b> 신호봉 종가가 <b>KST 09:00 시작 세션 VWAP 위</b>. 빗썸 5분봉 실제 거래대금 ÷ 거래량을 사용합니다.<br>
+<b>VWAP B:</b> 세션 VWAP가 <b>15분 전보다 상승</b>. A+B는 두 조건 모두 충족합니다.<br>
+<b>BTC 안정:</b> 동일한 60분 구간의 BTC 종가 수익률이 <b>-0.30% 이상</b>.<br>
+<b>BTC 상대강도:</b> 같은 60분간 코인의 상승률이 BTC 상승률보다 <b>0.50%p 이상 높음</b>.<br>
+<b>조합:</b> VWAP A+B와 BTC 안정 조건 동시 충족.<br>
+<i>BTC 데이터·VWAP 거래대금·VWAP 기울기 계산이 불가한 신호는 해당 비교에서 별도로 제외합니다. 계산 불가 신호를 성공적인 손실 회피로 취급하지 않습니다. 위 기준은 검증 전 설정한 연구용 가설로, 수익성은 아직 입증되지 않았습니다.</i>
+</div></section>
+<section class="panel"><h2>검증 조건</h2><div class="controls">
+<label class="field">과거 날짜 (KST)<input id="date" type="date" value="2026-11-01"></label>
+<label class="field">익절 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
+</div><div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.11 기록 초기화</button><button id="csv" class="secondary" disabled>전체 VWAP/BTC 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">전체 검사가 끝나기 전에는 최종 성과를 공개하지 않습니다. 브라우저 저장 후 이어하기 가능. 기록은 이 버전만 별도로 저장됩니다.</p></section>
+<section class="panel"><h2>전 종목 검사 상태</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>동일 신호 기준 공정 비교</h2><div id="summary" class="stats">검사 완료 후 공개</div>
+<p class="hint">공통 계산 가능 신호의 기존 C 성적과 필터 통과 신호를 비교합니다. 보류를 0%로 처리한 신호당 평균은 실제 계좌 수익률이 아닙니다. 반복 신호는 독립 표본이 아닙니다.</p><div id="results" class="scroll">검사 완료 후 공개</div></section>
+<section class="panel"><h2>종목별 첫 C 신호만 별도 비교</h2><div id="first" class="scroll">검사 완료 후 공개</div></section>
+<section class="panel"><h2>검증의 한계</h2><p class="hint">현재 상장 중인 빗썸 KRW 종목을 과거 날짜로 검사하므로 생존자 편향이 있습니다. 과거 거래대금 및 BTC 봉 공백은 계산 불가로 표시합니다. 11/1~3은 규칙 탐색 자료이므로 이후 새로운 날짜에서 독립 검증이 필요합니다. 실제 체결·수익을 보장하지 않으며 주문 기능은 없습니다.</p>
+<a href="/backtest-winrate-htf-macd">V11.14.10 MACD</a> · <a href="/backtest-winrate-ich">V11.14.9 일목</a> · <a href="/backtest-winrate-bb">V11.14.8 볼린저</a> · <a href="/backtest-winrate-c2">V11.14.7 C2</a> · <a href="/">V2 메인</a></section>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id),KEY='bithumb_v111411_vwapbtc_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+const fields=['date','tp','sl','horizon','fee','slip'];
+function cfgOf(){const c={};for(const k of fields)c[k]=$(k).value;if(!/^20\d{2}-\d{2}-\d{2}$/.test(c.date))throw Error('날짜를 선택해');for(const k of fields.slice(1))if(!Number.isFinite(Number(c[k])))throw Error('입력 확인: '+k);return c;}
+function signature(c){return fields.map(k=>String(c[k])).join('|');}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?.version===11&&Array.isArray(x.markets)&&x.config&&x.results?x:null;}catch{return null;}}
+function setConfig(c){for(const k of fields)$(k).value=c[k];}
+function sampleResults(){return state?state.markets.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x)).map(x=>state.results[x]):[];}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function card(k,v){return `<div class="stat"><small>${esc(k)}</small><strong>${esc(v)}</strong></div>`;}
+function fmt(x){return Number.isFinite(x)?x.toFixed(3)+'%':'—';}
+function decided(e){return e?.c&&['TP','SL','TIME'].includes(e.c.outcome)&&Number.isFinite(e.c.net_pct);}
+function stat(es){const n=es.length,sum=es.reduce((s,e)=>s+e.c.net_pct,0),wins=es.filter(e=>e.c.net_pct>0).length;return {n,sum,avg:n?sum/n:NaN,wins,win:n?100*wins/n:NaN,tp:es.filter(e=>e.c.outcome==='TP').length,sl:es.filter(e=>e.c.outcome==='SL').length,tm:es.filter(e=>e.c.outcome==='TIME').length};}
+function cohort(e,k){const v=e.vwap||{},b=e.btc||{};if(k==='all')return true;if(k==='va')return v.eligible===true;if(k==='vb')return v.eligible===true&&v.slope_eligible===true;if(k==='btc')return b.eligible===true;if(k==='both')return v.eligible===true&&v.slope_eligible===true&&b.eligible===true;return false;}
+const plans=[
+  {co:'all',name:'기존 C 전체 (기준)',pass:e=>true},
+  {co:'va',name:'VWAP A 비교 · 기준 C',pass:e=>true},
+  {co:'va',name:'VWAP A · 종가 위',pass:e=>e.vwap.above_pass===true},
+  {co:'vb',name:'VWAP B 비교 · 기준 C',pass:e=>true},
+  {co:'vb',name:'VWAP B · 15분 상승',pass:e=>e.vwap.rising_pass===true},
+  {co:'vb',name:'VWAP A+B',pass:e=>e.vwap.both_pass===true},
+  {co:'btc',name:'BTC 비교 · 기준 C',pass:e=>true},
+  {co:'btc',name:'BTC 1시간 급락 제외',pass:e=>e.btc.stable_pass===true},
+  {co:'btc',name:'BTC 대비 상대강도',pass:e=>e.btc.relative_pass===true},
+  {co:'both',name:'조합 비교 · 기준 C',pass:e=>true},
+  {co:'both',name:'VWAP A+B + BTC 안정',pass:e=>e.vwap.both_pass===true&&e.btc.stable_pass===true}
+];
+function table(base){let html='<table><thead><tr><th>비교 방식</th><th>공통 계산 가능 C</th><th>진입</th><th>TP/SL/시간</th><th>승률</th><th>진입당 순평균</th><th>미진입=0% 신호당 순평균</th><th>제외</th><th>제외한 수익거래</th></tr></thead><tbody>';
+ for(const p of plans){const es=base.filter(e=>cohort(e,p.co)),kept=es.filter(p.pass),removed=es.filter(e=>!p.pass(e)),s=stat(kept);html+=`<tr><td>${esc(p.name)}</td><td>${es.length}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${fmt(s.win)}</td><td>${fmt(s.avg)}</td><td>${fmt(es.length?s.sum/es.length:NaN)}</td><td>${removed.length}</td><td>${removed.filter(e=>e.c.net_pct>0).length}</td></tr>`;}
+ return html+'</tbody></table>';}
+function renderResults(arr){const events=arr.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market}))),base=events.filter(decided),all=stat(base),a=base.filter(e=>cohort(e,'va')),b=base.filter(e=>cohort(e,'vb')),btc=base.filter(e=>cohort(e,'btc')),both=base.filter(e=>cohort(e,'both'));
+ $('summary').innerHTML=card('원본 C 신호',events.length+'건')+card('원본 C 손익 판정',base.length+'건')+card('원본 C 평균',fmt(all.avg))+card('VWAP 값 계산 가능',a.length+'건')+card('VWAP 15분 기울기 가능',b.length+'건')+card('BTC 최근 1시간 가능',btc.length+'건')+card('VWAP+BTC 모두 가능',both.length+'건')+card('VWAP 계산 불가 · 판정',base.length-a.length+'건')+card('BTC 계산 불가 · 판정',base.length-btc.length+'건');
+ $('results').innerHTML=table(base);$('first').innerHTML=table(base.filter(e=>e.is_first_signal));}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0,signals=a.reduce((s,r)=>s+r.signals,0);
+ $('progress').max=total||1;$('progress').value=n;
+ $('coverage').innerHTML=card('검사 진행',`${n}/${total}`)+card('C 신호',signals+'건')+card('유효 C 검색 구간',a.reduce((s,r)=>s+(r.valid_windows||0),0)+'개')+card('5분봉 240개 이상',a.filter(x=>x.observed_5m>=240).length+'코인')+card('5분봉 조회 상한 도달',a.filter(x=>x.truncated).length+'코인');
+ if(complete){renderResults(a);$('csv').disabled=false;}else{$('summary').textContent='전체 KRW 검사 완료 후 공개';$('results').textContent='전체 검사 후 공개';$('first').textContent='전체 검사 후 공개';$('csv').disabled=true;}
+ $('status').textContent=state?(complete?'✅ 전체 검사 완료':'⏳ 검사 중 또는 중단')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 실패 묶음 재검사 필요':''):'검사 전';}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid);}}
+async function initSession(c){const v=await req('/api/winrate14vwapbtc/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 목록이 없습니다');state={version:11,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=cfgOf();}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(c)){if(!confirm('날짜·설정이 변경됐어. 이 버전의 이전 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(c);state.failed=0;save();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m)),batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+ async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+ for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{const v=await req('/api/winrate14vwapbtc/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});
+ if(v.errors||v.scanned!==batch.length||!Array.isArray(v.results)||v.results.length!==batch.length||v.results.some(r=>!batch.includes(r.market)||!Array.isArray(r.events)||r.events.length!==r.signals||r.events.some(e=>!e.c||!e.vwap||!e.btc)))throw Error('불완전한 응답');
+ response=v;break;}catch(e){if(attempt===2){fail++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패 '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+ if(response){for(const x of response.results)state.results[x.market]=x;try{save();}catch(e){hardFailure=true;$('status').textContent='⚠️ 저장 공간 부족';break;}paint();}
+ if(fail>=4){hardFailure=true;break;}}}
+ await Promise.all([worker(),worker()]);state.failed=fail;try{save();}catch{}paint();if(stopRequested)$('status').textContent+='\n일시 중지. 다시 시작하면 이어서 검사합니다.';if(fail)$('status').textContent+=`\n누락 묶음 ${fail}개 · 다시 실행해서 재검사하세요.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 전체 검사 전 성과 미공개';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.11 진행 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','c_signals','original_signal_time_kst','c_entry_time_kst','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','vwap_eligible','vwap_reason','vwap_bars','vwap_coverage_pct','vwap_value','vwap_distance_pct','vwap_above_pass','vwap_slope_eligible','vwap_rising_pass','vwap_both_pass','btc_eligible','btc_reason','btc_1h_pct','coin_1h_pct','relative_1h_pp','btc_stable_pass','btc_relative_pass','combo_pass','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const rows=[cols.map(csvCell).join(',')],prefix={version:'V11.14.11',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(obj){rows.push(cols.map(k=>csvCell(obj[k])).join(','));}
+ for(const r of sampleResults()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:0});continue;}
+ if(r.events.length!==r.signals){$('status').textContent='⚠️ CSV 이벤트 수 불일치';return;}
+ for(const e of r.events){const c=e.c||{},v=e.vwap||{},b=e.btc||{},f=e.features||{};
+ append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:r.signals,original_signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,
+ vwap_eligible:v.eligible?1:0,vwap_reason:v.reason,vwap_bars:v.bars,vwap_coverage_pct:v.coverage_pct,vwap_value:v.vwap,vwap_distance_pct:v.distance_pct,vwap_above_pass:v.eligible?(v.above_pass?1:0):'',vwap_slope_eligible:v.eligible?(v.slope_eligible?1:0):'',vwap_rising_pass:v.slope_eligible?(v.rising_pass?1:0):'',vwap_both_pass:v.slope_eligible?(v.both_pass?1:0):'',
+ btc_eligible:b.eligible?1:0,btc_reason:b.reason,btc_1h_pct:b.btc_1h_pct,coin_1h_pct:b.coin_1h_pct,relative_1h_pp:b.relative_1h_pp,btc_stable_pass:b.eligible?(b.stable_pass?1:0):'',btc_relative_pass:b.eligible?(b.relative_pass?1:0):'',combo_pass:v.slope_eligible&&b.eligible?(v.both_pass&&b.stable_pass?1:0):'',
+ original_volume_ratio:f.volume_ratio,original_body_pct:f.body_pct,original_pullback_pct:f.pullback_depth_pct});}}
+ const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_VWAP_BTC_${state.config.date}_v111411.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+
+</script></body></html>"""
+
+
+def register_vwap_btc_v111411_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'names':None,'names_at':0,'btc':{},'btc_at':{}}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['names_at']>600:
+                names=sorted({m for m in get_markets() if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 목록이 없습니다')
+                cache['names']=names;cache['names_at']=time.time()
+            return cache['names']
+
+    def btc_for_day(cfg):
+        key=cfg['day'].isoformat()
+        with mutex:
+            if key not in cache['btc'] or time.time()-cache['btc_at'].get(key,0)>1800:
+                # A single shared historical BTC download per date per worker,
+                # rather than one BTC API request for EVERY altcoin.
+                bars,_=lab_fetch_5m(api_get,'KRW-BTC',cfg,kst)
+                if not bars:raise ValueError('BTC 5분봉 데이터가 비어 있습니다')
+                cache['btc']={key:{r['t']:r for r in bars}}
+                cache['btc_at']={key:time.time()}
+            return cache['btc'][key]
+
+    @app.get('/backtest-winrate-vwap-btc')
+    def page_vwap_btc_v111411():
+        return render_template_string(VWAP_BTC_V111411_PAGE)
+
+    @app.get('/api/winrate14vwapbtc/universe')
+    def universe_vwap_btc_v111411():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings',
+                            'rule_version':'V11.14.11'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14vwapbtc/evaluate')
+    def evaluate_vwap_btc_v111411():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            known=set(listed())
+            if any(m not in known for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            btc_by_time=btc_for_day(cfg)
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                jobs={pool.submit(vwb_v111411_evaluate_symbol,api_get,m,cfg,kst,btc_by_time):m for m in markets}
+                for job in as_completed(jobs):
+                    try:results.append(job.result())
+                    except Exception as exc:errors.append({'market':jobs[job],'error':str(exc)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.11'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+_v111410_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111410_register_daytrade_review(app,deps)
+    register_vwap_btc_v111411_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.12: Separate historical C + objective Fibonacci/BTC-relative lab.
+# All older endpoints and C entries/outcomes are kept unchanged.
+# Pivots, pullback and BTC returns use only completed bars at C signal close.
+# No order placement, BUY signal modification, or live scanner changes.
+# ---------------------------------------------------------------------------
+FIB_V111412_LOOKBACK = 48              # Prior 4h, completed 5m bars only
+FIB_V111412_MAX_PEAK_AGE = 24          # Most recent confirmed high <=2h old
+FIB_V111412_MIN_IMPULSE_PCT = 1.5      # Rise from pre-peak low to peak
+FIB_V111412_RELATIVE_MIN_PP = 0.50     # 1h coin - BTC in percentage points
+
+
+def fib_v111412_snapshot(rows,i):
+    """Deterministic prior-low -> prior-high Fibonacci retracement study.
+
+    Select highest HIGH among 48 immediately preceding, contiguous closed 5M
+    bars; use lowest LOW *before* that high. Require at least two bars both
+    between low and high and after high for a usable impulse/pullback. The C
+    signal itself is completed and can test whether its low retraced to a
+    Fibonacci area. Neither entry/exit prices nor any future candle are used.
+
+    This is a rolling-window proxy for an impulse, NOT an Elliott wave parser.
+    """
+    if i < FIB_V111412_LOOKBACK:
+        return {'eligible':False,'reason':'직전 4시간 5분봉 부족'}
+    start=i-FIB_V111412_LOOKBACK
+    if not lab_contiguous(rows,start,i):
+        return {'eligible':False,'reason':'최근 4시간 5분봉 공백'}
+    peak_idx=max(range(start,i),key=lambda k:(rows[k]['h'],k))
+    age=i-peak_idx
+    if age<3 or age>FIB_V111412_MAX_PEAK_AGE:
+        return {'eligible':True,'swing_valid':False,'narrow_pass':False,'broad_pass':False,'reason':'최근 확정된 상승 고점 부재'}
+    if peak_idx-start<3:
+        return {'eligible':True,'swing_valid':False,'narrow_pass':False,'broad_pass':False,'reason':'상승 고점 이전 저점 구간 부족'}
+    low_idx=min(range(start,peak_idx),key=lambda k:(rows[k]['l'],k))
+    if peak_idx-low_idx<2:
+        return {'eligible':True,'swing_valid':False,'narrow_pass':False,'broad_pass':False,'reason':'상승 저점·고점 간격 부족'}
+    low=rows[low_idx]['l'];high=rows[peak_idx]['h']
+    if low<=0 or high<=low:
+        return {'eligible':True,'swing_valid':False,'narrow_pass':False,'broad_pass':False,'reason':'상승 파동 계산 불가'}
+    impulse=(high/low-1)*100
+    if impulse<FIB_V111412_MIN_IMPULSE_PCT:
+        return {'eligible':True,'swing_valid':False,'narrow_pass':False,'broad_pass':False,'reason':'최근 상승 폭 1.5% 미만','impulse_pct':round(impulse,4)}
+    span=high-low
+    current=rows[i]
+    depth=(high-current['l'])/span
+    # Support levels for an upward impulse: High - depth * (High-Low).
+    support_382=high-0.382*span
+    support_500=high-0.500*span
+    support_618=high-0.618*span
+    support_786=high-0.786*span
+    narrow=0.382<=depth<=0.618 and current['c']>=support_618
+    broad=0.236<=depth<=0.786 and current['c']>=support_786
+    return {'eligible':True,'swing_valid':True,'reason':None,'impulse_low':round(low,10),
+            'impulse_high':round(high,10),
+            'low_time_kst':rows[low_idx]['t'].strftime('%Y-%m-%d %H:%M'),
+            'high_time_kst':rows[peak_idx]['t'].strftime('%Y-%m-%d %H:%M'),
+            'peak_age_bars':age,'impulse_pct':round(impulse,5),
+            'signal_low':round(current['l'],10),'signal_close':round(current['c'],10),
+            'retracement_pct':round(depth*100,5),
+            'level_382':round(support_382,10),'level_500':round(support_500,10),
+            'level_618':round(support_618,10),'level_786':round(support_786,10),
+            'narrow_pass':bool(narrow),'broad_pass':bool(broad)}
+
+
+def fib_v111412_evaluate_symbol(api_get,market,cfg,kst,btc_by_time):
+    """Unchanged baseline C search/exit, adding independent at-signal filters."""
+    rows,truncated=vwb_v111411_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_rows=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:continue
+            if not lab_contiguous(rows,i-24,i):continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):continue
+            cooldown=i+n
+            signals+=1
+            out=lab_outcome_v11145(rows,i,cfg)
+            if out['outcome']=='UNKNOWN':unknown+=1
+            e={'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+               'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+               'is_first_signal':signals==1,'c':out,
+               'features':lab_c_signal_features(rows,i),
+               'fib':fib_v111412_snapshot(rows,i),
+               'btc':vwb_v111411_btc_snapshot(rows,i,btc_by_time)}
+            events.append(e)
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_rows),
+          'longest_day_run':lab_longest_consecutive_5m(day_rows),
+          'valid_windows':valid,'signals':signals,'unknown':unknown,
+          'truncated':truncated,'events':events}
+
+FIB_BTC_V111412_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.12 · C + 피보나치 · BTC 상대강도 검증실</title><style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.12 · C + 피보나치 · BTC 상대강도</h1>
+<p class="muted">별도 과거 모의검증 · 기존 V2 실전 BUY, C/C2, 볼린저, 일목, MACD, VWAP/BTC 검증실은 변경하지 않습니다.</p>
+<section class="panel"><h2>이번 실험 규칙 (결과 확인 전 고정)</h2><div class="note">
+<b>기존 C:</b> 원래 신호봉 확정 → 다음 5분봉 시가 진입. 익절·손절·보유·비용은 동일하며 추가 확인봉을 기다리지 않습니다.<br>
+<b>피보나치 고점·저점:</b> C 신호 직전 <b>연속 48개 확정 5분봉(4시간)</b>에서 가장 높은 고점과 그 이전 최저 저점을 선택합니다. 고점은 신호보다 3~24봉 전에 발생했고 저점은 고점보다 최소 2봉 앞서 있어야 합니다. 상승 폭이 <b>1.5% 이상</b>인 경우만 피보나치 계산 가능으로 분류합니다.<br>
+<b>피보나치 A:</b> C 신호봉 저가가 상승 파동의 <b>38.2~61.8% 되돌림</b> 구간이며 신호봉 종가는 61.8% 지지 가격 위에 마감.<br>
+<b>피보나치 B:</b> 신호봉 저가가 <b>23.6~78.6% 되돌림</b> 구간이며 종가는 78.6% 지지 가격 위에 마감 (넓은 탐색 조건).<br>
+<b>BTC 상대강도:</b> 동일한 최근 60분 확정봉에서 <b>코인 등락률 - BTC 등락률 ≥ +0.50%p</b>.<br>
+<b>조합:</b> 각각 피보나치 A 또는 B + BTC 상대강도 동시 충족.<br>
+<i>4시간 봉이 부족해서 계산할 수 없는 신호는 통과 실패로 세지 않고 별도 집계합니다. 상승 파동 기준 미충족은 계산 가능한 신호 중 필터 탈락으로 집계합니다. 과거 봉의 가장 높은/낮은 가격을 이용한 규칙적 근사이며 진짜 추세 전환이나 지지선을 보증하지 않습니다. 수익성이 아직 검증된 조건이 아닙니다.</i>
+</div></section>
+<section class="panel"><h2>검증 설정</h2><div class="controls">
+<label class="field">과거 날짜 (KST)<input id="date" type="date" value="2026-11-01"></label>
+<label class="field">익절 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
+</div><div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.12 기록 초기화</button><button id="csv" class="secondary" disabled>전체 FIB/BTC 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">전체 검사가 완료되기 전에는 최종 성과를 공개하지 않습니다. 이 버전의 기록만 브라우저에 저장되어 이어서 실행할 수 있습니다.</p></section>
+<section class="panel"><h2>전 종목 검사 현황</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>공정 비교 · 같은 C 신호 기준</h2><div id="summary" class="stats">전체 검사 후 공개</div>
+<p class="hint">각 필터별 동일한 계산 가능 집단에서 기존 C와 필터 통과 종목을 함께 표시합니다. ‘미진입 0%’ 평균은 실제 계좌 수익률이 아닙니다. 동일 종목 반복 C 신호는 독립적인 표본이 아닙니다.</p><div id="results" class="scroll">전체 검사 후 공개</div></section>
+<section class="panel"><h2>종목별 첫 C 신호만</h2><div id="first" class="scroll">전체 검사 후 공개</div></section>
+<section class="panel"><h2>검증 한계 및 기존 검증실</h2><p class="hint">현재 상장 종목을 과거 날짜로 검사하므로 생존자 편향이 있습니다. 11월 1~3일은 기존 전략 설계에 참고한 날짜라 독립 검증으로 사용할 수 없습니다. 과거 BTC 봉 누락이나 코인 5분봉 공백은 별도 계산 불가로 처리합니다. 수익을 보장하지 않으며 주문 기능은 없습니다.</p>
+<a href="/backtest-winrate-vwap-btc">V11.14.11 VWAP/BTC</a> · <a href="/backtest-winrate-htf-macd">V11.14.10 MACD</a> · <a href="/backtest-winrate-ich">V11.14.9 일목</a> · <a href="/backtest-winrate-bb">V11.14.8 볼린저</a> · <a href="/backtest-winrate-c2">V11.14.7 C2</a> · <a href="/">V2 메인</a></section>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id),KEY='bithumb_v111412_fibbtc_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+const fields=['date','tp','sl','horizon','fee','slip'];
+function cfgOf(){const c={};for(const k of fields)c[k]=$(k).value;if(!/^20\d{2}-\d{2}-\d{2}$/.test(c.date))throw Error('날짜를 선택해');for(const k of fields.slice(1))if(!Number.isFinite(Number(c[k])))throw Error('입력 확인: '+k);return c;}
+function signature(c){return fields.map(k=>String(c[k])).join('|');}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?.version===12&&Array.isArray(x.markets)&&x.config&&x.results?x:null;}catch{return null;}}
+function setConfig(c){for(const k of fields)$(k).value=c[k];}
+function sampleResults(){return state?state.markets.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x)).map(x=>state.results[x]):[];}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function card(k,v){return `<div class="stat"><small>${esc(k)}</small><strong>${esc(v)}</strong></div>`;}
+function fmt(x){return Number.isFinite(x)?x.toFixed(3)+'%':'—';}
+function decided(e){return e?.c&&['TP','SL','TIME'].includes(e.c.outcome)&&Number.isFinite(e.c.net_pct);}
+function stat(es){const n=es.length,sum=es.reduce((s,e)=>s+e.c.net_pct,0),wins=es.filter(e=>e.c.net_pct>0).length;return {n,sum,avg:n?sum/n:NaN,wins,win:n?100*wins/n:NaN,tp:es.filter(e=>e.c.outcome==='TP').length,sl:es.filter(e=>e.c.outcome==='SL').length,tm:es.filter(e=>e.c.outcome==='TIME').length};}
+function cohort(e,k){const f=e.fib||{},b=e.btc||{};if(k==='all')return true;if(k==='fib')return f.eligible===true;if(k==='btc')return b.eligible===true;if(k==='both')return f.eligible===true&&b.eligible===true;return false;}
+const plans=[
+ {co:'all',name:'기존 C 전체 (기준)',pass:e=>true},
+ {co:'fib',name:'피보나치 비교 · 기존 C',pass:e=>true},
+ {co:'fib',name:'피보나치 A · 38.2~61.8%',pass:e=>e.fib.narrow_pass===true},
+ {co:'fib',name:'피보나치 B · 23.6~78.6%',pass:e=>e.fib.broad_pass===true},
+ {co:'btc',name:'BTC 비교 · 기존 C',pass:e=>true},
+ {co:'btc',name:'BTC 대비 상대강도 +0.5%p',pass:e=>e.btc.relative_pass===true},
+ {co:'both',name:'공통 계산 가능 · 기존 C',pass:e=>true},
+ {co:'both',name:'피보나치 A + BTC 상대강도',pass:e=>e.fib.narrow_pass===true&&e.btc.relative_pass===true},
+ {co:'both',name:'피보나치 B + BTC 상대강도',pass:e=>e.fib.broad_pass===true&&e.btc.relative_pass===true}
+];
+function table(base){let html='<table><thead><tr><th>비교 방식</th><th>공통 계산 가능 C</th><th>진입</th><th>TP/SL/시간</th><th>승률</th><th>진입당 순평균</th><th>미진입=0% 신호당 순평균</th><th>제외</th><th>제외한 수익거래</th></tr></thead><tbody>';
+ for(const p of plans){const es=base.filter(e=>cohort(e,p.co)),kept=es.filter(p.pass),removed=es.filter(e=>!p.pass(e)),s=stat(kept);html+=`<tr><td>${esc(p.name)}</td><td>${es.length}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${fmt(s.win)}</td><td>${fmt(s.avg)}</td><td>${fmt(es.length?s.sum/es.length:NaN)}</td><td>${removed.length}</td><td>${removed.filter(e=>e.c.net_pct>0).length}</td></tr>`;}
+ return html+'</tbody></table>';}
+function renderResults(arr){const events=arr.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market}))),base=events.filter(decided),all=stat(base),fib=base.filter(e=>cohort(e,'fib')),btc=base.filter(e=>cohort(e,'btc')),both=base.filter(e=>cohort(e,'both'));
+ $('summary').innerHTML=card('원본 C 신호',events.length+'건')+card('원본 C 손익 판정',base.length+'건')+card('원본 C 평균',fmt(all.avg))+card('피보나치 계산 가능',fib.length+'건')+card('피보나치 상승 파동 충족',fib.filter(e=>e.fib.swing_valid===true).length+'건')+card('BTC 1시간 상대강도 계산 가능',btc.length+'건')+card('피보나치·BTC 모두 계산 가능',both.length+'건')+card('피보나치 5분봉 부족',base.length-fib.length+'건')+card('BTC 1시간 봉 부족',base.length-btc.length+'건');
+ $('results').innerHTML=table(base);$('first').innerHTML=table(base.filter(e=>e.is_first_signal));}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0,signals=a.reduce((s,r)=>s+r.signals,0);
+ $('progress').max=total||1;$('progress').value=n;
+ $('coverage').innerHTML=card('검사 진행',`${n}/${total}`)+card('C 신호',signals+'건')+card('유효 C 검색 구간',a.reduce((s,r)=>s+(r.valid_windows||0),0)+'개')+card('5분봉 240개 이상',a.filter(x=>x.observed_5m>=240).length+'코인')+card('5분봉 조회 상한 도달',a.filter(x=>x.truncated).length+'코인');
+ if(complete){renderResults(a);$('csv').disabled=false;}else{$('summary').textContent='전체 KRW 검사 완료 후 공개';$('results').textContent='전체 검사 후 공개';$('first').textContent='전체 검사 후 공개';$('csv').disabled=true;}
+ $('status').textContent=state?(complete?'✅ 전체 검사 완료':'⏳ 검사 중 또는 중단')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 실패 묶음 재검사 필요':''):'검사 전';}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid);}}
+async function initSession(c){const v=await req('/api/winrate14fibbtc/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 목록이 없습니다');state={version:12,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=cfgOf();}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(c)){if(!confirm('날짜·설정이 변경됐어. 이 버전의 이전 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(c);state.failed=0;save();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m)),batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+ async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+ for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{const v=await req('/api/winrate14fibbtc/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});
+ if(v.errors||v.scanned!==batch.length||!Array.isArray(v.results)||v.results.length!==batch.length||v.results.some(r=>!batch.includes(r.market)||!Array.isArray(r.events)||r.events.length!==r.signals||r.events.some(e=>!e.c||!e.fib||!e.btc)))throw Error('불완전한 응답');
+ response=v;break;}catch(e){if(attempt===2){fail++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패 '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+ if(response){for(const x of response.results)state.results[x.market]=x;try{save();}catch(e){hardFailure=true;$('status').textContent='⚠️ 저장 공간 부족';break;}paint();}
+ if(fail>=4){hardFailure=true;break;}}}
+ await Promise.all([worker(),worker()]);state.failed=fail;try{save();}catch{}paint();if(stopRequested)$('status').textContent+='\n일시 중지. 다시 시작하면 이어서 검사합니다.';if(fail)$('status').textContent+=`\n누락 묶음 ${fail}개 · 다시 실행해서 재검사하세요.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 전체 검사 전 성과 미공개';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.12 진행 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','c_signals','original_signal_time_kst','c_entry_time_kst','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','fib_eligible','fib_reason','fib_swing_valid','fib_low_time_kst','fib_high_time_kst','fib_low','fib_high','fib_impulse_pct','fib_peak_age_bars','fib_signal_low','fib_retracement_pct','fib_level_382','fib_level_500','fib_level_618','fib_level_786','fib_narrow_pass','fib_broad_pass','btc_eligible','btc_reason','btc_1h_pct','coin_1h_pct','relative_1h_pp','btc_relative_pass','combo_narrow_pass','combo_broad_pass','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const rows=[cols.map(csvCell).join(',')],prefix={version:'V11.14.12',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(obj){rows.push(cols.map(k=>csvCell(obj[k])).join(','));}
+ for(const r of sampleResults()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:0});continue;}
+ if(r.events.length!==r.signals){$('status').textContent='⚠️ CSV 이벤트 수 불일치';return;}
+ for(const e of r.events){const c=e.c||{},f=e.fib||{},b=e.btc||{},ft=e.features||{};
+ append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:r.signals,original_signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,
+ fib_eligible:f.eligible?1:0,fib_reason:f.reason,fib_swing_valid:f.eligible?(f.swing_valid?1:0):'',fib_low_time_kst:f.low_time_kst,fib_high_time_kst:f.high_time_kst,fib_low:f.impulse_low,fib_high:f.impulse_high,fib_impulse_pct:f.impulse_pct,fib_peak_age_bars:f.peak_age_bars,fib_signal_low:f.signal_low,fib_retracement_pct:f.retracement_pct,fib_level_382:f.level_382,fib_level_500:f.level_500,fib_level_618:f.level_618,fib_level_786:f.level_786,fib_narrow_pass:f.eligible?(f.narrow_pass?1:0):'',fib_broad_pass:f.eligible?(f.broad_pass?1:0):'',
+ btc_eligible:b.eligible?1:0,btc_reason:b.reason,btc_1h_pct:b.btc_1h_pct,coin_1h_pct:b.coin_1h_pct,relative_1h_pp:b.relative_1h_pp,btc_relative_pass:b.eligible?(b.relative_pass?1:0):'',combo_narrow_pass:f.eligible&&b.eligible?(f.narrow_pass&&b.relative_pass?1:0):'',combo_broad_pass:f.eligible&&b.eligible?(f.broad_pass&&b.relative_pass?1:0):'',
+ original_volume_ratio:ft.volume_ratio,original_body_pct:ft.body_pct,original_pullback_pct:ft.pullback_depth_pct});}}
+ const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_FIB_BTC_${state.config.date}_v111412.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+
+</script></body></html>"""
+
+
+def register_fib_btc_v111412_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'names':None,'names_at':0,'btc':{},'btc_at':{}}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['names_at']>600:
+                names=sorted({m for m in get_markets() if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 목록이 없습니다')
+                cache['names']=names;cache['names_at']=time.time()
+            return cache['names']
+
+    def btc_for_day(cfg):
+        key=cfg['day'].isoformat()
+        with mutex:
+            if key not in cache['btc'] or time.time()-cache['btc_at'].get(key,0)>1800:
+                bars,_=lab_fetch_5m(api_get,'KRW-BTC',cfg,kst)
+                if not bars:raise ValueError('BTC 5분봉 데이터가 비어 있습니다')
+                cache['btc']={key:{r['t']:r for r in bars}}
+                cache['btc_at']={key:time.time()}
+            return cache['btc'][key]
+
+    @app.get('/backtest-winrate-fib-btc')
+    def page_fib_btc_v111412():
+        return render_template_string(FIB_BTC_V111412_PAGE)
+
+    @app.get('/api/winrate14fibbtc/universe')
+    def universe_fib_btc_v111412():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings',
+                            'rule_version':'V11.14.12'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14fibbtc/evaluate')
+    def evaluate_fib_btc_v111412():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            known=set(listed())
+            if any(m not in known for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            btc_by_time=btc_for_day(cfg)
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                jobs={pool.submit(fib_v111412_evaluate_symbol,api_get,m,cfg,kst,btc_by_time):m for m in markets}
+                for job in as_completed(jobs):
+                    try:results.append(job.result())
+                    except Exception as exc:errors.append({'market':jobs[job],'error':str(exc)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.12'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+_v111411_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111411_register_daytrade_review(app,deps)
+    register_fib_btc_v111412_lab(app,deps)
