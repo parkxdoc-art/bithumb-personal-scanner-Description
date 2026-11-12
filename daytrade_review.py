@@ -2939,3 +2939,314 @@ _v11147_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v11147_register_daytrade_review(app,deps)
     register_bb_v11148_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.9: C + Ichimoku 9/26/52 filter study (READ-ONLY separate route).
+# Existing V2, C, C2, Bollinger and older endpoints are not changed.
+# Signals, C cooldown, entry opening, costs & exits remain identical.
+# Future-leakage prevention: cloud plotted AT i uses spans COMPUTED at i-26.
+# ---------------------------------------------------------------------------
+
+def ich_v11149_fetch_5m(api_get, market, cfg, kst):
+    """Only for V11.14.9: fetch >= 8h history for unshifted 78-bar Ichimoku.
+
+    Same data and outcome semantics as the historic C labs, but extended prehistory.
+    No fabricated bars; no lookahead. Older labs keep their original fetch logic.
+    """
+    begin = datetime.combine(cfg["day"], _time.min, tzinfo=kst) - timedelta(hours=8)
+    end = datetime.combine(cfg["day"] + timedelta(days=1), _time.min, tzinfo=kst) + timedelta(hours=2, minutes=5)
+    cursor = end
+    observed = {}
+    truncated = True
+    for _ in range(LAB_MAX_PAGES):
+        raw = api_get("/v1/candles/minutes/5", {
+            "market": market, "count": 200,
+            "to": cursor.strftime("%Y-%m-%d %H:%M:%S")})
+        if not isinstance(raw, list):
+            raise ValueError("과거 5분봉 API 응답 오류")
+        oldest = None
+        for bar in raw:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                ts = local_time(bar["candle_date_time_kst"], kst)
+                op, hi, lo, cl = (float(bar[k]) for k in
+                                  ("opening_price", "high_price", "low_price", "trade_price"))
+                vol = float(bar["candle_acc_trade_volume"])
+                if not (all(isfinite(x) and x > 0 for x in (op, hi, lo, cl))
+                        and isfinite(vol) and vol >= 0
+                        and lo <= min(op, cl) and hi >= max(op, cl) and lo <= hi):
+                    continue
+                if oldest is None or ts < oldest:
+                    oldest = ts
+                if begin <= ts < end:
+                    observed[ts] = {"t": ts, "o": op, "h": hi, "l": lo, "c": cl, "v": vol}
+            except (TypeError, ValueError, KeyError, OverflowError):
+                continue
+        if oldest is None:
+            truncated = False
+            break
+        if oldest <= begin or len(raw) < 200:
+            truncated = False
+            break
+        # Exclusive pagination; do not skip the oldest bar or repeat a page.
+        if oldest >= cursor:
+            raise ValueError("과거 봉 페이지가 전진하지 않습니다")
+        cursor = oldest
+    return [observed[t] for t in sorted(observed)], truncated
+
+
+
+def ich_v11149_midpoint(rows, end, length):
+    """Donchian midpoint of observed HIGH/LOW over length bars ending at end."""
+    subset=rows[end-length+1:end+1]
+    return (max(r['h'] for r in subset)+min(r['l'] for r in subset))/2.0
+
+
+def ich_v11149_snapshot(rows, i):
+    """All values are known when C signal candle i CLOSES.
+
+    Tenkan 9, Kijun 26 (at i).
+    Senkou A/B *appearing* under the price at i are the values computed at
+    i-26, 26 bars BEFORE signal candle i. 52-bar Span B at i-26 requires
+    earliest i-77; require all 78 bars contiguous. Never read after i.
+    This is the historically plotted cloud, not tomorrow's forward cloud.
+    """
+    if i < 77 or not lab_contiguous(rows, i-77, i):
+        return {'eligible':False, 'reason':'일목 78개 연속 확정 5분봉 부족'}
+    tenkan=ich_v11149_midpoint(rows,i,9)
+    kijun=ich_v11149_midpoint(rows,i,26)
+    anchor=i-26
+    tenkan_anchor=ich_v11149_midpoint(rows,anchor,9)
+    kijun_anchor=ich_v11149_midpoint(rows,anchor,26)
+    senkou_a=(tenkan_anchor+kijun_anchor)/2
+    senkou_b=ich_v11149_midpoint(rows,anchor,52)
+    top=max(senkou_a,senkou_b)
+    bottom=min(senkou_a,senkou_b)
+    price=rows[i]['c']
+    above_cloud=price>top
+    line_pass=tenkan>kijun
+    thickness_pct=(top-bottom)/bottom*100 if bottom>0 else None
+    gap_pct=(price/top-1)*100 if top>0 else None
+    return {'eligible':True,'reason':None,'tenkan':round(tenkan,10),
+            'kijun':round(kijun,10),'senkou_a_now':round(senkou_a,10),
+            'senkou_b_now':round(senkou_b,10),'cloud_top':round(top,10),
+            'cloud_bottom':round(bottom,10),'price_gap_pct':round(gap_pct,5) if gap_pct is not None else None,
+            'cloud_thickness_pct':round(thickness_pct,5) if thickness_pct is not None else None,
+            'cloud_pass':bool(above_cloud),'line_pass':bool(line_pass),
+            'both_pass':bool(above_cloud and line_pass)}
+
+
+def ich_v11149_evaluate_symbol(api_get,market,cfg,kst):
+    """Replays exactly the same C events as V11.14.8; never delays entry."""
+    rows,truncated=ich_v11149_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_bars=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:
+                continue
+            if not lab_contiguous(rows,i-24,i):
+                continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):
+                continue
+            cooldown=i+n
+            signals+=1
+            c=lab_outcome_v11145(rows,i,cfg)
+            if c['outcome']=='UNKNOWN':unknown+=1
+            events.append({
+                'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+                'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                'is_first_signal':signals==1,
+                'c':c,
+                'ich':ich_v11149_snapshot(rows,i),
+                'features':lab_c_signal_features(rows,i),
+            })
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_bars),
+            'longest_day_run':lab_longest_consecutive_5m(day_bars),
+            'valid_windows':valid,'signals':signals,'unknown':unknown,
+            'truncated':truncated,'events':events}
+
+
+ICH_V11149_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.9 · 일목균형표 C 필터 연구실</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.9 · C + 일목균형표 비교</h1>
+<p class="muted">과거 모의 연구 전용 · V2 실전 BUY / V11.13 / C / C2 / RSI·MACD 검증실은 변경하지 않습니다.</p>
+<section class="panel"><h2>미리 고정한 비교 조건</h2>
+<div class="note">기존 C 신호, 재진입 대기, <b>다음 5분봉 시가 진입</b>, 익절·손절·비용은 동일합니다. 필터가 제외한 신호는 진입하지 않아 <b>0% 손익</b>으로 비교합니다.<br>
+<b>일목균형표:</b> 5분봉 기준 전환선(9), 기준선(26), 선행스팬(9·26·52, 26봉 이동)을 사용합니다. 지표 계산에는 신호 확정 시점까지의 5분봉만 사용합니다.<br>
+<b>A · 구름대 위:</b> C 신호봉 <b>종가 &gt; 현재 시점에 표시되는 구름대 상단</b>.<br>
+<b>B · 전환선 우위:</b> C 신호봉 마감 시점의 <b>전환선(9) &gt; 기준선(26)</b>.<br>
+<b>A+B:</b> 두 조건 모두 충족.<br>
+<b>중요:</b> 시점 i의 구름대는 i-26봉에 계산된 선행스팬을 사용합니다. 미래 26봉을 읽지 않습니다. 후행스팬은 이번 가설에서 사용하지 않습니다.<br>
+이는 실전 최적값이 아닌 사전 정의한 가설입니다. 이 연구실은 <b>주문을 실행하지 않습니다.</b></div></section>
+<section class="panel"><h2>검증 조건</h2>
+<div class="controls">
+<label class="field">과거 날짜 (KST)<input id="date" type="date" value="2026-11-01"></label>
+<label class="field">익절 목표 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 기준 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" step="0.01" value="0.04" min="0" max="0.5"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" step="0.01" value="0.05" min="0" max="0.5"></label>
+</div>
+<div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.9 기록 초기화</button><button id="csv" class="secondary" disabled>전체 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">전체 검사 완료 전에는 비교 결과를 공개하지 않습니다. 같은 브라우저에서 중단 후 이어 할 수 있습니다. 검증에 현재 상장 중인 KRW 종목 목록을 사용하므로 생존자 편향이 있습니다. 데이터 공백 시 일목 계산 불가 신호는 별도 집계합니다.</p>
+</section>
+<section class="panel"><h2>데이터 완성도</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>전체 신호 · 공정 비교</h2><div id="summary" class="stats">검사 완료 후 표시</div>
+<p class="hint">원본 C 전체 판정 결과와 지표 계산 가능한 공통 표본을 구분합니다. 같은 신호에서 필터가 제외한 거래를 0%로 처리한 원본 신호당 평균 손익도 보여줍니다.</p><div id="results" class="scroll">검사 완료 후 표시</div></section>
+<section class="panel"><h2>코인별 첫 신호만</h2><div id="first" class="scroll">검사 완료 후 표시</div>
+<p class="hint">한 코인에서 여러 번 발생한 신호의 영향도 확인합니다. 평균 수익률은 실제 포트폴리오 성적이 아닙니다.</p></section>
+<section class="panel"><h2>주의사항</h2><p class="hint">수수료·슬리피지 설정을 차감합니다. 동일 봉에서 익절/손절 모두 닿으면 손절 우선, 손절 갭은 불리한 체결을 반영합니다. 11월 1~3일 자료로 규칙을 고르는 경우 이 날짜의 결과를 독립 검증으로 사용하면 안 됩니다. 실제 주문 기능은 없습니다.</p>
+<a href="/backtest-winrate-c2">V11.14.7 C vs C2 검증실</a> · <a href="/backtest-winrate-c-validated">V11.14.5 기존 C 검증실</a></section>
+</main><script>
+
+'use strict';
+const $=id=>document.getElementById(id),KEY='bithumb_v11149_ich_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+const fields=['date','tp','sl','horizon','fee','slip'];
+function cfgOf(){const c={};for(const k of fields)c[k]=$(k).value;if(!/^20\d{2}-\d{2}-\d{2}$/.test(c.date))throw Error('날짜를 선택하세요');for(const k of fields.slice(1)){if(!Number.isFinite(Number(c[k])))throw Error('설정 값 오류: '+k);}return c;}
+function signature(c){return fields.map(k=>String(c[k])).join('|')}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?.version===9&&Array.isArray(x.markets)&&x.config&&x.results?x:null;}catch{return null;}}
+function setConfig(c){for(const k of fields)$(k).value=c[k];}
+function sampleResults(){return state?state.markets.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x)).map(x=>state.results[x]):[];}
+function card(k,v){return `<div class="stat"><small>${esc(k)}</small><strong>${esc(v)}</strong></div>`;}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmt(x){return Number.isFinite(x)?x.toFixed(3)+'%':'—';}
+function decided(e){return e?.c&&['TP','SL','TIME'].includes(e.c.outcome)&&Number.isFinite(e.c.net_pct)}
+function stat(es){const n=es.length,sum=es.reduce((s,e)=>s+e.c.net_pct,0);return{n,wins:es.filter(e=>e.c.net_pct>0).length,tp:es.filter(e=>e.c.outcome==='TP').length,sl:es.filter(e=>e.c.outcome==='SL').length,tm:es.filter(e=>e.c.outcome==='TIME').length,sum,avg:n?sum/n:NaN,win:n?100*es.filter(e=>e.c.net_pct>0).length/n:NaN};}
+function table(es){const cols=[['기존 C · 공통 표본',()=>true],['C + A · 구름대 위',e=>e.ich.cloud_pass===true],['C + B · 전환선 우위',e=>e.ich.line_pass===true],['C + A+B',e=>e.ich.both_pass===true]];
+ const header='<table><thead><tr><th>방식</th><th>진입</th><th>익절/손절/시간</th><th>순승률</th><th>거래당 평균</th><th>원본 신호당 평균 (보류=0%)</th><th>보류 건수</th><th>보류한 수익거래</th></tr></thead><tbody>';
+ return header+cols.map(([name,test])=>{const kept=es.filter(test),removed=es.filter(e=>!test(e)),s=stat(kept);return `<tr><td>${esc(name)}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${fmt(s.win)}</td><td>${fmt(s.avg)}</td><td>${fmt(es.length?s.sum/es.length:NaN)}</td><td>${removed.length}</td><td>${removed.filter(e=>e.c.net_pct>0).length}</td></tr>`;}).join('')+'</tbody></table>';
+}
+function renderResults(a){const events=a.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market}))),base=events.filter(decided),eligible=base.filter(e=>e.ich?.eligible===true),first=eligible.filter(e=>e.is_first_signal),all=stat(base),common=stat(eligible);
+ $('summary').innerHTML=card('전체 C 발생',events.length+'건')+card('전체 C 판정',all.n+'건')+card('전체 C 평균 순손익',fmt(all.avg))+card('일목 계산 가능 · 판정',eligible.length+'건')+card('일목 계산 불가 · 판정',base.length-eligible.length+'건')+card('일목 공통표본 평균',fmt(common.avg));
+ $('results').innerHTML='<p class="hint">같은 원본 C 신호 '+eligible.length+'건을 대상으로 비교. 계산 불가 및 미판정은 이 표에서 제외.</p>'+table(eligible);
+ $('first').innerHTML='<p class="hint">코인별 첫 원본 C 신호 중 지표 계산 가능 + 손익 판정된 '+first.length+'건</p>'+table(first);
+}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0,signals=a.reduce((s,r)=>s+r.signals,0);
+ $('progress').max=total||1;$('progress').value=n;
+ $('coverage').innerHTML=card('조회 종목',`${n}/${total}`)+card('분석 가능 종목',a.filter(x=>x.valid_windows>0).length+'개')+card('C 신호',signals+'건')+card('데이터 240봉 이상',a.filter(x=>x.observed_5m>=240).length+'개')+card('과거 페이지 상한',a.filter(x=>x.truncated).length+'개');
+ if(complete){renderResults(a);$('csv').disabled=false;}else{$('summary').textContent='전체 KRW 검사 완료 후 표시';$('results').textContent='전체 KRW 검사 완료 후 표시';$('first').textContent='전체 KRW 검사 완료 후 표시';$('csv').disabled=true;}
+ $('status').textContent=state?(complete?'✅ 전체 검사 완료':'⏳ 진행/중단 상태')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 일부 요청 실패, 이어하기 필요':''):'검사 전 · 전체 시장 결과 없음';
+}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid)}}
+async function initSession(c){const v=await req('/api/winrate14ich/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 종목 목록이 없습니다');state={version:9,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=cfgOf()}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(c)){if(!confirm('날짜나 설정이 바뀌었습니다. V11.14.9의 이전 진행 기록만 지우고 시작할까요?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(c);state.failed=0;save();paint();let pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m));const batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+  async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+   for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{let r=await req('/api/winrate14ich/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});
+    if(r.errors||r.scanned!==batch.length||!Array.isArray(r.results)||r.results.length!==batch.length||r.results.some(x=>!batch.includes(x.market)||!Array.isArray(x.events)||x.events.length!==x.signals||x.events.some(e=>!e.c||!e.ich)))throw Error('불완전한 검사 결과');
+    response=r;break;}catch(e){if(attempt===2){fail++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패: '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+   if(response){for(const x of response.results)state.results[x.market]=x;try{save()}catch(e){hardFailure=true;$('status').textContent='⚠️ 브라우저 저장 공간 부족';break;}paint();}
+   if(fail>=4){hardFailure=true;break;}
+  }}
+  await Promise.all([worker(),worker()]);state.failed=fail;try{save()}catch{}paint();
+  if(stopRequested)$('status').textContent+='\n일시 중지했습니다. 다시 누르면 남은 종목부터 검사합니다.';
+  if(fail)$('status').textContent+=`\n실패한 묶음 ${fail}개 · 다시 실행하면 누락된 종목을 재검사합니다.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 부분 결과를 승률로 공개하지 않습니다.';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}
+}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;$('status').textContent+='\n진행 중 요청이 끝나면 중지합니다.';};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.9 일목 검증 기록만 초기화할까요?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','c_signals','original_signal_time_kst','c_entry_time_kst','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','ich_eligible','ich_reason','ich_tenkan','ich_kijun','ich_senkou_a_now','ich_senkou_b_now','ich_cloud_top','ich_cloud_bottom','ich_price_gap_pct','ich_cloud_thickness_pct','ich_cloud_pass','ich_line_pass','ich_both_pass','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const rows=[cols.map(csvCell).join(',')];const prefix={version:'V11.14.9',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(obj){rows.push(cols.map(k=>csvCell(obj[k])).join(','));}
+ for(const r of sampleResults()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:0});continue;}
+  if(!Array.isArray(r.events)||r.events.length!==r.signals){$('status').textContent='⚠️ CSV에 필요한 이벤트 누락';return;}
+  for(const e of r.events){const c=e.c||{},s=e.ich||{},f=e.features||{};append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:r.signals,original_signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,ich_eligible:s.eligible?1:0,ich_reason:s.reason,ich_tenkan:s.tenkan,ich_kijun:s.kijun,ich_senkou_a_now:s.senkou_a_now,ich_senkou_b_now:s.senkou_b_now,ich_cloud_top:s.cloud_top,ich_cloud_bottom:s.cloud_bottom,ich_price_gap_pct:s.price_gap_pct,ich_cloud_thickness_pct:s.cloud_thickness_pct,ich_cloud_pass:s.eligible?(s.cloud_pass?1:0):'',ich_line_pass:s.eligible?(s.line_pass?1:0):'',ich_both_pass:s.eligible?(s.both_pass?1:0):'',original_volume_ratio:f.volume_ratio,original_body_pct:f.body_pct,original_pullback_pct:f.pullback_depth_pct});}
+ }
+ const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_ICH_${state.config.date}_v11149.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+
+</script></body></html>"""
+
+
+def register_ich_v11149_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets() if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:
+                    raise ValueError('현재 빗썸 KRW 종목 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-ich')
+    def ich_page_v11149():
+        return render_template_string(ICH_V11149_PAGE)
+
+    @app.get('/api/winrate14ich/universe')
+    def ich_universe_v11149():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings','rule_version':'V11.14.9'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14ich/evaluate')
+    def ich_evaluate_v11149():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            allowed=set(listed())
+            if any(m not in allowed for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks={pool.submit(ich_v11149_evaluate_symbol,api_get,m,cfg,kst):m for m in markets}
+                for future in as_completed(tasks):
+                    try:results.append(future.result())
+                    except Exception as e:errors.append({'market':tasks[future],'error':str(e)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.9'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11148_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11148_register_daytrade_review(app,deps)
+    register_ich_v11149_lab(app,deps)
