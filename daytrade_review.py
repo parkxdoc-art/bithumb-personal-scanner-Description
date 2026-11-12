@@ -4484,3 +4484,341 @@ _v111412_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111412_register_daytrade_review(app,deps)
     register_lossdiag_v111413_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.14 — Independent 3-minute versus existing 5-minute C research lab.
+# Original C / V2 / all older research endpoints are registered unchanged.
+# Both variants use C's same price/volume thresholds, equal wall-clock windows,
+# 60-minute example cooldown, TP/SL/cost convention, and next-bar entry.
+# The 5-minute arm reuses the EXACT V11.14.5 C evaluator as its baseline.
+# This is NOT an actual buy signal and cannot place any order.
+# ---------------------------------------------------------------------------
+
+TF_V111414_CONFIG = {
+    3: {'volume': 34, 'flow_hour': 20, 'ma_reclaim': 17, 'fast': 10, 'warmup': 40},
+    5: {'volume': 20, 'flow_hour': 12, 'ma_reclaim': 10, 'fast': 6, 'warmup': 26},
+}
+
+
+def tf_v111414_fetch_3m(api_get, market, cfg, kst):
+    """KST-exclusive Bithumb 3m pagination; only observed OHLCV bars.
+
+    Up to six pages cover the normal 4h prehistory, full selected date and
+    2h forward settlement window; sparse/short history is reported, not filled.
+    """
+    day_start = datetime.combine(cfg['day'], _time.min, tzinfo=kst)
+    begin = day_start - timedelta(hours=4)
+    end = day_start + timedelta(days=1, hours=2, minutes=3)
+    cursor, observed, truncated = end, {}, True
+    for _ in range(6):
+        raw = api_get('/v1/candles/minutes/3', {
+            'market': market, 'count': 200,
+            'to': cursor.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        if not isinstance(raw, list):
+            raise ValueError('3분봉 API 응답 형식 오류')
+        oldest = None
+        for bar in raw:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                t = local_time(bar['candle_date_time_kst'], kst)
+                op, hi, lo, close = (float(bar[k]) for k in
+                                     ('opening_price', 'high_price', 'low_price', 'trade_price'))
+                volume = float(bar['candle_acc_trade_volume'])
+                if not (all(isfinite(x) and x > 0 for x in (op, hi, lo, close))
+                        and isfinite(volume) and volume >= 0
+                        and lo <= min(op, close) and hi >= max(op, close) and lo <= hi):
+                    continue
+                # Time boundaries for 3m candles are KST-aligned.
+                if t.minute % 3 != 0 or t.second != 0 or t.microsecond != 0:
+                    continue
+                oldest = t if oldest is None else min(oldest, t)
+                if begin <= t < end:
+                    observed[t] = {'t': t, 'o': op, 'h': hi, 'l': lo, 'c': close, 'v': volume}
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+        if oldest is None:
+            truncated = False
+            break
+        if oldest <= begin or len(raw) < 200:
+            truncated = False
+            break
+        if oldest >= cursor:
+            raise ValueError('3분봉 API 조회 페이지가 전진하지 않습니다')
+        cursor = oldest
+    return [observed[t] for t in sorted(observed)], truncated
+
+
+def tf_v111414_contiguous(rows, a, b, minutes):
+    if a < 0 or b >= len(rows) or a > b:
+        return False
+    delta = timedelta(minutes=minutes)
+    return all(rows[j]['t'] - rows[j-1]['t'] == delta for j in range(a+1, b+1))
+
+
+def tf_v111414_signal_3m(rows, i):
+    """Wall-clock scaled C formula; NO future or current unclosed bars.
+
+    Old+recent 1-hour averages: 20x3m instead of 12x5m.
+    Short trend: 10x3m instead of 6x5m. Reclaim: ~51m instead of 50m.
+    Previous volume average: ~102m instead of 100m.
+    """
+    n = TF_V111414_CONFIG[3]
+    if i < n['warmup']:
+        return False
+    c = rows[i]
+    vol = sum(x['v'] for x in rows[i-n['volume']:i]) / n['volume']
+    if vol <= 0:
+        return False
+    span = max(1e-12, c['h'] - c['l'])
+    bull = c['c'] > c['o'] and (c['c'] - c['o']) / span >= .30
+    hour = n['flow_hour']
+    ma_old = sum(x['c'] for x in rows[i-2*hour:i-hour]) / hour
+    ma_recent = sum(x['c'] for x in rows[i-hour:i]) / hour
+    short = n['fast']
+    fast = sum(x['c'] for x in rows[i-short:i]) / short
+    fast_old = sum(x['c'] for x in rows[i-short-1:i-1]) / short
+    ma_reclaim = sum(x['c'] for x in rows[i-n['ma_reclaim']:i]) / n['ma_reclaim']
+    return bool(bull and c['v']/vol >= .90 and ma_recent >= ma_old*1.003
+                and fast >= fast_old and c['l'] <= ma_reclaim*1.005
+                and c['c'] >= ma_reclaim*1.001 and c['c'] >= rows[i-1]['c'])
+
+
+def tf_v111414_outcome_3m(rows, i, cfg):
+    """3m equivalent of V11.14.5 conservative earliest-exit model.
+
+    Next actual 3m candle open; SL first on a same-bar TP/SL tie. Never
+    settle beyond a missing observed bar. Fees and slip are charged per side.
+    """
+    n = cfg['horizon']//3
+    if not (0 <= i < len(rows)) or n < 1 or i+1 >= len(rows):
+        return {'outcome': 'UNKNOWN', 'reason': '진입 다음 3분봉 부족'}
+    delta = timedelta(minutes=3)
+    if rows[i+1]['t']-rows[i]['t'] != delta:
+        return {'outcome': 'UNKNOWN', 'reason': '진입 전 3분봉 공백'}
+    entry = rows[i+1]['o']
+    target, stop = entry*(1+cfg['tp']/100), entry*(1-cfg['sl']/100)
+    last = i
+    for j in range(i+1, i+n+1):
+        if j >= len(rows):
+            return {'outcome': 'UNKNOWN', 'reason': '청산 전 3분봉 부족'}
+        if rows[j]['t']-rows[last]['t'] != delta:
+            return {'outcome': 'UNKNOWN', 'reason': '청산 전 3분봉 공백'}
+        last = j
+        candle = rows[j]
+        if candle['l'] <= stop:
+            result, exit_price = 'SL', min(stop, candle['o'])
+        elif candle['h'] >= target:
+            result, exit_price = 'TP', target
+        elif j == i+n:
+            result, exit_price = 'TIME', candle['c']
+        else:
+            continue
+        cost = (cfg['fee']+cfg['slip'])/100
+        net = (exit_price*(1-cost)/(entry*(1+cost))-1)*100
+        return {'outcome': result, 'entry': round(entry, 10),
+                'exit': round(exit_price, 10), 'net_pct': round(net, 4),
+                'minutes': (j-i)*3}
+    return {'outcome': 'UNKNOWN', 'reason': '3분봉 미판정'}
+
+
+def tf_v111414_evaluate_3m(api_get, market, cfg, kst):
+    rows, truncated = tf_v111414_fetch_3m(api_get, market, cfg, kst)
+    start = datetime.combine(cfg['day'], _time.min, tzinfo=kst)
+    end = start + timedelta(days=1)
+    observed = sum(start <= r['t'] < end for r in rows)
+    warmup = TF_V111414_CONFIG[3]['warmup']
+    n = cfg['horizon']//3
+    events = []
+    cooldown, valid = -1, 0
+    if len(rows) >= warmup+2:
+        for i in range(warmup, len(rows)-1):
+            t = rows[i]['t']
+            if not start <= t < end:
+                continue
+            if not tf_v111414_contiguous(rows, i-warmup, i, 3):
+                continue
+            valid += 1
+            if i < cooldown or not tf_v111414_signal_3m(rows, i):
+                continue
+            cooldown = i+n
+            outcome = tf_v111414_outcome_3m(rows, i, cfg)
+            events.append({'signal_time_kst': t.strftime('%Y-%m-%d %H:%M'),
+                           'entry_time_kst': (t+timedelta(minutes=3)).strftime('%Y-%m-%d %H:%M'),
+                           'is_first_signal': len(events)==0,
+                           **outcome})
+    return {'observed': observed, 'valid_windows': valid,
+            'truncated': truncated, 'signals': len(events),
+            'unknown': sum(e['outcome']=='UNKNOWN' for e in events),
+            'events': events}
+
+
+def tf_v111414_evaluate_symbol(api_get, market, cfg, kst):
+    """Existing C 5m evaluator called WITHOUT altering its logic or history."""
+    old = lab_cdiag_v11145_evaluate_symbol(api_get, market, cfg, kst)
+    arm5 = {
+        'observed': old['observed_5m'],
+        'valid_windows': old['valid_windows'],
+        'truncated': old['truncated'],
+        'signals': old['signals'], 'unknown': old['unknown'],
+        'events': [{
+            'signal_time_kst': (
+                datetime.strptime(e['signal_kst'], '%Y-%m-%d %H:%M')
+                - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+            'entry_time_kst': e['signal_kst'],
+            'is_first_signal': e['is_first_signal'],
+            'outcome': e['outcome'], 'net_pct': e.get('net_pct'),
+            'entry': e.get('entry'), 'exit': e.get('exit'),
+            'minutes': e.get('minutes'), 'reason': e.get('reason'),
+        } for e in old['events']]
+    }
+    arm3 = tf_v111414_evaluate_3m(api_get, market, cfg, kst)
+    return {'market': market, 'tf5': arm5, 'tf3': arm3}
+
+
+TF_V111414_PAGE = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V11.14.14 · C 전략 3분봉 vs 5분봉 독립 검증</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--good:#4ade80;--bad:#ffb4b4}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 60px}h1{font-size:23px;margin:9px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:14px}
+.note{border-radius:10px;background:#10182d;padding:12px;font-size:13px;line-height:1.75}
+.muted,.hint{font-size:13px;color:var(--muted)}.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.field{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:13px}
+input,select,button{font:inherit}input,select{min-width:0;width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;background:#10182d;color:var(--fg)}
+button{padding:11px 13px;border:0;border-radius:9px;background:var(--blue);color:white;font-weight:750;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin:14px 0 10px}progress{width:100%;height:17px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{padding:12px;border-radius:10px;background:var(--card);border:1px solid var(--border)}
+.stat small{display:block;color:var(--muted);font-size:12px}.stat strong{display:block;font-size:21px}.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:10px 8px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}
+.good{color:var(--good)}.bad{color:var(--bad)}a{color:#bcd0ff}.status{white-space:pre-wrap;color:var(--muted);font-size:13px}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.14 · 3분봉 vs 5분봉 C 전략 검증실</h1>
+<p class="muted">실전 BUY와 기존 5분봉 C 검증실은 변경하지 않습니다. 두 전략을 <b>같은 날짜·현재 KRW 종목군</b>에서 독립적으로 비교하는 과거 모의 실험입니다.</p>
+<section class="panel"><h2>비교 기준</h2><div class="note">
+<b>기존 5분봉 C:</b> 원래 V11.14.5 C 신호·손익 판정 함수를 그대로 사용합니다.<br>
+<b>실험 3분봉 C:</b> 흐름 1시간(20×3분), 빠른 평균 30분(10×3분), 눌림 평균 약 51분(17×3분), 이전 거래량 약 102분(34×3분)으로 시간 기준을 맞춥니다. 신호 강도 임계값은 같습니다.<br>
+<b>진입:</b> 각 신호봉이 확정된 후 다음 해당 분봉 시가에서 모의 진입합니다. <b>청산:</b> 익절·손절·보유 시간과 수수료·슬리피지를 동일하게 적용합니다. 같은 봉에 익절·손절 동시 도달 시 손절 우선입니다.<br>
+<b>주의:</b> 3분봉의 발생 신호는 5분봉 신호와 서로 다릅니다. 단순히 거래당 승률만 비교하면 안 되고 신호 개수, 서로 다른 종목 수, 첫 신호, 미판정, 평균 순손익을 함께 보아야 합니다. 거래소 3분봉과 5분봉 간 가격 경로 재현 차이도 있습니다. 결과는 실제 체결이나 실전 수익률을 보장하지 않습니다.
+</div></section>
+<section class="panel"><h2>검증 조건</h2><div class="controls">
+<label class="field">검증 날짜 (KST)<input type="date" id="date"></label>
+<label class="field">익절 목표 (%)<input type="number" id="tp" step="0.1" min="0.3" max="10" value="1.5"></label>
+<label class="field">손절 기준 (%)<input type="number" id="sl" step="0.1" min="0.2" max="8" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input type="number" id="fee" step="0.01" min="0" max="0.5" value="0.04"></label>
+<label class="field">편도 슬리피지 (%)<input type="number" id="slip" step="0.01" min="0" max="0.5" value="0.05"></label>
+</div>
+<div class="actions"><button id="run">전체 KRW 비교 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">진행 기록 초기화</button><button id="csv" class="secondary" disabled>3분봉·5분봉 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p></section>
+<section class="panel"><h2>검사 현황</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>전체 C 신호 비교</h2><p class="hint">전체 종목 검사가 끝나야 최종 성적을 공개합니다. 미판정은 승률/평균 손익 분모에서 제외합니다.</p><div class="scroll" id="mainStats">검사 완료 후 공개</div></section>
+<section class="panel"><h2>종목당 첫 C 신호만 비교</h2><p class="hint">동일 종목·동일 날짜의 반복 신호에 따른 중복 영향을 줄이기 위한 추가 지표입니다. 서로 다른 3분봉·5분봉 신호를 1:1 매칭한 것은 아닙니다.</p><div class="scroll" id="firstStats">검사 완료 후 공개</div></section>
+<section class="panel"><h2>코인별 결과</h2><div id="byMarket" class="scroll">검사 완료 후 공개</div></section>
+<section class="panel"><h2>기존 연구실</h2><p><a href="/backtest-winrate-lossdiag">V11.14.13 손실 원인 분석</a> · <a href="/backtest-winrate-fib-btc">피보나치/BTC</a> · <a href="/backtest-winrate-vwap-btc">VWAP/BTC</a> · <a href="/backtest-winrate-c-validated">기존 C 검증</a> · <a href="/">V2 메인</a></p><div class="note">완료된 과거 한 날짜의 현재 상장된 KRW 종목만 검사합니다. 현재 상장 목록을 과거 시점의 상장 종목 목록으로 간주할 수 없으며, 거래정지·상장폐지·과거 거래 비용을 완벽히 재현하지 않습니다.</div></section>
+</main><script>
+const $=id=>document.getElementById(id);
+const KEY='bithumb_v111414_3m5m_checkpoint_1', API='/api/winrate14tf';
+let state=null, running=false, stopRequested=false, hardFailure=false;
+function dateKST(d){const p=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);const x=k=>p.find(a=>a.type===k).value;return `${x('year')}-${x('month')}-${x('day')}`;}
+const yesterday=()=>dateKST(new Date(Date.now()-86400000));
+$('date').max=yesterday();$('date').value=('2026-11-10'<=yesterday()&&'2026-11-10'>=dateKST(new Date(Date.now()-59*86400000)))?'2026-11-10':yesterday();
+function config(){const c={date:$('date').value,tp:+$('tp').value,sl:+$('sl').value,horizon:+$('horizon').value,fee:+$('fee').value,slip:+$('slip').value};if(!/^\d{4}-\d{2}-\d{2}$/.test(c.date)||c.date>yesterday()||!Object.values(c).slice(1).every(Number.isFinite)||c.tp<.3||c.tp>10||c.sl<.2||c.sl>8||![30,60,120].includes(c.horizon)||c.fee<0||c.fee>.5||c.slip<0||c.slip>.5)throw Error('검증 날짜·손익·비용 설정을 확인하세요');return c;}
+const sig=c=>JSON.stringify([c.date,c.tp,c.sl,c.horizon,c.fee,c.slip]);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pct=n=>Number.isFinite(n)?n.toFixed(3)+'%':'—';
+const card=(title,val)=>`<div class="stat"><small>${esc(title)}</small><strong>${esc(val)}</strong></div>`;
+function load(){try{const s=JSON.parse(localStorage.getItem(KEY)||'null');if(!s||s.version!==1||!s.config||!Array.isArray(s.markets)||!s.markets.length||!s.results||typeof s.results!=='object'||s.markets.some(m=>!/^KRW-[A-Z0-9]+$/.test(m))||new Set(s.markets).size!==s.markets.length)return null;return s;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function setConfig(c){for(const name of ['date','tp','sl','horizon','fee','slip'])$(name).value=c[name];}
+function symbols(){return state?state.markets.filter(m=>Object.prototype.hasOwnProperty.call(state.results,m)).map(m=>state.results[m]):[];}
+function finished(){return !!state&&symbols().length===state.markets.length&&state.failed===0;}
+function sum(group,tf,firstOnly){let signals=0,unknown=0,n=0,wins=0,net=0,tp=0,sl=0,timed=0,markets=0,valid=0,observed=0;for(const s of group){const a=s[tf];valid+=a.valid_windows;observed+=a.observed;let events=a.events;if(firstOnly)events=events.filter(e=>e.is_first_signal);signals+=firstOnly?events.length:a.signals;unknown+=firstOnly?events.filter(e=>e.outcome==='UNKNOWN').length:a.unknown;if(events.length)markets++;for(const e of events){if(e.outcome==='UNKNOWN')continue;const v=Number(e.net_pct);if(!Number.isFinite(v))continue;n++;net+=v;if(v>0)wins++;if(e.outcome==='TP')tp++;if(e.outcome==='SL')sl++;if(e.outcome==='TIME')timed++;}}return {signals,unknown,n,wins,tp,sl,timed,markets,valid,observed,avg:n?net/n:NaN,win:n?100*wins/n:NaN};}
+function tableStats(group,firstOnly){const a=sum(group,'tf5',firstOnly),b=sum(group,'tf3',firstOnly);const rows=[['신호 건수',a.signals,b.signals],['신호 발생 종목',a.markets,b.markets],['판정 완료 거래',a.n,b.n],['미판정 신호',a.unknown,b.unknown],['수익 거래',a.wins,b.wins],['수익 거래 비율',pct(a.win),pct(b.win)],['거래당 평균 순손익',pct(a.avg),pct(b.avg)],['익절/손절/시간종료',`${a.tp}/${a.sl}/${a.timed}`,`${b.tp}/${b.sl}/${b.timed}`]];return `<table><thead><tr><th>비교 항목</th><th>기존 5분봉</th><th>실험 3분봉</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td><td>${esc(r[2])}</td></tr>`).join('')}</tbody></table>`;}
+function paint(){const all=symbols(),n=all.length,total=state?.markets.length||0,complete=finished();$('progress').max=total||1;$('progress').value=n;const v5=sum(all,'tf5',false),v3=sum(all,'tf3',false);
+$('coverage').innerHTML=card('조회 완료 종목',`${n}/${total}`)+card('5분봉 C 신호',v5.signals+'건')+card('3분봉 C 신호',v3.signals+'건')+card('5분봉·3분봉 미판정',`${v5.unknown} / ${v3.unknown}`)+card('5분봉 유효 평가 구간',v5.valid.toLocaleString())+card('3분봉 유효 평가 구간',v3.valid.toLocaleString());
+$('csv').disabled=!complete;if(!complete){$('mainStats').textContent='전체 검사 완료 후 최종 결과를 공개합니다.';$('firstStats').textContent='전체 검사 완료 후 공개';$('byMarket').textContent='전체 검사 완료 후 공개';}else{$('mainStats').innerHTML=tableStats(all,false);$('firstStats').innerHTML=tableStats(all,true);const rows=all.filter(s=>s.tf5.signals||s.tf3.signals).sort((a,b)=>a.market.localeCompare(b.market));$('byMarket').innerHTML=rows.length?`<table><thead><tr><th>종목</th><th>5m 신호</th><th>3m 신호</th><th>5m 판정</th><th>3m 판정</th><th>5m 평균</th><th>3m 평균</th></tr></thead><tbody>${rows.map(s=>{const a=sum([s],'tf5',false),b=sum([s],'tf3',false);return `<tr><td>${esc(s.market)}</td><td>${a.signals}</td><td>${b.signals}</td><td>${a.n}</td><td>${b.n}</td><td>${pct(a.avg)}</td><td>${pct(b.avg)}</td></tr>`;}).join('')}</tbody></table>`:'C 신호 없음';}
+$('status').textContent=(complete?'✅ 전체 KRW 종목 3분봉·5분봉 비교 완료':'⏳ 전체 시장 검사 미완료')+` · ${n}/${total}종목`+(state?.failed?' · ⚠️ 실패 배치 '+state.failed+'개':'')+(complete?'\n거래당 평균 순손익은 실제 계좌 수익률이 아닙니다. 실전 적용 전 독립 검증이 필요합니다.':'\n최종 승률과 손익은 모든 종목 검사 완료 뒤에만 표시합니다.');}
+async function call(url,opts){const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),115000);try{const resp=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),data=await resp.json();if(!resp.ok||!data.ok)throw Error(data.error||'HTTP '+resp.status);return data;}finally{clearTimeout(timer);}}
+async function init(c){const v=await call(API+'/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('현재 KRW 종목 목록 없음');state={version:1,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=config();}catch(e){$('status').textContent='⚠️ '+e.message;return;}if(state&&sig(state.config)!==sig(c)){if(!confirm('날짜나 설정이 바뀌었어. 이전 진행 기록을 지우고 새 검사를 시작할까?'))return;state=null;localStorage.removeItem(KEY);}running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;try{if(!state)await init(c);state.failed=0;save();paint();const todo=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m)),jobs=todo.map(m=>[m]);let pos=0,failed=0;async function worker(){while(!stopRequested&&!hardFailure){const batch=jobs[pos++];if(!batch)return;let response=null;for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{const x=await call(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});if(x.errors||x.scanned!==batch.length||!Array.isArray(x.results)||x.results.length!==batch.length||x.results.some(r=>!batch.includes(r.market)||!r.tf3||!r.tf5||!Array.isArray(r.tf3.events)||!Array.isArray(r.tf5.events)||r.tf3.events.length!==r.tf3.signals||r.tf5.events.length!==r.tf5.signals))throw Error('불완전한 종목 결과');response=x;break;}catch(e){if(attempt===2){failed++;$('status').textContent='⚠️ '+batch.join(', ')+' 검사 실패: '+String(e.message||e);}else await new Promise(resolve=>setTimeout(resolve,1000*(attempt+1)));}}if(response){for(const r of response.results)state.results[r.market]=r;try{save();}catch(e){hardFailure=true;$('status').textContent='⚠️ 브라우저 저장 공간 부족';break;}paint();}if(failed>=4){hardFailure=true;break;}}}await Promise.all([worker(),worker()]);state.failed=failed;try{save();}catch{}paint();if(stopRequested)$('status').textContent+='\n일시 중지했어. 같은 날짜/설정으로 누르면 이어서 검사해.';if(failed)$('status').textContent+='\n누락된 종목은 다시 실행할 때 재검사해.';}catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};$('reset').onclick=()=>{if(running)return;if(!confirm('이 3분봉·5분봉 검증의 진행 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(s){s=String(s??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!finished())return;const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','timeframe_minutes','observed_day_bars','valid_windows','c_signals','c_unknown','signal_time_kst','entry_time_kst','is_first_signal','outcome','net_pct','entry','exit','minutes','reason'];const lines=[cols.join(',')];for(const r of symbols()){for(const [tf,unit] of [['tf5',5],['tf3',3]]){const arm=r[tf];const prefix={version:'V11.14.14',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip,market:r.market,timeframe_minutes:unit,observed_day_bars:arm.observed,valid_windows:arm.valid_windows,c_signals:arm.signals,c_unknown:arm.unknown};if(!arm.events.length){lines.push(cols.map(k=>csvCell(prefix[k])).join(','));continue;}for(const ev of arm.events)lines.push(cols.map(k=>csvCell(({...prefix,...ev})[k])).join(','));}}const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_C_3m_vs_5m_${state.config.date}_v111414.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);};
+state=load();if(state)setConfig(state.config);paint();
+</script></body></html>
+'''
+
+
+def register_tf_v111414_lab(app, deps):
+    api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
+    cache = {'names': None, 'time': 0}
+    mutex = Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time() - cache['time'] > 600:
+                names = sorted({m for m in get_markets()
+                                if isinstance(m, str) and MARKET_RE.fullmatch(m)})
+                if not names:
+                    raise ValueError('현재 KRW 종목 목록이 비었습니다')
+                cache['names'], cache['time'] = names, time.time()
+            return cache['names']
+
+    @app.get('/backtest-winrate-3m5m')
+    def page_tf_v111414():
+        return render_template_string(TF_V111414_PAGE)
+
+    @app.get('/api/winrate14tf/universe')
+    def universe_tf_v111414():
+        try:
+            names = listed()
+            return jsonify({'ok': True, 'items': names, 'count': len(names),
+                            'rule_version': 'V11.14.14',
+                            'universe_type': 'currently_listed_KRW'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+    @app.post('/api/winrate14tf/evaluate')
+    def evaluate_tf_v111414():
+        try:
+            body = request.get_json(silent=True)
+            cfg = lab_valid_request(body, kst)
+            markets = body.get('markets') if isinstance(body, dict) else None
+            if (not isinstance(markets, list) or not 1 <= len(markets) <= 2
+                    or len(set(markets)) != len(markets)
+                    or any(not isinstance(m, str) or not MARKET_RE.fullmatch(m)
+                           for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            names = set(listed())
+            if any(m not in names for m in markets):
+                raise ValueError('현재 KRW 종목에 없는 코인입니다')
+            results, errors = [], []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {pool.submit(tf_v111414_evaluate_symbol,
+                                       api_get, market, cfg, kst): market
+                           for market in markets}
+                for future in as_completed(futures):
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        errors.append({'market': futures[future],
+                                       'error': str(exc)[:120]})
+            return jsonify({'ok': not errors, 'scanned': len(markets),
+                            'results': results, 'errors': len(errors),
+                            'error_markets': errors, 'rule_version': 'V11.14.14'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+
+_v111413_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app, deps):
+    _v111413_register_daytrade_review(app, deps)
+    register_tf_v111414_lab(app, deps)
