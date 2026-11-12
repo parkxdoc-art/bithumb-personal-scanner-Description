@@ -1,4 +1,4 @@
- """V11.13 live scanner + independent V11.14.5 historical C-strategy research lab.
+"""V11.13 live scanner + independent V11.14.5 historical C-strategy research lab.
 
 The V11.13 read-only scanner is preserved and separate historical research
 endpoints (V11.14.x) are registered alongside it. app.py and the V2 main
