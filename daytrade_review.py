@@ -2028,3 +2028,366 @@ _v11144_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v11144_register_daytrade_review(app, deps)
     register_c_valid_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.6: RSI(14) and MACD(12,26,9) research on ORIGINAL C signals.
+# Comparison-only. No changes to V11.13 BUY or any V11.14.5 endpoints.
+# RSI/Wilder and MACD/SMA-seeded EMAs computed on 70 CONTIGUOUS completed
+# five-minute candles ending at the C signal candle, never future prices.
+# Hypotheses are fixed BEFORE examining results:
+#   C+RSI  : 40 <= RSI14 <= 70 and RSI14 > RSI14_previous
+#   C+MACD : histogram > 0 and histogram > preceding histogram
+#   C+both : both conditions
+# Every subset is compared to ORIGINAL C on the SAME indicator-eligible cohort.
+# ---------------------------------------------------------------------------
+
+C_IND_LOOKBACK = 70
+
+
+def cind_fetch_extended(api_get, market, cfg, kst):
+    """Fetch 12h prehistory for indicator warm-up; keep prior 4h baseline intact.
+
+    Uses the same Bithumb 5m KST-exclusive pagination and OHLCV validity as
+    lab_fetch_5m. No synthetic candles and no modifications to old fetching.
+    """
+    begin = datetime.combine(cfg['day'], _time.min, tzinfo=kst) - timedelta(hours=12)
+    end = datetime.combine(cfg['day']+timedelta(days=1), _time.min, tzinfo=kst)+timedelta(hours=2,minutes=5)
+    cursor, seen, truncated = end, {}, True
+    for _ in range(LAB_MAX_PAGES):
+        raw = api_get('/v1/candles/minutes/5', {
+            'market': market, 'count': 200,
+            'to': cursor.strftime('%Y-%m-%d %H:%M:%S')})
+        if not isinstance(raw, list):
+            raise ValueError('5분봉 응답 형식 오류')
+        oldest = None
+        for bar in raw:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                ts = local_time(bar['candle_date_time_kst'], kst)
+                op,hi,lo,cl = (float(bar[k]) for k in
+                        ('opening_price','high_price','low_price','trade_price'))
+                vol = float(bar['candle_acc_trade_volume'])
+                if not (all(isfinite(v) and v>0 for v in (op,hi,lo,cl))
+                        and isfinite(vol) and vol>=0
+                        and lo<=min(op,cl) and hi>=max(op,cl) and lo<=hi):
+                    continue
+                oldest = ts if oldest is None else min(oldest,ts)
+                if begin <= ts < end:
+                    seen[ts]={'t':ts,'o':op,'h':hi,'l':lo,'c':cl,'v':vol}
+            except (KeyError,TypeError,ValueError,OverflowError):
+                continue
+        if oldest is None:
+            truncated = False
+            break
+        if oldest<=begin or len(raw)<200:
+            truncated = False
+            break
+        if oldest >= cursor:
+            raise ValueError('분봉 페이지 진행 오류')
+        cursor=oldest
+    return [seen[k] for k in sorted(seen)], truncated
+
+
+def cind_rsi_series(closes, period=14):
+    """Wilder RSI; return last and preceding RSI. For flat prices, RSI=50."""
+    if len(closes)<period+2:
+        return None
+    diffs=[closes[j]-closes[j-1] for j in range(1,len(closes))]
+    gain=sum(max(d,0.0) for d in diffs[:period])/period
+    loss=sum(max(-d,0.0) for d in diffs[:period])/period
+    def value(g,l):
+        if l==0 and g==0: return 50.0
+        if l==0: return 100.0
+        return 100-100/(1+g/l)
+    r=value(gain,loss)
+    prev=None
+    for d in diffs[period:]:
+        prev=r
+        gain=(gain*(period-1)+max(d,0))/period
+        loss=(loss*(period-1)+max(-d,0))/period
+        r=value(gain,loss)
+    return r,prev
+
+
+def cind_macd_series(closes, fast=12, slow=26, signal=9):
+    """SMA-seeded EMA 12/26; MACD, signal and histogram current/previous."""
+    if len(closes)<slow+signal+1:
+        return None
+    a=sum(closes[:fast])/fast
+    b=sum(closes[:slow])/slow
+    ma=[]
+    af=2/(fast+1)
+    bs=2/(slow+1)
+    for idx,price in enumerate(closes):
+        if idx>=fast:
+            a=af*price+(1-af)*a
+        if idx>=slow:
+            b=bs*price+(1-bs)*b
+        if idx>=slow-1:
+            ma.append(a-b)
+    if len(ma)<signal+1:
+        return None
+    sg=sum(ma[:signal])/signal
+    k=2/(signal+1)
+    last_h=None
+    prev_h=None
+    for idx,macd in enumerate(ma):
+        if idx>=signal:
+            sg=k*macd+(1-k)*sg
+        if idx>=signal-1:
+            prev_h,last_h=last_h,macd-sg
+    return ma[-1],sg,last_h,prev_h
+
+
+def cind_indicators(extended, idx):
+    """Only already completed 5m candles through signal idx are used."""
+    if idx < C_IND_LOOKBACK-1:
+        return {'eligible':False,'reason':'70개 과거 5분봉 부족'}
+    if not lab_contiguous(extended, idx-(C_IND_LOOKBACK-1), idx):
+        return {'eligible':False,'reason':'최근 70개 5분봉 연속성 부족'}
+    prices=[r['c'] for r in extended[idx-C_IND_LOOKBACK+1:idx+1]]
+    rsi=cind_rsi_series(prices)
+    macd=cind_macd_series(prices)
+    if not rsi or not macd or rsi[1] is None or macd[3] is None:
+        return {'eligible':False,'reason':'지표 계산 불가'}
+    rv,rprev=rsi
+    m,s,h,hprev=macd
+    denom=prices[-1]
+    return {
+        'eligible':True,'reason':None,
+        'rsi14':round(rv,5), 'rsi_prev':round(rprev,5),
+        'macd_pct':round(100*m/denom,6),
+        'macd_signal_pct':round(100*s/denom,6),
+        'hist_pct':round(100*h/denom,6),
+        'hist_prev_pct':round(100*hprev/denom,6),
+        'rsi_pass':bool(40<=rv<=70 and rv>rprev),
+        'macd_pass':bool(h>0 and h>hprev),
+    }
+
+
+def cind_evaluate_symbol(api_get,market,cfg,kst):
+    """Preserve V11.14.5 C events by evaluating ONLY its original 4h slice.
+
+    Additional fetched history is used ONLY for RSI/MACD. It cannot create
+    extra C signals or change the original next-bar outcome calculation.
+    """
+    extended,truncated=cind_fetch_extended(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    base_begin=day_start-timedelta(hours=4)
+    base=[r for r in extended if r['t']>=base_begin]
+    offset=len(extended)-len(base)
+    day_bars=sum(day_start<=r['t']<day_end for r in base)
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events,trades,first=None,[],None
+    events=[]
+    if len(base)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(base)-1):
+            t=base[i]['t']
+            if not day_start<=t<day_end:
+                continue
+            if not lab_contiguous(base,i-24,i):
+                continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(base,i):
+                continue
+            cooldown=i+n
+            signals+=1
+            outcome=lab_outcome_v11145(base,i,cfg)
+            entry_time=t+timedelta(minutes=5)
+            event={
+                'time':entry_time.strftime('%m-%d %H:%M'),
+                'signal_kst':entry_time.strftime('%Y-%m-%d %H:%M'),
+                'outcome':outcome['outcome'],
+                'net_pct':outcome.get('net_pct'),
+                'entry':outcome.get('entry'),
+                'exit':outcome.get('exit'),
+                'minutes':outcome.get('minutes'),
+                'reason':outcome.get('reason'),
+                'is_first_signal':first is None,
+                'features':lab_c_signal_features(base,i),
+                'indicators':cind_indicators(extended,offset+i),
+            }
+            if first is None:
+                first={k:event[k] for k in ('time','outcome','net_pct','entry','minutes')}
+            events.append(event)
+            if event['outcome']=='UNKNOWN':
+                unknown+=1
+            else:
+                trades.append(event)
+    assert len(events)==signals and len(trades)+unknown==signals
+    return {'market':market,'observed_5m':day_bars,
+        'longest_day_run':lab_longest_consecutive_5m([r for r in base if day_start<=r['t']<day_end]),
+        'valid_windows':valid,'signals':signals,'unknown':unknown,
+        'truncated':truncated,'first_signal':first,'trades':trades,'events':events}
+
+
+def make_c_indicator_page():
+    """Reuse the tested V11.14.5 mobile workflow, add paired-cohort table."""
+    p=C_VALID_PAGE.replace('V11.14.5','V11.14.6')
+    p=p.replace('bithumb_v11145_c_outcome_fix_checkpoint_1',
+                'bithumb_v11146_rsi_macd_checkpoint_1')
+    p=p.replace('/api/winrate14cfix/','/api/winrate14cind/')
+    p=p.replace('x.version!==3','x.version!==4')
+    p=p.replace('state={version:3,','state={version:4,')
+    p=p.replace('현재 V11.14.4 진단용 진행 기록만 삭제할까요?',
+                '현재 V11.14.6 지표 비교 진행 기록만 삭제할까요?')
+    assert '/api/winrate14cfix/' not in p
+    assert 'x.version!==4' in p and 'state={version:4,' in p
+    assert 'bithumb_v11146_rsi_macd_checkpoint_1' in p
+    intro='<section class="panel"><h2>검증 조건</h2>'
+    info="""<section class="panel"><h2>V11.14.6 · RSI·MACD 가설 사전 고정</h2>
+<div class="note"><b>기존 C 신호는 동일</b>하며, RSI·MACD는 신규 BUY 신호가 아니라 C의 <b>모의 거래 필터 후보</b>입니다.
+RSI(14)는 Wilder 방식으로 <b>40~70이면서 직전 확정봉보다 상승</b>하는 경우,
+MACD(12,26,9)는 <b>히스토그램이 양수이고 직전 확정봉보다 증가</b>하는 경우로 가설을 고정했습니다.
+지표는 신호 시점까지 <b>연속 70개의 확정 5분봉</b>이 있는 경우에만 계산합니다.
+<strong>공정 비교:</strong> 지표 계산이 가능한 동일 C 신호 집단에서 C 원본 / C+RSI / C+MACD / C+두 지표를 비교합니다.
+기존 C 전체 신호에 대한 성적은 위의 종합 화면에 그대로 따로 나타납니다. 제외된 수익 기회도 표에 보입니다.
+과거 6일에 대해 이미 알고 있는 결과로 규칙을 변경하지 마세요. 아직 평가하지 않은 다른 날짜에서 확인해야 합니다.</div></section>
+<section class="panel"><h2>검증 조건</h2>"""
+    assert p.count(intro)==1
+    p=p.replace(intro,info,1)
+    insertion='<section class="panel"><h2>주의사항</h2>'
+    extra="""<section class="panel"><h2>RSI·MACD 비교 실험 (지표 계산 가능한 C 신호만)</h2>
+<div id="indicatorSummary" class="stats">전체 시장 검사 후 표시</div>
+<div id="indicatorResults" class="scroll">검사 완료 후 표시</div>
+<p class="hint">수익/손실 여부는 비용 차감 후 순손익 기준입니다. TP/SL은 개별 봉 내 보수적인 체결 가정이며 실제 체결은 보장되지 않습니다. 필터 통과 거래 수가 적으면 승률이 높아도 신뢰할 수 없습니다. 현재 전체 시장 목록을 과거에 적용하므로 상장폐지 종목이 빠지는 생존자 편향이 있습니다.</p>
+<div class="scroll" id="indicatorFirst">첫 신호만 비교: 검사 완료 후 표시</div>
+</section>
+<section class="panel"><h2>주의사항</h2>"""
+    assert p.count(insertion)==1
+    p=p.replace(insertion,extra,1)
+    foot='<a href="/backtest-winrate-c-diagnostics">V11.14.4 기존 손절 분석판</a>'
+    assert foot in p
+    p=p.replace(foot,'<a href="/backtest-winrate-c-validated">V11.14.5 기준 검사</a> · '+foot,1)
+    # Add compare calculations BEFORE paint(), and invoke after complete status.
+    anchor='function paint(){let a=sampleResults()'
+    assert p.count(anchor)==1
+    compare_js=r"""
+function renderIndicatorComparison(results){
+ const events=results.flatMap(x=>(x.events||[]).map(e=>({...e,market:x.market})));
+ const withIndicators=events.filter(x=>x.indicators?.eligible===true);
+ const decided=withIndicators.filter(x=>x.outcome!=='UNKNOWN'&&typeof x.net_pct==='number');
+ const first=decided.filter(x=>x.is_first_signal);
+ const cases=[
+  ['C 원본 (지표 공통표본)',x=>true],
+  ['C + RSI(14)',x=>x.indicators.rsi_pass===true],
+  ['C + MACD(12·26·9)',x=>x.indicators.macd_pass===true],
+  ['C + RSI + MACD',x=>x.indicators.rsi_pass===true&&x.indicators.macd_pass===true]
+ ];
+ const unavailable=events.length-withIndicators.length;
+ const missing=withIndicators.filter(x=>x.outcome==='UNKNOWN').length;
+ $('indicatorSummary').innerHTML=card('전체 C 신호',events.length+'건')+
+  card('지표 계산 가능 신호',withIndicators.length+'건')+
+  card('지표 불가능 · 비교 제외',unavailable+'건')+
+  card('지표 가능하지만 승패 미판정',missing+'건')+
+  card('동일 표본 · 판정 거래',decided.length+'건');
+ const baseline=aggregate(decided);
+ function table(data){return '<table><thead><tr><th>비교 방식</th><th>판정 거래</th><th>익절</th><th>손절</th><th>시간 종료</th><th>순승률</th><th>평균 순손익</th><th>기존 대비 기회 제외</th><th>제외한 수익 거래</th></tr></thead><tbody>'+cases.map(([label,check])=>{
+  const kept=data.filter(check),omitted=data.filter(x=>!check(x)),s=aggregate(kept);
+  return `<tr><td>${escapeHtml(label)}</td><td>${s.n}</td><td>${s.tp}</td><td>${s.sl}</td><td>${s.time}</td><td>${s.n?numPct(s.winPct):'—'}</td><td>${s.n?numPct(s.avg):'—'}</td><td>${omitted.length}</td><td>${omitted.filter(x=>x.net_pct>0).length}</td></tr>`;
+ }).join('')+'</tbody></table>';}
+ $('indicatorResults').innerHTML='<p class="hint">같은 데이터로 계산 가능한 판정 C 거래 '+decided.length+'건이 공통 모집단입니다. 전체 C '+events.length+'건을 기준으로 한 직접 비교가 아닙니다.</p>'+table(decided);
+ $('indicatorFirst').innerHTML='<p class="hint">코인별 실제 최초 C 신호 중 지표 계산 가능하며 판정된 거래만 별도 비교합니다. 최초 신호가 미판정이면 뒤의 거래로 대체하지 않습니다.</p>'+table(first);
+}
+
+"""
+    p=p.replace(anchor,compare_js+anchor,1)
+    trigger="if(complete)renderRisk(a);else for(const id of ['riskSummary','featureGroups','lossSummary','lossCases'])$(id).textContent='전체 시장 검사 완료 후 공개';"
+    assert p.count(trigger)==1
+    p=p.replace(trigger,trigger+"\n if(complete)renderIndicatorComparison(a);else { $('indicatorSummary').textContent='전체 시장 검사 완료 후 공개'; $('indicatorResults').textContent='전체 시장 검사 완료 후 공개'; $('indicatorFirst').textContent='전체 시장 검사 완료 후 공개'; }",1)
+    # Replace only V11.14.5 CSV handler with V11.14.6 expanded CSV schema.
+    start=p.index("$('csv').onclick=()=>{")
+    end=p.index('\nstate=load();',start)
+    new_csv=r"""$('csv').onclick=()=>{
+ if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const configCols=['rule_version','date','tp_pct','sl_pct','max_hold_minutes','fee_per_side_pct','slippage_per_side_pct'];
+ const detailCols=['market','observed_day_5m','c_signals','unknown_c','signal_time_kst','outcome','reason','entry','exit','minutes','net_pct','is_first_signal','volume_ratio','body_pct','body_share_pct','flow_1h_proxy_pct','pullback_depth_pct','reclaim_ma10_pct','prior_15m_pct','prior_30m_pct',
+  'ind_eligible','ind_reason','rsi14','rsi_prev','macd_pct','macd_signal_pct','hist_pct','hist_prev_pct','rsi_pass','macd_pass'];
+ const lines=[[...configCols,...detailCols].map(csvCell).join(',')];
+ const prefix=['V11.14.6',state.config.date,state.config.tp,state.config.sl,state.config.horizon,state.config.fee,state.config.slip];
+ function push(row){if(row.length!==detailCols.length)throw Error('CSV 열 개수 불일치');lines.push([...prefix,...row].map(csvCell).join(','));}
+ for(const x of sampleResults()){
+  if(!x.signals){const row=Array(detailCols.length).fill('');row[0]=x.market;row[1]=x.observed_5m;row[2]=0;row[3]=0;row[5]='NO_SIGNAL';push(row);continue;}
+  if(!Array.isArray(x.events)||x.events.length!==x.signals){$('status').textContent='⚠️ 모든 C 신호를 보존하지 못했습니다. 재검사하세요.';return;}
+  for(const e of x.events){const d=e.features||{},i=e.indicators||{};
+   push([x.market,x.observed_5m,x.signals,x.unknown,e.signal_kst,e.outcome,e.reason,e.entry,e.exit,e.minutes,e.net_pct,e.is_first_signal?1:0,d.volume_ratio,d.body_pct,d.body_share_pct,d.flow_1h_proxy_pct,d.pullback_depth_pct,d.reclaim_ma10_pct,d.prior_15m_pct,d.prior_30m_pct,
+    i.eligible?1:0,i.reason,i.rsi14,i.rsi_prev,i.macd_pct,i.macd_signal_pct,i.hist_pct,i.hist_prev_pct,i.eligible?(i.rsi_pass?1:0):'',i.eligible?(i.macd_pass?1:0):'']);
+  }
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=u;a.download=`bithumb_full_krw_C_rsi_macd_${state.config.date}_v11146.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);
+};"""
+    p=p[:start]+new_csv+p[end:]
+    assert 'renderIndicatorComparison(a)' in p and "ind_eligible" in p
+    assert '/api/winrate14cfix/' not in p
+    return p
+
+
+C_IND_PAGE=make_c_indicator_page()
+
+
+def register_c_indicator_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:
+                    raise ValueError('현재 KRW 상장 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-c-indicators')
+    def c_ind_page_11146():
+        return render_template_string(C_IND_PAGE)
+
+    @app.get('/api/winrate14cind/universe')
+    def c_ind_universe_11146():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings',
+                            'rule_version':'V11.14.6'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14cind/evaluate')
+    def c_ind_eval_11146():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            allowed=set(listed())
+            if any(m not in allowed for m in markets):
+                raise ValueError('현재 빗썸 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks={pool.submit(cind_evaluate_symbol,api_get,m,cfg,kst):m for m in markets}
+                for future in as_completed(tasks):
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        errors.append({'market':tasks[future],'error':str(e)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.6'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11145_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11145_register_daytrade_review(app,deps)
+    register_c_indicator_lab(app,deps)
