@@ -3250,3 +3250,342 @@ _v11148_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v11148_register_daytrade_review(app,deps)
     register_ich_v11149_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.10: Independent higher-timeframe MACD(12,26,9) C filter experiment.
+# Backward-only daily/weekly completed candles. No future candles, no edits to
+# V2, V11.13 BUY, C signal definitions, outcomes, or previous research labs.
+# All threshold choices are preregistered hypotheses, NOT tuned performance.
+# ---------------------------------------------------------------------------
+
+HTF_V111410_MIN_BARS = 60
+HTF_V111410_RULES = {
+    'day': {'period': timedelta(days=1), 'cross_window':3, 'near_gap_pct':0.12,
+            'api_path':'/v1/candles/days'},
+    'week': {'period': timedelta(days=7), 'cross_window':2, 'near_gap_pct':0.25,
+             'api_path':'/v1/candles/weeks'},
+}
+
+
+def htf_v111410_fetch(api_get, market, cfg, kst, timeframe):
+    """Fetch OHLC candle starts before target date end; later partial candles
+    may be returned but htf_v111410_snapshot excludes them at EVERY C event.
+    Bithumb's `to` is KST exclusive, 200 candles max. No pagination necessary
+    for 130-session MACD warmup in this experiment.
+    """
+    rule=HTF_V111410_RULES[timeframe]
+    day_end=datetime.combine(cfg['day']+timedelta(days=1),_time.min,tzinfo=kst)
+    raw=api_get(rule['api_path'], {'market':market,'count':130,
+             'to':day_end.strftime('%Y-%m-%d %H:%M:%S')})
+    if not isinstance(raw,list):
+        raise ValueError('상위 시간봉 API 응답 형식 오류: '+timeframe)
+    found={}
+    for bar in raw:
+        if not isinstance(bar,dict):continue
+        try:
+            ts=local_time(bar['candle_date_time_kst'],kst)
+            op,hi,lo,cl=(float(bar[k]) for k in
+                           ('opening_price','high_price','low_price','trade_price'))
+            if not (all(isfinite(x) and x>0 for x in (op,hi,lo,cl))
+                    and lo<=min(op,cl) and hi>=max(op,cl) and lo<=hi):
+                continue
+            if ts<day_end:
+                found[ts]={'t':ts,'c':cl}
+        except (KeyError,TypeError,ValueError,OverflowError):
+            continue
+    return [found[t] for t in sorted(found)]
+
+
+def htf_v111410_macd_histogram(closes):
+    """Proper SMA-seeded 12/26 EMA and 9 EMA signal; returns last 4
+    completed MACD/signal/hist values, or None when history is short.
+    """
+    if len(closes)<HTF_V111410_MIN_BARS:return None
+    alpha_f,alpha_s,alpha_g=2/13,2/27,2/10
+    ema_f=sum(closes[:12])/12
+    ema_s=sum(closes[:26])/26
+    diffs=[]
+    for idx,price in enumerate(closes):
+        if idx>=12:ema_f=alpha_f*price+(1-alpha_f)*ema_f
+        if idx>=26:ema_s=alpha_s*price+(1-alpha_s)*ema_s
+        if idx>=25:diffs.append(ema_f-ema_s)
+    if len(diffs)<12:return None
+    ema_g=sum(diffs[:9])/9
+    out=[]
+    for idx,macd in enumerate(diffs):
+        if idx>=9:ema_g=alpha_g*macd+(1-alpha_g)*ema_g
+        if idx>=8:out.append({'macd':macd,'signal':ema_g,'hist':macd-ema_g})
+    return out
+
+
+def htf_v111410_snapshot(raw, signal_close, timeframe):
+    """Never use an uncompleted day/week candle, even if API returns it.
+    signal_close is time the original 5-minute C candle is CONFIRMED.
+    Candles after that instant cannot enter the EMA or cross calculation.
+    """
+    rule=HTF_V111410_RULES[timeframe]
+    period=rule['period']
+    available=[x for x in raw if x['t']+period<=signal_close]
+    if not available:
+        return {'eligible':False,'reason':'확정된 '+('일봉' if timeframe=='day' else '주봉')+' 없음'}
+    # A missing most-recent completed candle is not a fresh crossover signal.
+    if signal_close-(available[-1]['t']+period)>=period:
+        return {'eligible':False,'reason':'최근 확정 봉 누락'}
+    # Require 60 most recent COMPLETED uninterrupted periods; never blend over
+    # missing daily/weekly bars as if the missing bar was a flat candle.
+    start=0
+    for j in range(len(available)-1,0,-1):
+        if available[j]['t']-available[j-1]['t']!=period:
+            start=j
+            break
+    stable=available[start:]
+    if len(stable)<HTF_V111410_MIN_BARS:
+        return {'eligible':False,'reason':'연속 확정 '+('일봉' if timeframe=='day' else '주봉')+' 60개 미만',
+                'available_bars':len(stable)}
+    arr=htf_v111410_macd_histogram([x['c'] for x in stable])
+    if arr is None or len(arr)<4:return {'eligible':False,'reason':'MACD 계산 실패'}
+    curr,prev,prev2=arr[-1],arr[-2],arr[-3]
+    cross_age=None
+    window=rule['cross_window']
+    for age in range(window):
+        j=len(arr)-1-age
+        if j>0 and arr[j-1]['hist']<=0<arr[j]['hist'] and curr['hist']>0:
+            cross_age=age
+            break
+    close=stable[-1]['c']
+    hist_pct=curr['hist']/close*100
+    prior_pct=prev['hist']/close*100
+    before_pct=prev2['hist']/close*100
+    near=(curr['hist']<0 and -rule['near_gap_pct']<=hist_pct
+          and hist_pct>prior_pct>before_pct)
+    crossed=(cross_age is not None)
+    return {'eligible':True,'reason':None,
+            'latest_closed_bar_end_kst':(stable[-1]['t']+period).strftime('%Y-%m-%d %H:%M'),
+            'available_bars':len(stable),'macd_pct':round(curr['macd']/close*100,6),
+            'signal_pct':round(curr['signal']/close*100,6),
+            'hist_pct':round(hist_pct,6),'hist_prev_pct':round(prior_pct,6),
+            'hist_prev2_pct':round(before_pct,6),
+            'cross_age_bars':cross_age,'cross_pass':crossed,
+            'near_pass':bool(near),'either_pass':bool(crossed or near)}
+
+
+def htf_v111410_evaluate_symbol(api_get,market,cfg,kst):
+    """Preserve the EXACT original C 5m signal universe and C outcomes.
+    Daily and weekly lookback data are only explanatory filters at C close.
+    """
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    day_start=datetime.combine(cfg['day'],_time.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    day_rows=[r for r in rows if day_start<=r['t']<day_end]
+    n,valid,signals,unknown,cooldown=cfg['bars'],0,0,0,-1
+    events=[]
+    if len(rows)>=LAB_WARMUP_BARS+2:
+        for i in range(LAB_WARMUP_BARS,len(rows)-1):
+            if not day_start<=rows[i]['t']<day_end:continue
+            if not lab_contiguous(rows,i-24,i):continue
+            valid+=1
+            if i<cooldown or 'C' not in lab_signals(rows,i):continue
+            cooldown=i+n
+            signals+=1
+            out=lab_outcome_v11145(rows,i,cfg)
+            if out['outcome']=='UNKNOWN':unknown+=1
+            events.append({'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+                   'c_entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                   'is_first_signal':signals==1,'c':out,
+                   'features':lab_c_signal_features(rows,i),
+                   '_signal_close':rows[i]['t']+timedelta(minutes=5)})
+    if events:
+        daily=htf_v111410_fetch(api_get,market,cfg,kst,'day')
+        weekly=htf_v111410_fetch(api_get,market,cfg,kst,'week')
+        # Many C events per symbol are possible; run same causal snapshot each time.
+        for e in events:
+            e['htf']={'day':htf_v111410_snapshot(daily,e['_signal_close'],'day'),
+                      'week':htf_v111410_snapshot(weekly,e['_signal_close'],'week')}
+            del e['_signal_close']
+    assert len(events)==signals
+    return {'market':market,'observed_5m':len(day_rows),
+          'longest_day_run':lab_longest_consecutive_5m(day_rows),
+          'valid_windows':valid,'signals':signals,'unknown':unknown,
+          'truncated':truncated,'events':events}
+
+HTF_V111410_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.10 · 일봉·주봉 MACD 비교 검증실</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#1a2038;--card:#121a2e;--border:#35425f;--fg:#f2f5ff;--muted:#afc0db;--blue:#3867ee;--green:#4ade80;--warn:#ffc46c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1050px;margin:auto;padding:18px 14px 70px}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:0 0 8px}
+.panel{border:1px solid var(--border);background:var(--panel);border-radius:16px;padding:16px;margin-top:15px}
+.muted,.hint{font-size:13px;color:var(--muted)}.note{padding:12px;background:#101a30;border-radius:10px;font-size:13px;line-height:1.75}
+.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.field{display:flex;flex-direction:column;font-size:13px;color:var(--muted);gap:5px}
+input,button,select{font:inherit}input,select{padding:10px;background:#10182d;border:1px solid var(--border);color:var(--fg);border-radius:8px;width:100%;min-width:0}
+button{background:var(--blue);border:0;border-radius:9px;color:#fff;padding:12px 14px;font-weight:800;cursor:pointer}button:disabled{opacity:.48}.secondary{background:#364660}
+.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px;align-items:center}a{color:#bcd0ff}progress{width:100%;height:15px;margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{border:1px solid var(--border);background:var(--card);border-radius:10px;padding:11px}
+.stat small{font-size:12px;color:var(--muted);display:block}.stat strong{font-size:22px;display:block}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--border);padding:9px 7px;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}
+.status{font-size:13px;white-space:pre-wrap;color:var(--muted)}
+@media(max-width:650px){.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><main>
+<h1>🧪 V11.14.10 · C + 일봉·주봉 MACD 비교</h1>
+<p class="muted">별도 과거 모의검증 · 기존 V2 BUY / C / C2 / 볼린저 / 일목 및 예전 검증실은 변경하지 않습니다.</p>
+<section class="panel"><h2>이번 연구에서 고정한 조건</h2>
+<div class="note">
+<b>기본:</b> 기존 C 신호 그대로, 다음 5분봉 시가 진입과 익절·손절·비용 동일. MACD는 C 신호가 확정되는 시점에 <b>완전히 종료된 일봉·주봉만</b> 사용합니다. 진행 중인 일/주봉은 제외합니다.<br>
+<b>일봉 D 확정:</b> MACD(12,26,9) 히스토그램이 0을 상향 돌파한 지 <b>최근 3개 확정 일봉 이내</b>이고 지금도 0 초과.<br>
+<b>일봉 D 직전:</b> 아직 MACD &lt; 시그널(히스토그램 음수)이나, 최근 2번 연속으로 차이가 줄고 히스토그램이 종가 대비 <b>-0.12% 이상 ~ 0% 미만</b>.<br>
+<b>주봉 W 확정:</b> 골든크로스가 <b>최근 2개 확정 주봉 이내</b> 발생했고 지금도 0 초과.<br>
+<b>주봉 W 직전:</b> 2주 연속 히스토그램 개선, 음수이면서 종가 대비 <b>-0.25% 이상 ~ 0% 미만</b>.<br>
+<b>각 시간대 OR:</b> 확정 또는 직전. <b>일봉 OR 주봉:</b> 각 시간대의 확정/직전 중 하나라도 통과(적어도 한쪽 계산 가능하면 평가).<br>
+<b>계산 불가:</b> 연속 확정 60개 미만이면 실패가 아닌 별도 집계. 지표 계산 불가와 손익 미판정은 공정 비교에서 제외합니다.<br>
+<i>교차 직전 기준은 사전에 정한 실험용 수치이며 미래의 교차 성공을 알고 적용한 게 아닙니다. 지난 기간으로 조정하면 새 날짜로 별도 검증해야 합니다.</i>
+</div></section>
+<section class="panel"><h2>검증 조건</h2><div class="controls">
+<label class="field">검사할 과거 날짜 (KST)<input id="date" type="date" value="2026-11-01"></label>
+<label class="field">익절 (%)<input id="tp" type="number" min="0.3" max="10" step="0.1" value="1.5"></label>
+<label class="field">손절 (%)<input id="sl" type="number" min="0.2" max="8" step="0.1" value="1.0"></label>
+<label class="field">최대 보유<select id="horizon"><option value="30">30분</option><option value="60" selected>60분</option><option value="120">120분</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
+</div><div class="actions"><button id="run">전체 KRW 검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">V11.14.10 기록 초기화</button><button id="csv" class="secondary" disabled>전체 MACD 비교 CSV 저장</button></div>
+<progress id="progress" value="0" max="1"></progress><p id="status" class="status">검사 전</p>
+<p class="hint">검사가 끝나기 전에는 결과를 공개하지 않습니다. 브라우저 저장으로 이어하기 가능. 일/주봉이 추가 조회되므로 기존 C 검사보다 느릴 수 있습니다.</p></section>
+<section class="panel"><h2>전체 검사 상태</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>공정 비교 · 모든 신호</h2><div id="summary" class="stats">검사 후 공개</div>
+<p class="hint">각 필터는 해당 시간봉이 계산 가능한 원본 C 신호의 성적과 비교합니다. 계산 불가 종목은 자동으로 손실회피 성공으로 취급하지 않습니다. 보류=0%는 신호당 수치이지 포트폴리오 수익률이 아닙니다.</p><div id="results" class="scroll">검사 후 공개</div></section>
+<section class="panel"><h2>코인별 첫 C 신호만 따로 확인</h2><div id="first" class="scroll">검사 후 공개</div></section>
+<section class="panel"><h2>검증 한계</h2><p class="hint">현재 상장 중인 KRW 목록을 과거 날짜에 조회하므로 생존자 편향이 있습니다. 동일 코인 내 여러 신호는 독립 표본이 아닙니다. 고가·저가 기반 결과는 실제 체결을 보장하지 않습니다. 11/1~3 자료로 지표를 설계했다면 별도 미사용 날짜로 재검증해야 합니다. 실전 주문 기능은 없습니다.</p>
+<a href="/backtest-winrate-ich">V11.14.9 일목</a> · <a href="/backtest-winrate-bb">V11.14.8 볼린저</a> · <a href="/backtest-winrate-c2">V11.14.7 C2</a> · <a href="/">V2 메인</a></section>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id),KEY='bithumb_v111410_htfmacd_checkpoint_1';
+let state=null,running=false,stopRequested=false,hardFailure=false;
+const fields=['date','tp','sl','horizon','fee','slip'];
+function cfgOf(){const c={};for(const k of fields)c[k]=$(k).value;if(!/^20\d{2}-\d{2}-\d{2}$/.test(c.date))throw Error('날짜를 선택해');for(const k of fields.slice(1))if(!Number.isFinite(Number(c[k])))throw Error('입력 확인: '+k);return c;}
+function signature(c){return fields.map(k=>String(c[k])).join('|')}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?.version===10&&Array.isArray(x.markets)&&x.config&&x.results?x:null}catch{return null}}
+function setConfig(c){for(const k of fields)$(k).value=c[k];}
+function sampleResults(){return state?state.markets.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x)).map(x=>state.results[x]):[];}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function card(k,v){return `<div class="stat"><small>${esc(k)}</small><strong>${esc(v)}</strong></div>`;}
+function fmt(x){return Number.isFinite(x)?x.toFixed(3)+'%':'—';}
+function decided(e){return e?.c&&['TP','SL','TIME'].includes(e.c.outcome)&&Number.isFinite(e.c.net_pct);}
+function stat(es){const n=es.length,sum=es.reduce((s,e)=>s+e.c.net_pct,0);return {n,sum,avg:n?sum/n:NaN,wins:es.filter(e=>e.c.net_pct>0).length,win:n?100*es.filter(e=>e.c.net_pct>0).length/n:NaN,tp:es.filter(e=>e.c.outcome==='TP').length,sl:es.filter(e=>e.c.outcome==='SL').length,tm:es.filter(e=>e.c.outcome==='TIME').length};}
+function eligible(e,k){if(k==='any')return e.htf?.day?.eligible===true||e.htf?.week?.eligible===true;return e.htf?.[k]?.eligible===true;}
+const plans=[
+  {cohort:'day',name:'일봉 · 기준 C',test:e=>true},
+  {cohort:'day',name:'일봉 · 골든크로스 확정',test:e=>e.htf.day.cross_pass===true},
+  {cohort:'day',name:'일봉 · 교차 직전',test:e=>e.htf.day.near_pass===true},
+  {cohort:'day',name:'일봉 · 확정 또는 직전',test:e=>e.htf.day.either_pass===true},
+  {cohort:'week',name:'주봉 · 기준 C',test:e=>true},
+  {cohort:'week',name:'주봉 · 골든크로스 확정',test:e=>e.htf.week.cross_pass===true},
+  {cohort:'week',name:'주봉 · 교차 직전',test:e=>e.htf.week.near_pass===true},
+  {cohort:'week',name:'주봉 · 확정 또는 직전',test:e=>e.htf.week.either_pass===true},
+  {cohort:'any',name:'일봉 또는 주봉 · 기준 C',test:e=>true},
+  {cohort:'any',name:'일봉 또는 주봉 충족',test:e=>(e.htf.day.eligible&&e.htf.day.either_pass)||(e.htf.week.eligible&&e.htf.week.either_pass)}
+];
+function table(base){let html='<table><thead><tr><th>방식</th><th>공통 C</th><th>진입</th><th>TP/SL/시간</th><th>순승률</th><th>진입당 평균</th><th>보류=0% 신호당 평균</th><th>제외 거래</th><th>제외한 수익거래</th></tr></thead><tbody>';
+ for(const p of plans){const es=base.filter(e=>eligible(e,p.cohort)),kept=es.filter(p.test),removed=es.filter(e=>!p.test(e)),s=stat(kept);html+=`<tr><td>${esc(p.name)}</td><td>${es.length}</td><td>${s.n}</td><td>${s.tp}/${s.sl}/${s.tm}</td><td>${fmt(s.win)}</td><td>${fmt(s.avg)}</td><td>${fmt(es.length?s.sum/es.length:NaN)}</td><td>${removed.length}</td><td>${removed.filter(e=>e.c.net_pct>0).length}</td></tr>`;}
+ return html+'</tbody></table>';}
+function renderResults(a){const events=a.flatMap(r=>(r.events||[]).map(e=>({...e,market:r.market}))),base=events.filter(decided),day=base.filter(e=>eligible(e,'day')),week=base.filter(e=>eligible(e,'week')),both=base.filter(e=>eligible(e,'any')),all=stat(base),first=base.filter(e=>e.is_first_signal);
+ $('summary').innerHTML=card('원본 C 전체 신호',events.length+'건')+card('C 손익 판정',all.n+'건')+card('원본 C 평균',fmt(all.avg))+card('일봉 계산 가능',day.length+'건')+card('주봉 계산 가능',week.length+'건')+card('일/주 중 적어도 하나 가능',both.length+'건')+card('일봉 불가 · 판정',base.length-day.length+'건')+card('주봉 불가 · 판정',base.length-week.length+'건');
+ $('results').innerHTML=table(base);$('first').innerHTML=table(first);
+}
+function paint(){const a=sampleResults(),n=a.length,total=state?.markets.length||0,complete=total>0&&n===total&&state?.failed===0,signals=a.reduce((s,r)=>s+r.signals,0);
+ $('progress').max=total||1;$('progress').value=n;
+ $('coverage').innerHTML=card('검사 진행',`${n}/${total}`)+card('C 신호',signals+'건')+card('유효 C 검색 윈도우',a.reduce((s,r)=>s+(r.valid_windows||0),0)+'개')+card('5분봉 240개 이상',a.filter(x=>x.observed_5m>=240).length+'코인')+card('과거 5분봉 상한 도달',a.filter(x=>x.truncated).length+'코인');
+ if(complete){renderResults(a);$('csv').disabled=false;}else{$('summary').textContent='전체 KRW 검사 후 공개';$('results').textContent='검사 후 공개';$('first').textContent='검사 후 공개';$('csv').disabled=true;}
+ $('status').textContent=state?(complete?'✅ 전체 검사 완료':'⏳ 진행 중 또는 중단')+` · ${n}/${total}종목 · C 신호 ${signals}건`+(state.failed?' · 실패 묶음 재검사 필요':''):'검사 전';}
+async function req(url,opts){const ctl=new AbortController(),tid=setTimeout(()=>ctl.abort(),115000);try{const r=await fetch(url,{...opts,cache:'no-store',signal:ctl.signal}),v=await r.json();if(!r.ok||!v.ok)throw Error(v.error||'HTTP '+r.status);return v;}finally{clearTimeout(tid);}}
+async function initSession(c){const v=await req('/api/winrate14htfmacd/universe');if(!Array.isArray(v.items)||!v.items.length)throw Error('KRW 목록이 없습니다');state={version:10,config:c,markets:v.items,results:{},failed:0};save();}
+async function run(){if(running)return;let c;try{c=cfgOf()}catch(e){$('status').textContent='⚠️ '+e.message;return;}
+ if(state&&signature(state.config)!==signature(c)){if(!confirm('날짜·설정이 변경됐어. 이 버전의 이전 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}
+ running=true;stopRequested=false;hardFailure=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;
+ try{if(!state)await initSession(c);state.failed=0;save();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m)),batches=[];for(let i=0;i<pending.length;i+=2)batches.push(pending.slice(i,i+2));let pos=0,fail=0;
+ async function worker(){while(!stopRequested&&!hardFailure){const batch=batches[pos++];if(!batch)break;let response=null;
+ for(let attempt=0;attempt<3&&!stopRequested;attempt++){try{const v=await req('/api/winrate14htfmacd/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:batch})});
+ if(v.errors||v.scanned!==batch.length||!Array.isArray(v.results)||v.results.length!==batch.length||v.results.some(r=>!batch.includes(r.market)||!Array.isArray(r.events)||r.events.length!==r.signals||r.events.some(e=>!e.c||!e.htf?.day||!e.htf?.week)))throw Error('불완전한 응답');
+ response=v;break;}catch(e){if(attempt===2){fail++;$('status').textContent='⚠️ '+batch.join(', ')+' 실패 '+String(e.message||e);}else await new Promise(ok=>setTimeout(ok,1000*(attempt+1)));}}
+ if(response){for(const x of response.results)state.results[x.market]=x;try{save()}catch(e){hardFailure=true;$('status').textContent='⚠️ 저장 공간 부족';break;}paint();}
+ if(fail>=4){hardFailure=true;break;}}}
+ await Promise.all([worker(),worker()]);state.failed=fail;try{save()}catch{}paint();if(stopRequested)$('status').textContent+='\n일시 중지. 다시 시작하면 이어서 검사합니다.';if(fail)$('status').textContent+=`\n누락 묶음 ${fail}개 · 다시 실행해 재검사하세요.`;
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e)+' · 전체 검사 전 성과 미공개';}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;
+$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.10 진행 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cols=['version','date','tp_pct','sl_pct','horizon_minutes','fee_pct_side','slip_pct_side','market','observed_5m','c_signals','original_signal_time_kst','c_entry_time_kst','is_first_signal','c_outcome','c_reason','c_entry','c_exit','c_minutes','c_net_pct','day_eligible','day_reason','day_latest_closed_kst','day_macd_pct','day_signal_pct','day_hist_pct','day_hist_prev_pct','day_hist_prev2_pct','day_cross_age','day_cross_pass','day_near_pass','day_either_pass','week_eligible','week_reason','week_latest_closed_kst','week_macd_pct','week_signal_pct','week_hist_pct','week_hist_prev_pct','week_hist_prev2_pct','week_cross_age','week_cross_pass','week_near_pass','week_either_pass','original_volume_ratio','original_body_pct','original_pullback_pct'];
+ const rows=[cols.map(csvCell).join(',')],prefix={version:'V11.14.10',date:state.config.date,tp_pct:state.config.tp,sl_pct:state.config.sl,horizon_minutes:state.config.horizon,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip};
+ function append(obj){rows.push(cols.map(k=>csvCell(obj[k])).join(','));}
+ for(const r of sampleResults()){if(!r.signals){append({...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:0});continue;}
+ if(r.events.length!==r.signals){$('status').textContent='⚠️ CSV 이벤트 수 불일치';return;}
+ for(const e of r.events){const c=e.c||{},d=e.htf?.day||{},w=e.htf?.week||{},f=e.features||{};
+ const obj={...prefix,market:r.market,observed_5m:r.observed_5m,c_signals:r.signals,original_signal_time_kst:e.signal_time_kst,c_entry_time_kst:e.c_entry_time_kst,is_first_signal:e.is_first_signal?1:0,c_outcome:c.outcome,c_reason:c.reason,c_entry:c.entry,c_exit:c.exit,c_minutes:c.minutes,c_net_pct:c.net_pct,original_volume_ratio:f.volume_ratio,original_body_pct:f.body_pct,original_pullback_pct:f.pullback_depth_pct};
+ for(const [pre,s] of [['day',d],['week',w]]){obj[pre+'_eligible']=s.eligible?1:0;obj[pre+'_reason']=s.reason;obj[pre+'_latest_closed_kst']=s.latest_closed_bar_end_kst;for(const k of ['macd_pct','signal_pct','hist_pct','hist_prev_pct','hist_prev2_pct'])obj[pre+'_'+k]=s[k];obj[pre+'_cross_age']=s.cross_age_bars;for(const k of ['cross_pass','near_pass','either_pass'])obj[pre+'_'+k]=s.eligible?(s[k]?1:0):'';}
+ append(obj);}}
+ const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_full_krw_C_HTF_MACD_${state.config.date}_v111410.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+state=load();if(state)setConfig(state.config);paint();
+</script></body></html>"""
+
+
+def register_htf_macd_v111410_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'at':0,'names':None}
+    mutex=Lock()
+
+    def listed():
+        with mutex:
+            if cache['names'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:raise ValueError('현재 빗썸 KRW 목록이 없습니다')
+                cache.update(names=markets,at=time.time())
+            return cache['names']
+
+    @app.get('/backtest-winrate-htf-macd')
+    def page_htf_macd_v111410():
+        return render_template_string(HTF_V111410_PAGE)
+
+    @app.get('/api/winrate14htfmacd/universe')
+    def universe_htf_macd_v111410():
+        try:
+            names=listed()
+            return jsonify({'ok':True,'items':names,'count':len(names),
+                            'universe_type':'current_KRW_listings',
+                            'rule_version':'V11.14.10'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14htfmacd/evaluate')
+    def evaluate_htf_macd_v111410():
+        try:
+            payload=request.get_json(silent=True)
+            cfg=lab_valid_request(payload,kst)
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                    or len(set(markets))!=len(markets)
+                    or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 검사합니다')
+            if any(m not in set(listed()) for m in markets):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            results,errors=[],[]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                jobs={pool.submit(htf_v111410_evaluate_symbol,api_get,m,cfg,kst):m
+                      for m in markets}
+                for job in as_completed(jobs):
+                    try:results.append(job.result())
+                    except Exception as exc:errors.append({'market':jobs[job],
+                                                         'error':str(exc)[:120]})
+            return jsonify({'ok':not errors,'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.10'})
+        except Exception as e:return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+_v11149_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v11149_register_daytrade_review(app,deps)
+    register_htf_macd_v111410_lab(app,deps)
