@@ -1,7 +1,9 @@
-"""V11.13 experiment: 5-minute activity -> 1-hour flow + 4-hour structure.
+"""V11.13 live scanner + independent V11.14.5 historical C-strategy research lab.
 
-Standalone, read-only scanner. Only /backtest-daytrade and /api/flow513/*
-are registered; app.py and the V2 scanner are untouched.
+The V11.13 read-only scanner is preserved and separate historical research
+endpoints (V11.14.x) are registered alongside it. app.py and the V2 main
+scanner are untouched. The V11.14.5 corrected outcome logic runs ONLY on
+/backtest-winrate-c-validated and does not rewrite older experiment results.
 - Scan all Bithumb KRW markets' 80 most recent completed 5-minute candles.
 - Recent activity/pattern screening uses the last 3 consecutive candles and a
   real-time 5-minute close, NOT 21 consecutive candles. Older missing intervals
@@ -1511,7 +1513,7 @@ def lab_c_signal_features(rows, i):
     }
 
 
-def lab_cdiag_evaluate_symbol(api_get, market, cfg, kst):
+def lab_cdiag_evaluate_symbol(api_get, market, cfg, kst, outcome_fn=lab_outcome, require_full_horizon=True):
     """Keep EXACT C signal, cooldown, and outcome rules of V11.14.3.
 
     Store all signal events, including *every* UNKNOWN (not only first).
@@ -1523,7 +1525,7 @@ def lab_cdiag_evaluate_symbol(api_get, market, cfg, kst):
     day_rows = [r for r in rows if day_start <= r['t'] < day_end]
     n, valid, signals, unknown, cooldown = cfg['bars'], 0, 0, 0, -1
     events, trades, first_signal = [], [], None
-    if len(rows) >= LAB_WARMUP_BARS + n:
+    if len(rows) >= LAB_WARMUP_BARS + (n if require_full_horizon else 2):
         for i in range(LAB_WARMUP_BARS, len(rows)-1):
             t = rows[i]['t']
             if not day_start <= t < day_end:
@@ -1537,7 +1539,7 @@ def lab_cdiag_evaluate_symbol(api_get, market, cfg, kst):
                 continue
             cooldown = i + n
             signals += 1
-            outcome = lab_outcome(rows, i, cfg)
+            outcome = outcome_fn(rows, i, cfg)
             entry_time = t + timedelta(minutes=5)
             event = {
                 'time': entry_time.strftime('%m-%d %H:%M'),
@@ -1828,3 +1830,201 @@ _v11143_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v11143_register_daytrade_review(app, deps)
     register_cdiag_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.5: FIX SETTLEMENT-ORDER VALIDATION, WITHOUT CHANGING C SIGNALS.
+# This is a NEW experimental endpoint and a NEW browser checkpoint. The
+# V11.14.2 / .3 / .4 endpoints and historical results remain unchanged.
+# ---------------------------------------------------------------------------
+
+def lab_outcome_v11145(rows, index, cfg):
+    """Determine TP / SL as soon as hit, in time order, without future leakage.
+
+    Only the observed bars up to the earliest decided exit need to be
+    continuous. Gaps BEFORE the exit => UNKNOWN; gaps AFTER an exit do not
+    retroactively invalidate it. When neither barrier is hit, a TIME exit
+    needs all `n` consecutive future bars. Same-bar TP+SL => SL first.
+
+    Retains the V11.14.x NEXT 5-minute candle opening entry, assumptions for
+    target / stop price, fees / slippage and minute counting; this changes
+    ONLY the ordering of the historical completeness check.
+    """
+    n = cfg['bars']
+    if index < 0 or index >= len(rows) or n <= 0:
+        return {'outcome': 'UNKNOWN', 'reason': '입력 봉 범위 오류'}
+    if index + 1 >= len(rows):
+        return {'outcome': 'UNKNOWN', 'reason': '진입 다음 봉 부족'}
+    step = timedelta(minutes=5)
+    # Enter only if the NEXT observed bar is the actual next 5-minute slot.
+    if rows[index+1]['t'] - rows[index]['t'] != step:
+        return {'outcome': 'UNKNOWN', 'reason': '진입 전 봉 공백'}
+
+    entry = rows[index+1]['o']
+    target = entry*(1+cfg['tp']/100)
+    stop = entry*(1-cfg['sl']/100)
+    outcome = None
+    exit_price = None
+    elapsed = None
+    last = index
+
+    for j in range(index+1, index+n+1):
+        if j >= len(rows):
+            return {'outcome': 'UNKNOWN', 'reason': '청산 전 미래 봉 부족'}
+        # Gaps are unknown even when the observed next bar later reaches TP/SL.
+        if rows[j]['t'] - rows[last]['t'] != step:
+            return {'outcome': 'UNKNOWN', 'reason': '청산 전 봉 공백'}
+        last = j
+        r = rows[j]
+        # Conservative intrabar convention: if TP & SL both touched, SL wins.
+        if r['l'] <= stop:
+            outcome = 'SL'
+            # A bar that opens below stop cannot assume an ideal stop fill.
+            exit_price = min(stop, r['o'])
+        elif r['h'] >= target:
+            outcome = 'TP'
+            exit_price = target
+        elif j == index + n:
+            outcome = 'TIME'
+            exit_price = r['c']
+        if outcome:
+            elapsed = (j-index)*5
+            break
+
+    if outcome is None:
+        return {'outcome': 'UNKNOWN', 'reason': '판정 불가'}
+    cost_in = entry*(1+(cfg['fee']+cfg['slip'])/100)
+    revenue_out = exit_price*(1-(cfg['fee']+cfg['slip'])/100)
+    net = (revenue_out/cost_in-1)*100
+    return {'outcome': outcome, 'entry': round(entry,10),
+            'exit': round(exit_price,10), 'net_pct': round(net,4),
+            'minutes': elapsed}
+
+
+def lab_cdiag_v11145_evaluate_symbol(api_get, market, cfg, kst):
+    # All C signal gates, feature snapshots and cooldown remain V11.14.4.
+    return lab_cdiag_evaluate_symbol(api_get, market, cfg, kst,
+                                     outcome_fn=lab_outcome_v11145,
+                                     require_full_horizon=False)
+
+
+def make_c_v11145_page():
+    """Reuse the V11.14.4 presentation, but isolate data and mark new rules."""
+    p = C_DIAG_PAGE
+    p = p.replace('V11.14.4', 'V11.14.5')
+    p = p.replace('bithumb_v11144_c_diagnostics_checkpoint_1',
+                  'bithumb_v11145_c_outcome_fix_checkpoint_1')
+    p = p.replace('/api/winrate14cdiag/', '/api/winrate14cfix/')
+    p = p.replace('x.version!==2', 'x.version!==3')
+    p = p.replace('state={version:2,', 'state={version:3,')
+    # Add a distinct, unambiguous explanation of the fix and its scope.
+    intro = '<section class="panel"><h2>검증 조건</h2>'
+    note = ("""<section class="panel"><h2>V11.14.5 · 판정 순서 수정</h2>
+<div class="note">이번 화면은 과거 C 진입 조건은 변경하지 않고, <b>TP/SL 도달까지의 5분봉만 연속성을 확인</b>합니다.
+먼저 익절·손절했다면 그 뒤의 봉 공백으로 결과를 미판정으로 되돌리지 않습니다.
+신호를 판단할 과거 25봉과 다음 진입봉이 있으면, 미래 보유 기간 전체의 봉이 없더라도 신호는 기록하고 판정을 시도합니다.
+반대로 <b>청산 전에 봉이 빠지면 여전히 UNKNOWN</b>입니다. 이 화면은 V11.14.4의 기존 검사 기록과 저장소를 공유하지 않습니다.
+검증 비교는 <b>2026-11-11 / 60분 / TP 1.5% / SL 1.0% / 수수료 0.04% / 슬리피지 0.05%</b>를 권장합니다.
+단일 날짜의 승률은 실전 성과나 장래 승률을 보장하지 않습니다.</div></section>
+<section class="panel"><h2>검증 조건</h2>""")
+    assert p.count(intro) == 1
+    p = p.replace(intro,note,1)
+    # New data MUST not accidentally mix with any old cached outcome labels.
+    assert "bithumb_v11145_c_outcome_fix_checkpoint_1" in p
+    assert "x.version!==3" in p and "state={version:3," in p
+    assert '/api/winrate14cdiag/' not in p
+    # V11.14.3 / 14.4 links remain accessible separately.
+    previous = '<a href="/backtest-winrate-full-c">'
+    assert previous in p
+    p = p.replace(previous, '<a href="/backtest-winrate-c-diagnostics">V11.14.4 기존 손절 분석판</a> · '+previous,1)
+    start = p.index("$('csv').onclick=()=>{")
+    end = p.index('\nstate=load();', start)
+    new_csv = r"""$('csv').onclick=()=>{
+ if(!state||sampleResults().length!==state.markets.length||state.failed)return;
+ const cfgCols=['rule_version','date','tp_pct','sl_pct','max_hold_minutes','fee_per_side_pct','slippage_per_side_pct'];
+ const tradeCols=['market','observed_day_5m','c_signals','unknown_c','signal_time_kst','outcome','reason','entry','exit','minutes','net_pct','is_first_signal','volume_ratio','body_pct','body_share_pct','flow_1h_proxy_pct','pullback_depth_pct','reclaim_ma10_pct','prior_15m_pct','prior_30m_pct'];
+ const lines=[[...cfgCols,...tradeCols].map(csvCell).join(',')];
+ const prefix=['V11.14.5',state.config.date,state.config.tp,state.config.sl,state.config.horizon,state.config.fee,state.config.slip];
+ function append(row){if(row.length!==tradeCols.length)throw Error('CSV 열 개수 불일치');lines.push([...prefix,...row].map(csvCell).join(','));}
+ for(const x of sampleResults()){
+  if(!x.signals){const row=Array(tradeCols.length).fill('');row[0]=x.market;row[1]=x.observed_5m;row[2]=0;row[3]=0;row[5]='NO_SIGNAL';append(row);continue;}
+  if(!Array.isArray(x.events)||x.events.length!==x.signals){$('status').textContent='⚠️ CSV 신호 보존 개수가 일치하지 않습니다. 데이터를 다시 검사하세요.';return;}
+  for(const e of x.events){const d=e.features||{};
+   append([x.market,x.observed_5m,x.signals,x.unknown,e.signal_kst,e.outcome,e.reason,e.entry,e.exit,e.minutes,e.net_pct,e.is_first_signal?1:0,d.volume_ratio,d.body_pct,d.body_share_pct,d.flow_1h_proxy_pct,d.pullback_depth_pct,d.reclaim_ma10_pct,d.prior_15m_pct,d.prior_30m_pct]);
+  }
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=u;a.download=`bithumb_full_krw_C_validated_${state.config.date}_v11145.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);
+};"""
+    p = p[:start]+new_csv+p[end:]
+    assert 'rule_version' in p and 'max_hold_minutes' in p
+    assert 'bithumb_full_krw_C_validated_' in p
+    return p
+
+
+C_VALID_PAGE = make_c_v11145_page()
+
+
+def register_c_valid_lab(app, deps):
+    api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
+    cached = {'names': None, 'at': 0}
+    mu = Lock()
+
+    def current_names():
+        with mu:
+            if cached['names'] is None or time.time()-cached['at']>600:
+                names = sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:
+                    raise ValueError('현재 빗썸 KRW 종목 목록이 비었습니다')
+                cached.update(names=names,at=time.time())
+            return cached['names']
+
+    @app.get('/backtest-winrate-c-validated')
+    def cvalid_page_11145():
+        return render_template_string(C_VALID_PAGE)
+
+    @app.get('/api/winrate14cfix/universe')
+    def cvalid_universe_11145():
+        try:
+            names=current_names()
+            return jsonify({'ok': True, 'items': names,'count': len(names),
+                            'universe_type': 'current_KRW_listings',
+                            'rule_version': 'V11.14.5'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+    @app.post('/api/winrate14cfix/evaluate')
+    def cvalid_evaluate_11145():
+        try:
+            payload = request.get_json(silent=True)
+            cfg = lab_valid_request(payload,kst)
+            markets = payload.get('markets') if isinstance(payload,dict) else None
+            if (not isinstance(markets,list) or not 1<=len(markets)<=2
+                or len(markets)!=len(set(markets))
+                or any(not isinstance(m,str) or not MARKET_RE.fullmatch(m) for m in markets)):
+                raise ValueError('한 번에 1~2개 KRW 종목만 조회할 수 있습니다')
+            allowed = set(current_names())
+            if any(m not in allowed for m in markets):
+                raise ValueError('현재 빗썸 KRW 목록에서 찾을 수 없는 종목입니다')
+            results, errors = [], []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures={pool.submit(lab_cdiag_v11145_evaluate_symbol,
+                                     api_get,m,cfg,kst):m for m in markets}
+                for fut in as_completed(futures):
+                    try:
+                        results.append(fut.result())
+                    except Exception as e:
+                        errors.append({'market':futures[fut],'error':str(e)[:120]})
+            return jsonify({'ok':not errors, 'scanned':len(markets),
+                            'results':results,'errors':len(errors),
+                            'error_markets':errors,'rule_version':'V11.14.5'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)[:160]}),400
+
+
+_v11144_register_daytrade_review = register_daytrade_review
+
+def register_daytrade_review(app, deps):
+    _v11144_register_daytrade_review(app, deps)
+    register_c_valid_lab(app, deps)
