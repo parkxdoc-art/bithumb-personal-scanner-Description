@@ -8787,7 +8787,7 @@ select{background:#111a2e;color:#f3f6ff;padding:10px;border:1px solid var(--line
 <label class="field">편도 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
 <label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
 </div>
-<p class="small28">처음에는 11월 12일 · 40종목부터 시작해 기능을 확인해 줘. 40종목은 정렬된 목록에서 균등 간격으로 고른 기능 확인용 표본이며 시장 대표 표본은 아니야. 7일 전체 KRW 분석은 API 조회량이 크므로 필요할 때만 선택해.</p>
+<p class="small28">먼저 11월 9~10일 · 전체 종목으로 기존 A~F 결과를 대조해 보고, 40종목은 화면 기능 확인용으로만 사용해 줘. 40종목은 정렬된 목록에서 균등 간격으로 고른 기능 확인용 표본이며 시장 대표 표본은 아니야. 7일 전체 KRW 분석은 API 조회량이 크므로 필요할 때만 선택해.</p>
 <div class="actions"><button type="button" id="run">검사 시작 / 이어하기</button><button type="button" id="pause" class="secondary" disabled>일시 중지</button><button type="button" id="reset" class="secondary">이번 검사 초기화</button><button type="button" id="csv" class="secondary" disabled>결과 CSV 저장</button><button type="button" id="diag" class="secondary">연결·1종목 진단</button></div>
 <p class="small28">✅ 이번 검증은 별도 IndexedDB에 저장돼. 기존 다른 연구실의 로컬 기록은 삭제하지 않아.</p>
 <progress id="prog" max="1" value="0"></progress><div id="status" class="status" style="white-space:pre-wrap">검사 대기 중</div>
@@ -10771,3 +10771,359 @@ _v111432_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111432_register_daytrade_review(app,deps)
     register_c5_h2_v111433_lab(app,deps)
+
+
+# =============================================================================
+# V11.14.34 — RESEARCH ONLY: SIX-HOUR H2 PREHISTORY / COVERAGE AUDIT
+# The existing A/B/C signal and D/E/F shadow selection are computed from the
+# exact same four-hour truncated rows as V11.14.33.  All existing results and
+# endpoints are unchanged.  Six-hour prehistory contributes ONLY to optional
+# early-window H2 (G) comparisons and improved coverage diagnostics.
+# G is independent, explicitly hypothetical; it never alters A-F cooldowns,
+# trading orders, the live V2 scanner, or the strict 66-bar continuity gate.
+# =============================================================================
+
+C5_H2_V111434_EXTENDED_HISTORY_HOURS = 6
+C5_H2_V111434_LEGACY_HISTORY_HOURS = 4
+C5_H2_V111434_EARLY_MINUTES = (66-1-4*60//5)*5  # 85 minutes: 65 prior bars - 48
+
+
+def c5_h2_v111434_fetch_extended(api_get,market,cfg,kst):
+    """Fetch same raw candle endpoint with 6h rather than 4h prehistory.
+
+    Same page size, exclusive KST cursor, validation, and missing-candle policy
+    as lab_fetch_5m. No candle interpolation or price forward-fill. Returns
+    meta for transparent audit; all prices are exchange observations.
+    """
+    from datetime import datetime as _dt,time as _tm
+    begin=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)-timedelta(hours=6)
+    end=_dt.combine(cfg['day']+timedelta(days=1),_tm.min,tzinfo=kst)+timedelta(hours=2,minutes=5)
+    cursor=end
+    observed={}
+    truncated=True
+    pages_used=0
+    raw_count=0
+    skipped_count=0
+    duplicate_count=0
+    reason='PAGE_LIMIT'
+    for _ in range(LAB_MAX_PAGES):
+        raw=api_get('/v1/candles/minutes/5',{
+            'market':market,'count':200,
+            'to':cursor.strftime('%Y-%m-%d %H:%M:%S')})
+        if not isinstance(raw,list):
+            raise ValueError('6시간 사전 데이터 API 응답 형식 오류')
+        pages_used+=1
+        raw_count+=len(raw)
+        oldest=None
+        for bar in raw:
+            if not isinstance(bar,dict):
+                skipped_count+=1
+                continue
+            try:
+                ts=local_time(bar['candle_date_time_kst'],kst)
+                op,hi,lo,cl=(float(bar[k]) for k in
+                    ('opening_price','high_price','low_price','trade_price'))
+                vol=float(bar['candle_acc_trade_volume'])
+                if not (all(isfinite(v) and v>0 for v in (op,hi,lo,cl))
+                        and isfinite(vol) and vol>=0
+                        and lo<=min(op,cl) and hi>=max(op,cl) and lo<=hi):
+                    skipped_count+=1
+                    continue
+                if oldest is None or ts<oldest:
+                    oldest=ts
+                if begin<=ts<end:
+                    if ts in observed:duplicate_count+=1
+                    observed[ts]={'t':ts,'o':op,'h':hi,'l':lo,'c':cl,'v':vol}
+            except (TypeError,ValueError,KeyError,OverflowError):
+                skipped_count+=1
+                continue
+        if oldest is None:
+            truncated=False;reason='NO_VALID_BARS'
+            break
+        if oldest<=begin:
+            truncated=False;reason='BEGIN_REACHED'
+            break
+        if len(raw)<200:
+            truncated=False;reason='SHORT_PAGE'
+            break
+        if oldest>=cursor:
+            raise ValueError('6시간 사전 봉 조회 페이지가 전진하지 않습니다')
+        cursor=oldest
+    info={'fetch_5m_pages_used':pages_used,
+          'fetch_5m_raw_records':raw_count,
+          'fetch_5m_invalid_records':skipped_count,
+          'fetch_5m_duplicates':duplicate_count,
+          'fetch_5m_stop_reason':reason,
+          'fetch_5m_page_limit_reached':truncated}
+    return [observed[t] for t in sorted(observed)],truncated,info
+
+
+def c5_h2_v111434_window_audit(rows,cfg,kst):
+    """Measure fully observed prior windows; short windows are NOT H2 signals."""
+    from datetime import datetime as _dt,time as _tm
+    day=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=day+timedelta(days=1)
+    early=end if C5_H2_V111434_EARLY_MINUTES>=1440 else day+timedelta(minutes=C5_H2_V111434_EARLY_MINUTES)
+    sizes=(20,35,50,66)
+    eligible={k:0 for k in sizes}
+    markets={k:False for k in sizes}
+    early_eligible=0
+    gaps=[]
+    longest=0;streak=0
+    for i,bar in enumerate(rows):
+        if i and bar['t']-rows[i-1]['t']==timedelta(minutes=5):
+            streak+=1
+        else:
+            if i:
+                missed=int((bar['t']-rows[i-1]['t']).total_seconds()//300)-1
+                if missed>0 and day<=rows[i-1]['t']<end and day<=bar['t']<end:
+                    gaps.append((missed,rows[i-1]['t'],bar['t']))
+            streak=1
+        if day<=bar['t']<end:
+            longest=max(longest,streak)
+            if i<len(rows)-1:
+                for n in sizes:
+                    if streak>=n:
+                        eligible[n]+=1
+                        markets[n]=True
+                if bar['t']<early and streak>=66:
+                    early_eligible+=1
+    # Only observed historical candles are counted; do not interpret missing
+    # slots as a specific cause (e.g. no trade or API outage).
+    return {
+        'window_20_positions':eligible[20],
+        'window_35_positions':eligible[35],
+        'window_50_positions':eligible[50],
+        'window_66_positions_extended':eligible[66],
+        'window_20_available':markets[20],
+        'window_35_available':markets[35],
+        'window_50_available':markets[50],
+        'window_66_available_extended':markets[66],
+        'extended_longest_observed_streak':longest,
+        'early_66_eligible_positions':early_eligible,
+        'day_gap_largest_missing_slots':max((g[0] for g in gaps),default=0),
+        'day_gap_first_time_kst':gaps[0][1].strftime('%Y-%m-%d %H:%M') if gaps else None,
+        'day_gap_count':len(gaps),
+        'day_gap_cause':'UNVERIFIED' if gaps else 'NO_INTERNAL_GAPS_OBSERVED',
+    }
+
+
+def c5_h2_v111434_early_events(rows,cfg,market,kst):
+    """Early-only H2 hypotheses enabled by real additional historical bars.
+
+    No insertion into C. Uses EXACT H2 thresholds and old settlement with no
+    synthesis. G signal time must precede first potentially eligible legacy C
+    time (01:25 KST), so original C events cannot be duplicated.
+    """
+    from datetime import datetime as _dt,time as _tm
+    start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=start+timedelta(minutes=C5_H2_V111434_EARLY_MINUTES)
+    ind=c5_brooks_v111431_indicators(rows)
+    events=[];last=-1000000
+    for i in range(65,len(rows)-1):
+        if rows[i]['t']<start:continue
+        if rows[i]['t']>=end:break
+        if i-last<cfg['bars'] or not lab_contiguous(rows,i-65,i):
+            continue
+        details=c5_brooks_v111431_h2(rows,i,ind)
+        if details is None:continue
+        last=i
+        when=rows[i]['t'].strftime('%Y-%m-%d %H:%M')
+        ev={'market':market,'strategy':'G',
+            'base_id':market+'|H2_PREFIX_6H|'+when,
+            'base_signal_time_kst':when,
+            'signal_time_kst':when,
+            'entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+            'entry_delay_minutes':0,
+            'reason':'6시간 실제 사전봉을 활용한 자정 직후 H2 추가 관측 (실험만)',
+            'hypothetical_only':True,
+            'comparison_group':'EXTENDED_PREFIX_ONLY',
+            **details}
+        ev.update(lab_outcome_v11145(rows,i,cfg))
+        events.append(ev)
+    return events
+
+
+def c5_h2_v111434_evaluate_rows(rows6,cfg,market,kst,truncated=False,fetch_info=None):
+    """Feed pre-existing .33 evaluator ONLY the original four-hour subset."""
+    from datetime import datetime as _dt,time as _tm
+    start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    legacy_begin=start-timedelta(hours=4)
+    legacy=[r for r in rows6 if r['t']>=legacy_begin]
+    result=c5_h2_v111433_evaluate_rows(legacy,cfg,market,kst,truncated)
+    result['truncated']=truncated
+    g=c5_h2_v111434_early_events(rows6,cfg,market,kst)
+    prev4=sum(legacy_begin<=r['t']<start for r in rows6)
+    prev6=sum(start-timedelta(hours=6)<=r['t']<start for r in rows6)
+    lens=c5_h2_v111434_window_audit(rows6,cfg,kst)
+    extra={'extended_pre_day_observed_bars':prev6,
+           'legacy_pre_day_observed_bars':prev4,
+           'extra_pre_day_observed_bars':prev6-prev4,
+           'extended_observed_5m':len(rows6),
+           'legacy_observed_5m':len(legacy),
+           'early_legacy_eligible_positions':0,
+           'early_extra_h2_signals':len(g),
+           **lens,**(fetch_info or {})}
+    # Result includes C coverage in legacy rows; the early additions must be
+    # non-overlapping and cannot change the original C event time set.
+    c_ids={e['signal_time_kst'] for e in result['events']['C']}
+    if any(e['signal_time_kst'] in c_ids for e in g):
+        raise RuntimeError('V11.14.34 기존 H2 신호와 6시간 조기 연구 신호 중복')
+    if extra['window_66_positions_extended']<result['h2_eligible_windows']:
+        raise RuntimeError('V11.14.34 관측 가능 창 개수 역전')
+    result['h2_extended_audit']=extra
+    result['h2_early_events']=g
+    return result
+
+
+def c5_h2_v111434_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    return c5_h2_v111434_evaluate_rows(rows,cfg,market,kst,truncated,meta)
+
+
+def c5_h2_v111434_make_page():
+    """New isolated UI/DB/CSV; previous experiment pages left in place."""
+    page=C5_H2_V111433_PAGE.replace('V11.14.33','V11.14.34')
+    def one(old,new):
+        nonlocal page
+        n=page.count(old)
+        if n!=1:raise RuntimeError('V11.14.34 페이지 텍스트 대상 '+str(n)+': '+old[:100])
+        page=page.replace(old,new,1)
+    one('<title>V11.14.34 · BROOKS H2 거래량·EMA 그림자 필터 비교</title>',
+        '<title>V11.14.34 · H2 6시간 사전 데이터 확보 연구</title>')
+    one('<h1>🧪 V11.14.34 · BROOKS H2 필터 비교 실험</h1>',
+        '<h1>🧪 V11.14.34 · H2 5분봉 데이터 확보 연구</h1>')
+    one('기존 A/B/C 유지 · D 거래량 / E EMA / F 동시 필터 가상 검증',
+        '기존 A~F 그대로 · 6시간 사전봉 조기 H2 실험 · 봉 공백 정밀 진단')
+    one("const API='/api/winrate14c5shadow', KEY='bithumb_c5_shadow_v111433_v1';",
+        "const API='/api/winrate14c5history', KEY='bithumb_c5_history_v111434_v1';")
+    one("const DB_NAME='bithumb_c5_shadow_v111433_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_history_v111434_indexeddb_v1';")
+    marker='<section class="panel"><h2>V11.14.34 — 기존 H2 원본과 거래량·EMA 강화형 3종 비교</h2>'
+    if page.count(marker)!=1:raise RuntimeError('V11.14.34 기존 설명 마커 오류')
+    intro="""<section class="panel"><h2>V11.14.34 — 과거 6시간 데이터 확보 실험</h2>
+<div class="alert28">
+<b>발견:</b> 기존 버전은 날짜 시작 전 4시간(최대 48개 5분봉)을 확보하지만 H2는 66개 연속 5분봉이 필요해. 그래서 자정 이후 최초 약 85분은 H2 후보를 평가하지 못할 수 있어.<br>
+<b>A/B/C/D/E/F:</b> 이전과 <b>똑같은 4시간 사전봉 구간</b>을 사용해 평가. 진입·익절·손절·그림자 필터와 결과를 바꾸지 않아.<br>
+<b>G 조기 H2 관측:</b> 실제 API로 확인한 6시간 사전봉으로 00:00~01:20의 H2 후보만 별도 시뮬레이션. <b>기존 C에 합치거나 실전 BUY에 적용하지 않아.</b><br>
+<b>데이터 분석:</b> 20/35/50/66개 연속봉 확보 가능 수치, API 페이지 상태, 봉 사이 공백, 더 확보된 사전봉 개수 기록. 20/35/50봉은 H2 진입 조건 완화가 아니라 <b>진단용 비교</b>야.</div>
+<p class="alert28 warn">⚠️ 5분봉이 누락된 이유는 실제 무거래·API 기록 누락·조회 시점 차이를 이 CSV만으로 구분할 수 없어. 어떠한 가격도 임의로 채우지 않으며, G는 다른 사전 데이터 기간을 쓰는 연구 가설이므로 A~F 실전 성과와 합산하지 마.</p>
+</section>\n"""
+    page=page.replace(marker,intro+marker,1)
+    panel="""<section class="panel"><h2>10. 6시간 사전봉 확보 및 자정 직후 H2 별도 탐색</h2>
+<p class="small28">A~F는 4시간 사전봉으로 계산한 기존 버전 결과 그대로야. G는 자정 직후 85분에 한정된 연구용 H2 별도 기록이며 주문 신호가 아니야.</p>
+<div id="h2_extended_history" class="wide28">검사 후 표시</div>
+</section>"""
+    one('</main>',panel+'\n</main>')
+    function=r"""function paintH2History(){
+ const rs=Object.values(state.results||{});
+ const audits=rs.map(r=>r.h2_extended_audit||{});
+ const sum=k=>audits.reduce((a,c)=>a+(Number(c[k])||0),0);
+ const count=k=>audits.filter(c=>c[k]===true).length;
+ const early=rs.flatMap(r=>(r.h2_early_events||[]).map(e=>({...e,date:r.date})));
+ const done=early.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+ const mean=done.length?done.reduce((a,e)=>a+num(e.net_pct),0)/done.length:NaN;
+ const pct=Number.isFinite(mean)?mean.toFixed(3)+'%':'—';
+ const rows=[tr(['종목×날짜',rs.length]),
+  tr(['기존 4시간 사전봉',sum('legacy_pre_day_observed_bars')]),
+  tr(['확대 6시간 사전봉',sum('extended_pre_day_observed_bars')]),
+  tr(['추가로 확보된 실제 사전봉',sum('extra_pre_day_observed_bars')]),
+  tr(['20개 연속봉 평가 가능 종목',count('window_20_available')]),
+  tr(['35개 연속봉 평가 가능 종목',count('window_35_available')]),
+  tr(['50개 연속봉 평가 가능 종목',count('window_50_available')]),
+  tr(['66개 연속봉 평가 가능 종목',count('window_66_available_extended')]),
+  tr(['기존 H2 66봉 평가 위치',rs.reduce((a,r)=>a+(Number(r.h2_eligible_windows)||0),0)]),
+  tr(['6시간 데이터 66봉 평가 위치',sum('window_66_positions_extended')]),
+  tr(['자정 직후(00:00~01:20) 새로 평가 가능 위치',sum('early_66_eligible_positions')]),
+  tr(['G 조기 H2 가상 신호',early.length]),
+  tr(['G 결과 확인 / 미확정',done.length+' / '+(early.length-done.length)]),
+  tr(['G 평균 순수익률 (완료분만)',pct]),
+  tr(['API 페이지 제한 도달',count('fetch_5m_page_limit_reached')])];
+ let details=early.slice(0,60).map(e=>tr([e.date,e.market,e.signal_time_kst,e.outcome||'UNKNOWN',
+  Number.isFinite(num(e.net_pct))?num(e.net_pct).toFixed(3)+'%':'—']));
+ const gapCases=rs.filter(r=>(r.h2_extended_audit?.day_gap_count||0)>0).length;
+ $('h2_extended_history').innerHTML=tbl(['데이터 확보·연속봉 점검','값'],rows)+
+  '<p class="small28">하루 내부 공백 관측: '+gapCases+'개 시장·날짜. 공백 원인은 아직 미확정. 20/35/50봉 지표는 기존 H2 신호 검사가 아님.</p>'+ 
+  '<h3>G 연구 신호 예시 (최대 60건)</h3>'+
+  (details.length?tbl(['날짜','종목','신호 시각','청산','가상 순수익률'],details):'<p class="small28">추가 H2 신호 없음</p>');
+}
+"""
+    marker='function paintH2Coverage(){'
+    one(marker,function+marker)
+    one(' paintH2Coverage();\n}', ' paintH2Coverage();\n paintH2History();\n}')
+    # Append extended audit fields to the exported COVERAGE and G-event rows.
+    one("'first_day_bar_kst','last_day_bar_kst','comparison_group'];",
+        "'first_day_bar_kst','last_day_bar_kst','comparison_group',\n"
+        "  'extended_pre_day_observed_bars','legacy_pre_day_observed_bars',\n"
+        "  'extra_pre_day_observed_bars','extended_observed_5m','legacy_observed_5m',\n"
+        "  'window_20_positions','window_35_positions','window_50_positions',\n"
+        "  'window_66_positions_extended','window_20_available','window_35_available',\n"
+        "  'window_50_available','window_66_available_extended',\n"
+        "  'extended_longest_observed_streak','early_66_eligible_positions',\n"
+        "  'early_extra_h2_signals','day_gap_largest_missing_slots',\n"
+        "  'day_gap_first_time_kst','day_gap_count','day_gap_cause',\n"
+        "  'fetch_5m_pages_used','fetch_5m_raw_records',\n"
+        "  'fetch_5m_invalid_records','fetch_5m_duplicates',\n"
+        "  'fetch_5m_stop_reason','fetch_5m_page_limit_reached','hypothetical_only'];")
+    one('...c};','...c,...(r.h2_extended_audit||{})};')
+    one("  for(const e of d.near_misses||[])add({...base,strategy:'H2_NEAR_MISS',",
+        "  for(const e of r.h2_early_events||[])add({...base,...e,strategy:'G',comparison_group:'EXTENDED_PREFIX_ONLY'});\n"
+        "  for(const e of d.near_misses||[])add({...base,strategy:'H2_NEAR_MISS',")
+    one('bithumb_C5_VOLMAN_BEGGS_BROOKS_SHADOW_v111433.csv',
+        'bithumb_C5_VOLMAN_BEGGS_BROOKS_HISTORY_v111434.csv')
+    if '/api/winrate14c5shadow' in page or 'bithumb_c5_shadow_v111433_indexeddb_v1' in page:
+        raise RuntimeError('V11.14.34 API/DB 독립 연결 실패')
+    if page.count('function paintH2History(){')!=1:
+        raise RuntimeError('V11.14.34 데이터 화면 구문 누락')
+    return page
+
+
+C5_H2_V111434_PAGE=c5_h2_v111434_make_page()
+
+
+def register_c5_h2_v111434_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                items=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not items:
+                    raise ValueError('현재 빗썸 KRW 시장 목록을 조회하지 못했어')
+                cache.update(items=items,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-h2-history')
+    def c5_h2_v111434_page():
+        return render_template_string(C5_H2_V111434_PAGE)
+
+    @app.get('/api/winrate14c5history/universe')
+    def c5_h2_v111434_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.34'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5history/evaluate')
+    def c5_h2_v111434_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):raise ValueError('현재 KRW 목록에 없는 코인')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_h2_v111434_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.34',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111433_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111433_register_daytrade_review(app,deps)
+    register_c5_h2_v111434_lab(app,deps)
