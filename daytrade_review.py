@@ -8769,6 +8769,7 @@ select{background:#111a2e;color:#f3f6ff;padding:10px;border:1px solid var(--line
 @media(max-width:650px){main{padding:13px 9px 60px}}
 </style></head><body><main>
 <h1>🧪 V11.14.28 · C5 선행 포착 vs 거래량 돌파</h1>
+<p class="small28">진단 보완판 · 검사 실패 원인 표시 및 성공한 검사 기록 보존</p>
 <p class="muted">빗썸 KRW · 5분봉 완료 신호만 사용 · 기존 V2 실전 스캐너는 변경하지 않음</p>
 <section class="panel"><h2>세 가지 진입 비교</h2>
 <div class="alert28">
@@ -8787,8 +8788,9 @@ select{background:#111a2e;color:#f3f6ff;padding:10px;border:1px solid var(--line
 <label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
 </div>
 <p class="small28">처음에는 11월 12일 · 40종목부터 시작해 기능을 확인해 줘. 40종목은 정렬된 목록에서 균등 간격으로 고른 기능 확인용 표본이며 시장 대표 표본은 아니야. 7일 전체 KRW 분석은 API 조회량이 크므로 필요할 때만 선택해.</p>
-<div class="actions"><button id="run">검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">이번 검사 초기화</button><button id="csv" class="secondary" disabled>결과 CSV 저장</button></div>
-<progress id="prog" max="1" value="0"></progress><div id="status" class="status">검사 대기 중</div>
+<div class="actions"><button type="button" id="run">검사 시작 / 이어하기</button><button type="button" id="pause" class="secondary" disabled>일시 중지</button><button type="button" id="reset" class="secondary">이번 검사 초기화</button><button type="button" id="csv" class="secondary" disabled>결과 CSV 저장</button><button type="button" id="diag" class="secondary">연결·1종목 진단</button></div>
+<progress id="prog" max="1" value="0"></progress><div id="status" class="status" style="white-space:pre-wrap">검사 대기 중</div>
+<div class="alert28 warn" id="diagnosis" style="display:none;white-space:pre-wrap;margin-top:10px"></div>
 </section>
 <section class="panel"><h2>1. 진행 상황</h2><div id="coverage" class="stats">검사 대기</div></section>
 <section class="panel"><h2>2. 세 전략 성적 비교</h2><div id="summary" class="wide28">검사 전</div><p class="small28">평균 순손익은 수수료·슬리피지 차감 이후이며, 손익 확정 거래 기준으로 계산. 표본이 적으면 수익성을 결론낼 수 없어.</p></section>
@@ -8807,14 +8809,15 @@ const cell=v=>'<td>'+esc(v)+'</td>';
 const tr=xs=>'<tr>'+xs.map(cell).join('')+'</tr>';
 const tbl=(headers,rs)=>'<table><thead><tr>'+headers.map(v=>'<th>'+esc(v)+'</th>').join('')+'</tr></thead><tbody>'+rs.join('')+'</tbody></table>';
 const stat=(name,value)=>'<div class="stat"><small>'+esc(name)+'</small><strong>'+esc(value)+'</strong></div>';
-let state=null,running=false,stopped=false,errors=0,lastError='';
+let state=null,running=false,stopped=false,errors=0,lastError='',diagnosticMessage='';
 const signature=cfg=>JSON.stringify(cfg);
 function chosen(){const day=$('day').value,period=$('period').value,scope=$('scope').value,fee=num($('fee').value),slip=num($('slip').value);
  if(!/^\d{4}-\d{2}-\d{2}$/.test(day))throw Error('검증 날짜를 골라줘');
  if(!Number.isFinite(fee)||!Number.isFinite(slip)||fee<0||fee>0.5||slip<0||slip>0.5)throw Error('비용은 0~0.5% 범위로 설정해 줘');
  return {day,period,scope,fee,slip};}
-function load(){try{let v=JSON.parse(localStorage.getItem(KEY)||'null');return v&&v.version===1&&v.cfg&&v.items&&v.results&&typeof v.results==='object'?v:null;}catch{return null;}}
+function load(){try{let v=JSON.parse(localStorage.getItem(KEY)||'null');return v&&v.version===1&&v.cfg&&Array.isArray(v.items)&&v.results&&typeof v.results==='object'?v:null;}catch{return null;}}
 function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){stopped=true;throw Error('브라우저 저장 용량 부족 · CSV로 기록을 보관하거나 이번 검사 초기화 필요');}}
+function report(message){diagnosticMessage=String(message||'');let el=$('diagnosis');el.style.display=diagnosticMessage?'block':'none';el.textContent=diagnosticMessage;}
 function eventRows(){let arr=[];for(let val of Object.values(state?.results||{})){for(let [k] of ARMS){for(let ev of val.events?.[k]||[])arr.push({...ev,date:val.date,market:val.market,strategy:k});}}return arr;}
 function calculate(es){let ok=es.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(num(e.net_pct)));
  let a=ok.map(e=>num(e.net_pct));return {total:es.length,done:ok.length,miss:es.length-ok.length,win:a.filter(x=>x>0).length,
@@ -8827,7 +8830,10 @@ function paint(){if(!state)return;let finishedJobs=Object.keys(state.results).le
  let valid=Object.values(state.results).reduce((a,r)=>a+(r.eligible_windows||0),0);
  $('coverage').innerHTML=stat('완료',finishedJobs+' / '+items)+stat('C5 WATCH',c5)+stat('분석 가능 봉 위치',valid)+stat('총 발생 신호',es.length)+stat('조회 오류',errors)+stat('결과 미확정',es.filter(e=>e.outcome==='UNKNOWN').length);
  $('csv').disabled=!es.length;
- $('status').textContent=(complete?'✅ 선택한 구간 검증 완료':running?'⏳ 조회 중':'중단 / 이어하기 가능')+' · '+finishedJobs+'/'+items+'건'+(errors?'\n⚠️ 조회 실패 '+errors+'건 · '+lastError+' · 다시 누르면 미완료 종목부터 이어서 검사해.':'')+(complete?'\n최종 숫자도 과거 모의검증이므로 독립 날짜에서 재확인해야 해.':'\n검사가 모두 끝나기 전 숫자는 임시 통계야.');
+ const failures=state.failures||{},failureCount=Object.keys(failures).length;
+ const problem=lastError||(failureCount?Object.values(failures)[0]:'');
+ $('status').textContent=(complete?'✅ 선택한 구간 검증 완료':running?'⏳ 조회 중':problem?'⚠️ 검사 중단 · 원인 확인 필요':'중단 / 이어하기 가능')+' · '+finishedJobs+'/'+items+'건'+(problem?'\n오류: '+problem+'\n정상 완료된 종목은 유지돼. 같은 설정으로 다시 시작하면 실패 종목만 재검사해.':'')+(complete?'\n최종 숫자도 과거 모의검증이므로 독립 날짜에서 재확인해야 해.':'\n검사가 모두 끝나기 전 숫자는 임시 통계야.');
+ if(problem)report('서버 진단 정보 (복사하거나 화면 캡처해서 보내줘)\n'+problem+'\n성공 '+finishedJobs+'/'+items+'건 · 실패 '+failureCount+'건');
  let sums=ARMS.map(([k,label])=>{let a=calculate(es.filter(e=>e.strategy===k));return tr([label,a.total,a.done,a.miss,a.win,a.tp,a.sl,a.tm,pct(a.winRate),pct(a.avg)]);});
  $('summary').innerHTML=tbl(['전략','신호','확정','미확정','수익 거래','익절','손절','시간만료','수익 거래 비율','평균 순손익'],sums);
  let dates=[...new Set(state.items.map(j=>j.day))].sort();
@@ -8836,23 +8842,88 @@ function paint(){if(!state)return;let finishedJobs=Object.keys(state.results).le
  let ex=[...es].sort((a,b)=>b.signal_time_kst.localeCompare(a.signal_time_kst)).slice(0,80);
  $('examples').innerHTML=ex.length?tbl(['날짜','종목','전략','C5 WATCH 시각','BUY 확정 봉','진입 시각','거래량 배수','결과','순손익'],ex.map(e=>tr([e.date,e.market,e.strategy,e.watch_time_kst||'—',e.signal_time_kst,e.entry_time_kst,Number.isFinite(num(e.volume_ratio))?num(e.volume_ratio).toFixed(2):'—',e.outcome,pct(num(e.net_pct))]))):'아직 신호 없음';
 }
-async function requestJSON(url,opts={}){let ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),90000);try{let resp=await fetch(url,{cache:'no-store',...opts,signal:ctrl.signal});let j=await resp.json();if(!resp.ok||!j.ok)throw Error(j.error||'HTTP '+resp.status);return j;}finally{clearTimeout(timer);}}
+async function requestJSON(url,opts={}){
+ let ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),90000);
+ try{
+  let resp;
+  try{resp=await fetch(url,{cache:'no-store',...opts,signal:ctrl.signal});}
+  catch(e){throw Error(e?.name==='AbortError'?'서버 응답 90초 초과 ('+url+')':'네트워크 연결 실패 ('+url+'): '+String(e?.message||e));}
+  let raw=await resp.text(),j;
+  try{j=JSON.parse(raw);}catch{throw Error('HTTP '+resp.status+' · JSON이 아닌 서버 응답 ('+url+'): '+raw.replace(/<[^>]*>/g,' ').slice(0,170));}
+  if(!resp.ok||!j?.ok)throw Error('HTTP '+resp.status+' ('+url+'): '+String(j?.error||'서버에서 검증 요청을 거절했어'));
+  return j;
+ }finally{clearTimeout(timer);}
+}
 function sample(items,n){if(items.length<=n)return items;return [...new Set(Array.from({length:n},(_,i)=>items[Math.round(i*(items.length-1)/(n-1))]))];}
 async function prepare(cfg){let old=load();if(old&&signature(old.cfg)===signature(cfg)&&old.items.length){state=old;paint();return;}
  let res=await requestJSON(API+'/universe');let markets=cfg.scope==='40'?sample(res.items,40):res.items;
  let days=cfg.period==='week'?DAYS:[cfg.day];
- state={version:1,cfg,items:days.flatMap(day=>markets.map(market=>({day,market}))),results:{}};save();paint();}
-async function run(){if(running)return;running=true;stopped=false;errors=0;lastError='';$('run').disabled=true;$('pause').disabled=false;
- try{let cfg=chosen();await prepare(cfg);let jobs=state.items.filter(j=>!state.results[jobKey(j)]),cursor=0;
-  async function worker(){while(!stopped){let i=cursor++;if(i>=jobs.length)break;let job=jobs[i],done=false;
-   for(let attempt=0;attempt<3&&!stopped;attempt++){try{let result=await requestJSON(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...job,date:job.day,fee:cfg.fee,slip:cfg.slip})});
-   if(result.date!==job.day||result.market!==job.market)throw Error('서버 결과 종목/날짜 불일치');state.results[jobKey(job)]=result;save();done=true;break;
-   }catch(e){lastError=job.day+' '+job.market+': '+String(e.message||e);$('status').textContent='⚠️ '+lastError;if(attempt<2)await new Promise(r=>setTimeout(r,1000*(attempt+1)));}}
-   if(!done){errors++;if(errors>=8)stopped=true;}paint();}}
+ state={version:1,cfg,items:days.flatMap(day=>markets.map(market=>({day,market}))),results:{},failures:{}};save();paint();}
+async function run(){
+ if(running)return;
+ running=true;stopped=false;errors=0;lastError='';report('');
+ $('run').disabled=true;$('pause').disabled=false;
+ try{
+  const cfg=chosen();
+  $('status').textContent='⏳ 종목 목록 및 설정 확인 중…';
+  await prepare(cfg);
+  if(!state.failures)state.failures={};
+  const jobs=state.items.filter(j=>!state.results[jobKey(j)]);
+  if(!jobs.length){$('status').textContent='✅ 모든 종목 검사 완료';return;}
+  let cursor=0;
+  async function worker(){
+   while(!stopped){
+    const idx=cursor++;if(idx>=jobs.length)break;
+    const job=jobs[idx],key=jobKey(job);
+    let done=false,reason='';
+    for(let attempt=0;attempt<2&&!stopped;attempt++){
+     try{
+      const result=await requestJSON(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...job,date:job.day,fee:cfg.fee,slip:cfg.slip})});
+      if(result.date!==job.day||result.market!==job.market)throw Error('서버 결과 종목/날짜 불일치: '+job.day+' '+job.market);
+      if(!result.events||!Array.isArray(result.events.A)||!Array.isArray(result.events.B)||!Array.isArray(result.events.C))throw Error('서버 응답 신호 목록 형식 오류');
+      state.results[key]=result;delete state.failures[key];
+      save();done=true;break;
+     }catch(e){
+      reason=job.day+' '+job.market+': '+String(e?.message||e);
+      lastError=reason;
+      if(/HTTP (400|401|403|404)\b/.test(reason)||/저장 용량 부족/.test(reason)){stopped=true;break;}
+      if(attempt===0)await new Promise(r=>setTimeout(r,800));
+     }
+    }
+    if(!done){
+      state.failures[key]=reason||'응답 실패';errors++;
+      try{save();}catch(e){lastError=String(e?.message||e);stopped=true;}
+      if(errors>=3)stopped=true;
+    }
+    paint();
+   }
+  }
   await Promise.all([worker(),worker()]);
- }catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;paint();}}
+ }catch(e){
+  lastError=String(e?.message||e);
+  report('검사를 시작하거나 진행하는 중 오류 발생\n'+lastError);
+ }finally{
+  running=false;$('run').disabled=false;$('pause').disabled=true;
+  if(state){paint();}
+  else if(lastError)$('status').textContent='⚠️ 검사 시작 실패 · '+lastError;
+  if(lastError)report('V11.14.28 진단 정보\n'+lastError+'\n같은 설정의 정상 완료 기록은 유지돼.');
+ }
+}
+$('diag').onclick=async()=>{
+ if(running)return;
+ $('diag').disabled=true;report('⏳ 연결 및 1종목 진단 중…');
+ try{
+  const cfg=chosen();
+  const universe=await requestJSON(API+'/universe');
+  if(!Array.isArray(universe.items)||!universe.items.length)throw Error('종목 목록이 비어 있어');
+  const market=universe.items[0];
+  const result=await requestJSON(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market,date:cfg.day,fee:cfg.fee,slip:cfg.slip})});
+  report('✅ 연결 정상 · V11.14.28 · '+cfg.day+' '+market+' · 5분봉 '+result.observed_5m+'개 · C5 WATCH '+result.c5_watches+'건');
+ }catch(e){report('⚠️ 진단 실패 · '+String(e?.message||e)+'\n이 내용을 그대로 보내줘.');}
+ finally{$('diag').disabled=false;}
+};
 $('run').onclick=run;$('pause').onclick=()=>{stopped=true;$('pause').disabled=true;};
-$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.28 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);$('coverage').textContent='검사 대기';$('summary').textContent='검사 전';$('daily').textContent='검사 전';$('examples').textContent='검사 전';$('status').textContent='기록 초기화 완료';};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.28 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);$('coverage').textContent='검사 대기';$('summary').textContent='검사 전';$('daily').textContent='검사 전';$('examples').textContent='검사 전';$('status').textContent='기록 초기화 완료';report('');};
 for(let id of ['day','scope','period','fee','slip'])$(id).addEventListener('change',()=>{if(running)return;let cfg;try{cfg=chosen();}catch{return;}let old=load();state=old&&signature(old.cfg)===signature(cfg)?old:null;if(state)paint();else $('status').textContent='설정이 바뀌었어. 검사 시작을 누르면 새로운 기록으로 실행해.';});
 function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
 $('csv').onclick=()=>{let cols=['version','date','market','strategy','watch_time_kst','signal_time_kst','entry_time_kst','volume_ratio','breakout_high','outcome','entry','exit','net_pct','minutes','reason','eligible_windows','observed_5m','c5_watches','truncated','scope','period'];
@@ -8886,7 +8957,7 @@ def register_c5_break_v111428_lab(app,deps):
         try:
             return jsonify({'ok':True,'items':listed(),'version':'V11.14.28'})
         except Exception as exc:
-            return jsonify({'ok':False,'error':str(exc)[:160]}),400
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
     @app.post('/api/winrate14c5breakout/evaluate')
     def c5_break_v111428_evaluate():
         try:
@@ -8904,7 +8975,7 @@ def register_c5_break_v111428_lab(app,deps):
             return jsonify({'ok':True,'version':'V11.14.28',
                             'date':cfg['day'].isoformat(),**res})
         except Exception as exc:
-            return jsonify({'ok':False,'error':str(exc)[:200]}),400
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
 
 
 _v111427_register_daytrade_review=register_daytrade_review
