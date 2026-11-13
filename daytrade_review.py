@@ -7598,3 +7598,284 @@ _v111423_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v111423_register_daytrade_review(app, deps)
     register_c5_ma_v111424_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.25 FINAL, ONE-OFF TEST ONLY:
+# C5 + Volman compression breakout, with SMA12/SMA200 crossover,
+# 200-SMA retest support and renewed price breakout.
+# Reuses identical 74 base signal IDs and *unchanged* historical outcomes
+# (Nov 8, 9, 11) from V11.14.22; never alters live V2 app.py.
+# Pre-registered research rules; not a profitable-strategy claim.
+# Distinguish 241-slot fully observed RAW from carry-forward assumptions.
+# Recent 31 bars must be real observed OHLC; no lookahead after signal.
+# ---------------------------------------------------------------------------
+
+C5_MA_V111425_SLOTS = 241             # 20 hours and five minutes of 5m slots
+C5_MA_V111425_MAX_MISSING = 24        # <= ~10% of all slots
+C5_MA_V111425_MAX_GAP_RUN = 3        # <=3 adjacent missing slots
+C5_MA_V111425_RECENT_RAW = 31        # prior 30 and signal candle must be real
+C5_MA_V111425_CROSS_LOOKBACK = 30    # <=150 minutes before the C5 signal
+C5_MA_V111425_RETEST_LOOKBACK = 12   # <=60 minutes before the C5 signal
+C5_MA_V111425_TOUCH_ABOVE = 1.005   # prior wick <= SMA200 +0.5%
+C5_MA_V111425_CLOSE_FLOOR = 0.997   # prior close >= SMA200 -0.3%
+
+
+def c5_ma_v111425_classify(slots):
+    """Pure causal classifier for chronological 241 fully indexed 5m slots.
+
+    A slot is {'open','high','low','close','raw'}. Older slots may be
+    reconstructed, but last 31 must be genuine OHLC. No future bars.
+    """
+    n = len(slots)
+    if n != C5_MA_V111425_SLOTS:
+        raise ValueError('241개 5분 구간이 필요합니다')
+    prices = [float(s['close']) for s in slots]
+    prefix = [0.0]
+    for p in prices:
+        prefix.append(prefix[-1] + p)
+    def ma(i, period):
+        if i + 1 < period:
+            return None
+        return (prefix[i+1] - prefix[i+1-period]) / period
+    m12 = [ma(i, 12) for i in range(n)]
+    m200 = [ma(i, 200) for i in range(n)]
+    last = n-1
+    above = m12[last] > m200[last]
+    previous = slots[last-3:last]
+    candle = slots[last]
+    # A deliberately explicit restart, separate from the earlier Volman test.
+    restart = (float(candle['close']) > float(candle['open']) and
+               float(candle['close']) > m12[last] and
+               float(candle['close']) > m200[last] and
+               float(candle['close']) > max(float(b['high']) for b in previous))
+    # Search most recent *observed* crossing, where an MA200 is defined
+    # on both sides of the crossover. The signal candle is NOT the retest.
+    crossing = []
+    for i in range(max(200, last-C5_MA_V111425_CROSS_LOOKBACK), last):
+        if m12[i-1] <= m200[i-1] and m12[i] > m200[i]:
+            crossing.append(i)
+    recent_cross = crossing[-1] if crossing else None
+    def touching(i):
+        return (float(slots[i]['low']) <= m200[i]*C5_MA_V111425_TOUCH_ABOVE
+                and float(slots[i]['close']) >= m200[i]*C5_MA_V111425_CLOSE_FLOOR
+                and m12[i] >= m200[i])
+    recent_start = last-C5_MA_V111425_RETEST_LOOKBACK
+    any_retest = [i for i in range(recent_start, last) if touching(i)]
+    post_cross = [i for i in any_retest if recent_cross is not None and i > recent_cross]
+    simple = bool(above and restart and any_retest)
+    strict = bool(above and restart and post_cross)
+    return {
+        'sma12':round(m12[last], 10), 'sma200':round(m200[last], 10),
+        'ma_above':bool(above), 'relaunch_pass':bool(restart),
+        'retest_relaunch':simple, 'cross_retest_relaunch':strict,
+        'cross_bars_ago':last-recent_cross if recent_cross is not None else None,
+        'retest_bars_ago':last-any_retest[-1] if any_retest else None,
+        'strict_retest_bars_ago':last-post_cross[-1] if post_cross else None,
+        'signal_close':float(candle['close']),
+    }
+
+
+def c5_ma_v111425_features(api_get, event, kst):
+    """Fetch only as-of C5 signal; maintain API candles' 5m timestamps.
+
+    Missing old slots: optional carry-forward sensitivity only. A missing
+    recent pattern bar returns UNAVAILABLE, never a false negative.
+    """
+    signal=local_time(event['signal_time_kst'],kst)
+    step=timedelta(minutes=5)
+    if signal.minute%5 or signal.second or signal.microsecond:
+        raise ValueError('5분봉에 맞지 않는 신호 시각입니다')
+    start=signal-(C5_MA_V111425_SLOTS-1)*step
+    exclusive=signal+step
+    cursor=exclusive
+    found={}
+    pages=0
+    oldest=None
+    for _ in range(5):
+        raw=api_get('/v1/candles/minutes/5', {
+            'market':event['market'], 'count':200,
+            'to':cursor.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        pages+=1
+        if not isinstance(raw,list):
+            raise ValueError('빗썸 5분봉 응답 형식 오류')
+        page_oldest=None
+        for b in raw:
+            if not isinstance(b,dict):
+                continue
+            try:
+                t=local_time(b['candle_date_time_kst'],kst)
+                o=float(b['opening_price'])
+                h=float(b['high_price'])
+                l=float(b['low_price'])
+                c=float(b['trade_price'])
+            except (KeyError,ValueError,TypeError,OverflowError):
+                continue
+            if not (all(isfinite(v) and v>0 for v in (o,h,l,c)) and
+                    l<=min(o,c) and h>=max(o,c) and t<exclusive):
+                continue
+            if t not in found:
+                found[t]={'open':o,'high':h,'low':l,'close':c,'raw':True}
+            if page_oldest is None or t<page_oldest:
+                page_oldest=t
+        if page_oldest is None:
+            break
+        if page_oldest>=cursor:
+            raise ValueError('캔들 페이지 진행이 멈췄습니다')
+        oldest=page_oldest if oldest is None or page_oldest<oldest else oldest
+        if oldest <= start or len(raw)<200:
+            break
+        cursor=page_oldest
+
+    result={
+        'id':event['id'], 'signal_time_kst':event['signal_time_kst'],
+        'history_status':'SOURCE_SHORT','data_quality':'UNAVAILABLE',
+        'pages':pages,'observed_bars':len(found),
+        'actual_slots_241':None,'filled_slots_241':None,'max_gap_run':None,
+        'recent_31_raw':False,
+        'sma12':None,'sma200':None,'ma_above':None,
+        'relaunch_pass':None,'retest_relaunch':None,
+        'cross_retest_relaunch':None,'cross_bars_ago':None,
+        'retest_bars_ago':None,'strict_retest_bars_ago':None,
+        'signal_close':None,
+    }
+    if signal not in found:
+        result['history_status']='SIGNAL_NOT_OBSERVED'
+        return result
+    if oldest is None or oldest > start:
+        return result
+    prior=[t for t in found if t<=start]
+    if not prior:
+        return result
+    last_close=found[max(prior)]['close']
+    slots=[]
+    missing=[]
+    longest=run=0
+    for i in range(C5_MA_V111425_SLOTS):
+        t=start+i*step
+        if t in found:
+            candle=found[t]
+            last_close=candle['close']
+            run=0
+        else:
+            # Never pretend this was an observed candle.
+            candle={'open':last_close,'high':last_close,'low':last_close,
+                    'close':last_close,'raw':False}
+            missing.append(i)
+            run+=1
+            longest=max(longest,run)
+        slots.append(candle)
+    result.update(actual_slots_241=C5_MA_V111425_SLOTS-len(missing),
+                  filled_slots_241=len(missing),max_gap_run=longest,
+                  recent_31_raw=all(s['raw'] for s in slots[-C5_MA_V111425_RECENT_RAW:]))
+    if len(missing)>C5_MA_V111425_MAX_MISSING or longest>C5_MA_V111425_MAX_GAP_RUN:
+        result['history_status']='UNVERIFIED_GAP'
+        return result
+    if not result['recent_31_raw']:
+        result['history_status']='RECENT_PATTERN_GAP'
+        return result
+    computed=c5_ma_v111425_classify(slots)
+    result.update(computed)
+    if not missing:
+        result.update(history_status='RAW_OK',data_quality='RAW')
+    else:
+        result.update(history_status='OLDER_GAP_ASSUMPTION',
+                      data_quality='CARRY_FORWARD_ASSUMPTION')
+    return result
+
+
+C5_MA_V111425_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.25 마지막 12/200 재지지·재출발 검증</title>
+<style>/*REPLACE_STYLE*/</style></head><body>
+<main class="wrap"><header><div><small>7일 연구 후 마지막 일회성 검증 · V2 실전 스캐너 변경 없음</small>
+<h1>🔬 V11.14.25 · 볼먼 + 12/200 돌파·재지지·재출발</h1>
+<p>기존 볼먼 통과 신호 74건 · 2026년 11월 8·9·11일</p></div>
+<a class="btn secondary" href="/">V2 스캐너</a></header>
+<section class="panel"><h2>이번 한 번의 검증 기준 (미리 고정)</h2>
+<p><b>① 기본 볼먼</b> · 기존 C5+압축 돌파에서 이미 발생한 동일한 74건<br>
+<b>② 12 &gt; 200</b> · 신호 당시 SMA12가 SMA200 위<br>
+<b>③ 재지지→재출발</b> · 위 조건 + 최근 12봉 이내 저가가 200이평의 +0.5% 안쪽, 해당 봉 종가는 200이평 -0.3% 이상 + 신호봉 양봉·SMA12 위·직전 3개 봉 고가 돌파<br>
+<b>④ 최근 교차→재지지→재출발</b> · ③ 조건 + 신호 전 최근 30봉 안에 SMA12가 SMA200 상향 교차, 교차 <em>이후</em> 지지 확인</p>
+<p class="hint">⚠️ 과거 신호를 새 기준으로 <b>분류</b>할 뿐, 새로운 매수가격이나 진입 시각을 가정하지 않아. 기존 V11.14.22 순손익을 그대로 사용해. 신호 이후 캔들은 지표 계산에 사용하지 않아.</p>
+<p class="hint">⚠️ 최근 31개 패턴 봉은 실제 관측된 5분봉만 사용. 앞선 장기 이평 구간에 빈 봉이 있으면 직전 종가로 가정한 계산을 <b>별도 표</b>에 표시. 미확인과 손실을 혼동하지 않아.</p>
+<div class="actions"><button id="run" disabled>74건 최종 검사 / 이어하기</button><button class="secondary" id="pause" disabled>일시 중지</button><button class="secondary" id="reset" disabled>이 검증 초기화</button><button class="secondary" id="csv" disabled>CSV 다운로드</button></div>
+<progress id="progress" max="74" value="0"></progress><div class="status" id="status">신호 불러오는 중</div></section>
+<section class="panel"><h2>1. 자료 확보 현황</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>2. 실제 연속 봉만 사용한 RAW 결과 — 최우선</h2><div id="raw_report" class="scroll">검사 전</div></section>
+<section class="panel"><h2>3. 과거 봉 공백 보완 결과 — 참고용</h2><div id="assumed_report" class="scroll">검사 전</div></section>
+<section class="panel"><h2>4. 날짜별 RAW 결과</h2><div id="daily" class="scroll">검사 전</div></section>
+<section class="panel"><h2>5. 신호별 판정</h2><div id="details" class="scroll">검사 전</div></section>
+</main><script>
+'use strict';
+const API='/api/winrate14c5ma12200final',KEY='bithumb_v111425_c5_ma_final_v1';
+const DAYS=['2026-11-08','2026-11-09','2026-11-11'];
+const ARMS=[['base','볼먼 원래 74건 (참고)'],['comparable','볼먼 (동일 자료)'],['ma_above','볼먼 + 12>200'],['retest_relaunch','볼먼 + 재지지·재출발'],['cross_retest_relaunch','볼먼 + 최근교차·재지지·재출발']];
+const $=id=>document.getElementById(id), num=x=>x==null||x===''?NaN:Number(x);
+const fmt=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const row=xs=>'<tr>'+xs.map(x=>'<td>'+esc(x)+'</td>').join('')+'</tr>';
+const table=(h,rs)=>'<table><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+rs.join('')+'</tbody></table>';
+const card=(a,b)=>`<div class="stat"><small>${esc(a)}</small><strong>${esc(b)}</strong></div>`;
+let seeds=[],state=null,running=false,stopping=false;
+function load(){try{let x=JSON.parse(localStorage.getItem(KEY)||'null');return x&&x.version===1&&x.results&&typeof x.results==='object'?x:null;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function ready(){return seeds.length===74 && seeds.every(e=>Object.prototype.hasOwnProperty.call(state.results,e.id));}
+function flag(e,k){if(k==='base')return true;let r=state.results[e.id];if(!r)return null;if(k==='comparable')return r.data_quality!=='UNAVAILABLE';if(r.data_quality==='UNAVAILABLE')return null;return r[k];}
+function stats(items,k){let eligible=items.filter(e=>flag(e,k)===true);let done=eligible.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(num(e.net_pct)));let sum=done.reduce((s,e)=>s+num(e.net_pct),0);let win=done.filter(e=>num(e.net_pct)>0).length;return {passed:eligible.length,judged:done.length,win,avg:done.length?sum/done.length:NaN, tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,time:done.filter(e=>e.outcome==='TIME').length};}
+function report(items){let base=stats(items,'comparable');let rows=ARMS.map(([key,title])=>{let x=stats(items,key);return row([title,x.passed,x.judged,x.judged?((x.win/x.judged)*100).toFixed(1)+'%':'—',fmt(x.avg),key==='base'?'—':(Number.isFinite(x.avg)&&Number.isFinite(base.avg)?fmt(x.avg-base.avg):'—'),`${x.tp}/${x.sl}/${x.time}`]);});return table(['전략','통과','손익 확정','수익비율','평균 순손익','동일자료 볼먼 대비','TP/SL/TIME'],rows);}
+function filtered(quality){return seeds.filter(e=>state.results[e.id]?.data_quality===quality);}
+function paint(){if(!seeds.length||!state)return;let checked=seeds.filter(e=>state.results[e.id]).length;let fin=ready();$('progress').value=checked;$('csv').disabled=!fin;let raws=filtered('RAW'), assumed=filtered('CARRY_FORWARD_ASSUMPTION'), unknown=seeds.length-raws.length-assumed.length;
+$('coverage').innerHTML=card('원본 볼먼 신호','74건')+card('검사 완료',checked+'/74')+card('RAW 완전 연속봉',raws.length+'건')+card('장기봉 가정보완',assumed.length+'건')+card('판정 불가',unknown+'건');
+let rawStrict=stats(raws,'cross_retest_relaunch');let rawRelaxed=stats(raws,'retest_relaunch');let base=stats(raws,'comparable');
+let advice=fin? (rawStrict.judged<20&&rawRelaxed.judged<20?'⚠️ 새 조건의 RAW 확정 거래가 20건 미만이야. 좋은 수익률이 나와도 개선 입증 불가. 12/200 필터는 실전 도입 보류.':(rawStrict.avg>0&&rawStrict.avg>base.avg?'조건부 개선 신호가 있지만, 선택한 3일 데이터라 새 날짜의 독립 검증 전에는 실전 적용하지 않아.':'RAW 기준 개선이 확인되지 않았어. 12/200 추가 도입 보류.')):'검사가 끝나기 전 숫자는 중간 결과야.';
+$('status').textContent=(fin?'✅ 74건 검사 완료':running?'⏳ 과거 5분봉 조회 중':'검사 대기 / 이어하기 가능')+` · ${checked}/74건`+'\n'+advice;
+$('raw_report').innerHTML=report(raws)+'<p class="hint">RAW는 최근 241개 5분 구간 모두 원본 관측. 선택된 결과를 보고 고른 세 날짜이므로 독립적인 수익성 검증은 아님.</p>';
+$('assumed_report').innerHTML=report(assumed)+'<p class="hint">과거 일부 5분봉을 직전 종가로 채운 가정 계산. 실제 거래소 봉과 동일하게 취급하면 안 돼.</p>';
+$('daily').innerHTML=DAYS.map(d=>`<h3>${esc(d)}</h3>`+report(raws.filter(e=>e.date===d))).join('');
+let observed=seeds.filter(e=>state.results[e.id]);$('details').innerHTML=observed.length?table(['날짜','종목','손익','자료 분류','12>200','재지지·재출발','교차→재지지→재출발','교차 몇 봉 전','재지지 몇 봉 전','구간 누락','판정 이유'],observed.map(e=>{let r=state.results[e.id];let p=k=>r[k]==null?'미확인':r[k]?'YES':'NO';return row([e.date,e.market,Number.isFinite(num(e.net_pct))?fmt(num(e.net_pct)):'UNKNOWN',r.data_quality,p('ma_above'),p('retest_relaunch'),p('cross_retest_relaunch'),r.cross_bars_ago??'—',r.retest_bars_ago??'—',r.filled_slots_241??'—',r.history_status]);})):'검사 전';
+}
+async function fetchJson(url,opts={}){const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),110000);try{const x=await fetch(url,{...opts,cache:'no-store',signal:ctrl.signal});const d=await x.json();if(!x.ok||!d.ok)throw Error(d.error||'API 요청 오류');return d;}finally{clearTimeout(t);}}
+async function init(){let d=await fetchJson(API+'/seed');if(!Array.isArray(d.items)||d.items.length!==74)throw Error('기존 74건 불러오기 실패');seeds=d.items;state=load();if(!state||state.source_sha!==d.source_sha)state={version:1,source_sha:d.source_sha,results:{}};$('run').disabled=false;$('reset').disabled=false;paint();}
+async function run(){if(running||!seeds.length)return;running=true;stopping=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;let pending=seeds.filter(e=>!state.results[e.id]),idx=0,failed=0;paint();async function worker(){while(!stopping&&idx<pending.length){let e=pending[idx++];try{let d=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:e.id})});state.results[e.id]=d.result;save();}catch(err){failed++;if(failed<=3)$('status').textContent='⚠️ '+String(err.message||err);if(failed>=5){stopping=true;break;}}paint();}}try{await Promise.all([worker(),worker()]);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;paint();if(failed)$('status').textContent+=`
+실패 ${failed}건: 다시 누르면 실패한 신호만 재검사`;}}
+$('run').onclick=run;$('pause').onclick=()=>{stopping=true;$('pause').disabled=true;};$('reset').onclick=()=>{if(running||!state)return;if(!confirm('이번 마지막 검증 기록만 초기화할까?'))return;state={version:1,source_sha:state.source_sha,results:{}};save();paint();};
+function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!ready())return;const cols=['version','date','market','signal_time_kst','strategy','status','outcome','net_pct','data_quality','history_status','actual_slots_241','filled_slots_241','max_gap_run','recent_31_raw','ma_above','relaunch_pass','retest_relaunch','cross_retest_relaunch','cross_bars_ago','retest_bars_ago','strict_retest_bars_ago','sma12','sma200','signal_close','pages','entry','exit','minutes'];let lines=[cols.join(',')];for(let e of seeds){let r=state.results[e.id];for(let [key] of ARMS){let f=flag(e,key),o={...e,...r,version:'V11.14.25',strategy:key,status:f===null?'FEATURE_UNAVAILABLE':f?'ACCEPTED':'BLOCKED'};lines.push(cols.map(k=>csvCell(o[k])).join(','));}}let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download='bithumb_C5_volman_MA12_200_FINAL_v111425.csv';a.click();setTimeout(()=>URL.revokeObjectURL(u),2000);};
+init().catch(e=>{$('status').textContent='⚠️ '+String(e.message||e);});
+</script></body></html>""".replace('/*REPLACE_STYLE*/', C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
+
+
+def register_c5_ma_v111425_lab(app, deps):
+    api_get,kst=deps['api_get'],deps['KST']
+
+    @app.get('/backtest-winrate-c5-ma12200-final')
+    def c5_ma_v111425_page():
+        return render_template_string(C5_MA_V111425_PAGE)
+
+    @app.get('/api/winrate14c5ma12200final/seed')
+    def c5_ma_v111425_seed():
+        return jsonify({'ok':True,'rule_version':'V11.14.25',
+                        'source_sha':C5_MA_V111423_SEED_SHA,
+                        'items':C5_MA_V111423_SEEDS})
+
+    @app.post('/api/winrate14c5ma12200final/evaluate')
+    def c5_ma_v111425_evaluate():
+        try:
+            body=request.get_json(silent=True)
+            ident=body.get('id') if isinstance(body,dict) else None
+            if type(ident) is not int or ident not in C5_MA_V111423_BY_ID:
+                raise ValueError('74개 기존 신호 중 하나를 선택해야 합니다')
+            r=c5_ma_v111425_features(api_get,C5_MA_V111423_BY_ID[ident],kst)
+            return jsonify({'ok':True,'rule_version':'V11.14.25','result':r})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':str(exc)[:180]}),400
+
+
+_v111424_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app, deps):
+    _v111424_register_daytrade_review(app,deps)
+    register_c5_ma_v111425_lab(app,deps)
