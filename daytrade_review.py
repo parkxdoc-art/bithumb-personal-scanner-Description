@@ -7879,3 +7879,418 @@ _v111424_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v111424_register_daytrade_review(app,deps)
     register_c5_ma_v111425_lab(app,deps)
+ 
+
+# ---------------------------------------------------------------------------
+# V11.14.26 | Historic C5 + Volman-inspired compression x BTC 1h regimes.
+# The 2026-11-06 .. 2026-11-12 events below are EXACT snapshots of the
+# user's seven COMPLETE-KRW V11.14.22 CSV exports. They are not generated
+# anew or substituted with today's candles. Outcomes/entries are unchanged.
+# The only external data fetched are BTC's historical completed 5-minute bars.
+# All gate decisions are time-bounded to the signal bar. No V2 app.py changes.
+# ---------------------------------------------------------------------------
+
+import base64 as _btc26_base64
+import zlib as _btc26_zlib
+import json as _btc26_json
+from hashlib import sha256 as _btc26_sha256
+
+C5_BTC_V111426_DAYS = tuple('2026-11-%02d' % n for n in range(6,13))
+C5_BTC_V111426_BAND = 0.30  # BTC up >= +0.30%; down <= -0.30%; sideways otherwise.
+C5_BTC_V111426_SOURCE_SHA = 'cdb74d8ce07d0496d6601d5ef2b470fd0d8cc515ff084fa7e4ebcfd98dbea695'
+C5_BTC_V111426_ENCODED = (
+    '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'
+)
+
+def c5_btc_v111426_records():
+    b = _btc26_zlib.decompress(_btc26_base64.b64decode(C5_BTC_V111426_ENCODED))
+    if _btc26_sha256(b).hexdigest() != C5_BTC_V111426_SOURCE_SHA:
+        raise ValueError('V11.14.22 CSV 입력 자료 검증 실패')
+    raw = _btc26_json.loads(b)
+    if set(raw) != set(C5_BTC_V111426_DAYS):
+        raise ValueError('검증 날짜와 CSV 불일치')
+    return raw
+
+C5_BTC_V111426_RECORDS = c5_btc_v111426_records()
+
+
+def c5_btc_v111426_regime(returns):
+    if returns is None: return 'UNKNOWN'
+    if returns >= C5_BTC_V111426_BAND: return 'UP'
+    if returns <= -C5_BTC_V111426_BAND: return 'DOWN'
+    return 'SIDE'
+
+
+def c5_btc_v111426_fetch_day(api_get, day, kst):
+    """Retrieve BTC bars for the precise historic C5 event window.
+
+    Cursor is KST, like the existing labs. We store raw observed 5m BTC bars
+    and do NOT fill missing slots. No candle at or after the latest signal
+    bar's *next* 5-minute slot can influence any classification.
+    """
+    if day not in C5_BTC_V111426_RECORDS: raise ValueError('검증 날짜 오류')
+    events = C5_BTC_V111426_RECORDS[day]
+    signals = [local_time(x[1],kst) for x in events]
+    earliest = min(signals) - timedelta(minutes=60)
+    end_exclusive = max(signals) + timedelta(minutes=5)
+    cursor = end_exclusive
+    found = {}
+    pages = 0
+    for _ in range(6):
+        raw = api_get('/v1/candles/minutes/5', {
+            'market':'KRW-BTC', 'count':200,
+            'to':cursor.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        pages += 1
+        if not isinstance(raw,list):raise ValueError('BTC 5분봉 응답 형식 오류')
+        oldest = None
+        for b in raw:
+            if not isinstance(b,dict):continue
+            try:
+                t = local_time(b['candle_date_time_kst'],kst)
+                close = float(b['trade_price'])
+                if not isfinite(close) or close <= 0:continue
+                if t < end_exclusive:
+                    found[t] = close
+                if oldest is None or t < oldest:oldest = t
+            except (KeyError,ValueError,TypeError,OverflowError):continue
+        if oldest is None:break
+        if oldest <= earliest:break
+        if oldest >= cursor:raise ValueError('BTC 캔들 페이지네이션 오류')
+        if len(raw) < 200:break
+        cursor = oldest
+    return found,pages
+
+
+def c5_btc_v111426_classify(day, bars, kst):
+    """Use only 13 ACTUAL consecutive 5m closes through C5 signal bar.
+
+    The signal_time_kst in V11.14.22 CSV is the last completed C5 candle's
+    open timestamp. Its close becomes observable 5m later; a snapshot ending
+    at this candle is therefore known before the next candle's entry.
+    """
+    if day not in C5_BTC_V111426_RECORDS:raise ValueError('검증 날짜 오류')
+    out=[]
+    step=timedelta(minutes=5)
+    for market, ts, outcome, net, volman in C5_BTC_V111426_RECORDS[day]:
+        t=local_time(ts,kst)
+        sequence=[bars.get(t-step*k) for k in range(13)]
+        if any(x is None for x in sequence):
+            ret=None
+            regime='UNKNOWN'
+            why='BTC_CONTIGUOUS_13_MISSING'
+        else:
+            ret=round((sequence[0]/sequence[12]-1)*100,6)
+            regime=c5_btc_v111426_regime(ret)
+            why='OK'
+        out.append({'date':day,'market':market,'signal_time_kst':ts,
+                    'outcome':outcome,'net_pct':net,'volman':bool(volman),
+                    'btc_1h_pct':ret,'btc_regime':regime,'btc_reason':why})
+    return out
+
+
+C5_BTC_V111426_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.26 · C5 볼먼 × BTC 시장 상태 비교</title>
+<style>/*REPLACE_STYLE*/
+#btc26 main{max-width:1120px;margin:0 auto;padding:14px 12px 56px}
+#btc26 .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:9px}
+#btc26 .summary>div{padding:12px;border-radius:10px;background:#101a30;border:1px solid #35405a}
+#btc26 .summary small{display:block;color:#a9b8d4;font-size:12px}
+#btc26 .summary strong{font-size:20px}
+#btc26 table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}
+#btc26 th,#btc26 td{border-bottom:1px solid #33435b;padding:10px 8px;text-align:right}
+#btc26 th:first-child,#btc26 td:first-child{text-align:left}
+#btc26 .scroll{overflow-x:auto}
+#btc26 .muted26{color:#abbad4;font-size:13px;line-height:1.7}
+#btc26 .list26{line-height:1.85}
+#btc26 button{cursor:pointer}
+#btc26 pre{white-space:pre-wrap;word-wrap:break-word}
+</style></head><body id="btc26"><main>
+<header><div><small>C5 연구 · 과거 CSV 7개 재활용 · V2 스캐너 변경 없음</small>
+<h1>🔬 V11.14.26 · 볼먼 압축 돌파 × BTC 시장 상태</h1>
+<p>2026년 11월 6~12일 · 기존 C5 2,149건 / 볼먼 통과 214건</p></div>
+<a class="btn secondary" href="/">V2 스캐너</a></header>
+<section class="panel"><h2>검증 기준</h2>
+<p class="list26"><b>BTC 상승:</b> 해당 C5 신호봉까지 완료된 BTC 5분봉 13개의 양 끝 종가 비교, 최근 60분 +0.30% 이상<br>
+<b>BTC 횡보:</b> -0.30% 초과 ~ +0.30% 미만<br>
+<b>BTC 하락:</b> -0.30% 이하<br>
+<b>BTC 데이터 불완전:</b> 중간 5분봉이 하나라도 없으면 미확인</p>
+<p class="muted26">같은 기존 C5 신호들을 두 그룹(전체 C5 / 볼먼 조건 통과)에 나눠 기존의 <b>익절 +1.5%, 손절 -1%, 최대 60분, 수수료와 슬리피지 적용 순손익</b>을 재사용해. 진입·청산을 새로 만들어내지 않아. 미확정 수익률은 평균에서 제외하고 누락 건수를 공개해.</p>
+<p class="muted26">⚠️ 이 7일은 이전 연구에 사용한 기간이라 독립적인 수익성 검증이 아니야. 볼먼 조건이 일부 신호만 선택한 효과와 BTC 시장 상태의 효과를 혼동하지 말아야 해. 현재 상장 종목으로 과거를 분석하는 생존자 편향도 있어.</p>
+<div class="actions"><button id="run" disabled>7일 BTC 시장 분석 / 이어하기</button>
+<button id="pause" class="secondary" disabled>일시 중지</button>
+<button id="reset" class="secondary" disabled>이 실험만 초기화</button>
+<button id="csv" class="secondary" disabled>전체 결과 CSV 저장</button></div>
+<progress id="progress" max="7" value="0"></progress><pre id="status" class="status">자료 불러오는 중...</pre>
+</section>
+<section class="panel"><h2>1. 데이터 현황</h2><div id="overview" class="summary">검사 전</div></section>
+<section class="panel"><h2>2. BTC 상태별 C5와 볼먼 성적</h2><div id="regime" class="scroll">검사 전</div>
+<p class="muted26">평균 순손익은 거래별 평균이며, 표에 표시한 두 전략의 거래 집합은 달라. 볼먼 - 전체 C5 차이가 원인·효과를 증명하는 것은 아니야.</p></section>
+<section class="panel"><h2>3. 날짜별 볼먼 시장 상태</h2><div id="daily" class="scroll">검사 전</div></section>
+<section class="panel"><h2>4. 신호별 분류 (최근 50건)</h2><div id="details" class="scroll">검사 전</div></section>
+</main><script>
+'use strict';
+const API='/api/winrate14c5btcregime';
+const KEY='bithumb_c5_v111426_regime_v1';
+const DAYS=['2026-11-06','2026-11-07','2026-11-08','2026-11-09','2026-11-10','2026-11-11','2026-11-12'];
+const REGIMES=[['UP','BTC 상승'],['SIDE','BTC 횡보'],['DOWN','BTC 하락'],['UNKNOWN','BTC 미확인']];
+const $=id=>document.getElementById(id);
+const number=v=>v==null||v===''?NaN:Number(v);
+const fmt=v=>Number.isFinite(v)?v.toFixed(3)+'%':'—';
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const td=v=>'<td>'+esc(v)+'</td>';
+const row=a=>'<tr>'+a.map(td).join('')+'</tr>';
+const table=(head,rows)=>'<table><thead><tr>'+head.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody></table>';
+const card=(a,b)=>'<div><small>'+esc(a)+'</small><strong>'+esc(b)+'</strong></div>';
+let state=null,meta=null,running=false,stopping=false;
+function load(){try{let x=JSON.parse(localStorage.getItem(KEY)||'null');return x&&x.version===1&&x.days&&typeof x.days==='object'?x:null;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function all(){return DAYS.flatMap(d=>state?.days[d]?.events||[]);}
+function finished(){return !!state && DAYS.every(d=>Array.isArray(state.days[d]?.events));}
+function done(e){return e.outcome!=='UNKNOWN'&&Number.isFinite(number(e.net_pct));}
+function stat(arr){const v=arr.filter(done);const sum=v.reduce((s,e)=>s+number(e.net_pct),0);const win=v.filter(e=>number(e.net_pct)>0).length;const sl=v.filter(e=>e.outcome==='SL').length;return {n:arr.length,done:v.length,unknown:arr.length-v.length,win,sl,avg:v.length?sum/v.length:NaN, winrate:v.length?win/v.length*100:NaN,slrate:v.length?sl/v.length*100:NaN};}
+function summary(events){let base=stat(events),vol=stat(events.filter(e=>e.volman));return {base,vol};}
+function paint(){if(!meta||!state)return;const d=DAYS.filter(k=>Array.isArray(state.days[k]?.events));const items=all(),v=items.filter(e=>e.volman),mapped=items.filter(e=>e.btc_regime!=='UNKNOWN');$('progress').value=d.length;
+$('csv').disabled=!finished();$('overview').innerHTML=card('완료 날짜',d.length+'/7')+card('기존 C5',items.length+' / 2149')+card('볼먼 조건 통과',v.length+' / 214')+card('BTC 상태 확인',mapped.length)+card('BTC 자료 미확인',items.length-mapped.length)+card('수익 미확정',items.filter(e=>!done(e)).length);
+let rows=[];for(const [r,name] of REGIMES){const a=items.filter(e=>e.btc_regime===r),b=a.filter(e=>e.volman),x=stat(a),y=stat(b);rows.push(row([name,x.n,x.done,x.unknown,fmt(x.avg),fmt(x.slrate),y.n,y.done,y.unknown,fmt(y.avg),fmt(y.slrate),Number.isFinite(x.avg)&&Number.isFinite(y.avg)?fmt(y.avg-x.avg):'—']));}
+let known=items.filter(e=>e.btc_regime!=='UNKNOWN');let k=summary(known),z=summary(items);rows.push(row(['BTC 확인 합계',k.base.n,k.base.done,k.base.unknown,fmt(k.base.avg),fmt(k.base.slrate),k.vol.n,k.vol.done,k.vol.unknown,fmt(k.vol.avg),fmt(k.vol.slrate),Number.isFinite(k.vol.avg)&&Number.isFinite(k.base.avg)?fmt(k.vol.avg-k.base.avg):'—']));
+rows.push(row(['전체 (BTC 미확인 포함)',z.base.n,z.base.done,z.base.unknown,fmt(z.base.avg),fmt(z.base.slrate),z.vol.n,z.vol.done,z.vol.unknown,fmt(z.vol.avg),fmt(z.vol.slrate),Number.isFinite(z.vol.avg)&&Number.isFinite(z.base.avg)?fmt(z.vol.avg-z.base.avg):'—']));
+$('regime').innerHTML=table(['BTC 상태','C5 신호','C5 확정','C5 미확정','C5 평균','C5 SL율','볼먼 신호','볼먼 확정','볼먼 미확정','볼먼 평균','볼먼 SL율','평균 차이'],rows);
+let ds=[];for(let day of DAYS){let events=state.days[day]?.events;if(!events){ds.push(row([day,'미검사','—','—','—','—','—']));continue;}for(let [r,name] of REGIMES){let x=stat(events.filter(e=>e.volman&&e.btc_regime===r));ds.push(row([day,name,x.n,x.done,x.unknown,fmt(x.avg),fmt(x.slrate)]));}}
+$('daily').innerHTML=table(['날짜','BTC 상태','볼먼 신호','손익 확정','손익 미확정','평균 순손익','손절 비율'],ds);
+let last=items.filter(e=>e.volman).sort((a,b)=>b.signal_time_kst.localeCompare(a.signal_time_kst)).slice(0,50);
+$('details').innerHTML=last.length?table(['신호 시각','종목','BTC 상태','BTC 60분','손익 판정','순손익'],last.map(e=>row([e.signal_time_kst,e.market,REGIMES.find(x=>x[0]===e.btc_regime)?.[1]||'미확인',fmt(number(e.btc_1h_pct)),e.outcome,fmt(number(e.net_pct))]))):'검사 전';
+$('status').textContent=(finished()?'✅ 7일 전체 BTC 시장 상태 분석 완료':running?'⏳ BTC 과거 봉 조회 중':'검사 전 / 이어하기 가능')+' · '+d.length+'/7일'+(finished()?'\n현재 화면은 과거 모의 결과야. 수익 개선 여부는 별도 미사용 날짜에서 검증해야 해.':'\n중간 결과는 참고용이야.');
+}
+async function fetchJson(path,opts={}){const ac=new AbortController(),timeout=setTimeout(()=>ac.abort(),110000);try{let res=await fetch(path,{...opts,cache:'no-store',signal:ac.signal});let data=await res.json();if(!res.ok||!data.ok)throw Error(data.error||'HTTP '+res.status);return data;}finally{clearTimeout(timeout);}}
+async function init(){meta=await fetchJson(API+'/seed');if(meta.total!==2149||meta.volman!==214)throw Error('7일 원본 CSV 수량 불일치');state=load();if(!state||state.source_sha!==meta.source_sha)state={version:1,source_sha:meta.source_sha,days:{}};$('run').disabled=false;$('reset').disabled=false;paint();}
+async function run(){if(running||!meta)return;running=true;stopping=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;let failed=0;paint();try{for(const day of DAYS){if(stopping)break;if(state.days[day]?.events)continue;try{let result=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:day})});if(result.date!==day||!Array.isArray(result.events)||result.events.length!==meta.by_date[day])throw Error('서버 기록 수량 불일치');state.days[day]=result;save();failed=0;}catch(e){failed++;$('status').textContent='⚠️ '+day+' : '+String(e.message||e);if(failed>=2)break;}paint();}}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;paint();if(failed)$('status').textContent+='\n일부 날짜 처리 실패. 다시 누르면 미완료 날짜만 검사해.';}}
+$('run').onclick=run;$('pause').onclick=()=>{stopping=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.26 이 실험의 저장 결과만 초기화할까?'))return;state={version:1,source_sha:meta.source_sha,days:{}};save();paint();};
+function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!finished())return;let columns=['version','date','market','signal_time_kst','btc_regime','btc_1h_pct','btc_reason','volman','outcome','net_pct'];let lines=[columns.join(',')];for(let e of all()){let r={version:'V11.14.26',...e};lines.push(columns.map(k=>csvCell(r[k])).join(','));}let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download='bithumb_C5_VOLMAN_BTC_REGIME_2026-11-06_to_12_v111426.csv';a.click();setTimeout(()=>URL.revokeObjectURL(u),2500);};
+init().catch(e=>{$('status').textContent='⚠️ '+String(e.message||e);});
+</script></body></html>""".replace('/*REPLACE_STYLE*/', C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
+
+
+def register_c5_btc_v111426_lab(app, deps):
+    api_get,kst=deps['api_get'],deps['KST']
+    from threading import Lock as _BTC26Lock
+    cache={}
+    lock=_BTC26Lock()
+
+    @app.get('/backtest-winrate-c5-btc-regime')
+    def c5_btc_v111426_page():
+        return render_template_string(C5_BTC_V111426_PAGE)
+
+    @app.get('/api/winrate14c5btcregime/seed')
+    def c5_btc_v111426_seed():
+        rows=C5_BTC_V111426_RECORDS
+        return jsonify({'ok':True,'rule_version':'V11.14.26',
+                        'source_sha':C5_BTC_V111426_SOURCE_SHA,
+                        'by_date':{k:len(v) for k,v in rows.items()},
+                        'total':sum(len(v) for v in rows.values()),
+                        'volman':sum(x[4] for v in rows.values() for x in v)})
+
+    @app.post('/api/winrate14c5btcregime/evaluate')
+    def c5_btc_v111426_evaluate():
+        try:
+            body=request.get_json(silent=True)
+            day=body.get('date') if isinstance(body,dict) else None
+            if day not in C5_BTC_V111426_DAYS:
+                raise ValueError('정해진 7일 중 하루를 선택하세요')
+            with lock:
+                cached=cache.get(day)
+            if cached is None:
+                bars,pages=c5_btc_v111426_fetch_day(api_get,day,kst)
+                cached=(bars,pages)
+                with lock:
+                    cache[day]=cached
+            else:
+                bars,pages=cached
+            events=c5_btc_v111426_classify(day,bars,kst)
+            return jsonify({'ok':True,'date':day,'rule_version':'V11.14.26',
+                            'pages':pages,'btc_bars':len(bars),'events':events})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':str(exc)[:200]}),400
+
+
+_v111425_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app,deps):
+    _v111425_register_daytrade_review(app,deps)
+    register_c5_btc_v111426_lab(app,deps)
