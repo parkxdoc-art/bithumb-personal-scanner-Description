@@ -8769,7 +8769,7 @@ select{background:#111a2e;color:#f3f6ff;padding:10px;border:1px solid var(--line
 @media(max-width:650px){main{padding:13px 9px 60px}}
 </style></head><body><main>
 <h1>🧪 V11.14.28 · C5 선행 포착 vs 거래량 돌파</h1>
-<p class="small28">진단 보완판 · 검사 실패 원인 표시 및 성공한 검사 기록 보존</p>
+<p class="small28">저장공간 보완판 · V11.14.28 결과를 별도 브라우저 데이터베이스에 저장</p>
 <p class="muted">빗썸 KRW · 5분봉 완료 신호만 사용 · 기존 V2 실전 스캐너는 변경하지 않음</p>
 <section class="panel"><h2>세 가지 진입 비교</h2>
 <div class="alert28">
@@ -8789,6 +8789,7 @@ select{background:#111a2e;color:#f3f6ff;padding:10px;border:1px solid var(--line
 </div>
 <p class="small28">처음에는 11월 12일 · 40종목부터 시작해 기능을 확인해 줘. 40종목은 정렬된 목록에서 균등 간격으로 고른 기능 확인용 표본이며 시장 대표 표본은 아니야. 7일 전체 KRW 분석은 API 조회량이 크므로 필요할 때만 선택해.</p>
 <div class="actions"><button type="button" id="run">검사 시작 / 이어하기</button><button type="button" id="pause" class="secondary" disabled>일시 중지</button><button type="button" id="reset" class="secondary">이번 검사 초기화</button><button type="button" id="csv" class="secondary" disabled>결과 CSV 저장</button><button type="button" id="diag" class="secondary">연결·1종목 진단</button></div>
+<p class="small28">✅ 이번 검증은 별도 IndexedDB에 저장돼. 기존 다른 연구실의 로컬 기록은 삭제하지 않아.</p>
 <progress id="prog" max="1" value="0"></progress><div id="status" class="status" style="white-space:pre-wrap">검사 대기 중</div>
 <div class="alert28 warn" id="diagnosis" style="display:none;white-space:pre-wrap;margin-top:10px"></div>
 </section>
@@ -8815,8 +8816,92 @@ function chosen(){const day=$('day').value,period=$('period').value,scope=$('sco
  if(!/^\d{4}-\d{2}-\d{2}$/.test(day))throw Error('검증 날짜를 골라줘');
  if(!Number.isFinite(fee)||!Number.isFinite(slip)||fee<0||fee>0.5||slip<0||slip>0.5)throw Error('비용은 0~0.5% 범위로 설정해 줘');
  return {day,period,scope,fee,slip};}
-function load(){try{let v=JSON.parse(localStorage.getItem(KEY)||'null');return v&&v.version===1&&v.cfg&&Array.isArray(v.items)&&v.results&&typeof v.results==='object'?v:null;}catch{return null;}}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){stopped=true;throw Error('브라우저 저장 용량 부족 · CSV로 기록을 보관하거나 이번 검사 초기화 필요');}}
+// V11.14.28: separate IndexedDB persistence. Other research labs keep their existing storage.
+const DB_NAME='bithumb_c5_breakout_v111428_indexeddb_v1';
+let dbPromise=null;
+function openDB(){
+ if(dbPromise)return dbPromise;
+ dbPromise=new Promise((resolve,reject)=>{
+  if(!('indexedDB' in window)){reject(Error('이 브라우저는 IndexedDB를 지원하지 않아. Chrome 일반 탭에서 열어줘.'));return;}
+  const request=indexedDB.open(DB_NAME,1);
+  request.onupgradeneeded=()=>{
+   const db=request.result;
+   if(!db.objectStoreNames.contains('meta'))db.createObjectStore('meta');
+   if(!db.objectStoreNames.contains('results'))db.createObjectStore('results');
+  };
+  request.onsuccess=()=>resolve(request.result);
+  request.onerror=()=>reject(Error('브라우저 데이터베이스 열기 실패: '+(request.error?.message||'알 수 없는 오류')));
+  request.onblocked=()=>reject(Error('브라우저 데이터베이스가 다른 탭에서 사용 중이야. 동일 검증실 탭을 닫고 다시 열어줘.'));
+ }).catch(e=>{dbPromise=null;throw e;});
+ return dbPromise;
+}
+function txError(tx){return Error('브라우저 데이터베이스 저장 오류: '+(tx.error?.message||'브라우저 저장 공간이나 권한을 확인해 줘'));}
+async function readStored(){
+ const db=await openDB();
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction(['meta','results'],'readonly');
+  const a=tx.objectStore('meta').get('state');
+  const b=tx.objectStore('results').getAllKeys();
+  const c=tx.objectStore('results').getAll();
+  tx.oncomplete=()=>{
+   const meta=a.result;
+   if(!meta){resolve(null);return;}
+   const results={};b.result.forEach((key,i)=>{results[String(key)]=c.result[i];});
+   const failures=meta.failures||{};
+   for(const key of Object.keys(failures))if(Object.prototype.hasOwnProperty.call(results,key))delete failures[key];
+   resolve({version:meta.version,cfg:meta.cfg,items:meta.items,results,failures});
+  };
+  tx.onerror=()=>reject(txError(tx));tx.onabort=()=>reject(txError(tx));
+ });
+}
+async function storeNew(v){
+ const db=await openDB();
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction(['meta','results'],'readwrite');
+  tx.objectStore('results').clear();
+  tx.objectStore('meta').put({version:1,cfg:v.cfg,items:v.items,failures:v.failures||{}},'state');
+  for(const [key,value] of Object.entries(v.results||{}))tx.objectStore('results').put(value,key);
+  tx.oncomplete=()=>resolve();tx.onerror=()=>reject(txError(tx));tx.onabort=()=>reject(txError(tx));
+ });
+}
+async function storeResult(key,result){
+ const db=await openDB();
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction('results','readwrite');
+  tx.objectStore('results').put(result,key);
+  tx.oncomplete=()=>resolve();tx.onerror=()=>reject(txError(tx));tx.onabort=()=>reject(txError(tx));
+ });
+}
+async function storeFailures(){
+ if(!state)return;
+ const db=await openDB();
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction('meta','readwrite');
+  tx.objectStore('meta').put({version:1,cfg:state.cfg,items:state.items,failures:state.failures||{}},'state');
+  tx.oncomplete=()=>resolve();tx.onerror=()=>reject(txError(tx));tx.onabort=()=>reject(txError(tx));
+ });
+}
+async function clearStored(){
+ const db=await openDB();
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction(['meta','results'],'readwrite');
+  tx.objectStore('meta').delete('state');tx.objectStore('results').clear();
+  tx.oncomplete=()=>resolve();tx.onerror=()=>reject(txError(tx));tx.onabort=()=>reject(txError(tx));
+ });
+}
+async function load(){
+ const saved=await readStored();
+ if(saved&&saved.version===1&&saved.cfg&&Array.isArray(saved.items)&&saved.results)return saved;
+ // Migrate only this experiment's legacy localStorage data, if present. Do not touch other labs.
+ let old=null;
+ try{old=JSON.parse(localStorage.getItem(KEY)||'null');}catch{}
+ if(old&&old.version===1&&old.cfg&&Array.isArray(old.items)&&old.results&&typeof old.results==='object'){
+  await storeNew(old);
+  try{localStorage.removeItem(KEY);}catch{}
+  return old;
+ }
+ return null;
+}
 function report(message){diagnosticMessage=String(message||'');let el=$('diagnosis');el.style.display=diagnosticMessage?'block':'none';el.textContent=diagnosticMessage;}
 function eventRows(){let arr=[];for(let val of Object.values(state?.results||{})){for(let [k] of ARMS){for(let ev of val.events?.[k]||[])arr.push({...ev,date:val.date,market:val.market,strategy:k});}}return arr;}
 function calculate(es){let ok=es.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(num(e.net_pct)));
@@ -8855,10 +8940,10 @@ async function requestJSON(url,opts={}){
  }finally{clearTimeout(timer);}
 }
 function sample(items,n){if(items.length<=n)return items;return [...new Set(Array.from({length:n},(_,i)=>items[Math.round(i*(items.length-1)/(n-1))]))];}
-async function prepare(cfg){let old=load();if(old&&signature(old.cfg)===signature(cfg)&&old.items.length){state=old;paint();return;}
+async function prepare(cfg){let old=await load();if(old&&signature(old.cfg)===signature(cfg)&&old.items.length){state=old;paint();return;}
  let res=await requestJSON(API+'/universe');let markets=cfg.scope==='40'?sample(res.items,40):res.items;
  let days=cfg.period==='week'?DAYS:[cfg.day];
- state={version:1,cfg,items:days.flatMap(day=>markets.map(market=>({day,market}))),results:{},failures:{}};save();paint();}
+ state={version:1,cfg,items:days.flatMap(day=>markets.map(market=>({day,market}))),results:{},failures:{}};await storeNew(state);try{localStorage.removeItem(KEY);}catch{}paint();}
 async function run(){
  if(running)return;
  running=true;stopped=false;errors=0;lastError='';report('');
@@ -8881,18 +8966,18 @@ async function run(){
       const result=await requestJSON(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...job,date:job.day,fee:cfg.fee,slip:cfg.slip})});
       if(result.date!==job.day||result.market!==job.market)throw Error('서버 결과 종목/날짜 불일치: '+job.day+' '+job.market);
       if(!result.events||!Array.isArray(result.events.A)||!Array.isArray(result.events.B)||!Array.isArray(result.events.C))throw Error('서버 응답 신호 목록 형식 오류');
-      state.results[key]=result;delete state.failures[key];
-      save();done=true;break;
+      await storeResult(key,result);state.results[key]=result;delete state.failures[key];
+      done=true;break;
      }catch(e){
       reason=job.day+' '+job.market+': '+String(e?.message||e);
       lastError=reason;
-      if(/HTTP (400|401|403|404)\b/.test(reason)||/저장 용량 부족/.test(reason)){stopped=true;break;}
+      if(/HTTP (400|401|403|404)\b/.test(reason)||/데이터베이스|저장 공간|IndexedDB/.test(reason)){stopped=true;break;}
       if(attempt===0)await new Promise(r=>setTimeout(r,800));
      }
     }
     if(!done){
       state.failures[key]=reason||'응답 실패';errors++;
-      try{save();}catch(e){lastError=String(e?.message||e);stopped=true;}
+      try{await storeFailures();}catch(e){lastError=String(e?.message||e);stopped=true;}
       if(errors>=3)stopped=true;
     }
     paint();
@@ -8923,8 +9008,8 @@ $('diag').onclick=async()=>{
  finally{$('diag').disabled=false;}
 };
 $('run').onclick=run;$('pause').onclick=()=>{stopped=true;$('pause').disabled=true;};
-$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.28 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);$('coverage').textContent='검사 대기';$('summary').textContent='검사 전';$('daily').textContent='검사 전';$('examples').textContent='검사 전';$('status').textContent='기록 초기화 완료';report('');};
-for(let id of ['day','scope','period','fee','slip'])$(id).addEventListener('change',()=>{if(running)return;let cfg;try{cfg=chosen();}catch{return;}let old=load();state=old&&signature(old.cfg)===signature(cfg)?old:null;if(state)paint();else $('status').textContent='설정이 바뀌었어. 검사 시작을 누르면 새로운 기록으로 실행해.';});
+$('reset').onclick=async()=>{if(running)return;if(!confirm('V11.14.28 검사 기록만 초기화할까? 기존 다른 연구실 기록은 유지돼.'))return;try{await clearStored();try{localStorage.removeItem(KEY);}catch{}state=null;$('coverage').textContent='검사 대기';$('summary').textContent='검사 전';$('daily').textContent='검사 전';$('examples').textContent='검사 전';$('status').textContent='기록 초기화 완료';report('');}catch(e){report('초기화 실패: '+String(e?.message||e));}};
+for(let id of ['day','scope','period','fee','slip'])$(id).addEventListener('change',async()=>{if(running)return;let cfg;try{cfg=chosen();let old=await load();state=old&&signature(old.cfg)===signature(cfg)?old:null;if(state)paint();else $('status').textContent='설정이 바뀌었어. 검사 시작을 누르면 새로운 기록으로 실행해.';}catch(e){report('검사 기록 확인 실패: '+String(e?.message||e));}});
 function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
 $('csv').onclick=()=>{let cols=['version','date','market','strategy','watch_time_kst','signal_time_kst','entry_time_kst','volume_ratio','breakout_high','outcome','entry','exit','net_pct','minutes','reason','eligible_windows','observed_5m','c5_watches','truncated','scope','period'];
  let lines=[cols.join(',')];for(let r of Object.values(state.results)){
@@ -8933,7 +9018,7 @@ $('csv').onclick=()=>{let cols=['version','date','market','strategy','watch_time
  lines.push(cols.map(c=>csvCell(({...base,strategy:'COVERAGE'})[c])).join(','));
  for(let [key] of ARMS)for(let e of r.events?.[key]||[]){let v={...base,...e,strategy:key};lines.push(cols.map(c=>csvCell(v[c])).join(','));}}
  let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='bithumb_C5_watch_breakout_v111428.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);};
-try{let old=load();if(old){state=old;let c=old.cfg;for(let id of ['day','scope','period','fee','slip'])if(c[id]!==undefined)$(id).value=String(c[id]);paint();}}catch{}
+(async()=>{try{let old=await load();if(old){state=old;let c=old.cfg;for(let id of ['day','scope','period','fee','slip'])if(c[id]!==undefined)$(id).value=String(c[id]);paint();}}catch(e){report('저장 기록 복원 오류: '+String(e?.message||e)+'\nChrome 일반 탭에서 다시 시도해 줘.');}})();
 </script></body></html>'''.replace('/*REPLACE_STYLE*/',C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
 
 
