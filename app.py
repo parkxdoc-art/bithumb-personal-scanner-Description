@@ -32,6 +32,8 @@ h1{margin:0;font-size:26px;letter-spacing:-.5px}.sub{color:var(--muted);font-siz
 select,input,button{background:#0d1527;border:1px solid #33415e;color:var(--text);border-radius:9px;padding:10px 11px;font:inherit}button{cursor:pointer;background:#315de7;border-color:#315de7;font-weight:700}button.secondary{background:#1b2943;border-color:#354765}
 .panel{margin-top:14px}.panel h2{font-size:16px;margin:0 0 12px}.status{font-size:13px;color:var(--muted);margin:10px 0}
 .tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:11px 10px;border-bottom:1px solid #26324a;white-space:nowrap}th{font-size:11px;color:var(--muted);font-weight:600}td{font-size:13px}.signal{font-size:11px;border-radius:6px;padding:4px 7px;font-weight:700}.BUY{background:#123d35;color:#6cf0c2}.WATCH{background:#40351e;color:#ffd783}.WAIT{background:#243047;color:#c5d2ec}.SELL{background:#4a202c;color:#ff9cab}
+.c5-grade{display:inline-block;margin-left:5px;border-radius:6px;padding:3px 6px;font-size:11px;font-weight:800;vertical-align:middle}
+.c5-grade.A{color:#70f1bf;background:#153d33}.c5-grade.B{color:#9dc8ff;background:#203653}.c5-grade.C{color:#ffcd87;background:#453321}.c5-grade.unknown{color:#c7d3eb;background:#303b50}
 .two{display:grid;grid-template-columns:1.2fr 1fr;gap:14px}.rules{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.rule{padding:12px;border-radius:10px;background:#10182a;border:1px solid #26334b}.rule b{display:block;font-size:13px;margin-bottom:4px}.rule span{font-size:12px;color:var(--muted)}
 .note{font-size:12px;color:var(--muted);line-height:1.65}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}
 footer{margin-top:18px;color:var(--muted);font-size:11px}
@@ -288,6 +290,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <p><span class="signal WATCH">관심</span> 저항선 돌파 또는 재확인 진행 중. 추가 캔들 확인 필요.</p>
 <p><span class="signal WAIT">대기</span> 명확한 셋업이 없음.</p>
 <p class="note">C5는 단순이동평균(SMA5) 회복 신호입니다. 거래량 배수와 점수는 참고 지표이며 BUY 발생 조건에 추가되지 않습니다. 실전 스캐너 표시 기준가는 확정 신호봉 종가이므로 다음 봉 실제 진입가와 다를 수 있습니다.</p>
+<p class="note">🔬 C5 관찰 등급(실험): A = 15분 상승 + 거래량 1.0배 이상, B = 15분 중립 + 거래량 0.8배 이상, C = 그 외 유효 데이터. 데이터가 부족하면 미확인으로 표시합니다. 등급은 BUY 차단 조건이 아니며 수익 보장이나 검증된 예측 모델이 아닙니다.</p>
 </div>
 </div>
 
@@ -324,6 +327,38 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <script>
 let autoTimer=null;
 let scanning=false;
+
+// C5 등급은 이미 조회된 거래량 배수와 15분 추세만 활용한다.
+// BUY 발생 여부와 스캔 API 호출에는 영향을 주지 않는다.
+function c5Grade(x) {
+  const ratio = x?.vol_ratio;
+  const trend = x?.trend15;
+  if (ratio == null || ratio === "" || !Number.isFinite(Number(ratio)))
+    return "미확인";
+  const v = Number(ratio);
+  if (trend === "상승" && v >= 1.0) return "A";
+  if (trend === "중립" && v >= 0.8) return "B";
+  if (["상승", "중립", "하락"].includes(trend)) return "C";
+  return "미확인";
+}
+
+function isC5BuyHistory(x) {
+  return x && String(x.tf) === "5" &&
+    (x.strategy === "C5" || x.ma5_status === "MA5 상향 돌파");
+}
+
+function c5HistoryGrade(x) {
+  if (!isC5BuyHistory(x)) return null;
+  return ["A", "B", "C", "미확인"].includes(x.c5_grade)
+    ? x.c5_grade : c5Grade(x);
+}
+
+function c5GradeBadge(x) {
+  if (x.signal !== "BUY") return "";
+  const grade = c5Grade(x);
+  const css = grade === "미확인" ? "unknown" : grade;
+  return `<span class="c5-grade ${css}" title="C5 실험용 등급 · BUY 판단에는 영향 없음">${grade}등급</span>`;
+}
 
 function parseBuyCsv(text) {
   const rows = [];
@@ -492,7 +527,7 @@ function exportBuyHistory() {
       "source_candle_60m",
       "value24", "vol_ratio", "score",
       "ma5_status", "trend15", "stop_price",
-      "target_price"
+      "target_price", "strategy", "c5_grade"
     ];
 
     const safeCSV = value => {
@@ -504,7 +539,10 @@ function exportBuyHistory() {
     const csv = [
       fields.join(","),
       ...history.map(x =>
-        fields.map(k => safeCSV(x[k])).join(",")
+        fields.map(k => safeCSV(
+          k === "c5_grade" ? (c5HistoryGrade(x) ?? "") :
+          k === "strategy" ? (isC5BuyHistory(x) ? "C5" : (x[k] ?? "")) : x[k]
+        )).join(",")
       )
     ].join("\r\n");
     const blob = new Blob([csv], {
@@ -554,6 +592,8 @@ function saveBuySignals(results, tf) {
         score: x.score ?? null,
         ma5_status: x.ma5_info?.status ?? null,
         trend15: x.trend15 ?? null,
+        strategy: "C5",
+        c5_grade: c5Grade(x),
         stop_price: x.stop ?? null,
         target_price: x.target ?? null,
 
@@ -567,7 +607,7 @@ function saveBuySignals(results, tf) {
       known.add(id);
       
 
-      newBuyAlerts.push(`🚨 새 BUY 신호: ${x.market} | ${tf}분봉 | ${x.candle_time}`);
+      newBuyAlerts.push(`🚨 새 BUY 신호: ${x.market} | C5 ${c5Grade(x)}등급 | ${tf}분봉 | ${x.candle_time}`);
 
 
     }
@@ -643,7 +683,7 @@ function showRecentBuyAlerts() {
 
     area.textContent = recent.length
       ? recent.map(x =>
-          `🚨 ${x.market} | ${x.tf}분봉 | ${x.candle_time} | ⏱ ${formatBuyElapsed(x.candle_time)}`
+          `🚨 ${x.market} | ${x.tf}분봉${c5HistoryGrade(x) ? ` | C5 ${c5HistoryGrade(x)}등급` : ""} | ${x.candle_time} | ⏱ ${formatBuyElapsed(x.candle_time)}`
 
         ).join("\n")
       : "아직 기록된 BUY 신호가 없습니다.";
@@ -676,7 +716,7 @@ function showBuyHistory() {
       
       return `${x.market} | ${x.tf}분봉
 신호: ${x.candle_time}
-기준가: ${x.signal_price}원
+${c5HistoryGrade(x) ? `C5 관찰 등급: ${c5HistoryGrade(x)}등급\n` : ""}기준가: ${x.signal_price}원
 15분: ${result(x.price_15m)}
 사용 캔들: ${x.source_candle_15m || "시각 미기록"}
 30분: ${result(x.price_30m)}
@@ -779,6 +819,25 @@ function showBuyStats() {
           `${label} ${group.length}개`
         ).join(" | ") +
         "\n\n" + trendText;
+
+      // C5 기록만 분리해서 등급별 이후 가격 변화를 비교한다.
+      // 기존 저항선 BUY는 C5 성적에 포함하지 않는다.
+      const c5Records = history.filter(isC5BuyHistory);
+      const gradeGroups = ["A", "B", "C", "미확인"].map(grade => [
+        grade, c5Records.filter(x => c5HistoryGrade(x) === grade)
+      ]);
+      const gradeText = [15, 30, 60].map(m =>
+        `${m}분 후\n` + gradeGroups.map(([grade, group]) =>
+          `${grade}등급: ${getStats(group, m)}`
+        ).join("\n")
+      ).join("\n\n");
+
+      compareBox.textContent += "\n\n🔬 C5 관찰 등급별 성과 (실험)\n" +
+        `C5 신호 총 ${c5Records.length}개 | ` +
+        gradeGroups.map(([grade, group]) => `${grade} ${group.length}개`).join(" · ") +
+        "\nA: 상승·거래량 ≥1.0 / B: 중립·거래량 ≥0.8 / C: 나머지 (정보 부족은 미확인)\n" +
+        "기준가 대비 15/30/60분 가격 변화 · 수수료 및 중간 익절/손절 미반영\n\n" +
+        gradeText;
     }
 
 
@@ -1199,7 +1258,7 @@ if (scanAgeBox) {
     <td>${x.resistance}</td>
     <td>${bithumbGuideWon(x.stop)}</td>
     <td>${bithumbGuideWon(x.target)}</td>
-    <td><span class="signal ${x.signal}">${x.label}</span></td>
+    <td><span class="signal ${x.signal}">${x.label}</span>${c5GradeBadge(x)}</td>
     <td>${x.score ?? '-'}</td>
     <td>${x.ma5_info?.ma5 ?? '-'} (${x.ma5_info?.status ?? '-'})</td>
     <td>${x.note}</td>
@@ -1455,6 +1514,7 @@ if (capitalSelect) {
       ["5분봉 MA5", x.ma5_info?.ma5 ?? "-"],
       ["MA5 상태", x.ma5_info?.status ?? "-"],
       ["15분봉 추세", x.trend15 ?? "정보 없음"],
+      ["C5 관찰 등급", x.signal === "BUY" ? `${c5Grade(x)}등급 (실험·BUY 조건 아님)` : "BUY 발생 시 평가", "", true],
       ["분석 메모", x.note ?? "-", "", true]
       ];
     detailItems.forEach(([label, value, color, wide]) => {
