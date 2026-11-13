@@ -9664,3 +9664,355 @@ _v111429_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111429_register_daytrade_review(app,deps)
     register_c5_beggs_v111430_lab(app,deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.31 — RESEARCH ONLY: Independent Brooks-inspired High 2 (H2)
+# A = exact existing Volman baseline (from V11.14.30, unchanged)
+# B = exact existing Beggs breakout-quality subset (unchanged)
+# C = NEW, independent two-legged pullback H2 researcher.
+# H2 is not required to coincide with a Volman event. Therefore C lists
+# must never be paired 1:1 with A/B, and returns are unpaired cohorts.
+# No lookahead: every signal uses bars <= i, enters only at open of i+1.
+# Fixed experimental numerical thresholds are our own, NOT Al Brooks's.
+# ---------------------------------------------------------------------------
+
+C5_BROOKS_V111431_ARMS = (
+    ('A', '기존 VOLMAN 돌파 (변경 없음)'),
+    ('B', '기존 BEGGS 강도 필터 (변경 없음)'),
+    ('C', 'BROOKS H2 독립 눌림목 진입 (신규)'),
+)
+
+
+def c5_brooks_v111431_indicators(rows):
+    """Closed-bar-only EMA20, EMA50, ATR14; reset on a missing 5m bar."""
+    n=len(rows)
+    ema20=[None]*n
+    ema50=[None]*n
+    atr14=[None]*n
+    streak_start=0
+    for i,bar in enumerate(rows):
+        if i and bar['t']-rows[i-1]['t'] != timedelta(minutes=5):
+            streak_start=i
+        count=i-streak_start+1
+        if count==20:
+            ema20[i]=sum(x['c'] for x in rows[i-19:i+1])/20
+        elif count>20:
+            ema20[i]=ema20[i-1]+(2/21)*(bar['c']-ema20[i-1])
+        if count==50:
+            ema50[i]=sum(x['c'] for x in rows[i-49:i+1])/50
+        elif count>50:
+            ema50[i]=ema50[i-1]+(2/51)*(bar['c']-ema50[i-1])
+        if count>=15:
+            tr=max(bar['h']-bar['l'],abs(bar['h']-rows[i-1]['c']),
+                   abs(bar['l']-rows[i-1]['c']))
+            if count==15:
+                ts=[]
+                for k in range(i-13,i+1):
+                    b,p=rows[k],rows[k-1]
+                    ts.append(max(b['h']-b['l'],abs(b['h']-p['c']),
+                                  abs(b['l']-p['c'])))
+                atr14[i]=sum(ts)/14
+            else:
+                atr14[i]=(13*atr14[i-1]+tr)/14
+    return {'ema20':ema20,'ema50':ema50,'atr14':atr14}
+
+
+def c5_brooks_v111431_h2(rows,i,ind):
+    """Deterministic 5-minute H2 approximation, no future observations.
+
+    Structure: preceding uptrend; at least two falling closes into H1;
+    first upward attempt; a second dip (highs and lows lower); then a
+    bullish second upward attempt, confirmed by closing over prior high.
+    The H2 trigger is known at i close; backtest enters at i+1 open.
+    Returns diagnostic snapshot or None. Not an Al Brooks proprietary rule.
+    """
+    if i<65 or not lab_contiguous(rows,i-65,i):
+        return None
+    e20,e50,at=ind['ema20'],ind['ema50'],ind['atr14']
+    if any(v is None for v in (e20[i-9],e20[i-3],e20[i],e50[i-3],at[i])):
+        return None
+    atr=at[i]
+    b=rows[i]
+    if atr<=0 or b['c']<=0:
+        return None
+    atr_pct=100*atr/b['c']
+    # Trend before the current attempt, not trend observed afterward.
+    if not (e20[i-3]>e50[i-3] and e20[i-3]>e20[i-9]*1.0004):
+        return None
+    if not (0.12<=atr_pct<=4.0 and b['c']>e20[i]*0.992):
+        return None
+    # Cautious bar-close proxy for a stop-entry above the H2 signal bar.
+    width=b['h']-b['l']
+    if not (width>0 and b['c']>b['o'] and b['h']>rows[i-1]['h']
+            and b['c']>rows[i-1]['h']*1.0001
+            and (b['c']-b['l'])/width>=0.55):
+        return None
+    vavg=sum(r['v'] for r in rows[i-20:i])/20
+    if vavg<=0:
+        return None
+    volume_ratio=b['v']/vavg
+    if volume_ratio<0.80:
+        return None
+    # The most recent valid H1 within the prior 2~8 candles is used.
+    # Crucially H1 MUST precede a new down-leg, rather than two bullish bars.
+    for j in range(i-2,i-9,-1):
+        if j<8:
+            break
+        h1=rows[j]
+        if not (h1['h']>rows[j-1]['h'] and
+                rows[j-1]['c']<rows[j-2]['c'] and
+                rows[j-2]['c']<rows[j-3]['c']):
+            continue
+        # Prior down-leg was a genuine pullback from an earlier local high.
+        before_peak=max(q['h'] for q in rows[j-8:j-2])
+        first_low=min(q['l'] for q in rows[j-3:j])
+        if before_peak-first_low<0.6*atr:
+            continue
+        # H1 fails, price dips once more and H2 is the second try upward.
+        between=rows[j+1:i]
+        if not between or not (rows[i-1]['h']<rows[i-2]['h']):
+            continue
+        second_low=min(q['l'] for q in between)
+        if not (h1['h']-second_low>=0.40*atr and
+                any(rows[k]['c']<rows[k-1]['c'] for k in range(j+1,i))):
+            continue
+        # Some movement back toward EMA20 is required; trend itself survives.
+        pullback_low=min(q['l'] for q in rows[j-3:i])
+        if not (pullback_low<=e20[i-3]+1.6*atr and
+                pullback_low>=e50[i-3]-2.0*atr):
+            continue
+        resistance=max(q['h'] for q in rows[i-24:i])
+        return {
+            'h1_time_kst':rows[j]['t'].strftime('%Y-%m-%d %H:%M'),
+            'second_pullback_time_kst':rows[i-1]['t'].strftime('%Y-%m-%d %H:%M'),
+            'ema20':round(e20[i],10),'ema50':round(e50[i-3],10),
+            'atr_pct':round(atr_pct,5),
+            'volume_ratio':round(volume_ratio,4),
+            'pullback_depth_atr':round((before_peak-first_low)/atr,4),
+            'resistance_room_pct':round(100*(resistance/b['c']-1),4),
+            'h1_to_h2_bars':i-j,
+        }
+    return None
+
+
+def c5_brooks_v111431_evaluate_rows(rows,cfg,market,kst):
+    """Keep the exact original baseline + Beggs quality, add independent H2."""
+    from datetime import datetime as _dt, time as _tm
+    baseline=c5_beggs_v111430_evaluate_rows(rows,cfg,market,kst)
+    events={'A':baseline['events']['A'], 'B':baseline['events']['B'], 'C':[]}
+    ind=c5_brooks_v111431_indicators(rows)
+    start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=start+timedelta(days=1)
+    last_h2=-1000000
+    valid_h2=0
+    for i in range(max(65,LAB_WARMUP_BARS),len(rows)-1):
+        if not start<=rows[i]['t']<end or not lab_contiguous(rows,i-65,i):
+            continue
+        valid_h2+=1
+        if i-last_h2<cfg['bars']:
+            continue
+        diag=c5_brooks_v111431_h2(rows,i,ind)
+        if diag is None:
+            continue
+        last_h2=i
+        when=rows[i]['t'].strftime('%Y-%m-%d %H:%M')
+        ev={'market':market,'strategy':'C',
+            'base_id':market+'|H2|'+when,
+            'base_signal_time_kst':when,
+            'signal_time_kst':when,
+            'entry_time_kst':(rows[i]['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+            'entry_delay_minutes':0,
+            'reason':'독립 H2 — 첫 반등 뒤 재눌림에서 두 번째 상승 시도',
+            'box_high':None,
+            **diag,
+        }
+        ev.update(lab_outcome_v11145(rows,i,cfg))
+        events['C'].append(ev)
+    return {**{k:v for k,v in baseline.items() if k!='events'},
+            'h2_eligible_windows':valid_h2,
+            'h2_signals':len(events['C']),
+            'events':events}
+
+
+def c5_brooks_v111431_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    result=c5_brooks_v111431_evaluate_rows(rows,cfg,market,kst)
+    result['truncated']=truncated
+    return result
+
+
+def c5_brooks_v111431_make_page():
+    """Clone proven UI + isolated IndexedDB, with independent-cohort stats."""
+    page=C5_BEGGS_V111430_PAGE.replace('V11.14.30','V11.14.31')
+
+    def one(old,new):
+        nonlocal page
+        if page.count(old)!=1:
+            raise RuntimeError('V11.14.31 페이지 기준 불일치: '+old[:100])
+        page=page.replace(old,new,1)
+
+    one('<title>V11.14.31 · 볼먼과 랜스 벡스 돌파 검증</title>',
+        '<title>V11.14.31 · VOLMAN / BEGGS / BROOKS H2 검증</title>')
+    one('<h1>🧪 V11.14.31 · 볼먼 + 랜스 벡스 돌파 감별</h1>',
+        '<h1>🧪 V11.14.31 · VOLMAN / BEGGS / BROOKS H2</h1>')
+    one('랜스 벡스의 돌파 후 강도·안착 관찰 원칙 응용 · 별도 브라우저 DB에 저장',
+        '알 브룩스 High 2 두 번째 진입 개념 응용 · 기존 결과와 분리 저장')
+    a=page.index('<section class="panel"><h2>기존 볼먼 신호에 다른 트레이더의 원칙을 더한 비교</h2>')
+    z=page.index('</section>',a)+len('</section>')
+    intro='''<section class="panel"><h2>같은 날짜·같은 종목의 세 가지 독립 코호트 비교</h2>
+<div class="alert28">
+<b>A — VOLMAN 원본:</b> 기존 V11.14.30 돌파 기반 진입을 코드 변경 없이 재사용.<br>
+<b>B — BEGGS 강도:</b> 기존 V11.14.30 돌파봉 강도 필터 그대로 재사용. A의 일부만 진입.<br>
+<b>C — BROOKS H2 신규:</b> 상승 EMA20 &gt; EMA50, 상승 기울기, 최초 눌림 후 첫 상승 시도(H1), 다시 눌림 후 두 번째 상승 시도(H2)가 종가로 확인되면 다음 5분봉 시가 진입. ATR 0.12~4%, 신호봉 거래량 ≥ 이전 20봉 평균 × 0.8. 기존 VOLMAN 신호와 무관하게 후보를 찾음.<br>
+<b>공통 청산:</b> 익절 +1.5% · 손절 -1.0% · 최대 60분 · 수수료와 슬리피지 반영. 기존 V2 실전 BUY 및 이전 연구실 변경 없음.</div>
+<p class="alert28 warn">⚠️ <b>C는 A/B와 같은 신호를 여과하는 필터가 아니야.</b> 별도의 H2 진입을 탐색하므로 1:1 짝비교는 금지하고 동일 종목·날짜별 독립 성과를 비교해. 실전 알 브룩스의 재량적 판단을 기계적으로 단순화한 연구 가설이며 정식 High 2 전체를 재현하지 않아. 고점 돌파는 완료봉 종가로 확인, 진입은 오직 다음 5분봉 시가. 당일 뒤 60분까지 실제 관측 봉이 없으면 UNKNOWN, TP와 SL이 같은 봉에 닿으면 SL 우선.</p>
+</section>'''
+    page=page[:a]+intro+page[z:]
+    one("const API='/api/winrate14c5beggs', KEY='bithumb_c5_beggs_v111430_v1';",
+        "const API='/api/winrate14c5brooks', KEY='bithumb_c5_brooks_v111431_v1';")
+    one("const DB_NAME='bithumb_c5_beggs_v111430_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_brooks_v111431_indexeddb_v1';")
+    one("const ARMS=[['A','기존 볼먼'],['B','돌파봉 강도 확인'],['C','다음 봉 안착 확인']];",
+        "const ARMS=[['A','기존 VOLMAN'],['B','기존 BEGGS 강도'],['C','독립 BROOKS H2']];")
+    one('<h2>2. 기존 볼먼 / 돌파봉 강도 / 다음 봉 안착 비교</h2>',
+        '<h2>2. VOLMAN / BEGGS / 독립 H2 성과 비교</h2>')
+    one('평균 순손익은 수수료·슬리피지 차감 뒤 실제 진입한 확정 거래 기준. A대비 차이는 둘 다 확정된 동일 볼먼 신호끼리 비교. 표본이 적으면 수익성을 결론낼 수 없어.',
+        '동일한 종목·날짜·비용으로 비교하지만, C는 독립 신호이므로 A와 짝비교하지 않아. 평균 순손익은 실제 진입 및 종료된 거래 기준. 손익 확정 전 UNKNOWN은 제외돼.')
+    first=page.index('function pairedDifference(es,key){')
+    last=page.index('const jobKey=',first)
+    page=page[:first]+page[last:]
+    first=page.index('function paint(){')
+    last=page.index('async function requestJSON',first)
+    paint=r'''function paint(){
+ if(!state)return;
+ const finished=Object.keys(state.results).length,items=state.items.length,es=eventRows();
+ const complete=items>0&&finished===items;
+ $('prog').max=Math.max(items,1);$('prog').value=finished;
+ const c5=Object.values(state.results).reduce((a,r)=>a+(r.c5_watches||0),0);
+ const h2=Object.values(state.results).reduce((a,r)=>a+(r.h2_signals||0),0);
+ const baseline=es.filter(e=>e.strategy==='A').length;
+ const valid=Object.values(state.results).reduce((a,r)=>a+(r.eligible_windows||0),0);
+ const noValid=Object.values(state.results).filter(r=>r.eligible_windows===0).length;
+ const b=calculate(es.filter(e=>e.strategy==='B'));
+ $('coverage').innerHTML=stat('검사 완료',finished+' / '+items)+stat('VOLMAN A 신호',baseline)+
+  stat('BEGGS B 진입',b.entered)+stat('독립 H2 진입 신호',h2)+
+  stat('C5 원형 WATCH',c5)+stat('유효 구간 0인 종목/날짜',noValid)+
+  stat('VOLMAN 유효 5분봉 위치',valid);
+ $('csv').disabled=!finished;
+ const failures=state.failures||{},failureCount=Object.keys(failures).length;
+ const problem=lastError||(failureCount?Object.values(failures)[0]:'');
+ $('status').textContent=(complete?'✅ 검증 완료':running?'⏳ 조회 중':problem?'⚠️ 검사 중단 · 원인 확인 필요':'중단 / 이어하기 가능')+
+  ' · '+finished+'/'+items+'건'+(problem?'\n오류: '+problem+'\n정상 완료 기록은 유지돼.':'')+
+  (complete?'\n과거 성과일 뿐이야. 미사용 날짜에 대한 독립 검증이 필요해.':'\n진행 중 통계는 잠정 결과야.');
+ if(problem)report('V11.14.31 서버 진단 정보\n'+problem+'\n성공 '+finished+'/'+items+'건 · 실패 '+failureCount+'건');
+ const sums=ARMS.map(([k,label])=>{const a=calculate(es.filter(e=>e.strategy===k));
+  return tr([label,a.total,a.entered,a.done,a.noentry,a.miss,a.win,a.tp,a.sl,a.tm,pct(a.winRate),pct(a.avg)]);});
+ $('summary').innerHTML=tbl(['진입 유형','신호/후보','실제 진입','손익 확정','미진입','결과 미확정','수익 거래','익절','손절','시간만료','수익거래 비율','평균 순손익'],sums);
+ const dates=[...new Set(state.items.map(j=>j.day))].sort();
+ $('daily').innerHTML=tbl(['날짜','A 진입','A 평균','B 진입','B 평균','C 진입','C 평균'],dates.map(d=>{
+  const s=es.filter(e=>e.date===d),ret=[];
+  for(const [k] of ARMS){const a=calculate(s.filter(e=>e.strategy===k));ret.push(a.entered,pct(a.avg));}
+  return tr([d,...ret]);}));
+ const ex=es.filter(e=>e.outcome!=='NO_ENTRY').sort((a,b)=>b.base_signal_time_kst.localeCompare(a.base_signal_time_kst)).slice(0,100);
+ $('examples').innerHTML=ex.length?tbl(['날짜','종목','방식','신호 시각','다음 봉 진입 예정','H1 시각(H2만)','진입가','결과','순손익'],ex.map(e=>
+  tr([e.date,e.market,e.strategy,e.signal_time_kst||'—',e.entry_time_kst||'—',e.h1_time_kst||'—',e.entry??'—',e.outcome,pct(num(e.net_pct))]))):'아직 신호 없음';
+}
+'''
+    page=page[:first]+paint+page[last:]
+    one("if(!result.events||!Array.isArray(result.events.A)||!Array.isArray(result.events.B)||!Array.isArray(result.events.C)||result.events.A.length!==result.events.B.length||result.events.A.length!==result.events.C.length)throw Error('볼먼 원본 신호와 돌파 확인 비교 목록 불일치');",
+        "if(!result.events||!Array.isArray(result.events.A)||!Array.isArray(result.events.B)||!Array.isArray(result.events.C)||result.events.A.length!==result.events.B.length)throw Error('VOLMAN·BEGGS 응답 오류');")
+    a=page.index("$('csv').onclick=()=>{")
+    z=page.index('(async()=>{try{let old=await load()',a)
+    csv=r'''$('csv').onclick=()=>{
+ if(!state)return;
+ const cols=['version','date','market','strategy','base_id','base_signal_time_kst',
+ 'signal_time_kst','entry_time_kst','entry_delay_minutes','box_high',
+ 'close_position','body_ratio','upper_wick_ratio','break_margin_pct',
+ 'h1_time_kst','second_pullback_time_kst','ema20','ema50','atr_pct',
+ 'volume_ratio','pullback_depth_atr','resistance_room_pct','h1_to_h2_bars',
+ 'outcome','entry','exit','net_pct','minutes','reason',
+ 'eligible_windows','h2_eligible_windows','observed_5m','c5_watches',
+ 'baseline_signals','h2_signals','truncated','scope','period','fee_pct_side','slip_pct_side'];
+ const lines=[cols.join(',')];
+ for(const r of Object.values(state.results)){
+  const base={version:'V11.14.31',date:r.date,market:r.market,
+  eligible_windows:r.eligible_windows,h2_eligible_windows:r.h2_eligible_windows,
+  observed_5m:r.observed_5m,c5_watches:r.c5_watches,
+  baseline_signals:r.baseline_signals,h2_signals:r.h2_signals,
+  truncated:r.truncated,scope:state.cfg.scope,period:state.cfg.period,
+  fee_pct_side:state.cfg.fee,slip_pct_side:state.cfg.slip};
+  lines.push(cols.map(c=>csvCell(({...base,strategy:'COVERAGE'})[c])).join(','));
+  for(const [key] of ARMS)for(const e of r.events?.[key]||[]){
+   const v={...base,...e,strategy:key};
+   lines.push(cols.map(c=>csvCell(v[c])).join(','));
+  }
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='bithumb_C5_VOLMAN_BEGGS_BROOKS_v111431.csv';a.click();
+ setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+'''
+    page=page[:a]+csv+page[z:]
+    # Version in template has already been updated; older lab links are never changed.
+    if "/api/winrate14c5beggs" in page or 'bithumb_c5_beggs_v111430' in page:
+        raise RuntimeError('V11.14.31 독립 저장/API 실패')
+    if "const API='/api/winrate14c5brooks'" not in page:
+        raise RuntimeError('V11.14.31 API 연결 실패')
+    return page
+
+
+C5_BROOKS_V111431_PAGE=c5_brooks_v111431_make_page()
+
+
+def register_c5_brooks_v111431_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0}
+    lock=Lock()
+
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                items=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not items:
+                    raise ValueError('현재 KRW 종목 조회 실패')
+                cache.update(items=items,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-brooks')
+    def c5_brooks_v111431_page():
+        return render_template_string(C5_BROOKS_V111431_PAGE)
+
+    @app.get('/api/winrate14c5brooks/universe')
+    def c5_brooks_v111431_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.31'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5brooks/evaluate')
+    def c5_brooks_v111431_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):
+                raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 종목 목록에 없는 코인')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_brooks_v111431_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.31',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111430_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111430_register_daytrade_review(app,deps)
+    register_c5_brooks_v111431_lab(app,deps)
