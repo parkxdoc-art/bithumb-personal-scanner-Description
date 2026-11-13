@@ -9068,3 +9068,334 @@ _v111427_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111427_register_daytrade_review(app,deps)
     register_c5_break_v111428_lab(app,deps)
+# ---------------------------------------------------------------------------
+# V11.14.29 - RESEARCH ONLY: Volman/C5 baseline vs PATS-inspired two entries.
+# All previous routes and the live V2 scanner are left untouched.
+# This is a *mechanical adaptation*, not a faithful implementation of Mack's
+# discretionary 2EL/2LPB price-action strategy.
+# ---------------------------------------------------------------------------
+
+C5_MACK_V111429_WINDOW = 12  # 12 completed 5-minute bars after baseline
+C5_MACK_V111429_SUPPORT_BAND = 0.007  # break more than 0.7% below box invalidates watch
+C5_MACK_V111429_ARMS = (
+    ('A', '기존 C5 + 볼먼 즉시 진입'),
+    ('B', '첫 눌림 후 1차 재상승 진입'),
+    ('C', '재눌림 후 2차 상승 진입 (Mack 응용)'),
+)
+
+
+def c5_mack_v111429_followups(rows, base_i, top, cfg, market, base_id):
+    """Observe bars strictly in chronological order after an A signal.
+
+    H1 (B): the first completed higher-close breakout after a pullback.
+    H2 (C): a new pullback after H1, then a SECOND bullish close above
+             the immediately preceding bar's high and the original box top.
+    All resulting BUY entries occur at the NEXT real 5m bar open.
+    Cancel on a 0.7% box-top support failure; gaps are UNKNOWN, not NO_ENTRY.
+    """
+    step = timedelta(minutes=5)
+    stamp = lambda ix: rows[ix]['t'].strftime('%Y-%m-%d %H:%M')
+    parent = stamp(base_i)
+    generic = {'market':market, 'base_id':base_id,
+               'base_signal_time_kst':parent, 'box_high':round(top,10)}
+    results = {}
+    phase = 0  # seek pullback -> H1 -> second pullback -> H2
+    first_dip = None
+    second_dip = None
+    h1_i = None
+    failure = None
+
+    def make(arm, j=None, outcome=None, reason=''):
+        row = dict(generic)
+        row.update(strategy=arm,
+                   signal_time_kst=stamp(j) if j is not None else '',
+                   entry_time_kst=(rows[j]['t']+step).strftime('%Y-%m-%d %H:%M') if j is not None else '',
+                   entry_delay_minutes=(j-base_i)*5 if j is not None else None,
+                   first_pullback_time_kst=stamp(first_dip) if first_dip is not None else '',
+                   first_attempt_time_kst=stamp(h1_i) if h1_i is not None else '',
+                   second_pullback_time_kst=stamp(second_dip) if second_dip is not None else '')
+        if j is None:
+            row.update(outcome=outcome or 'NO_ENTRY', reason=reason,
+                       net_pct=None, entry=None, exit=None, minutes=None)
+        else:
+            row.update(lab_outcome_v11145(rows,j,cfg))
+        return row
+
+    for j in range(base_i+1, base_i+C5_MACK_V111429_WINDOW+1):
+        if j>=len(rows) or rows[j]['t']-rows[j-1]['t']!=step:
+            failure='후속 5분봉 부족 또는 시간 공백'
+            break
+        prev, now = rows[j-1], rows[j]
+        if now['l'] < top*(1-C5_MACK_V111429_SUPPORT_BAND):
+            failure='압축 박스 지지 실패 (0.7% 초과 이탈)'
+            break
+        pullback = now['c'] < prev['c'] or now['l'] < prev['l']
+        bullish_try = (now['c'] > now['o'] and
+                       now['c'] > prev['h'] and now['c'] > top)
+        if phase == 0:
+            if pullback:
+                first_dip=j
+                phase=1
+        elif phase == 1:
+            if bullish_try:
+                h1_i=j
+                results['B']=make('B',j)
+                phase=2
+            elif pullback:
+                first_dip=j
+        elif phase == 2:
+            if pullback:
+                second_dip=j
+                phase=3
+        elif phase == 3:
+            if bullish_try:
+                results['C']=make('C',j)
+                break
+            if pullback:
+                second_dip=j
+    for arm in ('B','C'):
+        if arm not in results:
+            if failure and '공백' in failure:
+                results[arm]=make(arm,outcome='UNKNOWN',reason=failure)
+            elif failure:
+                results[arm]=make(arm,reason=failure)
+            else:
+                results[arm]=make(arm,reason=('1차 상승 시도 미확인' if arm=='B'
+                                              else '두 번째 상승 시도 미확인'))
+    return results
+
+
+def c5_mack_v111429_evaluate_rows(rows, cfg, market, kst):
+    from datetime import datetime as _dt, time as _tm
+    day_start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    events={'A':[],'B':[],'C':[]}
+    eligible=0
+    last_c5=-1000000
+    c5_count=0
+    step=timedelta(minutes=5)
+    for i in range(LAB_WARMUP_BARS,len(rows)-1):
+        if not day_start<=rows[i]['t']<day_end:
+            continue
+        if not lab_contiguous(rows,i-25,i):
+            continue
+        eligible+=1
+        if i-last_c5<cfg['bars'] or not c5_v111417_signal(rows,i):
+            continue
+        last_c5=i
+        c5_count+=1
+        gates=c5_expert_v111422_gates(rows,i)
+        if gates['volman'] is not True:
+            continue
+        top=max(b['h'] for b in rows[i-6:i])
+        base_id=market+'|'+rows[i]['t'].strftime('%Y-%m-%d %H:%M')
+        outcome=lab_outcome_v11145(rows,i,cfg)
+        first={'market':market,'strategy':'A','base_id':base_id,
+               'base_signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+               'signal_time_kst':rows[i]['t'].strftime('%Y-%m-%d %H:%M'),
+               'entry_time_kst':(rows[i]['t']+step).strftime('%Y-%m-%d %H:%M'),
+               'box_high':round(top,10),'entry_delay_minutes':0,
+               'first_pullback_time_kst':'','first_attempt_time_kst':'',
+               'second_pullback_time_kst':'',**outcome}
+        events['A'].append(first)
+        later=c5_mack_v111429_followups(rows,i,top,cfg,market,base_id)
+        for arm in ('B','C'):
+            events[arm].append(later[arm])
+    return {'market':market,'observed_5m':len(rows),
+            'eligible_windows':eligible,'c5_watches':c5_count,
+            'baseline_signals':len(events['A']), 'events':events}
+
+
+def c5_mack_v111429_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    answer=c5_mack_v111429_evaluate_rows(rows,cfg,market,kst)
+    answer['truncated']=truncated
+    return answer
+
+
+def c5_mack_v111429_make_page():
+    """Reuse the proven V11.14.28 IndexedDB/diagnosis UI, isolated by ID."""
+    page=C5_BREAK_V111428_PAGE
+
+    def replace_once(old,new):
+        nonlocal page
+        if page.count(old)!=1:
+            raise RuntimeError('V11.14.29 UI anchor mismatch: '+old[:95])
+        page=page.replace(old,new,1)
+
+    # Distinct research lab, APIs and IndexedDB: no old results get modified.
+    page=page.replace('V11.14.28','V11.14.29')
+    replace_once('<title>V11.14.29 · C5 WATCH vs 거래량 돌파</title>',
+                 '<title>V11.14.29 · 볼먼 vs 두 번째 진입 비교</title>')
+    replace_once('<h1>🧪 V11.14.29 · C5 선행 포착 vs 거래량 돌파</h1>',
+                 '<h1>🧪 V11.14.29 · 볼먼 vs 두 번째 진입</h1>')
+    replace_once('저장공간 보완판 · V11.14.29 결과를 별도 브라우저 데이터베이스에 저장',
+                 '맥(PATS) 2차 진입 원칙을 5분봉으로 수치화한 연구실 · 별도 브라우저 DB에 저장')
+    first=page.index('<section class="panel"><h2>세 가지 진입 비교</h2>')
+    last=page.index('</section>',first)+len('</section>')
+    intro='''<section class="panel"><h2>동일한 볼먼 신호에서 3가지 진입 비교</h2>
+<div class="alert28">
+<b>A. 기존 C5+볼먼:</b> 압축 박스 상향 돌파가 발생한 완료 5분봉 뒤 다음 5분봉 시가에 바로 진입.<br>
+<b>B. 첫 눌림 후 1차 진입:</b> 볼먼 돌파 이후 첫 하락/눌림을 기다렸다가 양봉 종가가 직전 봉 고점과 박스 상단을 넘으면 다음 봉 시가에 진입.<br>
+<b>C. 두 번째 진입(Mack 응용):</b> B의 첫 시도 이후 다시 눌림이 나타나고, 두 번째로 양봉 종가가 직전 고점과 박스 상단을 넘으면 다음 봉 시가에 진입.<br>
+<b>공통:</b> 볼먼 신호 뒤 12개 5분봉(60분)까지만 관찰. 박스 상단에서 0.7% 넘게 아래로 밀리면 취소. 익절 +1.5% / 손절 -1% / 최대 60분, 편도 수수료 0.04% + 슬리피지 0.05% 기본값.</div>
+<p class="alert28 warn">⚠️ <b>맥의 재량적 PATS 매매법을 그대로 재현한 게 아니라</b> H1/H2의 두 번 상승 시도 개념을 5분봉 종가로 단순화한 실험이야. B·C는 진입이 없으면 <b>NO_ENTRY</b>, 관측 봉이 끊기면 <b>UNKNOWN</b>으로 별도 기록해. A/B/C는 <b>같은 원본 볼먼 신호 1건에서 세 갈래로 비교</b>하며, 실제 진입가와 청산은 각 진입 시점에 새로 계산해. 같은 봉 익절·손절 시 손절 우선.</p>
+</section>'''
+    page=page[:first]+intro+page[last:]
+    page=page.replace('이번 검증은 별도 IndexedDB에 저장돼.',
+                      'V11.14.29 검증은 별도 IndexedDB에 저장돼.')
+    replace_once("const API='/api/winrate14c5breakout', KEY='bithumb_c5_breakout_v111428_v1';",
+                 "const API='/api/winrate14c5mack', KEY='bithumb_c5_mack_v111429_v1';")
+    replace_once("const ARMS=[['A','기존 C5+압축'],['B','C5 뒤 거래량 확인'],['C','독립 압축·거래량']];",
+                 "const ARMS=[['A','기존 볼먼 즉시 진입'],['B','첫 눌림 뒤 1차 진입'],['C','두 번째 진입 (맥 응용)']];")
+    replace_once("const DB_NAME='bithumb_c5_breakout_v111428_indexeddb_v1';",
+                 "const DB_NAME='bithumb_c5_mack_v111429_indexeddb_v1';")
+    # Old A/B/C backend validation is compatible with this new research endpoint.
+    # The stats and report must differentiate NO_ENTRY vs UNKNOWN.
+    start=page.index('function calculate(es){')
+    end=page.index('const jobKey=',start)
+    page=page[:start]+r'''function calculate(es){
+ let trades=es.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+ let entered=es.filter(e=>e.outcome!=='NO_ENTRY'&&!!e.signal_time_kst);
+ let a=trades.map(e=>num(e.net_pct));
+ return {total:es.length,entered:entered.length,done:trades.length,miss:entered.length-trades.length,
+  noentry:es.filter(e=>e.outcome==='NO_ENTRY').length,
+  win:a.filter(x=>x>0).length,tp:trades.filter(e=>e.outcome==='TP').length,
+  sl:trades.filter(e=>e.outcome==='SL').length,tm:trades.filter(e=>e.outcome==='TIME').length,
+  avg:a.length?a.reduce((p,v)=>p+v,0)/a.length:NaN,
+  winRate:a.length?100*a.filter(x=>x>0).length/a.length:NaN};
+}
+function pairedDifference(es,key){
+ const bases=new Map(es.filter(e=>e.strategy==='A'&&['TP','SL','TIME'].includes(e.outcome))
+  .map(e=>[e.base_id,e]));
+ const matched=es.filter(e=>e.strategy===key&&['TP','SL','TIME'].includes(e.outcome)&&bases.has(e.base_id));
+ const diff=matched.map(e=>num(e.net_pct)-num(bases.get(e.base_id).net_pct)).filter(Number.isFinite);
+ return {n:diff.length,avg:diff.length?diff.reduce((a,b)=>a+b,0)/diff.length:NaN};
+}
+'''+page[end:]
+    start=page.index('function paint(){')
+    end=page.index('async function requestJSON',start)
+    page=page[:start]+r'''function paint(){
+ if(!state)return;
+ let finished=Object.keys(state.results).length,items=state.items.length,es=eventRows();
+ let complete=items>0&&finished===items;
+ $('prog').max=Math.max(items,1);$('prog').value=finished;
+ let c5=Object.values(state.results).reduce((a,r)=>a+(r.c5_watches||0),0);
+ let baseline=es.filter(e=>e.strategy==='A').length;
+ let valid=Object.values(state.results).reduce((a,r)=>a+(r.eligible_windows||0),0);
+ let noValid=Object.values(state.results).filter(r=>r.eligible_windows===0).length;
+ let b=calculate(es.filter(e=>e.strategy==='B'));
+ let c=calculate(es.filter(e=>e.strategy==='C'));
+ $('coverage').innerHTML=stat('완료',finished+' / '+items)+stat('C5 신호',c5)+
+  stat('볼먼 기본 신호',baseline)+stat('B 실제 진입',b.entered)+stat('C 실제 진입',c.entered)+
+  stat('유효 구간 0인 종목/날짜',noValid)+stat('5분봉 유효 위치',valid);
+ $('csv').disabled=!finished;
+ const failures=state.failures||{},failureCount=Object.keys(failures).length;
+ const problem=lastError||(failureCount?Object.values(failures)[0]:'');
+ $('status').textContent=(complete?'✅ 검증 완료':running?'⏳ 조회 중':problem?'⚠️ 검사 중단 · 원인 확인 필요':'중단 / 이어하기 가능')+
+  ' · '+finished+'/'+items+'건'+(problem?'\n오류: '+problem+'\n완료 기록은 유지돼. 실패 종목만 다시 검사할 수 있어.':'')+
+  (complete?'\n좋은 결과가 나와도 미사용 날짜 검증 전에는 실전 적용하지 마.':'\n검사가 끝나기 전 숫자는 임시 통계야.');
+ if(problem)report('V11.14.29 서버 진단 정보\n'+problem+'\n성공 '+finished+'/'+items+'건 · 실패 '+failureCount+'건');
+ let sums=ARMS.map(([k,label])=>{let a=calculate(es.filter(e=>e.strategy===k));
+  let diff=k==='A'?null:pairedDifference(es,k);
+  return tr([label,a.total,a.entered,a.done,a.noentry,a.miss,a.win,a.tp,a.sl,a.tm,pct(a.winRate),pct(a.avg),diff?diff.n:'—',diff?pct(diff.avg):'—']);});
+ $('summary').innerHTML=tbl(['진입 방식','볼먼 대상','진입','손익 확정','미진입','결과 미확정','수익 거래','익절','손절','시간만료','수익거래 비율','평균 순손익','짝비교 건수','A대비 순손익차'],sums);
+ let dates=[...new Set(state.items.map(j=>j.day))].sort();
+ $('daily').innerHTML=tbl(['날짜','A 진입','A 평균','B 진입','B 평균','C 진입','C 평균'],dates.map(d=>{
+  let s=es.filter(e=>e.date===d),ret=[];
+  for(let [k] of ARMS){let a=calculate(s.filter(e=>e.strategy===k));ret.push(a.entered,pct(a.avg));}
+  return tr([d,...ret]);}));
+ let ex=es.filter(e=>e.outcome!=='NO_ENTRY').sort((a,b)=>b.base_signal_time_kst.localeCompare(a.base_signal_time_kst)).slice(0,100);
+ $('examples').innerHTML=ex.length?tbl(['날짜','종목','방식','원래 볼먼 시각','새 진입 신호','추가 대기(분)','진입가','결과','순손익'],ex.map(e=>tr([e.date,e.market,e.strategy,e.base_signal_time_kst,e.signal_time_kst||'—',e.entry_delay_minutes??'—',e.entry??'—',e.outcome,pct(num(e.net_pct))]))):'아직 신호 없음';
+}
+'''+page[end:]
+    start=page.index("$('csv').onclick=()=>{")
+    end=page.index("(async()=>{try{let old=await load()",start)
+    page=page[:start]+r'''$('csv').onclick=()=>{
+ if(!state)return;
+ const cols=['version','date','market','strategy','base_id','base_signal_time_kst',
+  'signal_time_kst','entry_time_kst','entry_delay_minutes','box_high',
+  'first_pullback_time_kst','first_attempt_time_kst','second_pullback_time_kst',
+  'outcome','entry','exit','net_pct','minutes','reason',
+  'eligible_windows','observed_5m','c5_watches','baseline_signals','truncated','scope','period'];
+ const lines=[cols.join(',')];
+ for(const r of Object.values(state.results)){
+  const base={version:'V11.14.29',date:r.date,market:r.market,
+   eligible_windows:r.eligible_windows,observed_5m:r.observed_5m,
+   c5_watches:r.c5_watches,baseline_signals:r.baseline_signals,
+   truncated:r.truncated,scope:state.cfg.scope,period:state.cfg.period};
+  lines.push(cols.map(c=>csvCell(({...base,strategy:'COVERAGE'})[c])).join(','));
+  for(const [key] of ARMS)for(const e of r.events?.[key]||[]){
+   const v={...base,...e,strategy:key};
+   lines.push(cols.map(c=>csvCell(v[c])).join(','));
+  }
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='bithumb_C5_VOLMAN_MACK_v111429.csv';a.click();
+ setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+'''+page[end:]
+    replace_once("if(!result.events||!Array.isArray(result.events.A)||!Array.isArray(result.events.B)||!Array.isArray(result.events.C))throw Error('서버 응답 신호 목록 형식 오류');",
+                 "if(!result.events||!Array.isArray(result.events.A)||!Array.isArray(result.events.B)||!Array.isArray(result.events.C)||result.events.A.length!==result.events.B.length||result.events.A.length!==result.events.C.length)throw Error('볼먼 원본 신호와 1차·2차 비교 목록 불일치');")
+    replace_once('C5 WATCH "+result.c5_watches+', 'C5 신호 "+result.c5_watches+') if False else None
+    page=page.replace('C5 WATCH '+"'+result.c5_watches+'건'",'C5 신호 '+"'+result.c5_watches+'건'")
+    # Remove stale V11.14.28 commentary from template, change all user-facing labels.
+    page=page.replace('이번 검사 초기화','V11.14.29 검사 초기화')
+    page=page.replace('40종목은 정렬된 목록에서 균등 간격으로 고른 기능 확인용 표본이며 시장 대표 표본은 아니야.',
+                      '40종목은 기능 확인용 표본이야. 결과가 좋더라도 전체 KRW와 다른 날짜로 재검증해.')
+    page=page.replace('2. 세 전략 성적 비교','2. 동일 볼먼 신호 A/B/C 짝비교')
+    page=page.replace('평균 순손익은 수수료·슬리피지 차감 이후이며, 손익 확정 거래 기준으로 계산.',
+                      '평균 순손익은 수수료·슬리피지 차감 뒤 실제 진입한 확정 거래 기준. A대비 차이는 둘 다 확정된 동일 볼먼 신호끼리 비교.')
+    if '/api/winrate14c5breakout' in page or 'bithumb_c5_breakout_v111428' in page:
+        raise RuntimeError('V11.14.29 새 연구실에 이전 API/DB 키가 남았습니다')
+    return page
+
+
+C5_MACK_V111429_PAGE = c5_mack_v111429_make_page()
+
+
+def register_c5_mack_v111429_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0}
+    lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                names=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:
+                    raise ValueError('현재 빗썸 KRW 종목을 조회할 수 없습니다')
+                cache.update(items=names,at=time.time())
+            return cache['items']
+    @app.get('/backtest-winrate-c5-mack')
+    def c5_mack_v111429_page():
+        return render_template_string(C5_MACK_V111429_PAGE)
+    @app.get('/api/winrate14c5mack/universe')
+    def c5_mack_v111429_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.29'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+    @app.post('/api/winrate14c5mack/evaluate')
+    def c5_mack_v111429_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            res=c5_mack_v111429_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.29',
+                            'date':cfg['day'].isoformat(),**res})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111428_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111428_register_daytrade_review(app,deps)
+    register_c5_mack_v111429_lab(app,deps)
