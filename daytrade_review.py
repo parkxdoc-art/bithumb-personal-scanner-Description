@@ -8645,3 +8645,267 @@ _v111426_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111426_register_daytrade_review(app,deps)
     register_c5_exit_v111427_lab(app,deps)
+
+# ---------------------------------------------------------------------------
+# V11.14.28 - RESEARCH ONLY: C5 early-watch vs confirmed volume breakouts.
+# Keeps all previous routes (including V11.14.27) and V2 app.py unchanged.
+# Comparisons are independent simulations, NOT matched trade portfolios.
+# A: C5 with original V11.14.22 Volman-style six-bar squeeze breakout.
+# B: C5 is WATCH; within next six complete 5m bars a close above the six
+#    preceding bars' highs with volume >= 1.5x prior 20-bar average is BUY.
+# C: same volume confirmed breakout + V11.14.22 squeeze condition without
+#    needing C5; independent 60m signal cooldown.
+# Entry: NEXT observed five-minute bar OPEN after signal confirmation.
+# Fixed TP/SL/hold/costs via original lab_outcome_v11145. Missing candles
+# never filled; simultaneous stop and target favors stop. No future leakage.
+# ---------------------------------------------------------------------------
+
+C5_BREAK_V111428_ARMS = (
+    ('A','기존 C5 + 압축 돌파'),
+    ('B','C5 WATCH → 고점·거래량 돌파'),
+    ('C','독립 압축·고점·거래량 돌파'),
+)
+C5_BREAK_V111428_CONFIRM_BARS = 6
+C5_BREAK_V111428_VOLUME = 1.5
+
+
+def c5_break_v111428_is_confirmed(rows, i):
+    """Only historical, contiguous candles through just-closed bar i."""
+    if i < 20 or not lab_contiguous(rows,i-20,i):
+        return False, None, None
+    avg = sum(b['v'] for b in rows[i-20:i])/20
+    if avg <= 0:
+        return False, None, None
+    vol_ratio = rows[i]['v']/avg
+    prior_high = max(b['h'] for b in rows[i-6:i])
+    ok = (rows[i]['c'] > rows[i]['o']
+          and rows[i]['c'] > prior_high
+          and vol_ratio >= C5_BREAK_V111428_VOLUME)
+    return ok, round(vol_ratio,6), round(prior_high,10)
+
+
+def c5_break_v111428_evaluate_rows(rows, cfg, market, kst):
+    """Replay independent signals with only candle-close-available inputs.
+
+    C5 cooldown is triggered by *every* valid C5, matching V11.14.17.
+    B uses that identical C5 candidate sequence as WATCH and only buys
+    on later observed, on-time 5m bar close, within 30min of the watch.
+    C independently permits compression breakouts, not just C5 subset.
+    """
+    from datetime import datetime as _dt, time as _tm
+    day_start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    step=timedelta(minutes=5)
+    events={'A':[],'B':[],'C':[]}
+    eligible=0
+    last_c5=-1000000
+    last_independent=-1000000
+    watch_index=None
+    possible_c5=0
+    for i in range(LAB_WARMUP_BARS,len(rows)-1):
+        t=rows[i]['t']
+        if not(day_start<=t<day_end):
+            continue
+        if not lab_contiguous(rows,i-25,i):
+            # Broken lookback invalidates this candidate and WATCH.
+            watch_index=None
+            continue
+        eligible+=1
+        # A watch may not survive more than six completed bars or a gap.
+        if watch_index is not None and (i-watch_index>6 or
+            rows[i]['t']-rows[watch_index]['t']!=(i-watch_index)*step):
+            watch_index=None
+        confirmed, vr, threshold = c5_break_v111428_is_confirmed(rows,i)
+        gate = None
+        def squeeze():
+            nonlocal gate
+            if gate is None:
+                gate = c5_expert_v111422_gates(rows,i)['volman']
+            return gate is True
+        def record(key, signal_i, watch_i=None):
+            outcome=lab_outcome_v11145(rows,signal_i,cfg)
+            events[key].append({
+                'market':market,
+                'signal_time_kst':rows[signal_i]['t'].strftime('%Y-%m-%d %H:%M'),
+                'entry_time_kst':(rows[signal_i]['t']+step).strftime('%Y-%m-%d %H:%M'),
+                'watch_time_kst':rows[watch_i]['t'].strftime('%Y-%m-%d %H:%M') if watch_i is not None else '',
+                'volume_ratio':vr if key!='A' else None,
+                'breakout_high':threshold if key!='A' else None,
+                **outcome})
+        # Process an existing WATCH before potentially issuing today's C5.
+        if watch_index is not None and i>watch_index and confirmed:
+            record('B',i,watch_index)
+            watch_index=None
+        if i-last_c5>=cfg['bars'] and c5_v111417_signal(rows,i):
+            last_c5=i
+            possible_c5+=1
+            watch_index=i
+            if squeeze():
+                record('A',i)
+        if i-last_independent>=cfg['bars'] and confirmed and squeeze():
+            last_independent=i
+            record('C',i)
+    return {'market':market,'observed_5m':len(rows),
+            'eligible_windows':eligible,'c5_watches':possible_c5,
+            'events':events}
+
+
+def c5_break_v111428_evaluate_symbol(api_get, market, cfg, kst):
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    result=c5_break_v111428_evaluate_rows(rows,cfg,market,kst)
+    result['truncated']=truncated
+    return result
+
+
+C5_BREAK_V111428_PAGE = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V11.14.28 · C5 WATCH vs 거래량 돌파</title>
+<style>/*REPLACE_STYLE*/
+.alert28{padding:12px 14px;border-radius:10px;background:#122541;font-size:13px;line-height:1.8}
+.alert28.warn{background:#2c2632}
+.wide28{overflow-x:auto}
+.small28{font-size:12px;color:var(--muted)}
+select{background:#111a2e;color:#f3f6ff;padding:10px;border:1px solid var(--line);border-radius:8px;min-width:0;width:100%}
+@media(max-width:650px){main{padding:13px 9px 60px}}
+</style></head><body><main>
+<h1>🧪 V11.14.28 · C5 선행 포착 vs 거래량 돌파</h1>
+<p class="muted">빗썸 KRW · 5분봉 완료 신호만 사용 · 기존 V2 실전 스캐너는 변경하지 않음</p>
+<section class="panel"><h2>세 가지 진입 비교</h2>
+<div class="alert28">
+<b>A. 기존 C5 + 볼먼 응용:</b> 5이평 첫 회복과 이전 6봉 가격 압축(폭 1.2% 이하)·EMA20 박스 부근·종가 상방 돌파가 같은 봉에서 나타난 경우.<br>
+<b>B. C5 WATCH → BUY:</b> C5를 관찰 신호로 기록한 뒤 <b>다음 6개 5분봉(30분)</b> 안에 종가가 그 직전 6봉 최고가를 넘고, 거래량이 이전 20봉 평균의 <b>1.5배 이상</b>이면 확정 BUY.<br>
+<b>C. C5 없는 독립 돌파:</b> C5 여부와 무관하게 볼먼식 가격 압축 조건에 고점·거래량 돌파(1.5배)를 확인해 BUY.<br>
+<b>공통:</b> 다음 5분봉 시가 진입, 익절 +1.5%, 손절 -1.0%, 최대 60분, 동일 종목 각 전략 60분 신호 제한, 편도 수수료 0.04% + 슬리피지 0.05% 기본값.</div>
+<p class="alert28 warn">⚠️ 서로 진입 시점·신호 수가 다른 <b>독립 전략 비교</b>야. B는 늦어진 실제 진입 가격으로 청산을 다시 계산하고, C는 C5 신호 목록 밖에서도 발생할 수 있어. 결과 미확정은 손실로 간주하지 않아. 익절·손절이 같은 5분봉에서 닿으면 손절을 먼저 가정해.</p>
+</section>
+<section class="panel"><h2>검증 설정</h2>
+<div class="controls">
+<label class="field">한국시간 날짜<input type="date" id="day" value="2026-11-12"></label>
+<label class="field">검사 기간<select id="period"><option value="one">선택한 날짜 1일</option><option value="week">11월 6~12일 전체 7일</option></select></label>
+<label class="field">검사 범위<select id="scope"><option value="40">40종목 빠른 시험</option><option value="all">전체 KRW 종목</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" min="0" max="0.5" step="0.01" value="0.04"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" min="0" max="0.5" step="0.01" value="0.05"></label>
+</div>
+<p class="small28">처음에는 11월 12일 · 40종목부터 시작해 기능을 확인해 줘. 40종목은 정렬된 목록에서 균등 간격으로 고른 기능 확인용 표본이며 시장 대표 표본은 아니야. 7일 전체 KRW 분석은 API 조회량이 크므로 필요할 때만 선택해.</p>
+<div class="actions"><button id="run">검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">이번 검사 초기화</button><button id="csv" class="secondary" disabled>결과 CSV 저장</button></div>
+<progress id="prog" max="1" value="0"></progress><div id="status" class="status">검사 대기 중</div>
+</section>
+<section class="panel"><h2>1. 진행 상황</h2><div id="coverage" class="stats">검사 대기</div></section>
+<section class="panel"><h2>2. 세 전략 성적 비교</h2><div id="summary" class="wide28">검사 전</div><p class="small28">평균 순손익은 수수료·슬리피지 차감 이후이며, 손익 확정 거래 기준으로 계산. 표본이 적으면 수익성을 결론낼 수 없어.</p></section>
+<section class="panel"><h2>3. 날짜별 비교</h2><div id="daily" class="wide28">검사 전</div></section>
+<section class="panel"><h2>4. 신호 개별 기록</h2><div id="examples" class="wide28">검사 전</div></section>
+</main><script>
+'use strict';
+const API='/api/winrate14c5breakout', KEY='bithumb_c5_breakout_v111428_v1';
+const ARMS=[['A','기존 C5+압축'],['B','C5 뒤 거래량 확인'],['C','독립 압축·거래량']];
+const DAYS=['2026-11-06','2026-11-07','2026-11-08','2026-11-09','2026-11-10','2026-11-11','2026-11-12'];
+const $=id=>document.getElementById(id);
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=v=>v===null||v===undefined||v===''?NaN:Number(v);
+const pct=v=>Number.isFinite(v)?v.toFixed(3)+'%':'—';
+const cell=v=>'<td>'+esc(v)+'</td>';
+const tr=xs=>'<tr>'+xs.map(cell).join('')+'</tr>';
+const tbl=(headers,rs)=>'<table><thead><tr>'+headers.map(v=>'<th>'+esc(v)+'</th>').join('')+'</tr></thead><tbody>'+rs.join('')+'</tbody></table>';
+const stat=(name,value)=>'<div class="stat"><small>'+esc(name)+'</small><strong>'+esc(value)+'</strong></div>';
+let state=null,running=false,stopped=false,errors=0;
+const signature=cfg=>JSON.stringify(cfg);
+function chosen(){const day=$('day').value,period=$('period').value,scope=$('scope').value,fee=num($('fee').value),slip=num($('slip').value);
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(day))throw Error('검증 날짜를 골라줘');
+ if(!Number.isFinite(fee)||!Number.isFinite(slip)||fee<0||fee>0.5||slip<0||slip>0.5)throw Error('비용은 0~0.5% 범위로 설정해 줘');
+ return {day,period,scope,fee,slip};}
+function load(){try{let v=JSON.parse(localStorage.getItem(KEY)||'null');return v&&v.version===1&&v.cfg&&v.items&&v.results&&typeof v.results==='object'?v:null;}catch{return null;}}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){stopped=true;throw Error('브라우저 저장 용량 부족 · CSV로 기록을 보관하거나 이번 검사 초기화 필요');}}
+function eventRows(){let arr=[];for(let val of Object.values(state?.results||{})){for(let [k] of ARMS){for(let ev of val.events?.[k]||[])arr.push({...ev,date:val.date,market:val.market,strategy:k});}}return arr;}
+function calculate(es){let ok=es.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(num(e.net_pct)));
+ let a=ok.map(e=>num(e.net_pct));return {total:es.length,done:ok.length,miss:es.length-ok.length,win:a.filter(x=>x>0).length,
+ tp:ok.filter(e=>e.outcome==='TP').length,sl:ok.filter(e=>e.outcome==='SL').length,tm:ok.filter(e=>e.outcome==='TIME').length,
+ avg:a.length?a.reduce((p,v)=>p+v,0)/a.length:NaN,winRate:a.length?100*a.filter(x=>x>0).length/a.length:NaN};}
+const jobKey=j=>j.day+'|'+j.market;
+function paint(){if(!state)return;let finishedJobs=Object.keys(state.results).length,items=state.items.length,es=eventRows(),complete=items&&finishedJobs===items;
+ $('prog').max=Math.max(items,1);$('prog').value=finishedJobs;
+ let c5=Object.values(state.results).reduce((a,r)=>a+(r.c5_watches||0),0);
+ let valid=Object.values(state.results).reduce((a,r)=>a+(r.eligible_windows||0),0);
+ $('coverage').innerHTML=stat('완료',finishedJobs+' / '+items)+stat('C5 WATCH',c5)+stat('분석 가능 봉 위치',valid)+stat('총 발생 신호',es.length)+stat('조회 오류',errors)+stat('결과 미확정',es.filter(e=>e.outcome==='UNKNOWN').length);
+ $('csv').disabled=!es.length;
+ $('status').textContent=(complete?'✅ 선택한 구간 검증 완료':running?'⏳ 조회 중':'중단 / 이어하기 가능')+' · '+finishedJobs+'/'+items+'건'+(errors?'\n⚠️ 일부 조회 실패: 다음에 이어하기를 실행하면 누락된 종목만 검사해.':'')+(complete?'\n최종 숫자도 과거 모의검증이므로 독립 날짜에서 재확인해야 해.':'\n검사가 모두 끝나기 전 숫자는 임시 통계야.');
+ let sums=ARMS.map(([k,label])=>{let a=calculate(es.filter(e=>e.strategy===k));return tr([label,a.total,a.done,a.miss,a.win,a.tp,a.sl,a.tm,pct(a.winRate),pct(a.avg)]);});
+ $('summary').innerHTML=tbl(['전략','신호','확정','미확정','수익 거래','익절','손절','시간만료','수익 거래 비율','평균 순손익'],sums);
+ let dates=[...new Set(state.items.map(j=>j.day))].sort();
+ $('daily').innerHTML=tbl(['날짜','A 신호','A 평균','B 신호','B 평균','C 신호','C 평균'],dates.map(d=>{
+ let s=es.filter(e=>e.date===d);let ret=[];for(let [k] of ARMS){let a=calculate(s.filter(e=>e.strategy===k));ret.push(a.total,pct(a.avg));}return tr([d,...ret]);}));
+ let ex=[...es].sort((a,b)=>b.signal_time_kst.localeCompare(a.signal_time_kst)).slice(0,80);
+ $('examples').innerHTML=ex.length?tbl(['날짜','종목','전략','C5 WATCH 시각','BUY 확정 봉','진입 시각','거래량 배수','결과','순손익'],ex.map(e=>tr([e.date,e.market,e.strategy,e.watch_time_kst||'—',e.signal_time_kst,e.entry_time_kst,Number.isFinite(num(e.volume_ratio))?num(e.volume_ratio).toFixed(2):'—',e.outcome,pct(num(e.net_pct))]))):'아직 신호 없음';
+}
+async function requestJSON(url,opts={}){let ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),90000);try{let resp=await fetch(url,{cache:'no-store',...opts,signal:ctrl.signal});let j=await resp.json();if(!resp.ok||!j.ok)throw Error(j.error||'HTTP '+resp.status);return j;}finally{clearTimeout(timer);}}
+function sample(items,n){if(items.length<=n)return items;return [...new Set(Array.from({length:n},(_,i)=>items[Math.round(i*(items.length-1)/(n-1))]))];}
+async function prepare(cfg){let old=load();if(old&&signature(old.cfg)===signature(cfg)&&old.items.length){state=old;paint();return;}
+ let res=await requestJSON(API+'/universe');let markets=cfg.scope==='40'?sample(res.items,40):res.items;
+ let days=cfg.period==='week'?DAYS:[cfg.day];
+ state={version:1,cfg,items:days.flatMap(day=>markets.map(market=>({day,market}))),results:{}};save();paint();}
+async function run(){if(running)return;running=true;stopped=false;errors=0;$('run').disabled=true;$('pause').disabled=false;
+ try{let cfg=chosen();await prepare(cfg);let jobs=state.items.filter(j=>!state.results[jobKey(j)]),cursor=0;
+  async function worker(){while(!stopped){let i=cursor++;if(i>=jobs.length)break;let job=jobs[i],done=false;
+   for(let attempt=0;attempt<3&&!stopped;attempt++){try{let result=await requestJSON(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...job,fee:cfg.fee,slip:cfg.slip})});
+   if(result.date!==job.day||result.market!==job.market)throw Error('서버 결과 종목/날짜 불일치');state.results[jobKey(job)]=result;save();done=true;break;
+   }catch(e){$('status').textContent='⚠️ '+job.day+' '+job.market+': '+String(e.message||e);if(attempt<2)await new Promise(r=>setTimeout(r,1000*(attempt+1)));}}
+   if(!done){errors++;if(errors>=8)stopped=true;}paint();}}
+  await Promise.all([worker(),worker()]);
+ }catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;paint();}}
+$('run').onclick=run;$('pause').onclick=()=>{stopped=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.28 검사 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);$('coverage').textContent='검사 대기';$('summary').textContent='검사 전';$('daily').textContent='검사 전';$('examples').textContent='검사 전';$('status').textContent='기록 초기화 완료';};
+for(let id of ['day','scope','period','fee','slip'])$(id).addEventListener('change',()=>{if(running)return;let cfg;try{cfg=chosen();}catch{return;}let old=load();state=old&&signature(old.cfg)===signature(cfg)?old:null;if(state)paint();else $('status').textContent='설정이 바뀌었어. 검사 시작을 누르면 새로운 기록으로 실행해.';});
+function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{let cols=['version','date','market','strategy','watch_time_kst','signal_time_kst','entry_time_kst','volume_ratio','breakout_high','outcome','entry','exit','net_pct','minutes','reason','eligible_windows','observed_5m','c5_watches','truncated','scope','period'];
+ let lines=[cols.join(',')];for(let r of Object.values(state.results)){
+ const base={version:'V11.14.28',date:r.date,market:r.market,eligible_windows:r.eligible_windows,observed_5m:r.observed_5m,c5_watches:r.c5_watches,truncated:r.truncated,scope:state.cfg.scope,period:state.cfg.period};
+ // COVERAGE rows preserve no-signal markets and exact denominators for review.
+ lines.push(cols.map(c=>csvCell(({...base,strategy:'COVERAGE'})[c])).join(','));
+ for(let [key] of ARMS)for(let e of r.events?.[key]||[]){let v={...base,...e,strategy:key};lines.push(cols.map(c=>csvCell(v[c])).join(','));}}
+ let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='bithumb_C5_watch_breakout_v111428.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);};
+try{let old=load();if(old){state=old;let c=old.cfg;for(let id of ['day','scope','period','fee','slip'])if(c[id]!==undefined)$(id).value=String(c[id]);paint();}}catch{}
+</script></body></html>'''.replace('/*REPLACE_STYLE*/',C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
+
+
+def register_c5_break_v111428_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cached={'items':None,'at':0.0}
+    lock=Lock()
+    def listed():
+        with lock:
+            if cached['items'] is None or time.time()-cached['at']>600:
+                items=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not items:raise ValueError('현재 KRW 종목을 조회하지 못했습니다')
+                cached.update(items=items,at=time.time())
+            return cached['items']
+    @app.get('/backtest-winrate-c5-breakout')
+    def c5_break_v111428_page():
+        return render_template_string(C5_BREAK_V111428_PAGE)
+    @app.get('/api/winrate14c5breakout/universe')
+    def c5_break_v111428_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.28'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':str(exc)[:160]}),400
+    @app.post('/api/winrate14c5breakout/evaluate')
+    def c5_break_v111428_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config(raw,kst)
+            res=c5_break_v111428_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.28',
+                            'date':cfg['day'].isoformat(),**res})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':str(exc)[:200]}),400
+
+
+_v111427_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111427_register_daytrade_review(app,deps)
+    register_c5_break_v111428_lab(app,deps)
