@@ -10016,3 +10016,418 @@ _v111430_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111430_register_daytrade_review(app,deps)
     register_c5_brooks_v111431_lab(app,deps)
+
+
+# =============================================================================
+# V11.14.32 - BROOKS HIGH 2 DIAGNOSTICS ONLY (RESEARCH)
+# Does not change V11.14.31 A/B/C entries, exits or thresholds.
+# Evaluates a closed-candle-only, stage-by-stage *audit* of the H2 conditions,
+# measures trade features without future information, and exports diagnostics.
+# Older labs, routes, IndexedDB databases and V2 BUY behavior remain intact.
+# =============================================================================
+
+C5_H2_V111432_STAGES = (
+    ('trend','EMA 상승추세'),
+    ('volatility','ATR·EMA 위치'),
+    ('trigger','상승 돌파봉'),
+    ('volume','거래량'),
+    ('h1','첫 번째 상승 시도 H1'),
+    ('pullback','두 번째 눌림'),
+    ('ema','눌림의 EMA 위치'),
+    ('signal','H2 확정'),
+)
+C5_H2_V111432_REJECTS = (
+    'indicators','trend','volatility','trigger','volume','h1','pullback','ema','cooldown'
+)
+
+
+def c5_h2_v111432_stage(rows, i, ind):
+    """Return (last passed gate index 0..8, first failure reason).
+
+    Exact same inequalities, H1 selection order, and closed bars as V11.14.31.
+    A stage is counted per evaluated 5-minute position, *not* per distinct
+    trade or market. The existing v111431 function remains the authority.
+    """
+    e20, e50, at = ind['ema20'], ind['ema50'], ind['atr14']
+    if any(v is None for v in (e20[i-9],e20[i-3],e20[i],e50[i-3],at[i])):
+        return 0,'indicators'
+    atr=at[i]
+    bar=rows[i]
+    if atr<=0 or bar['c']<=0:
+        return 0,'indicators'
+    if not (e20[i-3]>e50[i-3] and e20[i-3]>e20[i-9]*1.0004):
+        return 0,'trend'
+    atr_pct=100*atr/bar['c']
+    if not (0.12<=atr_pct<=4.0 and bar['c']>e20[i]*0.992):
+        return 1,'volatility'
+    width=bar['h']-bar['l']
+    if not (width>0 and bar['c']>bar['o'] and bar['h']>rows[i-1]['h']
+            and bar['c']>rows[i-1]['h']*1.0001
+            and (bar['c']-bar['l'])/width>=0.55):
+        return 2,'trigger'
+    vavg=sum(r['v'] for r in rows[i-20:i])/20
+    if vavg<=0 or bar['v']/vavg<0.80:
+        return 3,'volume'
+    has_h1=False
+    has_second=False
+    for j in range(i-2,i-9,-1):
+        if j<8:break
+        h1=rows[j]
+        if not (h1['h']>rows[j-1]['h'] and
+                rows[j-1]['c']<rows[j-2]['c'] and
+                rows[j-2]['c']<rows[j-3]['c']):
+            continue
+        before_peak=max(q['h'] for q in rows[j-8:j-2])
+        first_low=min(q['l'] for q in rows[j-3:j])
+        if before_peak-first_low<0.6*atr:
+            continue
+        has_h1=True
+        between=rows[j+1:i]
+        if not between or not (rows[i-1]['h']<rows[i-2]['h']):
+            continue
+        second_low=min(q['l'] for q in between)
+        if not (h1['h']-second_low>=0.40*atr and
+                any(rows[k]['c']<rows[k-1]['c'] for k in range(j+1,i))):
+            continue
+        has_second=True
+        pullback_low=min(q['l'] for q in rows[j-3:i])
+        if not (pullback_low<=e20[i-3]+1.6*atr and
+                pullback_low>=e50[i-3]-2.0*atr):
+            continue
+        return 8,'signal'
+    if has_second:
+        return 6,'ema'
+    if has_h1:
+        return 5,'pullback'
+    return 4,'h1'
+
+
+def c5_h2_v111432_features(rows, i, ind, event):
+    """Closed-bar explanatory features only; never used as new entry filters."""
+    e20,e50,at=ind['ema20'],ind['ema50'],ind['atr14']
+    a=at[i]
+    b=rows[i]
+    w=b['h']-b['l']
+    h1_time=event.get('h1_time_kst')
+    j=next((k for k in range(i-2,i-9,-1)
+            if k>=0 and rows[k]['t'].strftime('%Y-%m-%d %H:%M')==h1_time),None)
+    first_depth=None
+    second_depth=None
+    pback_ema=None
+    if j is not None and a and a>0:
+        first_depth=(max(q['h'] for q in rows[j-8:j-2])-
+                     min(q['l'] for q in rows[j-3:j]))/a
+        second_depth=(rows[j]['h']-min(q['l'] for q in rows[j+1:i]))/a
+        pback_ema=(min(q['l'] for q in rows[j-3:i])-e20[i-3])/a
+    return {
+        'h2_ema_gap_pct':round(100*(e20[i-3]/e50[i-3]-1),5) if e50[i-3] else None,
+        'h2_ema20_slope_pct':round(100*(e20[i-3]/e20[i-9]-1),5) if e20[i-9] else None,
+        'h2_close_vs_ema20_atr':round((b['c']-e20[i])/a,5) if a else None,
+        'h2_close_vs_ema50_atr':round((b['c']-e50[i-3])/a,5) if a else None,
+        'h2_first_pullback_atr':round(first_depth,5) if first_depth is not None else None,
+        'h2_second_pullback_atr':round(second_depth,5) if second_depth is not None else None,
+        'h2_pullback_vs_ema20_atr':round(pback_ema,5) if pback_ema is not None else None,
+        'h2_signal_body_ratio':round((b['c']-b['o'])/w,5) if w>0 else None,
+        'h2_signal_close_position':round((b['c']-b['l'])/w,5) if w>0 else None,
+        'h2_prior_high_room_pct':round(100*(max(q['h'] for q in rows[i-24:i])/b['c']-1),5)
+                                 if b['c']>0 else None,
+    }
+
+
+def c5_h2_v111432_evaluate_rows(rows,cfg,market,kst):
+    """Reuses unchanged v111431 results, then attaches diagnostics.
+
+    Assertions protect the legacy C signal count/times from accidental drift.
+    All audit measurements use bars no later than each candidate's closed bar.
+    """
+    from datetime import datetime as _dt, time as _tm
+    result=c5_brooks_v111431_evaluate_rows(rows,cfg,market,kst)
+    ind=c5_brooks_v111431_indicators(rows)
+    start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=start+timedelta(days=1)
+    times={e['signal_time_kst']:e for e in result['events']['C']}
+    diag={'day_positions':0,'eligible':0,'cooldown':0,'diagnosed':0,
+          'passed':{name:0 for name,_ in C5_H2_V111432_STAGES},
+          'rejected':{name:0 for name in C5_H2_V111432_REJECTS},
+          'near_misses':[]}
+    near=[]
+    last_h2=-1000000
+    seen=set()
+    for i in range(len(rows)-1):
+        if start<=rows[i]['t']<end:
+            diag['day_positions']+=1
+        if i<max(65,LAB_WARMUP_BARS) or not (start<=rows[i]['t']<end):
+            continue
+        if not lab_contiguous(rows,i-65,i):
+            continue
+        diag['eligible']+=1
+        if i-last_h2<cfg['bars']:
+            diag['cooldown']+=1
+            diag['rejected']['cooldown']+=1
+            continue
+        diag['diagnosed']+=1
+        passed,reason=c5_h2_v111432_stage(rows,i,ind)
+        for n,(name,_) in enumerate(C5_H2_V111432_STAGES,1):
+            if passed>=n:
+                diag['passed'][name]+=1
+        if reason!='signal':
+            diag['rejected'][reason]+=1
+            if passed>=5:
+                b=rows[i]
+                near.append((passed,{
+                    'market':market,
+                    'signal_time_kst':b['t'].strftime('%Y-%m-%d %H:%M'),
+                    'passed_stage':C5_H2_V111432_STAGES[passed-1][0],
+                    'failed_stage':reason,
+                    'close':round(b['c'],10),
+                    'atr_pct':round(100*ind['atr14'][i]/b['c'],4)
+                              if ind['atr14'][i] and b['c'] else None,
+                }))
+            continue
+        last_h2=i
+        when=rows[i]['t'].strftime('%Y-%m-%d %H:%M')
+        if when not in times:
+            raise RuntimeError('V11.14.32 H2 진단/기존 진입 시각 불일치')
+        seen.add(when)
+        times[when].update(c5_h2_v111432_features(rows,i,ind,times[when]))
+    if (diag['eligible']!=result['h2_eligible_windows'] or
+            diag['passed']['signal']!=result['h2_signals'] or
+            seen!=set(times)):
+        raise RuntimeError('V11.14.32 진단이 V11.14.31 H2 원본 결과와 다릅니다')
+    # Prioritize near-H2 (late rejection); at most 3 diagnostic examples / market.
+    near.sort(key=lambda z:(z[0],z[1]['signal_time_kst']),reverse=True)
+    diag['near_misses']=[x for _,x in near[:3]]
+    result['h2_diagnostics']=diag
+    return result
+
+
+def c5_h2_v111432_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    result=c5_h2_v111432_evaluate_rows(rows,cfg,market,kst)
+    result['truncated']=truncated
+    return result
+
+
+def c5_h2_v111432_make_page():
+    """Fresh lab page, JS and storage. V11.14.31 remains unchanged."""
+    page=C5_BROOKS_V111431_PAGE.replace('V11.14.31','V11.14.32')
+
+    def one(old,new):
+        nonlocal page
+        if page.count(old)!=1:
+            raise RuntimeError('V11.14.32 화면 교체 기준 불일치: '+old[:90])
+        page=page.replace(old,new,1)
+
+    one('<title>V11.14.32 · VOLMAN / BEGGS / BROOKS H2 검증</title>',
+        '<title>V11.14.32 · BROOKS H2 단계별 정밀 진단</title>')
+    one('<h1>🧪 V11.14.32 · VOLMAN / BEGGS / BROOKS H2</h1>',
+        '<h1>🧪 V11.14.32 · BROOKS H2 정밀 진단</h1>')
+    one('알 브룩스 High 2 두 번째 진입 개념 응용 · 기존 결과와 분리 저장',
+        '진입 변경 없는 H2 진단 연구실 · VOLMAN / BEGGS / H2 기존 결과 보존')
+    a=page.index('<section class="panel"><h2>같은 날짜·같은 종목의 세 가지 독립 코호트 비교</h2>')
+    z=page.index('</section>',a)+len('</section>')
+    intro="""<section class="panel"><h2>신호·진입·청산은 V11.14.31과 동일</h2>
+<div class="alert28">
+<b>A VOLMAN · B BEGGS:</b> 기존 V11.14.31 로직을 한 줄도 수정하지 않고 계산.<br>
+<b>C BROOKS H2:</b> 기존 H2 진입 조건 및 ATR, EMA, 거래량 설정과 익절 +1.5% / 손절 -1% / 최대 60분 유지.<br>
+<b>새 기능 1:</b> H2 상승추세 → ATR → 상승 돌파봉 → 거래량 → H1 → 2차 눌림 → EMA 위치의 단계별 통과·탈락 이유 기록.<br>
+<b>새 기능 2:</b> 실제 진입한 H2의 눌림 깊이(ATR), EMA와의 거리, 신호봉 몸통·종가 위치, 직전 고점까지 거리 등 사후 설명용 특징 기록.<br>
+<b>새 기능 3:</b> CSV에 시장별 진단 집계와 H2 신호별 지표, 가깝게 탈락한 예시 최대 3건 저장. 최신 연구실의 독립 DB를 사용하므로 이전 결과는 변경하지 않아.</div>
+<p class="alert28 warn">⚠️ <b>진단 값은 향후 가격이나 결과를 보고 만든 진입 조건이 아니야.</b> 모두 신호 시점까지 완료된 봉으로 계산. H2는 VOLMAN과 독립 진입이므로 신호 1:1 비교는 하지 않아. 단계별 건수는 종목 수나 거래 수가 아닌 <b>검사 가능한 5분봉 위치</b> 수야. 가까운 탈락 예시는 실제 매수 신호가 아니야. 결과 표본이 작으면 어떤 특징이 유리한지 결론 내릴 수 없어.</p>
+</section>"""
+    page=page[:a]+intro+page[z:]
+    one("const API='/api/winrate14c5brooks', KEY='bithumb_c5_brooks_v111431_v1';",
+        "const API='/api/winrate14c5h2diag', KEY='bithumb_c5_h2diag_v111432_v1';")
+    one("const DB_NAME='bithumb_c5_brooks_v111431_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_h2diag_v111432_indexeddb_v1';")
+    page=page.replace('bithumb_C5_VOLMAN_BEGGS_BROOKS_v111431.csv',
+                      'bithumb_C5_VOLMAN_BEGGS_BROOKS_DIAG_v111432.csv')
+
+    panels="""<section class="panel"><h2>5. H2 조건 단계별 통과 현황</h2>
+<p class="small28">단위: 신호가 아니라 검사 가능한 5분봉 위치. 앞 조건을 통과한 경우에만 다음 단계를 검사합니다. 같은 코인이 여러 봉을 제공할 수 있어요.</p>
+<div id="h2_diag_funnel" class="wide28">검사 후 표시</div>
+<h3>가장 먼저 탈락한 조건</h3><div id="h2_diag_reasons" class="wide28">검사 후 표시</div>
+</section>
+<section class="panel"><h2>6. H2 수익·손실 신호의 특징 비교</h2>
+<p class="small28">익절/손절/시간 종료 중 순수익률이 확인된 신호만 포함. 양수/0 이하 그룹의 단순 평균이며 표본이 적으면 차이를 전략 조건으로 사용하지 마세요.</p>
+<div id="h2_diag_outcomes" class="wide28">검사 후 표시</div>
+</section>
+<section class="panel"><h2>7. H2에 가까웠지만 진입하지 않은 봉</h2>
+<p class="small28">H1 또는 두 번째 눌림이 일부 확인된 봉만 예시 표시. 이 표는 매수 신호가 아니며 익절·손절을 계산하지 않습니다.</p>
+<div id="h2_diag_samples" class="wide28">검사 후 표시</div>
+</section>"""
+    if '</main>' not in page:
+        raise RuntimeError('V11.14.32 새 진단 패널을 넣을 수 없는 화면 구조')
+    page=page.replace('</main>',panels+'\n</main>',1)
+
+    script=r"""function paintH2Diagnostics(){
+ const results=Object.values(state.results||{});
+ const digits=(v,n=3)=>v===null||v===undefined||v===''?'—':Number.isFinite(Number(v))?Number(v).toFixed(n):'—';
+ const stageDefs=[['trend','EMA 상승추세'],['volatility','ATR·EMA 위치'],['trigger','상승 돌파봉'],
+  ['volume','거래량'],['h1','H1 첫 상승 시도'],['pullback','두 번째 눌림'],
+  ['ema','눌림의 EMA 위치'],['signal','H2 확정']];
+ const rejectDefs=[['indicators','지표 준비 부족'],['trend','추세 부적합'],
+  ['volatility','ATR/EMA 위치 미충족'],['trigger','상승 돌파봉 미충족'],
+  ['volume','거래량 미충족'],['h1','H1 구조 없음'],
+  ['pullback','두 번째 눌림 없음'],['ema','EMA 부근 눌림 아님'],
+  ['cooldown','동일 종목 재진입 간격 제한']];
+ const sum=(fn)=>results.reduce((a,r)=>a+(Number(fn(r))||0),0);
+ const eligible=sum(r=>r.h2_diagnostics?.eligible), diagnosed=sum(r=>r.h2_diagnostics?.diagnosed);
+ const dayPositions=sum(r=>r.h2_diagnostics?.day_positions),cooldown=sum(r=>r.h2_diagnostics?.cooldown);
+ const withWindows=results.filter(r=>(r.h2_diagnostics?.eligible||0)>0).length;
+ const frows=[tr(['해당 날짜 전체 봉 위치',dayPositions,'—']),
+  tr(['H2 66봉 연속 구간 확보',eligible,'—']),
+  tr(['재진입 간격으로 제외',cooldown,'—']),
+  tr(['H2 조건 순차 검사 대상',diagnosed,'100%'])];
+ for(const [k,lab] of stageDefs){
+  const count=sum(r=>r.h2_diagnostics?.passed?.[k]);
+  frows.push(tr([lab,count,diagnosed?digits(100*count/diagnosed,1)+'%':'—']));
+ }
+ $('h2_diag_funnel').innerHTML='<p class="small28">분석 가능한 종목/날짜 '+withWindows+' / '+results.length+
+  ' · 연속 봉 없는 종목/날짜 '+(results.length-withWindows)+'</p>'+
+  tbl(['순차 판정 단계','봉 위치 수','분석 대상 대비'],frows);
+ const rrows=rejectDefs.map(([k,lab])=>tr([lab,sum(r=>r.h2_diagnostics?.rejected?.[k])]));
+ $('h2_diag_reasons').innerHTML=tbl(['첫 탈락 이유','봉 위치 수'],rrows);
+ const es=eventRows().filter(e=>e.strategy==='C'&&['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+ const good=es.filter(e=>num(e.net_pct)>0),bad=es.filter(e=>num(e.net_pct)<=0);
+ const avg=(arr,key)=>{const a=arr.map(e=>num(e[key])).filter(Number.isFinite);
+   return a.length?a.reduce((x,y)=>x+y,0)/a.length:NaN};
+ const features=[['거래량 / 이전 20봉 평균','volume_ratio',3],['ATR 변동성 (%)','atr_pct',3],
+  ['첫 눌림 깊이 (ATR)','h2_first_pullback_atr',3],
+  ['재눌림 깊이 (ATR)','h2_second_pullback_atr',3],
+  ['20EMA 거리 (ATR)','h2_close_vs_ema20_atr',3],
+  ['20/50EMA 간격 (%)','h2_ema_gap_pct',3],
+  ['20EMA 상승 기울기 (%)','h2_ema20_slope_pct',3],
+  ['봉 몸통 비중','h2_signal_body_ratio',3],
+  ['직전 24봉 고점까지 여유 (%)','h2_prior_high_room_pct',3]];
+ const outrows=features.map(([label,k,n])=>tr([label,digits(avg(good,k),n),digits(avg(bad,k),n)]));
+ $('h2_diag_outcomes').innerHTML='<p class="small28">완료 '+es.length+'건 · 수익 '+good.length+
+  '건 · 손실/본전 '+bad.length+'건 · 미확정은 제외</p>'+
+  tbl(['특징','수익 평균','손실/본전 평균'],outrows);
+ const near=[];for(const r of results)for(const x of r.h2_diagnostics?.near_misses||[])
+    near.push({...x,date:r.date});
+ const names={h1:'H1 구조',pullback:'두 번째 눌림',ema:'EMA 위치'};
+ near.sort((a,b)=>(b.passed_stage==='pullback')-(a.passed_stage==='pullback')||
+  (b.passed_stage==='h1')-(a.passed_stage==='h1')||b.signal_time_kst.localeCompare(a.signal_time_kst));
+ $('h2_diag_samples').innerHTML=near.length?
+  tbl(['날짜','종목','봉 시각','통과 단계','탈락 이유','ATR (%)'],near.slice(0,35).map(e=>
+   tr([e.date,e.market,e.signal_time_kst,names[e.passed_stage]||e.passed_stage||'—',names[e.failed_stage]||e.failed_stage||'—',digits(e.atr_pct,3)]))):
+  '아직 H1에 가까운 탈락 예시가 없어.';
+}
+"""
+    start=page.index('function paint(){')
+    end=page.index('async function requestJSON',start)
+    paint=page[start:end]
+    close=paint.rfind('\n}')
+    if close<0:
+        raise RuntimeError('V11.14.32 화면 통계 함수 연결 실패')
+    paint=paint[:close]+'\n paintH2Diagnostics();'+paint[close:]
+    page=page[:start]+script+paint+page[end:]
+    start=page.index("$('csv').onclick=()=>{")
+    end=page.index('(async()=>{try{let old=await load()',start)
+    exporter=r"""$('csv').onclick=()=>{
+ if(!state)return;
+ const stages=['trend','volatility','trigger','volume','h1','pullback','ema','signal'];
+ const rejects=['indicators','trend','volatility','trigger','volume','h1','pullback','ema','cooldown'];
+ const passCols=stages.map(x=>'h2_pass_'+x),rejectCols=rejects.map(x=>'h2_reject_'+x);
+ const cols=['version','date','market','strategy','base_id','base_signal_time_kst',
+  'signal_time_kst','entry_time_kst','entry_delay_minutes','box_high',
+  'close_position','body_ratio','upper_wick_ratio','break_margin_pct',
+  'h1_time_kst','second_pullback_time_kst','ema20','ema50','atr_pct',
+  'volume_ratio','pullback_depth_atr','resistance_room_pct','h1_to_h2_bars',
+  'h2_ema_gap_pct','h2_ema20_slope_pct','h2_close_vs_ema20_atr',
+  'h2_close_vs_ema50_atr','h2_first_pullback_atr','h2_second_pullback_atr',
+  'h2_pullback_vs_ema20_atr','h2_signal_body_ratio',
+  'h2_signal_close_position','h2_prior_high_room_pct',
+  'outcome','entry','exit','net_pct','minutes','reason',
+  'eligible_windows','h2_eligible_windows','observed_5m','c5_watches',
+  'baseline_signals','h2_signals','truncated','scope','period','fee_pct_side','slip_pct_side',
+  'h2_day_positions','h2_diagnosed','h2_cooldown',...passCols,...rejectCols,
+  'diag_passed_stage','diag_failed_stage'];
+ const lines=[cols.join(',')];
+ for(const r of Object.values(state.results)){
+  const d=r.h2_diagnostics||{};
+  const base={version:'V11.14.32',date:r.date,market:r.market,
+   eligible_windows:r.eligible_windows,h2_eligible_windows:r.h2_eligible_windows,
+   observed_5m:r.observed_5m,c5_watches:r.c5_watches,
+   baseline_signals:r.baseline_signals,h2_signals:r.h2_signals,
+   truncated:r.truncated,scope:state.cfg.scope,period:state.cfg.period,
+   fee_pct_side:state.cfg.fee,slip_pct_side:state.cfg.slip,
+   h2_day_positions:d.day_positions,h2_diagnosed:d.diagnosed,h2_cooldown:d.cooldown};
+  for(const k of stages)base['h2_pass_'+k]=d.passed?.[k]??'';
+  for(const k of rejects)base['h2_reject_'+k]=d.rejected?.[k]??'';
+  const add=v=>lines.push(cols.map(c=>csvCell(v[c])).join(','));
+  add({...base,strategy:'COVERAGE'});
+  for(const [key] of ARMS)for(const e of r.events?.[key]||[])
+   add({...base,...e,strategy:key});
+  for(const e of d.near_misses||[])add({...base,strategy:'H2_NEAR_MISS',
+   signal_time_kst:e.signal_time_kst,diag_passed_stage:e.passed_stage,
+   diag_failed_stage:e.failed_stage,atr_pct:e.atr_pct,
+   outcome:'NOT_A_SIGNAL',reason:'진단용 탈락 봉 — 매수 신호 아님'});
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='bithumb_C5_VOLMAN_BEGGS_BROOKS_DIAG_v111432.csv';a.click();
+ setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+"""
+    page=page[:start]+exporter+page[end:]
+    if "const API='/api/winrate14c5h2diag'" not in page:
+        raise RuntimeError('V11.14.32 API 경로 교체 오류')
+    if 'bithumb_c5_brooks_v111431' in page:
+        raise RuntimeError('V11.14.32 구 버전 DB 혼재')
+    return page
+
+
+C5_H2_V111432_PAGE=c5_h2_v111432_make_page()
+
+
+def register_c5_h2_v111432_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0}
+    lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:
+                    raise ValueError('현재 빗썸 KRW 종목 조회 실패')
+                cache.update(items=markets,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-h2-diagnostics')
+    def c5_h2_v111432_page():
+        return render_template_string(C5_H2_V111432_PAGE)
+
+    @app.get('/api/winrate14c5h2diag/universe')
+    def c5_h2_v111432_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.32'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5h2diag/evaluate')
+    def c5_h2_v111432_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):
+                raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 종목 목록에 없는 코인')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_h2_v111432_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.32',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111431_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111431_register_daytrade_review(app,deps)
+    register_c5_h2_v111432_lab(app,deps)
