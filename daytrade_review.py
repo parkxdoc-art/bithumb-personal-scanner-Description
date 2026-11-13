@@ -7370,3 +7370,231 @@ _v111422_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v111422_register_daytrade_review(app, deps)
     register_c5_ma_v111423_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.24 - Research only: 5-minute SMA12/200 history continuity recheck.
+# Root cause of V11.14.23 CSV GAP_200: 400 observed candles were returned,
+# but absent time slots broke the strictly continuous 200/206-candle window.
+# No attempt is made to fabricate observed exchange candles. This lab has
+# two visibly distinguished data classes: raw-continuous, and cautiously
+# reconstructed no-trade assumptions (last observed close; zero-volume slot).
+# Reconstructed values are a sensitivity analysis, NOT verified exchange OHLC.
+# Existing V2 scanner and every prior lab are preserved byte-for-byte.
+# ---------------------------------------------------------------------------
+
+C5_MA_V111424_MAX_MISSING = 20        # <=9.7% of 206 five-minute slots
+C5_MA_V111424_MAX_GAP_RUN = 3        # <=15 minutes consecutive unobserved
+
+
+def c5_ma_v111424_features(api_get, event, kst):
+    """Compute SMA12/200 on 206 historical 5m slots, never after signal time.
+
+    A missing 5m slot may indicate no trades OR an unavailable API candle.
+    For transparency, only short/sparse gaps use previous-close assumption.
+    Longer gaps are 'UNVERIFIED_GAP' and no MA signal is assigned.
+    """
+    market = event['market']
+    signal = local_time(event['signal_time_kst'], kst)
+    step = timedelta(minutes=5)
+    if signal.second or signal.microsecond or signal.minute % 5:
+        raise ValueError('신호 시각이 5분봉 기준에 맞지 않습니다')
+    start = signal - 205*step
+    exclusive = signal + step
+    cursor = exclusive
+    found = {}
+    pages = 0
+    earliest = None
+    # Two pages normally suffice. Extra pages only when 206-slot window
+    # and a preceding close have not been reached because of sparse trading.
+    for _ in range(4):
+        raw = api_get('/v1/candles/minutes/5', {
+            'market': market, 'count': 200,
+            'to': cursor.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        pages += 1
+        if not isinstance(raw, list):
+            raise ValueError('빗썸 캔들 응답이 목록이 아닙니다')
+        page_oldest = None
+        for b in raw:
+            if not isinstance(b, dict):
+                continue
+            try:
+                t = local_time(b['candle_date_time_kst'], kst)
+                price = float(b['trade_price'])
+            except (ValueError, TypeError, KeyError, OverflowError):
+                continue
+            if not isfinite(price) or price <= 0 or t >= exclusive:
+                continue
+            if t not in found:
+                found[t] = price
+            if page_oldest is None or t < page_oldest:
+                page_oldest = t
+        if page_oldest is None:
+            break
+        if page_oldest >= cursor:
+            raise ValueError('캔들 페이지 진행이 멈췄습니다')
+        earliest = page_oldest if earliest is None or page_oldest < earliest else earliest
+        if earliest <= start or len(raw) < 200:
+            break
+        cursor = page_oldest
+
+    result = {
+        'id': event['id'], 'signal_time_kst': event['signal_time_kst'],
+        'history_status': 'SOURCE_SHORT', 'data_quality': 'UNAVAILABLE',
+        'pages': pages, 'observed_bars': len(found),
+        'actual_slots_206': None, 'filled_slots_206': None,
+        'max_gap_run': None, 'strict200_ok': False, 'strict206_ok': False,
+        'sma12': None, 'sma200': None,
+        'sma200_slope6_pct': None, 'distance12_200_pct': None,
+        'ma_above': None, 'ma_cross6': None, 'ma_slope6': None,
+        'signal_close': found.get(signal),
+    }
+    if signal not in found:
+        result['history_status'] = 'SIGNAL_NOT_OBSERVED'
+        return result
+    if earliest is None or earliest > start:
+        return result
+
+    # Need an observed candle at or before window start to avoid guessing
+    # its initial close when the first slot is empty.
+    prior_times = [t for t in found if t <= start]
+    if not prior_times:
+        return result
+    prior_time = max(prior_times)
+    last_close = found[prior_time]
+    closes = []
+    missing = []
+    longest = run = 0
+    for j in range(206):
+        t = start + j * step
+        if t in found:
+            last_close = found[t]
+            run = 0
+        else:
+            missing.append(j)
+            run += 1
+            longest = max(longest, run)
+        closes.append(last_close)
+    n_missing = len(missing)
+    raw200_ok = not any(j >= 6 for j in missing)
+    raw206_ok = not missing
+    result.update(actual_slots_206=206-n_missing,
+                  filled_slots_206=n_missing,
+                  max_gap_run=longest,
+                  strict200_ok=raw200_ok,
+                  strict206_ok=raw206_ok)
+
+    if n_missing > C5_MA_V111424_MAX_MISSING or longest > C5_MA_V111424_MAX_GAP_RUN:
+        result['history_status'] = 'UNVERIFIED_GAP'
+        return result
+
+    ma12 = sum(closes[-12:]) / 12
+    ma200 = sum(closes[-200:]) / 200
+    earlier200 = sum(closes[:200]) / 200
+    crossed = False
+    for end in range(201, 207):
+        prev12 = sum(closes[end-13:end-1]) / 12
+        prev200 = sum(closes[end-201:end-1]) / 200
+        now12 = sum(closes[end-12:end]) / 12
+        now200 = sum(closes[end-200:end]) / 200
+        if prev12 <= prev200 and now12 > now200:
+            crossed = True
+            break
+    result.update(
+        history_status='RAW_OK' if raw206_ok else 'REBUILT_5M',
+        data_quality='RAW' if raw206_ok else 'CARRY_FORWARD_ASSUMPTION',
+        sma12=round(ma12, 10), sma200=round(ma200, 10),
+        sma200_slope6_pct=round((ma200 / earlier200 - 1) * 100, 6),
+        distance12_200_pct=round((ma12 / ma200 - 1) * 100, 6),
+        ma_above=bool(ma12 > ma200),
+        ma_cross6=bool(ma12 > ma200 and crossed),
+        ma_slope6=bool(ma12 > ma200 and ma200 > earlier200),
+    )
+    return result
+
+
+C5_MA_V111424_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.24 · C5 볼먼 12/200이평 공백 재검증</title>
+<style>/*REPLACE_STYLE*/</style></head><body>
+<main class="wrap"><header><div><small>연구 검증실 · 기존 V2 변경 없음</small>
+<h1>🔬 V11.14.24 · 볼먼 + 12/200이평 재검증</h1>
+<p>11월 8·9·11일 기존 볼먼 신호 74건 · 과거 5분봉 공백 진단 및 보수적 보완</p></div>
+<a class="btn secondary" href="/">V2 스캐너</a></header>
+<section class="panel"><h2>검증 방식</h2>
+<p>기존 V11.14.23에서 74건 모두 400개의 거래 캔들을 조회했지만, 5분 간격이 끊긴 사례가 많았어.
+이번에는 <b>실제 연속 5분봉(RAW)</b>과 <b>중간 5분 구간에 직전 종가를 대입한 보완 계산(가정)</b>을 분리해.</p>
+<p class="hint">⚠️ 보완 값은 거래소가 제공한 실제 봉이 아니야. 거래 미발생과 데이터 장애를 확실히 구별할 수 없어서, 빠진 구간이 206봉 중 20개를 넘거나 3봉 연속 넘으면 판정하지 않아.
+신호 당일 이후 봉은 사용하지 않아. 이 연구는 거래 추천이 아니야.</p>
+<div class="actions"><button id="run">74건 재검사 / 이어하기</button><button class="secondary" id="pause" disabled>일시 중지</button><button class="secondary" id="reset">이 검증 초기화</button><button class="secondary" id="csv" disabled>결과 CSV 저장</button></div>
+<progress id="progress" max="74" value="0"></progress><div class="status" id="status">원본 신호 불러오는 중</div></section>
+<section class="panel"><h2>1. 자료 확보 현황</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>2. 3일 합산 성적 (비교 가능한 표본 표시)</h2><div id="overall" class="scroll">검사 전</div></section>
+<section class="panel"><h2>3. 날짜별 결과</h2><div id="byday" class="scroll">검사 전</div></section>
+<section class="panel"><h2>4. 신호별 이평 판정과 공백</h2><div id="examples" class="scroll">검사 전</div></section>
+</main><script>
+'use strict';
+const API='/api/winrate14c5ma12200v2',KEY='bithumb_v111424_c5_ma_history_v1',DAYS=['2026-11-08','2026-11-09','2026-11-11'];
+const $=id=>document.getElementById(id),num=v=>v==null||v===''?NaN:Number(v);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pct=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+const ARMS=[['base','원본 볼먼 전체'],['comparable','볼먼 (동일 비교표본)'],['ma_above','볼먼 + 12>200'],['ma_cross6','볼먼 + 최근 6봉 상향교차'],['ma_slope6','볼먼 + 12>200·200상승']];
+let seeds=[],state=null,running=false,stopping=false;
+function card(a,b){return `<div class="stat"><small>${esc(a)}</small><strong>${esc(b)}</strong></div>`;}
+function row(xs){return '<tr>'+xs.map(x=>'<td>'+esc(x)+'</td>').join('')+'</tr>';}
+function table(h,rs){return '<table><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+rs.join('')+'</tbody></table>';}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x&&x.version===1&&x.results&&typeof x.results==='object'?x:null;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function done(){return seeds.length===74&&seeds.every(e=>Object.prototype.hasOwnProperty.call(state.results,e.id));}
+function flag(e,k){if(k==='base')return true;const r=state.results[e.id];if(!r)return null;if(k==='comparable')return r.data_quality!=='UNAVAILABLE';return r[k];}
+function metrics(items,k){const taken=items.filter(e=>flag(e,k)===true),judged=taken.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(num(e.net_pct))),n=judged.length,sum=judged.reduce((s,e)=>s+num(e.net_pct),0);return {total:taken.length,judged:n,unknown:taken.length-n,win:judged.filter(e=>num(e.net_pct)>0).length,avg:n?sum/n:NaN,tp:judged.filter(e=>e.outcome==='TP').length,sl:judged.filter(e=>e.outcome==='SL').length,time:judged.filter(e=>e.outcome==='TIME').length,unavailable:k==='base'?0:items.filter(e=>flag(e,k)===null).length};}
+function report(items){const baseline=metrics(items,'comparable');return table(['전략','통과','손익확정','수익비율','평균순손익','동일표본 볼먼 대비','TP/SL/TIME','이평 미확인'],ARMS.map(([key,title])=>{const m=metrics(items,key);return row([title,m.total,m.judged,pct(m.judged?m.win/m.judged*100:NaN),pct(m.avg),pct(Number.isFinite(m.avg)&&Number.isFinite(baseline.avg)?m.avg-baseline.avg:NaN),`${m.tp}/${m.sl}/${m.time}`,m.unavailable]);}));}
+function paint(){if(!seeds.length||!state)return;const checked=seeds.filter(e=>state.results[e.id]).length,finished=done();$('csv').disabled=!finished;$('progress').max=74;$('progress').value=checked;const r=seeds.map(e=>state.results[e.id]).filter(Boolean);const raw=r.filter(x=>x.data_quality==='RAW').length,filled=r.filter(x=>x.data_quality==='CARRY_FORWARD_ASSUMPTION').length,missing=r.filter(x=>x.data_quality==='UNAVAILABLE').length;const totalGap=r.reduce((a,x)=>a+(x.filled_slots_206||0),0);
+$('coverage').innerHTML=card('원본 볼먼 신호',seeds.length+'건')+card('재검사',checked+'/74')+card('원본 연속 206봉',raw+'건')+card('단기 공백 가정보완',filled+'건')+card('판정 불가',missing+'건')+card('누락 슬롯 합계',totalGap+'개');
+$('status').textContent=(finished?'✅ 74건 검사 완료':running?'⏳ 당시 5분봉 확인 중':'검사 준비 / 이어하기 가능')+` · ${checked}/74건`+(finished?'\n원본과 가정 보완 결과를 구분해서 해석하고 CSV를 저장해줘.':'\n신호 성과는 이전 CSV의 원본 값을 그대로 사용해.');
+$('overall').innerHTML=report(seeds)+(finished?'':'<p class="hint">추가 전략 성적은 검사 중인 일부 자료만 반영했어.</p>')+'<p class="hint">동일표본 대비는 같은 자료 확인 가능한 볼먼 신호들과 비교한 값이야. 서로 다른 필터 통과 집합이므로 성과 향상을 단정할 수 없어.</p>';
+$('byday').innerHTML=DAYS.map(d=>`<h3>${d}</h3>`+report(seeds.filter(e=>e.date===d))).join('');
+$('examples').innerHTML=r.length?table(['날짜','종목','원본 순손익','12>200','6봉 교차','200상승','실제 5분봉','빈 구간','최대 연속 공백','자료 판정'],seeds.filter(e=>state.results[e.id]).map(e=>{const x=state.results[e.id],f=k=>x[k]===null?'미확인':x[k]?'O':'X';return row([e.date,e.market,pct(num(e.net_pct)),f('ma_above'),f('ma_cross6'),f('ma_slope6'),x.actual_slots_206??'—',x.filled_slots_206??'—',x.max_gap_run??'—',x.history_status]);})):'검사 전';}
+async function fetchJson(url,opts={}){const c=new AbortController(),t=setTimeout(()=>c.abort(),110000);try{const resp=await fetch(url,{...opts,cache:'no-store',signal:c.signal});const d=await resp.json();if(!resp.ok||!d.ok)throw Error(d.error||`HTTP ${resp.status}`);return d;}finally{clearTimeout(t);}}
+async function init(){const d=await fetchJson(API+'/seed');if(!Array.isArray(d.items)||d.items.length!==74)throw Error('원본 74건을 불러올 수 없어');seeds=d.items;state=load();if(!state||state.source_sha!==d.source_sha)state={version:1,source_sha:d.source_sha,results:{}};save();paint();}
+async function run(){if(running||!seeds.length)return;running=true;stopping=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;const pending=seeds.filter(e=>!state.results[e.id]);let index=0,errors=0;try{async function worker(){while(!stopping){const e=pending[index++];if(!e)return;for(let attempt=0;attempt<3&&!stopping;attempt++){try{const d=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:e.id})});const r=d.result;if(r.id!==e.id||![true,false,null].includes(r.ma_above)||![true,false,null].includes(r.ma_cross6)||![true,false,null].includes(r.ma_slope6))throw Error('판정 형식 오류');state.results[e.id]=r;save();paint();break;}catch(err){if(attempt===2){errors++;$('status').textContent=`⚠️ ${e.market}: ${String(err.message||err)} · 다시 검사하면 이어서 진행`;if(errors>=5)stopping=true;}else await new Promise(resolve=>setTimeout(resolve,700*(attempt+1)));}}}}await Promise.all([worker(),worker()]);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;paint();if(errors)$('status').textContent+=`\n실패 ${errors}건 · 다시 눌러 이어하기`;}}
+$('run').onclick=run;$('pause').onclick=()=>{stopping=true;$('pause').disabled=true;};$('reset').onclick=()=>{if(running||!state)return;if(!confirm('이번 12/200 공백 재검사 기록만 초기화할까?'))return;state={version:1,source_sha:state.source_sha,results:{}};save();paint();};
+function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!done())return;const cols=['version','date','market','signal_time_kst','strategy','status','outcome','net_pct','data_quality','history_status','actual_slots_206','filled_slots_206','max_gap_run','strict200_ok','strict206_ok','ma_above','ma_cross6','ma_slope6','sma12','sma200','sma200_slope6_pct','distance12_200_pct','observed_bars','pages','entry','exit','minutes'];const lines=[cols.join(',')];for(const e of seeds){const r=state.results[e.id];for(const [key] of ARMS){const f=flag(e,key),o={...e,...r,version:'V11.14.24',strategy:key,status:f===null?'FEATURE_UNAVAILABLE':f?'ACCEPTED':'BLOCKED'};lines.push(cols.map(k=>csvCell(o[k])).join(','));}}const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download='bithumb_C5_volman_MA12_200_HISTORY_v111424.csv';a.click();setTimeout(()=>URL.revokeObjectURL(u),2000);};
+init().catch(e=>{$('status').textContent='⚠️ '+String(e.message||e);});
+</script></body></html>""".replace('/*REPLACE_STYLE*/', C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
+
+
+def register_c5_ma_v111424_lab(app, deps):
+    api_get, kst = deps['api_get'], deps['KST']
+
+    @app.get('/backtest-winrate-c5-ma12200-history')
+    def c5_ma_v111424_page():
+        return render_template_string(C5_MA_V111424_PAGE)
+
+    @app.get('/api/winrate14c5ma12200v2/seed')
+    def c5_ma_v111424_seed():
+        return jsonify({'ok': True, 'rule_version': 'V11.14.24',
+                        'source_sha': C5_MA_V111423_SEED_SHA,
+                        'items': C5_MA_V111423_SEEDS})
+
+    @app.post('/api/winrate14c5ma12200v2/evaluate')
+    def c5_ma_v111424_evaluate():
+        try:
+            body = request.get_json(silent=True)
+            event_id = body.get('id') if isinstance(body, dict) else None
+            if type(event_id) is not int or event_id not in C5_MA_V111423_BY_ID:
+                raise ValueError('74개 기존 신호 중 하나를 지정해 주세요')
+            r = c5_ma_v111424_features(api_get, C5_MA_V111423_BY_ID[event_id], kst)
+            return jsonify({'ok': True, 'rule_version': 'V11.14.24', 'result': r})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:180]}), 400
+
+
+_v111423_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app, deps):
+    _v111423_register_daytrade_review(app, deps)
+    register_c5_ma_v111424_lab(app, deps)
