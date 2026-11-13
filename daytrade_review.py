@@ -8807,7 +8807,7 @@ const cell=v=>'<td>'+esc(v)+'</td>';
 const tr=xs=>'<tr>'+xs.map(cell).join('')+'</tr>';
 const tbl=(headers,rs)=>'<table><thead><tr>'+headers.map(v=>'<th>'+esc(v)+'</th>').join('')+'</tr></thead><tbody>'+rs.join('')+'</tbody></table>';
 const stat=(name,value)=>'<div class="stat"><small>'+esc(name)+'</small><strong>'+esc(value)+'</strong></div>';
-let state=null,running=false,stopped=false,errors=0;
+let state=null,running=false,stopped=false,errors=0,lastError='';
 const signature=cfg=>JSON.stringify(cfg);
 function chosen(){const day=$('day').value,period=$('period').value,scope=$('scope').value,fee=num($('fee').value),slip=num($('slip').value);
  if(!/^\d{4}-\d{2}-\d{2}$/.test(day))throw Error('검증 날짜를 골라줘');
@@ -8827,7 +8827,7 @@ function paint(){if(!state)return;let finishedJobs=Object.keys(state.results).le
  let valid=Object.values(state.results).reduce((a,r)=>a+(r.eligible_windows||0),0);
  $('coverage').innerHTML=stat('완료',finishedJobs+' / '+items)+stat('C5 WATCH',c5)+stat('분석 가능 봉 위치',valid)+stat('총 발생 신호',es.length)+stat('조회 오류',errors)+stat('결과 미확정',es.filter(e=>e.outcome==='UNKNOWN').length);
  $('csv').disabled=!es.length;
- $('status').textContent=(complete?'✅ 선택한 구간 검증 완료':running?'⏳ 조회 중':'중단 / 이어하기 가능')+' · '+finishedJobs+'/'+items+'건'+(errors?'\n⚠️ 일부 조회 실패: 다음에 이어하기를 실행하면 누락된 종목만 검사해.':'')+(complete?'\n최종 숫자도 과거 모의검증이므로 독립 날짜에서 재확인해야 해.':'\n검사가 모두 끝나기 전 숫자는 임시 통계야.');
+ $('status').textContent=(complete?'✅ 선택한 구간 검증 완료':running?'⏳ 조회 중':'중단 / 이어하기 가능')+' · '+finishedJobs+'/'+items+'건'+(errors?'\n⚠️ 조회 실패 '+errors+'건 · '+lastError+' · 다시 누르면 미완료 종목부터 이어서 검사해.':'')+(complete?'\n최종 숫자도 과거 모의검증이므로 독립 날짜에서 재확인해야 해.':'\n검사가 모두 끝나기 전 숫자는 임시 통계야.');
  let sums=ARMS.map(([k,label])=>{let a=calculate(es.filter(e=>e.strategy===k));return tr([label,a.total,a.done,a.miss,a.win,a.tp,a.sl,a.tm,pct(a.winRate),pct(a.avg)]);});
  $('summary').innerHTML=tbl(['전략','신호','확정','미확정','수익 거래','익절','손절','시간만료','수익 거래 비율','평균 순손익'],sums);
  let dates=[...new Set(state.items.map(j=>j.day))].sort();
@@ -8842,12 +8842,12 @@ async function prepare(cfg){let old=load();if(old&&signature(old.cfg)===signatur
  let res=await requestJSON(API+'/universe');let markets=cfg.scope==='40'?sample(res.items,40):res.items;
  let days=cfg.period==='week'?DAYS:[cfg.day];
  state={version:1,cfg,items:days.flatMap(day=>markets.map(market=>({day,market}))),results:{}};save();paint();}
-async function run(){if(running)return;running=true;stopped=false;errors=0;$('run').disabled=true;$('pause').disabled=false;
+async function run(){if(running)return;running=true;stopped=false;errors=0;lastError='';$('run').disabled=true;$('pause').disabled=false;
  try{let cfg=chosen();await prepare(cfg);let jobs=state.items.filter(j=>!state.results[jobKey(j)]),cursor=0;
   async function worker(){while(!stopped){let i=cursor++;if(i>=jobs.length)break;let job=jobs[i],done=false;
-   for(let attempt=0;attempt<3&&!stopped;attempt++){try{let result=await requestJSON(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...job,fee:cfg.fee,slip:cfg.slip})});
+   for(let attempt=0;attempt<3&&!stopped;attempt++){try{let result=await requestJSON(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...job,date:job.day,fee:cfg.fee,slip:cfg.slip})});
    if(result.date!==job.day||result.market!==job.market)throw Error('서버 결과 종목/날짜 불일치');state.results[jobKey(job)]=result;save();done=true;break;
-   }catch(e){$('status').textContent='⚠️ '+job.day+' '+job.market+': '+String(e.message||e);if(attempt<2)await new Promise(r=>setTimeout(r,1000*(attempt+1)));}}
+   }catch(e){lastError=job.day+' '+job.market+': '+String(e.message||e);$('status').textContent='⚠️ '+lastError;if(attempt<2)await new Promise(r=>setTimeout(r,1000*(attempt+1)));}}
    if(!done){errors++;if(errors>=8)stopped=true;}paint();}}
   await Promise.all([worker(),worker()]);
  }catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;paint();}}
@@ -8896,7 +8896,10 @@ def register_c5_break_v111428_lab(app,deps):
             if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
                 raise ValueError('KRW 종목 형식 오류')
             if market not in set(listed()):raise ValueError('현재 KRW 목록에 없는 종목')
-            cfg=c5_v111417_config(raw,kst)
+            # The browser submits `day` per individual job.  The shared
+            # C5 validator expects `date`; accept either field so both the
+            # fixed page and older cached pages keep working.
+            cfg=c5_v111417_config({**raw, 'date':raw.get('date') or raw.get('day')},kst)
             res=c5_break_v111428_evaluate_symbol(api_get,market,cfg,kst)
             return jsonify({'ok':True,'version':'V11.14.28',
                             'date':cfg['day'].isoformat(),**res})
