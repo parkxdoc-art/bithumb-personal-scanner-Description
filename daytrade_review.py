@@ -9399,3 +9399,268 @@ _v111428_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111428_register_daytrade_review(app,deps)
     register_c5_mack_v111429_lab(app,deps)
+
+# ---------------------------------------------------------------------------
+# V11.14.30 - RESEARCH ONLY: Volman baseline vs Lance Beggs-inspired
+# post-breakout quality and acceptance, not the original discretionary system.
+# Preserves original C5/Volman A signal and all older labs; no V2 edits.
+# B: evaluates only information available at the original closed signal bar.
+# C: evaluates the NEXT completed 5m bar and enters at the following open.
+# Both conditions were fixed before collecting any V11.14.30 results.
+# ---------------------------------------------------------------------------
+
+C5_BEGGS_V111430_ARMS = (
+    ('A', '기존 볼먼 즉시 진입 (기준)'),
+    ('B', '랜스 응용: 돌파봉 힘 확인'),
+    ('C', '랜스 응용: 다음 봉 돌파 안착 확인'),
+)
+
+
+def c5_beggs_v111430_quality(bar, box_top):
+    """Completed breakout candle only; no future bar reference.
+
+    These cutoffs are *experimental hypotheses*, not thresholds proposed by
+    Lance Beggs.  Genuine 0-range candles are rejected without division.
+    """
+    width = bar['h']-bar['l']
+    if width <= 0 or box_top <= 0:
+        return {'accepted':False,'close_position':None,'body_ratio':None,
+                'upper_wick_ratio':None,'break_margin_pct':None}
+    close_pos = (bar['c']-bar['l'])/width
+    body = (bar['c']-bar['o'])/width
+    upper = (bar['h']-max(bar['c'],bar['o']))/width
+    break_margin = 100*(bar['c']/box_top-1)
+    eligible = (close_pos >= .70 and body >= .40 and upper <= .30
+                and break_margin >= .02)
+    return {'accepted':eligible,'close_position':round(close_pos,5),
+            'body_ratio':round(body,5),'upper_wick_ratio':round(upper,5),
+            'break_margin_pct':round(break_margin,5)}
+
+
+def c5_beggs_v111430_evaluate_rows(rows, cfg, market, kst):
+    """Evaluate same historical Volman parent events as V11.14.29.
+
+    B is a filter applied to the ORIGINAL A entry time/price. C is a
+    one-candle delayed confirmation: signal at i+1, buy open at i+2.
+    In particular C does not secretly 'filter' an entry at time i+1 using
+    information from i+1; this avoids look-ahead bias.
+    """
+    from datetime import datetime as _dt, time as _tm
+    day_start = _dt.combine(cfg['day'], _tm.min, tzinfo=kst)
+    day_end = day_start+timedelta(days=1)
+    step = timedelta(minutes=5)
+    events = {'A':[], 'B':[], 'C':[]}
+    eligible = 0
+    c5_count = 0
+    last_c5 = -1000000
+
+    for i in range(LAB_WARMUP_BARS, len(rows)-1):
+        if not day_start <= rows[i]['t'] < day_end:
+            continue
+        if not lab_contiguous(rows, i-25, i):
+            continue
+        eligible += 1
+        if i-last_c5 < cfg['bars'] or not c5_v111417_signal(rows,i):
+            continue
+        last_c5 = i
+        c5_count += 1
+        if c5_expert_v111422_gates(rows,i)['volman'] is not True:
+            continue
+        box_top = max(r['h'] for r in rows[i-6:i])
+        base_time = rows[i]['t'].strftime('%Y-%m-%d %H:%M')
+        base_id = market+'|'+base_time
+        quality = c5_beggs_v111430_quality(rows[i],box_top)
+        shared = {
+            'market':market,'base_id':base_id,'base_signal_time_kst':base_time,
+            'box_high':round(box_top,10),
+            'close_position':quality['close_position'],
+            'body_ratio':quality['body_ratio'],
+            'upper_wick_ratio':quality['upper_wick_ratio'],
+            'break_margin_pct':quality['break_margin_pct'],
+        }
+
+        def make(arm, signal_i=None, reason='', outcome='NO_ENTRY'):
+            ev = dict(shared)
+            ev.update(strategy=arm,
+                      signal_time_kst=(rows[signal_i]['t'].strftime('%Y-%m-%d %H:%M')
+                                       if signal_i is not None else ''),
+                      entry_time_kst=((rows[signal_i]['t']+step).strftime('%Y-%m-%d %H:%M')
+                                      if signal_i is not None else ''),
+                      entry_delay_minutes=((signal_i-i)*5 if signal_i is not None else None),
+                      reason=reason)
+            if signal_i is None:
+                ev.update(outcome=outcome,net_pct=None,entry=None,exit=None,minutes=None)
+            else:
+                ev.update(lab_outcome_v11145(rows,signal_i,cfg))
+            return ev
+
+        baseline=make('A',i)
+        events['A'].append(baseline)
+        if quality['accepted']:
+            # This is the identical entry and outcome as A; filter only.
+            events['B'].append(make('B',i))
+        else:
+            events['B'].append(make('B',reason='돌파봉 힘 조건 미충족'))
+
+        if i+1 >= len(rows) or rows[i+1]['t']-rows[i]['t'] != step:
+            events['C'].append(make('C',reason='다음 완료 5분봉이 없어 확인 불가',
+                                    outcome='UNKNOWN'))
+        else:
+            next_bar=rows[i+1]
+            # 0.25% wick tolerance near the original six-bar box ceiling;
+            # closing above it is required to establish price acceptance.
+            accepted=(next_bar['c'] > box_top and
+                      next_bar['l'] >= box_top*(1-.0025))
+            if accepted:
+                events['C'].append(make('C',i+1))
+            else:
+                events['C'].append(make('C',reason='다음 봉에서 돌파 가격 안착 실패'))
+
+    return {'market':market,'observed_5m':len(rows),
+            'eligible_windows':eligible,'c5_watches':c5_count,
+            'baseline_signals':len(events['A']), 'events':events}
+
+
+def c5_beggs_v111430_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    answer=c5_beggs_v111430_evaluate_rows(rows,cfg,market,kst)
+    answer['truncated']=truncated
+    return answer
+
+
+def c5_beggs_v111430_make_page():
+    """Clone only the proven presentation/checkpoint logic from V11.14.29.
+
+    The IndexedDB store and API endpoint are new and isolated so earlier
+    experiments are never overwritten or deleted.
+    """
+    page=C5_MACK_V111429_PAGE.replace('V11.14.29','V11.14.30')
+
+    def one(old,new):
+        nonlocal page
+        if page.count(old) != 1:
+            raise RuntimeError('V11.14.30 화면 연결 기준 불일치: '+old[:90])
+        page=page.replace(old,new,1)
+
+    one('<title>V11.14.30 · 볼먼 vs 두 번째 진입 비교</title>',
+        '<title>V11.14.30 · 볼먼과 랜스 벡스 돌파 검증</title>')
+    one('<h1>🧪 V11.14.30 · 볼먼 vs 두 번째 진입</h1>',
+        '<h1>🧪 V11.14.30 · 볼먼 + 랜스 벡스 돌파 감별</h1>')
+    one('맥(PATS) 2차 진입 원칙을 5분봉으로 수치화한 연구실 · 별도 브라우저 DB에 저장',
+        '랜스 벡스의 돌파 후 강도·안착 관찰 원칙 응용 · 별도 브라우저 DB에 저장')
+    start=page.index('<section class="panel"><h2>동일한 볼먼 신호에서 3가지 진입 비교</h2>')
+    end=page.index('</section>',start)+len('</section>')
+    introduction='''<section class="panel"><h2>기존 볼먼 신호에 다른 트레이더의 원칙을 더한 비교</h2>
+<div class="alert28">
+<b>A. 기존 볼먼 (유지):</b> C5 + 가격 압축 돌파 직후 다음 5분봉 시가에 진입. 기존 V11.14.29와 같은 규칙.<br>
+<b>B. 돌파봉 강도 확인:</b> 원래 볼먼 신호봉이 캔들 전체 범위의 상위 30%에서 마감, 양봉 몸통 비율 40% 이상, 상단 꼬리 30% 이하, 박스 고점 대비 종가 +0.02% 이상이면 A와 동일한 시점에 진입.<br>
+<b>C. 다음 봉 안착 확인:</b> 돌파 직후 다음 완료 5분봉이 기존 박스 고점 위로 마감하고 저가가 고점보다 0.25% 초과 아래로 이탈하지 않으면 그다음 봉 시가에 진입.<br>
+<b>공통:</b> 익절 +1.5%, 손절 -1%, 최대 보유 60분, 수수료·슬리피지 기본값 유지. 실전 V2 BUY는 그대로.</div>
+<p class="alert28 warn">⚠️ 랜스 벡스의 <b>돌파 실패·돌파 후 가격 행동 관찰 원칙을 기계적으로 응용</b>한 실험이야. 위 수치 기준은 연구용 가설이지 그가 직접 제시한 고정 지표가 아니야. B는 미래 봉을 보지 않고 기존 A와 같은 진입가를 사용해. C는 다음 5분봉이 마감한 뒤에만 판단하고 <b>그다음 봉 시가에 새로 진입</b>해. 취소는 NO_ENTRY, 캔들 부족은 UNKNOWN으로 기록해.</p>
+</section>'''
+    page=page[:start]+introduction+page[end:]
+    one("const API='/api/winrate14c5mack', KEY='bithumb_c5_mack_v111429_v1';",
+        "const API='/api/winrate14c5beggs', KEY='bithumb_c5_beggs_v111430_v1';")
+    one("const DB_NAME='bithumb_c5_mack_v111429_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_beggs_v111430_indexeddb_v1';")
+    one("const ARMS=[['A','기존 볼먼 즉시 진입'],['B','첫 눌림 뒤 1차 진입'],['C','두 번째 진입 (맥 응용)']];",
+        "const ARMS=[['A','기존 볼먼'],['B','돌파봉 강도 확인'],['C','다음 봉 안착 확인']];")
+
+    # Unknown with no possible signal bar must still appear in missing count.
+    page=page.replace('miss:entered.length-trades.length,',
+                      "miss:es.filter(e=>e.outcome==='UNKNOWN').length,")
+
+    start=page.index("$('csv').onclick=()=>{")
+    end=page.index("(async()=>{try{let old=await load()",start)
+    page=page[:start]+r'''$('csv').onclick=()=>{
+ if(!state)return;
+ const cols=['version','date','market','strategy','base_id','base_signal_time_kst',
+  'signal_time_kst','entry_time_kst','entry_delay_minutes','box_high',
+  'close_position','body_ratio','upper_wick_ratio','break_margin_pct',
+  'outcome','entry','exit','net_pct','minutes','reason',
+  'eligible_windows','observed_5m','c5_watches','baseline_signals','truncated','scope','period'];
+ const lines=[cols.join(',')];
+ for(const r of Object.values(state.results)){
+  const base={version:'V11.14.30',date:r.date,market:r.market,
+   eligible_windows:r.eligible_windows,observed_5m:r.observed_5m,
+   c5_watches:r.c5_watches,baseline_signals:r.baseline_signals,
+   truncated:r.truncated,scope:state.cfg.scope,period:state.cfg.period};
+  lines.push(cols.map(c=>csvCell(({...base,strategy:'COVERAGE'})[c])).join(','));
+  for(const [key] of ARMS)for(const e of r.events?.[key]||[]){
+   const v={...base,...e,strategy:key};
+   lines.push(cols.map(c=>csvCell(v[c])).join(','));
+  }
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='bithumb_C5_VOLMAN_BEGGS_v111430.csv';a.click();
+ setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+'''+page[end:]
+    page=page.replace('V11.14.30 서버 진단 정보','V11.14.30 서버 진단 정보')
+    page=page.replace('B 실제 진입','B 강도 통과').replace('C 실제 진입','C 안착 통과')
+    page=page.replace('1차·2차 비교 목록 불일치','돌파 확인 비교 목록 불일치')
+    page=page.replace('V11.14.30 검사 초기화','V11.14.30 검사 초기화')
+    page=page.replace('원래 볼먼 시각','기존 볼먼 시각')
+    page=page.replace('2. 동일 볼먼 신호 A/B/C 짝비교',
+                      '2. 기존 볼먼 / 돌파봉 강도 / 다음 봉 안착 비교')
+    if '/api/winrate14c5mack' in page or 'bithumb_c5_mack_v111429' in page:
+        raise RuntimeError('V11.14.30 새로운 검증실에 과거 API/DB 키가 남아 있음')
+    if "const API='/api/winrate14c5beggs'" not in page:
+        raise RuntimeError('V11.14.30 API 연결 오류')
+    return page
+
+
+C5_BEGGS_V111430_PAGE=c5_beggs_v111430_make_page()
+
+
+def register_c5_beggs_v111430_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0}
+    lock=Lock()
+
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                names=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:
+                    raise ValueError('현재 빗썸 KRW 종목을 조회할 수 없습니다')
+                cache.update(items=names,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-beggs')
+    def c5_beggs_v111430_page():
+        return render_template_string(C5_BEGGS_V111430_PAGE)
+
+    @app.get('/api/winrate14c5beggs/universe')
+    def c5_beggs_v111430_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.30'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5beggs/evaluate')
+    def c5_beggs_v111430_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):
+                raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            res=c5_beggs_v111430_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.30',
+                            'date':cfg['day'].isoformat(),**res})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111429_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111429_register_daytrade_review(app,deps)
+    register_c5_beggs_v111430_lab(app,deps)
