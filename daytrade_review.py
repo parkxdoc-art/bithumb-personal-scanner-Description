@@ -7152,3 +7152,221 @@ _v111421_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v111421_register_daytrade_review(app, deps)
     register_c5_expert_v111422_lab(app, deps)
+
+
+# ---------------------------------------------------------------------------
+# V11.14.23 - Research ONLY: C5 + Volman-inspired + SMA12/SMA200 filters.
+# Uses the 74 already-observed Volman-ACCEPTED events from the three
+# user-supplied V11.14.22 CSV files: 2026-11-08, 2026-11-09, 2026-11-11.
+# Baseline results are preserved; only 12/200 SMA features are requested.
+# No changes to V2 app.py, existing labs, or existing scan/BUY functions.
+# ---------------------------------------------------------------------------
+
+import json as _ma12200_json
+
+C5_MA_V111423_SEEDS = _ma12200_json.loads(r'''[{"id":0,"date":"2026-11-08","market":"KRW-AKT","signal_time_kst":"2026-11-08 11:25","outcome":"TIME","net_pct":0.1733,"entry":848.0,"exit":851.0,"minutes":60},{"id":1,"date":"2026-11-08","market":"KRW-BLEND","signal_time_kst":"2026-11-08 18:00","outcome":"TP","net_pct":1.3175,"entry":76.77,"exit":77.92155,"minutes":10},{"id":2,"date":"2026-11-08","market":"KRW-BTC","signal_time_kst":"2026-11-08 20:00","outcome":"TIME","net_pct":-0.1933,"entry":103556000.0,"exit":103542000.0,"minutes":60},{"id":3,"date":"2026-11-08","market":"KRW-BTC","signal_time_kst":"2026-11-08 21:25","outcome":"TIME","net_pct":-0.0902,"entry":103615000.0,"exit":103708000.0,"minutes":60},{"id":4,"date":"2026-11-08","market":"KRW-BTR","signal_time_kst":"2026-11-08 08:20","outcome":"SL","net_pct":-1.178,"entry":56.08,"exit":55.5192,"minutes":10},{"id":5,"date":"2026-11-08","market":"KRW-ETH","signal_time_kst":"2026-11-08 07:15","outcome":"TIME","net_pct":-0.1798,"entry":3051000.0,"exit":3051000.0,"minutes":60},{"id":6,"date":"2026-11-08","market":"KRW-FLOCK","signal_time_kst":"2026-11-08 12:45","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":7,"date":"2026-11-08","market":"KRW-HUMA","signal_time_kst":"2026-11-08 23:45","outcome":"TIME","net_pct":-0.2438,"entry":15.61,"exit":15.6,"minutes":60},{"id":8,"date":"2026-11-08","market":"KRW-IN","signal_time_kst":"2026-11-08 19:05","outcome":"SL","net_pct":-1.178,"entry":35.46,"exit":35.1054,"minutes":60},{"id":9,"date":"2026-11-08","market":"KRW-ONDO","signal_time_kst":"2026-11-08 08:40","outcome":"TIME","net_pct":-0.3807,"entry":497.0,"exit":496.0,"minutes":60},{"id":10,"date":"2026-11-08","market":"KRW-Q","signal_time_kst":"2026-11-08 08:20","outcome":"TIME","net_pct":-0.447,"entry":37.36,"exit":37.26,"minutes":60},{"id":11,"date":"2026-11-08","market":"KRW-Q","signal_time_kst":"2026-11-08 16:15","outcome":"TP","net_pct":1.3175,"entry":36.78,"exit":37.3317,"minutes":40},{"id":12,"date":"2026-11-08","market":"KRW-SIGN","signal_time_kst":"2026-11-08 10:00","outcome":"TP","net_pct":1.3175,"entry":12.56,"exit":12.7484,"minutes":5},{"id":13,"date":"2026-11-08","market":"KRW-SUI","signal_time_kst":"2026-11-08 13:00","outcome":"TIME","net_pct":-0.2656,"entry":1164.0,"exit":1163.0,"minutes":60},{"id":14,"date":"2026-11-08","market":"KRW-TRUMP","signal_time_kst":"2026-11-08 01:50","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":15,"date":"2026-11-08","market":"KRW-US","signal_time_kst":"2026-11-08 20:00","outcome":"TP","net_pct":1.3175,"entry":5.894,"exit":5.98241,"minutes":60},{"id":16,"date":"2026-11-08","market":"KRW-USDT","signal_time_kst":"2026-11-08 07:45","outcome":"TIME","net_pct":-0.1798,"entry":1366.0,"exit":1366.0,"minutes":60},{"id":17,"date":"2026-11-09","market":"KRW-BTC","signal_time_kst":"2026-11-09 20:15","outcome":"TIME","net_pct":-0.1789,"entry":101266000.0,"exit":101267000.0,"minutes":60},{"id":18,"date":"2026-11-09","market":"KRW-BTC","signal_time_kst":"2026-11-09 23:40","outcome":"TIME","net_pct":0.6585,"entry":101450000.0,"exit":102302000.0,"minutes":60},{"id":19,"date":"2026-11-09","market":"KRW-DOGE","signal_time_kst":"2026-11-09 13:05","outcome":"TIME","net_pct":-0.6213,"entry":94.97,"exit":94.55,"minutes":60},{"id":20,"date":"2026-11-09","market":"KRW-DOGE","signal_time_kst":"2026-11-09 16:35","outcome":"TIME","net_pct":0.4741,"entry":93.11,"exit":93.72,"minutes":60},{"id":21,"date":"2026-11-09","market":"KRW-DOGE","signal_time_kst":"2026-11-09 20:15","outcome":"TIME","net_pct":-0.0099,"entry":93.98,"exit":94.14,"minutes":60},{"id":22,"date":"2026-11-09","market":"KRW-ELSA","signal_time_kst":"2026-11-09 19:45","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":23,"date":"2026-11-09","market":"KRW-ENA","signal_time_kst":"2026-11-09 20:15","outcome":"SL","net_pct":-1.178,"entry":207.0,"exit":204.93,"minutes":35},{"id":24,"date":"2026-11-09","market":"KRW-ENJ","signal_time_kst":"2026-11-09 20:00","outcome":"TP","net_pct":1.3175,"entry":31.45,"exit":31.92175,"minutes":5},{"id":25,"date":"2026-11-09","market":"KRW-ETH","signal_time_kst":"2026-11-09 20:15","outcome":"TIME","net_pct":-0.3873,"entry":2887000.0,"exit":2881000.0,"minutes":60},{"id":26,"date":"2026-11-09","market":"KRW-HPP","signal_time_kst":"2026-11-09 11:55","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":27,"date":"2026-11-09","market":"KRW-HUMA","signal_time_kst":"2026-11-09 23:40","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":28,"date":"2026-11-09","market":"KRW-ICNT","signal_time_kst":"2026-11-09 03:50","outcome":"SL","net_pct":-1.178,"entry":491.0,"exit":486.09,"minutes":40},{"id":29,"date":"2026-11-09","market":"KRW-KAIA","signal_time_kst":"2026-11-09 11:05","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":30,"date":"2026-11-09","market":"KRW-LINK","signal_time_kst":"2026-11-09 11:30","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":31,"date":"2026-11-09","market":"KRW-MPLX","signal_time_kst":"2026-11-09 14:05","outcome":"TP","net_pct":1.3175,"entry":93.47,"exit":94.87205,"minutes":20},{"id":32,"date":"2026-11-09","market":"KRW-NEAR","signal_time_kst":"2026-11-09 10:40","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":33,"date":"2026-11-09","market":"KRW-ONDO","signal_time_kst":"2026-11-09 13:05","outcome":"TIME","net_pct":-0.998,"entry":488.0,"exit":484.0,"minutes":60},{"id":34,"date":"2026-11-09","market":"KRW-SIGN","signal_time_kst":"2026-11-09 01:30","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":35,"date":"2026-11-09","market":"KRW-SOL","signal_time_kst":"2026-11-09 21:45","outcome":"TIME","net_pct":-0.5182,"entry":118000.0,"exit":117600.0,"minutes":60},{"id":36,"date":"2026-11-09","market":"KRW-SUI","signal_time_kst":"2026-11-09 12:40","outcome":"TIME","net_pct":-0.7912,"entry":1143.0,"exit":1136.0,"minutes":60},{"id":37,"date":"2026-11-09","market":"KRW-SUI","signal_time_kst":"2026-11-09 20:15","outcome":"TIME","net_pct":0.1744,"entry":1127.0,"exit":1131.0,"minutes":60},{"id":38,"date":"2026-11-09","market":"KRW-TRUMP","signal_time_kst":"2026-11-09 01:25","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":39,"date":"2026-11-09","market":"KRW-US","signal_time_kst":"2026-11-09 20:05","outcome":"TIME","net_pct":0.9077,"entry":5.507,"exit":5.567,"minutes":60},{"id":40,"date":"2026-11-09","market":"KRW-US","signal_time_kst":"2026-11-09 21:05","outcome":"TIME","net_pct":0.3229,"entry":5.559,"exit":5.587,"minutes":60},{"id":41,"date":"2026-11-09","market":"KRW-USDT","signal_time_kst":"2026-11-09 06:05","outcome":"TIME","net_pct":0.4783,"entry":1365.0,"exit":1374.0,"minutes":60},{"id":42,"date":"2026-11-09","market":"KRW-WAVES","signal_time_kst":"2026-11-09 19:20","outcome":"SL","net_pct":-1.178,"entry":305.0,"exit":301.95,"minutes":5},{"id":43,"date":"2026-11-09","market":"KRW-XLM","signal_time_kst":"2026-11-09 18:00","outcome":"TIME","net_pct":-0.1798,"entry":199.0,"exit":199.0,"minutes":60},{"id":44,"date":"2026-11-09","market":"KRW-XRP","signal_time_kst":"2026-11-09 16:35","outcome":"TIME","net_pct":-0.0452,"entry":1483.0,"exit":1485.0,"minutes":60},{"id":45,"date":"2026-11-09","market":"KRW-XRP","signal_time_kst":"2026-11-09 20:15","outcome":"TIME","net_pct":0.2254,"entry":1478.0,"exit":1484.0,"minutes":60},{"id":46,"date":"2026-11-09","market":"KRW-ZAMA","signal_time_kst":"2026-11-09 15:45","outcome":"SL","net_pct":-1.178,"entry":88.39,"exit":87.5061,"minutes":25},{"id":47,"date":"2026-11-09","market":"KRW-ZAMA","signal_time_kst":"2026-11-09 20:15","outcome":"TP","net_pct":1.3175,"entry":92.0,"exit":93.38,"minutes":50},{"id":48,"date":"2026-11-11","market":"KRW-BTC","signal_time_kst":"2026-11-11 22:50","outcome":"TIME","net_pct":-0.6019,"entry":100051000.0,"exit":99628000.0,"minutes":60},{"id":49,"date":"2026-11-11","market":"KRW-CHIP","signal_time_kst":"2026-11-11 10:25","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":50,"date":"2026-11-11","market":"KRW-DOGE","signal_time_kst":"2026-11-11 05:10","outcome":"TIME","net_pct":0.2872,"entry":91.91,"exit":92.34,"minutes":60},{"id":51,"date":"2026-11-11","market":"KRW-DOGE","signal_time_kst":"2026-11-11 07:05","outcome":"TIME","net_pct":-0.8486,"entry":92.54,"exit":91.92,"minutes":60},{"id":52,"date":"2026-11-11","market":"KRW-DOGE","signal_time_kst":"2026-11-11 23:35","outcome":"TP","net_pct":1.3175,"entry":92.45,"exit":93.83675,"minutes":60},{"id":53,"date":"2026-11-11","market":"KRW-ENA","signal_time_kst":"2026-11-11 09:00","outcome":"TP","net_pct":1.3175,"entry":205.0,"exit":208.075,"minutes":35},{"id":54,"date":"2026-11-11","market":"KRW-ETH","signal_time_kst":"2026-11-11 04:45","outcome":"TIME","net_pct":0.2503,"entry":2785000.0,"exit":2797000.0,"minutes":60},{"id":55,"date":"2026-11-11","market":"KRW-ETH","signal_time_kst":"2026-11-11 20:10","outcome":"TIME","net_pct":-0.3946,"entry":2789000.0,"exit":2783000.0,"minutes":60},{"id":56,"date":"2026-11-11","market":"KRW-ETH","signal_time_kst":"2026-11-11 23:35","outcome":"TIME","net_pct":0.5718,"entry":2789000.0,"exit":2810000.0,"minutes":60},{"id":57,"date":"2026-11-11","market":"KRW-HAEDAL","signal_time_kst":"2026-11-11 10:25","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":58,"date":"2026-11-11","market":"KRW-IRYS","signal_time_kst":"2026-11-11 20:15","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":59,"date":"2026-11-11","market":"KRW-KGEN","signal_time_kst":"2026-11-11 20:45","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":60,"date":"2026-11-11","market":"KRW-ONDO","signal_time_kst":"2026-11-11 05:10","outcome":"TIME","net_pct":0.2219,"entry":497.0,"exit":499.0,"minutes":60},{"id":61,"date":"2026-11-11","market":"KRW-ONDO","signal_time_kst":"2026-11-11 07:05","outcome":"SL","net_pct":-1.178,"entry":502.0,"exit":496.98,"minutes":55},{"id":62,"date":"2026-11-11","market":"KRW-ONDO","signal_time_kst":"2026-11-11 09:35","outcome":"TIME","net_pct":0.4167,"entry":502.0,"exit":505.0,"minutes":60},{"id":63,"date":"2026-11-11","market":"KRW-ONDO","signal_time_kst":"2026-11-11 16:20","outcome":"TIME","net_pct":0.4215,"entry":498.0,"exit":501.0,"minutes":60},{"id":64,"date":"2026-11-11","market":"KRW-PENGU","signal_time_kst":"2026-11-11 21:10","outcome":"TIME","net_pct":0.2279,"entry":8.568,"exit":8.603,"minutes":60},{"id":65,"date":"2026-11-11","market":"KRW-SOL","signal_time_kst":"2026-11-11 04:45","outcome":"TIME","net_pct":0.0852,"entry":113000.0,"exit":113300.0,"minutes":60},{"id":66,"date":"2026-11-11","market":"KRW-TRUMP","signal_time_kst":"2026-11-11 17:10","outcome":"SL","net_pct":-1.178,"entry":1513.0,"exit":1497.87,"minutes":25},{"id":67,"date":"2026-11-11","market":"KRW-US","signal_time_kst":"2026-11-11 06:05","outcome":"TIME","net_pct":-0.2353,"entry":5.398,"exit":5.395,"minutes":60},{"id":68,"date":"2026-11-11","market":"KRW-US","signal_time_kst":"2026-11-11 15:50","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":69,"date":"2026-11-11","market":"KRW-US","signal_time_kst":"2026-11-11 19:20","outcome":"UNKNOWN","net_pct":null,"entry":null,"exit":null,"minutes":null},{"id":70,"date":"2026-11-11","market":"KRW-USDT","signal_time_kst":"2026-11-11 01:30","outcome":"TIME","net_pct":-0.1798,"entry":1361.0,"exit":1361.0,"minutes":60},{"id":71,"date":"2026-11-11","market":"KRW-XPL","signal_time_kst":"2026-11-11 12:40","outcome":"TIME","net_pct":0.1862,"entry":70.9,"exit":71.16,"minutes":60},{"id":72,"date":"2026-11-11","market":"KRW-XRP","signal_time_kst":"2026-11-11 03:15","outcome":"TIME","net_pct":1.1372,"entry":1440.0,"exit":1459.0,"minutes":60},{"id":73,"date":"2026-11-11","market":"KRW-XRP","signal_time_kst":"2026-11-11 21:35","outcome":"TIME","net_pct":-0.389,"entry":1432.0,"exit":1429.0,"minutes":60}]''')
+C5_MA_V111423_SEED_SHA = "dc2811bff23545d46430cbbe5710b7da53e936497d2da3fdca73de4f72c0c191"
+C5_MA_V111423_BY_ID = {e['id']: e for e in C5_MA_V111423_SEEDS}
+C5_MA_V111423_DATES = ('2026-11-08', '2026-11-09', '2026-11-11')
+
+
+def c5_ma_v111423_features(api_get, event, kst):
+    """SMA12/SMA200 of completed 5m candle closes at the original signal.
+
+    The Bithumb `to` parameter is exclusive (in KST); signal+5min includes
+    the completed signal candle, with nothing from the future. Two 200-bar
+    pages are enough for 206 observed bars. Require true 5m continuity:
+      200 bars for current crossover state; 206 for past-six-bar crossing
+      and the slope of SMA200 over 30 minutes.
+    Missing candles are never forward-filled or replaced. No decision is
+    made when its prerequisite history is incomplete.
+    """
+    market = event['market']
+    signal = local_time(event['signal_time_kst'], kst)
+    if signal.second != 0 or signal.microsecond != 0 or signal.minute % 5:
+        raise ValueError('5분봉 신호 시각 형식 오류')
+    end_exclusive = signal + timedelta(minutes=5)
+    cursor = end_exclusive
+    found = {}
+    for page in range(2):
+        raw = api_get('/v1/candles/minutes/5', {
+            'market': market, 'count': 200,
+            'to': cursor.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        if not isinstance(raw, list):
+            raise ValueError('200이평 캔들 응답 형식 오류')
+        oldest = None
+        for b in raw:
+            if not isinstance(b, dict):
+                continue
+            try:
+                t = local_time(b['candle_date_time_kst'], kst)
+                close = float(b['trade_price'])
+                if not isfinite(close) or close <= 0:
+                    continue
+                if t < end_exclusive:
+                    found[t] = close
+                    oldest = t if oldest is None or t < oldest else oldest
+            except (KeyError, ValueError, TypeError, OverflowError):
+                continue
+        if oldest is None or len(raw) < 200 or len(found) >= 206:
+            break
+        if oldest >= cursor:
+            raise ValueError('과거 봉 페이지네이션이 전진하지 않습니다')
+        cursor = oldest
+
+    times = sorted(t for t in found if t <= signal)
+    rows = [(t, found[t]) for t in times]
+    n = len(rows)
+    result = {
+        'id': event['id'], 'signal_time_kst': event['signal_time_kst'],
+        'history_status': 'SHORT', 'observed_bars': n,
+        'sma12': None, 'sma200': None,
+        'sma200_slope6_pct': None, 'distance12_200_pct': None,
+        'ma_above': None, 'ma_cross6': None, 'ma_slope6': None,
+        'signal_close': None, 'missing_intervals_206': None,
+    }
+    if not rows or rows[-1][0] != signal:
+        result['history_status'] = 'SIGNAL_CANDLE_NOT_FOUND'
+        return result
+    result['signal_close'] = rows[-1][1]
+    if n < 200:
+        return result
+    step = timedelta(minutes=5)
+    last200 = rows[-200:]
+    if any(last200[j][0] - last200[j-1][0] != step for j in range(1, 200)):
+        result['history_status'] = 'GAP_200'
+        return result
+    closes = [p for t, p in rows]
+    sma12 = sum(closes[-12:]) / 12
+    sma200 = sum(closes[-200:]) / 200
+    result.update(sma12=round(sma12, 10), sma200=round(sma200, 10),
+                  distance12_200_pct=round((sma12 / sma200 - 1)*100, 6),
+                  ma_above=bool(sma12 > sma200),
+                  history_status='PARTIAL_200')
+    if n < 206:
+        return result
+    last206 = rows[-206:]
+    gaps = sum(last206[j][0] - last206[j-1][0] != step for j in range(1, 206))
+    result['missing_intervals_206'] = gaps
+    if gaps:
+        result['history_status'] = 'GAP_206'
+        return result
+    prev_sma200 = sum(closes[-206:-6])/200
+    slope = (sma200 / prev_sma200 - 1) * 100
+    crossed = False
+    for end in range(n-5, n+1):
+        now12 = sum(closes[end-12:end])/12
+        now200 = sum(closes[end-200:end])/200
+        prior12 = sum(closes[end-13:end-1])/12
+        prior200 = sum(closes[end-201:end-1])/200
+        if prior12 <= prior200 and now12 > now200:
+            crossed = True
+            break
+    result.update(history_status='OK',
+                  sma200_slope6_pct=round(slope, 6),
+                  ma_cross6=bool(sma12 > sma200 and crossed),
+                  ma_slope6=bool(sma12 > sma200 and sma200 > prev_sma200))
+    return result
+
+
+C5_MA_V111423_PAGE = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.23 · C5 볼먼 + 12/200이평 검증실</title>
+<style>/*REPLACE_STYLE*/
+.notice{border-left:3px solid #ffca7a;padding:11px 12px;background:#252339;font-size:13px;line-height:1.75}
+.note{border-radius:10px;padding:12px;background:#10182d;line-height:1.8;font-size:13px}
+select{padding:10px;background:#111a2e;border:1px solid #35435e;color:#f3f6ff;border-radius:8px}
+</style></head><body><main>
+<h1>🧪 V11.14.23 · 볼먼 + 12/200이평 비교</h1>
+<p class="muted">기존 C5·볼먼 압축돌파 기록에 12이평·200이평 조건만 덧붙이는 검증실 · 실전 V2 변경 없음</p>
+<section class="panel"><h2>이번 실험의 세 날짜</h2>
+<div class="note"><b>11월 8일:</b> 볼먼 응용 +0.074% (소폭 플러스)<br>
+<b>11월 11일:</b> 볼먼 응용 +0.072% (소폭 플러스)<br>
+<b>11월 9일:</b> 볼먼 응용 -0.054% (7일 중 가장 작은 평균 손실)<br>
+<b>기준:</b> 이미 저장한 V11.14.22 CSV의 볼먼 ACCEPTED 신호 74건 (11/8: 17 · 11/9: 31 · 11/11: 26). 그중 손익 확정 58건. 다른 날짜나 다른 신호는 섞지 않음.</div>
+<div class="notice">⚠️ 날짜와 필터는 이미 확인한 수익 결과를 참고해 고른 것이므로 <b>독립 검증이 아닌 사후 탐색</b>입니다. SMA는 신호가 완전히 끝난 시점의 과거 봉만 사용합니다. 거래량이 없는 5분봉을 임의 생성하지 않으며, 200봉 연속 데이터가 없으면 미확인으로 둡니다. 유명 트레이더의 원전 매매법과 동일하다고 주장하지 않습니다.</div>
+</section>
+<section class="panel"><h2>비교할 네 가지</h2>
+<div class="note"><b>① 볼먼 기본:</b> 기존 C5 + 볼먼 압축돌파 (기존 손익은 그대로)<br>
+<b>② 볼먼 + 12이평 > 200이평:</b> C5 신호 확정봉 종가 기준 SMA12가 SMA200보다 위<br>
+<b>③ 볼먼 + 최근 6봉 내 12/200 상향 교차:</b> 최근 30분 이내 SMA12가 SMA200을 아래에서 위로 돌파하고 현재도 위<br>
+<b>④ 볼먼 + 12>200 + 상승하는 200이평:</b> SMA12 > SMA200이고 SMA200이 6봉 전보다 높음</div>
+<p class="hint">전부 5분봉 단순이동평균(SMA)이며 진입가/청산 결과는 V11.14.22 CSV와 동일해. 조건이 성립하지 않으면 해당 BUY만 제외하며 다음 신호를 새로 생성하지 않아. 미확인 데이터는 제외/승패로 임의 처리하지 않아.</p>
+<div class="actions"><button id="run">74건 일괄 검사 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">이 실험만 초기화</button><button id="csv" class="secondary" disabled>비교 결과 CSV 저장</button></div>
+<progress id="progress" max="74" value="0"></progress><div id="status" class="status">기존 결과 불러오는 중</div></section>
+<section class="panel"><h2>1. 데이터 및 진행률</h2><div id="coverage" class="stats">불러오는 중</div></section>
+<section class="panel"><h2>2. 3일 통합 비교</h2><div id="overall" class="scroll">검사 전</div></section>
+<section class="panel"><h2>3. 날짜별 전략 비교</h2><div id="byday">검사 전</div></section>
+<section class="panel"><h2>4. 종목별 원본 신호와 이동평균 판정</h2><div id="examples" class="scroll">검사 전</div><p class="hint">미확인 사유(GAP_200 / GAP_206 / SHORT 등)도 CSV에 따로 남겨. 평균 순손익은 기존 CSV에 실제 값이 있는 신호만 집계해. 이 연구의 결론을 실전에 적용하려면 선택하지 않은 별도 날짜로 재검증해야 해.</p></section>
+</main><script>
+'use strict';
+const API='/api/winrate14c5ma12200',KEY='bithumb_v111423_volman_ma12_ma200_v1';
+const $=id=>document.getElementById(id);
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=v=>(v===null||v===undefined||v==='')?NaN:Number(v);
+const pct=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+const ARMS=[['base','볼먼 기본'],['ma_above','볼먼 + 12>200'],['ma_cross6','볼먼 + 6봉내 상향교차'],['ma_slope6','볼먼 + 12>200·200상승']];
+const DAYS=['2026-11-08','2026-11-09','2026-11-11'];
+let state=null,seeds=[],running=false,stopRequested=false;
+function row(vals){return '<tr>'+vals.map(x=>'<td>'+esc(x)+'</td>').join('')+'</tr>';}
+function table(head,rs){return '<table><thead><tr>'+head.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+rs.join('')+'</tbody></table>';}
+function card(name,value){return `<div class="stat"><small>${esc(name)}</small><strong>${esc(value)}</strong></div>`;}
+function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x&&x.version===1&&x.results&&typeof x.results==='object'?x:null;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function ready(){return seeds.length===74;}
+function done(){return ready()&&seeds.every(x=>Object.prototype.hasOwnProperty.call(state.results,x.id));}
+function flag(e,k){if(k==='base')return true;const r=state.results[e.id];return r?r[k]:null;}
+function metrics(items,k){const taken=items.filter(e=>flag(e,k)===true),ok=taken.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(num(e.net_pct))),n=ok.length;const sum=ok.reduce((a,e)=>a+num(e.net_pct),0);return {signals:taken.length,judged:n,unknown:taken.length-n,profit:ok.filter(e=>num(e.net_pct)>0).length,tp:ok.filter(e=>e.outcome==='TP').length,sl:ok.filter(e=>e.outcome==='SL').length,time:ok.filter(e=>e.outcome==='TIME').length,avg:n?sum/n:NaN,winrate:n?ok.filter(e=>num(e.net_pct)>0).length/n*100:NaN,filterMissing:k==='base'?0:items.filter(e=>flag(e,k)===null).length};}
+function oneTable(items){const base=metrics(items,'base');return table(['전략','통과','결과확정','미확정 손익','수익 거래 비율','평균 순손익','볼먼 대비 %p','TP/SL/TIME','이평 자료부족'],ARMS.map(([key,name])=>{const s=metrics(items,key);return row([name,s.signals,s.judged,s.unknown,pct(s.winrate),pct(s.avg),pct(Number.isFinite(s.avg)?s.avg-base.avg:NaN),`${s.tp}/${s.sl}/${s.time}`,s.filterMissing]);}));}
+function paint(){if(!ready())return;const checked=seeds.filter(x=>Object.prototype.hasOwnProperty.call(state.results,x.id)).length;const allok=done();$('progress').max=seeds.length;$('progress').value=checked;$('csv').disabled=!allok;$('coverage').innerHTML=card('원래 볼먼 신호',seeds.length+'건')+card('12/200 검사 완료',checked+' / '+seeds.length)+card('200봉 연속 확보',seeds.filter(e=>['OK','PARTIAL_200','GAP_206'].includes(state.results[e.id]?.history_status)).length+'건')+card('200봉 연속 미확보',seeds.filter(e=>['GAP_200','SHORT','SIGNAL_CANDLE_NOT_FOUND'].includes(state.results[e.id]?.history_status)).length+'건');
+$('status').textContent=(allok?'✅ 세 날짜의 모든 신호 검사 완료':running?'⏳ 과거 5분봉 확인 중':'검사 대기 / 이어하기 가능')+` · ${checked}/${seeds.length}건`+(allok?'\n기존 손익값은 변경하지 않았어. 이평 결과를 확인하고 CSV를 저장해줘.':'\n원본 볼먼 성적은 바로 보이고, 추가 조건은 검사 완료 후에 비교해줘.');
+$('overall').innerHTML=oneTable(seeds)+(allok?'':'<p class="hint">※ 추가 필터 성적은 아직 일부만 검사한 임시 집계야.</p>');
+$('byday').innerHTML=DAYS.map(d=>`<h3>${d} · 볼먼 ${seeds.filter(e=>e.date===d).length}건</h3>`+oneTable(seeds.filter(e=>e.date===d))).join('');
+const checkedRows=seeds.filter(e=>state.results[e.id]);$('examples').innerHTML=checkedRows.length?table(['날짜','종목','신호 시각','볼먼 순손익','12>200','최근 상향교차','200상승','12이평','200이평','데이터 상태'],checkedRows.map(e=>{const r=state.results[e.id],f=k=>r[k]===null?'자료부족':r[k]?'O':'X';return row([e.date,e.market,e.signal_time_kst,pct(num(e.net_pct)),f('ma_above'),f('ma_cross6'),f('ma_slope6'),Number.isFinite(num(r.sma12))?num(r.sma12).toFixed(6):'—',Number.isFinite(num(r.sma200))?num(r.sma200).toFixed(6):'—',r.history_status]);})):'검사 시작 전';}
+async function fetchJson(url,opts){const ac=new AbortController(),t=setTimeout(()=>ac.abort(),115000);try{const res=await fetch(url,{...opts,cache:'no-store',signal:ac.signal});const d=await res.json();if(!res.ok||!d.ok)throw Error(d.error||'HTTP '+res.status);return d;}finally{clearTimeout(t);}}
+async function init(){const d=await fetchJson(API+'/seed');if(!Array.isArray(d.items)||d.items.length!==74)throw Error('기존 볼먼 CSV 신호 목록 오류');seeds=d.items;state=load();if(!state||state.source_sha!==d.source_sha)state={version:1,source_sha:d.source_sha,results:{}};save();paint();}
+async function run(){if(running||!ready())return;running=true;stopRequested=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;const pending=seeds.filter(e=>!Object.prototype.hasOwnProperty.call(state.results,e.id));let cursor=0,failures=0;try{async function worker(){while(!stopRequested){const e=pending[cursor++];if(!e)return;for(let t=0;t<3&&!stopRequested;t++){try{const d=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:e.id})});const r=d.result;if(r.id!==e.id||![true,false,null].includes(r.ma_above)||![true,false,null].includes(r.ma_cross6)||![true,false,null].includes(r.ma_slope6))throw Error('이평 판정 구조 불일치');state.results[e.id]=r;save();paint();break;}catch(err){if(t===2){failures++;$('status').textContent=`⚠️ ${e.market} ${e.signal_time_kst}: ${String(err.message||err)} · 다시 누르면 이어하기`;if(failures>=5){stopRequested=true;break;}}else await new Promise(resolve=>setTimeout(resolve,650*(t+1)));}}}}await Promise.all([worker(),worker()]);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;paint();if(failures)$('status').textContent+=`
+API 실패 ${failures}건 · 검사 시작을 다시 눌러 재시도`;}}
+$('run').onclick=run;$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};$('reset').onclick=()=>{if(running)return;if(!confirm('12/200이평 검사 기록만 지울까? 기존 CSV 기초 데이터는 유지돼.'))return;state={version:1,source_sha:state.source_sha,results:{}};save();paint();};
+function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!done())return;const cols=['version','date','market','signal_time_kst','strategy','status','outcome','net_pct','ma_above','ma_cross6','ma_slope6','sma12','sma200','sma200_slope6_pct','distance12_200_pct','observed_bars','history_status','missing_intervals_206','entry','exit','minutes'];const lines=[cols.join(',')];for(const e of seeds){const r=state.results[e.id];for(const [key] of ARMS){const f=flag(e,key),o={version:'V11.14.23',...e,...r,strategy:key,status:f===null?'FEATURE_UNAVAILABLE':f?'ACCEPTED':'BLOCKED'};lines.push(cols.map(k=>csvCell(o[k])).join(','));}}const blob=new Blob(['﻿'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='bithumb_C5_volman_MA12_200_2026-11-08_09_11_v111423.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),2500);};
+init().catch(e=>{$('status').textContent='⚠️ '+String(e.message||e);});
+</script></body></html>
+'''.replace('/*REPLACE_STYLE*/', C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
+
+
+def register_c5_ma_v111423_lab(app, deps):
+    api_get, kst = deps['api_get'], deps['KST']
+
+    @app.get('/backtest-winrate-c5-ma12200')
+    def c5_ma_v111423_page():
+        return render_template_string(C5_MA_V111423_PAGE)
+
+    @app.get('/api/winrate14c5ma12200/seed')
+    def c5_ma_v111423_seed():
+        return jsonify({'ok': True, 'rule_version': 'V11.14.23',
+                        'source_sha': C5_MA_V111423_SEED_SHA,
+                        'items': C5_MA_V111423_SEEDS})
+
+    @app.post('/api/winrate14c5ma12200/evaluate')
+    def c5_ma_v111423_evaluate():
+        try:
+            raw = request.get_json(silent=True)
+            event_id = raw.get('id') if isinstance(raw, dict) else None
+            if type(event_id) is not int or event_id not in C5_MA_V111423_BY_ID:
+                raise ValueError('허용된 74개 신호 중 하나를 선택해 주세요')
+            result = c5_ma_v111423_features(
+                api_get, C5_MA_V111423_BY_ID[event_id], kst)
+            return jsonify({'ok': True, 'result': result,
+                            'rule_version': 'V11.14.23'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:180]}), 400
+
+
+_v111422_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app, deps):
+    _v111422_register_daytrade_review(app, deps)
+    register_c5_ma_v111423_lab(app, deps)
