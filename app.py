@@ -137,7 +137,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 </head>
 <body><main>
 <div class="top">
-  <div><h1>빗썸 KRW · Signal Scanner</h1><div class="sub">대각 저항 돌파 → 재확인 → 지지 반등을 찾는 단타 보조 도구</div></div>
+  <div><h1>빗썸 KRW · Signal Scanner</h1><div class="sub">5분봉 5이평(C5) 첫 회복을 포착하는 단타 신호 보조 도구</div></div>
   <div class="pill" id="connection">연결 확인 전</div>
 </div>
 <div class="grid">
@@ -166,15 +166,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 
 
 <div class="panel">
-<h2>스캔 설정</h2>
-<div style="margin:10px 0 12px;">
-  <a href="/research-c5-flow"
-     style="display:inline-block;padding:10px 12px;background:#123d35;
-            border:1px solid #2b8a68;color:#7bedbb;border-radius:9px;
-            text-decoration:none;font-weight:700;">
-    🔬 C5 차트 흐름 분석실
-  </a>
-</div>
+<h2>스캔 설정 · C5 신호</h2>
 <div style="margin:10px 0 14px;">
   <a href="/backtest-daytrade"
      style="display:inline-block;
@@ -189,10 +181,10 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
   </a>
 </div>
 <div class="controls">
-  <div class="field"><label for="tf">캔들 주기</label><select id="tf"><option value="1">1분</option><option value="3">3분</option><option value="5" selected>5분</option><option value="10">10분</option><option value="30">30분</option></select></div>
+  <div class="field"><label for="tf">캔들 주기</label><select id="tf"><option value="5" selected>5분 · C5 고정</option></select></div>
   <div class="field"><label for="limit">검색 코인 수</label><select id="limit"><option>20</option><option selected>40</option><option>80</option></select></div>
-  <div class="field"><label for="vol">최소 거래량 배수</label><select id="vol"><option value="1.2">1.2배</option><option value="1.5" selected>1.5배</option><option value="2">2.0배</option></select></div>
-  <div class="field"><label for="rr">목표 손익비</label><select id="rr"><option value="1.5">1 : 1.5</option><option value="2" selected>1 : 2</option><option value="3">1 : 3</option></select></div>
+  <div class="field"><label for="vol">거래량 참고 기준 (BUY 필터 아님)</label><select id="vol"><option value="1.2">1.2배</option><option value="1.5" selected>1.5배</option><option value="2">2.0배</option></select></div>
+  <div class="field"><label for="rr">C5 예시 손익비</label><select id="rr"><option value="1.5" selected>손절 -1% / 익절 +1.5%</option></select></div>
   <button onclick="scan()">지금 스캔</button><button class="secondary" onclick="toggleAuto()" id="autoBtn">자동 갱신 켜기</button>
 </div>
 <div class="status" id="status">스캔 버튼을 눌러 빗썸 공개 시세 데이터를 조회하세요. 처음 요청은 무료 서버 기동으로 지연될 수 있습니다.</div>
@@ -211,7 +203,7 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 <label for="resultSort">정렬 기준 <select id="resultSort"><option value="default">기본 추천순</option><option value="volume">24시간 거래대금 높은순</option><option value="change">24시간 상승률 높은순</option></select></label>
 <div class="field" style="margin:12px 0;"><label for="coinSearch">🔎 코인 검색</label><input type="search" id="coinSearch" placeholder="코인 검색 (예: XRP, BTC)" autocomplete="off"></div>
 <label for="signalFilter">신호 필터 <select id="signalFilter"><option value="ALL">전체 후보</option><option value="BUY">BUY만</option><option value="WATCH">WATCH만</option></select></label>
-<div class="tablewrap"><table><thead><tr><th>마켓</th><th>확정봉 종가</th><th>24h 변동</th><th>거래대금</th><th>거래량 배수</th><th>저항선 상태</th><th>예시 손절가</th><th>예시 목표가</th><th>신호</th><th>종합 점수</th><th>5분봉 MA5</th><th>관찰 메모</th></tr></thead><tbody id="rows"><tr><td colspan="10">아직 스캔하지 않았습니다.</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>마켓</th><th>확정봉 종가</th><th>24h 변동</th><th>거래대금</th><th>거래량 배수</th><th>C5 회복 상태</th><th>예시 손절가</th><th>예시 목표가</th><th>신호</th><th>종합 점수</th><th>5분봉 MA5</th><th>관찰 메모</th></tr></thead><tbody id="rows"><tr><td colspan="10">아직 스캔하지 않았습니다.</td></tr></tbody></table></div>
 <div id="coinDetail" style="display:none;margin-top:14px;padding:14px;border:1px solid #34405a;border-radius:10px;">
   <strong id="coinDetailTitle">코인 상세 분석</strong>
 <div id="coinDetailScanTime"
@@ -284,18 +276,18 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 </div>
 <div class="two">
 <div class="panel"><h2>진입·청산 규칙</h2><div class="rules">
-<div class="rule"><b class="good">진입 후보</b><span>최근 스윙 고점 2개로 계산한 하향 저항선을 종가가 상향 돌파하고 거래량 확인</span></div>
-<div class="rule"><b class="warn">재확인 대기</b><span>돌파 후 저항선 근처까지 되돌림. 아직 반등 종가가 확인되지 않으면 진입 신호 아님</span></div>
-<div class="rule"><b class="good">진입 확인</b><span>저항선 근처를 지지하고 양봉 종가가 선 위에 유지되며 거래량 조건 충족</span></div>
-<div class="rule"><b class="bad">손절</b><span>재확인 저점 또는 ATR 기반 손절선 아래로 이탈. 수수료·슬리피지는 별도 고려</span></div>
-<div class="rule"><b>익절 1차</b><span>설정한 손익비의 1R~2R 목표 구간. 저항선과 겹치면 보수적으로 판단</span></div>
-<div class="rule"><b>추세 청산</b><span>돌파선 재이탈 또는 단기 저점 붕괴 시 매도 검토. 자동 주문은 실행하지 않음</span></div>
+<div class="rule"><b class="good">진입 후보</b><span>직전 5분봉 종가가 당시 5이평 아래에서 마감</span></div>
+<div class="rule"><b class="warn">재확인 대기</b><span>현재 5분봉이 확정되기 전에는 BUY로 인정하지 않음</span></div>
+<div class="rule"><b class="good">진입 확인 · C5</b><span>양봉 종가가 5이평 위로 처음 회복하고 5이평이 전봉보다 상승 · 동일 종목 BUY 간 최소 60분 간격</span></div>
+<div class="rule"><b class="bad">손절 참고</b><span>신호봉 종가 기준 -1.0% · 실제 진입가는 다음 봉 시가에 따라 달라짐</span></div>
+<div class="rule"><b>익절 참고</b><span>신호봉 종가 기준 +1.5% · 실제 체결 시 목표가는 달라짐</span></div>
+<div class="rule"><b>보유 관찰</b><span>이전 C5 검증과 같이 최대 60분 관찰을 참고 · 자동 주문은 실행하지 않음</span></div>
 </div></div>
 <div class="panel"><h2>신호 읽는 법</h2>
 <p><span class="signal BUY">진입 확인</span> 규칙 조건을 모두 통과한 후보. 매수 권유나 수익 보장은 아님.</p>
 <p><span class="signal WATCH">관심</span> 저항선 돌파 또는 재확인 진행 중. 추가 캔들 확인 필요.</p>
 <p><span class="signal WAIT">대기</span> 명확한 셋업이 없음.</p>
-<p class="note">대각선은 최근 확인된 스윙 고점 두 개를 연결한 단순 모델입니다. 차트마다 선을 직접 긋는 것과 동일하지 않을 수 있으며, 신호는 캔들 종가 확정 후 판단해야 합니다.</p>
+<p class="note">C5는 단순이동평균(SMA5) 회복 신호입니다. 거래량 배수와 점수는 참고 지표이며 BUY 발생 조건에 추가되지 않습니다. 실전 스캐너 표시 기준가는 확정 신호봉 종가이므로 다음 봉 실제 진입가와 다를 수 있습니다.</p>
 </div>
 </div>
 
@@ -1459,7 +1451,7 @@ if (capitalSelect) {
       ["신호", `${x.signal ?? "-"} (${x.label ?? "-"})`,
         x.signal === "BUY" ? "buy" : "watch", true],
       ["24시간 거래대금", money(x.value24), "", true],
-      ["저항선", x.resistance ?? "-", "", true],
+      ["C5 회복 상태", x.resistance ?? "-", "", true],
       ["5분봉 MA5", x.ma5_info?.ma5 ?? "-"],
       ["MA5 상태", x.ma5_info?.status ?? "-"],
       ["15분봉 추세", x.trend15 ?? "정보 없음"],
@@ -2067,6 +2059,54 @@ def calculate_score(change, ma5_info=None, vol_ratio=None, value24=None, signal=
     
 
 
+def c5_live_reclaim(rows):
+    """Return current confirmed C5 signal and cooldown reason.
+
+    Matching V11.14.17: prior close < prior SMA5; green candle closing
+    above current SMA5; current SMA5 > prior SMA5. Accept no more than
+    one C5 BUY per market in 12 consecutive completed 5-minute bars.
+    Missing 5-minute bars invalidate the affected lookback; no future bars.
+    """
+    if len(rows) < 25:
+        return False, "5분봉 데이터 부족"
+
+    times = []
+    try:
+        for r in rows:
+            times.append(datetime.fromisoformat(r["candle_date_time_kst"]))
+        closes = [float(r["trade_price"]) for r in rows]
+        opens = [float(r["opening_price"]) for r in rows]
+    except (KeyError, TypeError, ValueError):
+        return False, "5분봉 데이터 오류"
+
+    cooldown_end = -1
+    latest_raw_signal = False
+    current_reason = "조건 대기"
+    for i in range(24, len(rows)):
+        if any(times[j] - times[j - 1] != timedelta(minutes=5)
+               for j in range(i - 23, i + 1)):
+            if i == len(rows) - 1:
+                current_reason = "연속 5분봉 부족"
+            continue
+        before_ma = sum(closes[i - 5:i]) / 5
+        after_ma = sum(closes[i - 4:i + 1]) / 5
+        raw = (closes[i - 1] < before_ma
+               and closes[i] > opens[i]
+               and closes[i] > after_ma
+               and after_ma > before_ma)
+        if i == len(rows) - 1:
+            latest_raw_signal = raw
+        if raw:
+            if i < cooldown_end:
+                if i == len(rows) - 1:
+                    current_reason = "최근 C5 BUY 이후 60분 이내"
+            else:
+                cooldown_end = i + 12
+                if i == len(rows) - 1:
+                    return True, "C5 첫 회복 · BUY"
+    return False, current_reason if latest_raw_signal else "조건 대기"
+
+
 def scan_market(market, minute, volume_multiple, rr, ticker=None):
   
     raw = candles(market, minute, 80)
@@ -2158,87 +2198,50 @@ def scan_market(market, minute, volume_multiple, rr, ticker=None):
                 trend15 = "중립"
  
 
-    # Candidate pivot highs: higher than two neighbors on either side.
-    pivots=[]
-    for i in range(2, len(highs)-2):
-        if highs[i] >= max(highs[i-2:i]) and highs[i] > max(highs[i+1:i+3]):
-            pivots.append(i)
-    # Use last two pivots, only treat a downward line as diagonal resistance.
-    line_now=None; line_prev=None; resistance="선 없음"; signal="WAIT"; label="대기"
-    note="뚜렷한 하향 저항 돌파 조건 없음"
-    if len(pivots)>=2:
-        a,b=pivots[-2],pivots[-1]
-        if highs[b] < highs[a] and b>a:
-            slope=(highs[b]-highs[a])/(b-a)
-            line_now=highs[b]+slope*((len(rows)-1)-b)
-            line_prev=highs[b]+slope*((len(rows)-2)-b)
-            tolerance=0.004
-            prev_close=closes[-2]; prev_vol=volumes[-2]
-            avg_vol=sum(volumes[-21:-1])/20 if len(volumes)>=21 else 0
-            vol_ratio=(volumes[-1]/avg_vol) if avg_vol>0 else None
-            atrv=atr(rows)
-            # retest tolerance around the line; last candle must hold line and close green.
-            
-            breakout_seen = False
-          
-            breakout_index = None
+    # C5 BUY signal. Old diagonal-resistance calculation is intentionally
+    # removed from live scanning; the V2 UI and API result shape stay the same.
+    signal = "WAIT"
+    label = "대기"
+    resistance = "C5 조건 대기"
+    note = "5분봉 5이평 첫 회복 대기"
+    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0
+    vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else None
+    stop = current * 0.99 if current > 0 else None
+    target = current * 1.015 if current > 0 else None
 
-            for i in range(max(b + 1, len(rows) - 8), len(rows) - 2):
-                previous_line = highs[b] + slope * ((i - 1) - b)
-                breakout_line = highs[b] + slope * (i - b)
-                if (
-                    closes[i - 1] <= previous_line * (1 + tolerance)
-                    and closes[i] > breakout_line * (1 + tolerance)
-                ):
-                    breakout_seen = True
-                  
-                    breakout_index = i
+    c5_buy, c5_reason = c5_live_reclaim(rows)
+    prev_ma5 = sum(closes[-6:-1]) / 5
+    current_ma5 = sum(closes[-5:]) / 5
+    ma_rising = current_ma5 > prev_ma5
+    previous_below = closes[-2] < prev_ma5
 
-                    break
-
-            support_held = (
-                breakout_index is not None
-                and all(
-                    closes[j] >= (highs[b] + slope * (j - b)) * (1 - tolerance)
-                    for j in range(breakout_index + 1, len(rows) - 1)
-                )
-            )
-
-            close_above=current > line_now * (1+tolerance)
-            retest=(lows[-1] <= line_now*(1+tolerance) and current >= line_now and current > closes[-2])
-            vol_ok=vol_ratio is not None and vol_ratio >= volume_multiple
-            # If breakout was very recent, mark WATCH; only retest bounce is BUY.
-            
-            
-            if close_above and vol_ok and retest and breakout_seen and support_held:
-
-
-                signal="BUY";label="진입 확인";resistance="돌파선 지지 확인"
-                note="종가가 저항선 위 + 재확인 반등 + 거래량 조건"
-            elif close_above or (current >= line_now*(1-tolerance) and vol_ok):
-                signal="WATCH";label="관심";resistance="돌파/재확인 중"
-                note="추가 캔들에서 지지 유지 여부 확인"
-            else:
-                resistance="저항선 아래"
-            if line_now and atrv:
-                stop=max(0.0, min(lows[-1], current-1.2*atrv))
-                risk=max(0.0,current-stop)
-                target=current+rr*risk
-            else: stop=None; target=None
-        else:
-            vol_ratio=None;stop=None;target=None
+    if c5_buy:
+        signal = "BUY"
+        label = "C5 진입 확인"
+        resistance = "5이평 첫 회복"
+        note = "직전봉 5이평 아래 → 양봉 종가 회복 · 5이평 상승 (다음 봉 진입 참고)"
+    elif c5_reason == "최근 C5 BUY 이후 60분 이내":
+        resistance = "C5 중복 제한"
+        note = "동일 종목의 최근 C5 BUY 후 60분 내이므로 반복 신호 차단"
+    elif previous_below and ma_rising and closes[-1] <= current_ma5 * 1.005:
+        signal = "WATCH"
+        label = "C5 회복 관찰"
+        resistance = "5이평 회복 관찰"
+        note = "직전봉 5이평 아래 · 이평 상승 중 · 완성된 양봉 회복 대기"
     else:
-        vol_ratio=None;stop=None;target=None
-    # Momentum volume ratio for table even when no descending trendline.
-    if 'vol_ratio' not in locals() or vol_ratio is None:
-        avg_vol=sum(volumes[-21:-1])/20 if len(volumes)>=21 else 0
-        vol_ratio=volumes[-1]/avg_vol if avg_vol>0 else None
-    # Don't label a BUY without a valid descending line and actual retest logic.
+        note = c5_reason if c5_reason != "조건 대기" else note
+
+    # Give the table useful MA5 context; no extra ticker/candle API calls.
+    ma5_info = {"ma5": round(current_ma5, 8),
+                "status": ("MA5 상향 돌파" if closes[-2] < prev_ma5
+                           and closes[-1] > current_ma5
+                           else "MA5 위 유지" if closes[-1] > current_ma5
+                           else "MA5 아래")}
     ticker = ticker or {}
     change=float(ticker.get("signed_change_rate", 0))*100 if ticker else ((current/closes[-2]-1)*100 if closes[-2] else 0)
     value24=float(ticker.get("acc_trade_price_24h", 0)) if ticker else 0
     score = calculate_score(
-        change, ma5_info, vol_ratio, value24, signal, rr
+        change, ma5_info, vol_ratio, value24, signal, 1.5
     )
     return {"market":market,"price":current,"change":change,"value24":value24,
             "vol_ratio":vol_ratio,"resistance":resistance,"signal":signal,"label":label,
@@ -3953,7 +3956,7 @@ def scan():
     scan_start = time.perf_counter()
     try:
         minute=int(request.args.get("tf","5"))
-        if minute not in (1,3,5,10,30): minute=5
+        minute=5  # C5 uses confirmed 5m candles only
         limit=max(10,min(80,int(request.args.get("limit","40"))))
         page = max(0, int(request.args.get("page", "0")))
         volume_multiple=max(1.0,min(3.0,float(request.args.get("vol","1.5"))))
@@ -4008,72 +4011,6 @@ def scan():
                         "updated":f"{datetime.now(KST):%H:%M:%S} KST · {time.perf_counter()-scan_start:.1f}초"})
     except Exception as e:
         return jsonify({"error":str(e)}), 502
-
-
-# V2 C5 flow research page: isolated from all /api/scan functions.
-# Depends on existing V11.14.19 pattern evaluation API, already registered
-# by daytrade_review.py. Original live signal logic is unchanged.
-V2_C5_FLOW_PAGE = r"""<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V2 연구실 · C5 차트 흐름별 성적</title>
-<style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#141c2f;--line:#34405a;--fg:#edf3ff;--muted:#aab7d0;--green:#69e6a9;--blue:#4266e8}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,"Noto Sans KR",sans-serif}main{max-width:1080px;margin:auto;padding:18px 14px 60px}h1{font-size:24px;margin:14px 0 6px}h2{font-size:17px;margin:0 0 12px}a{color:#b9cdff}p{margin:8px 0}.muted{color:var(--muted);font-size:13px}.panel{padding:15px;border:1px solid var(--line);border-radius:14px;background:var(--panel);margin-top:13px}.controls{display:flex;flex-wrap:wrap;align-items:end;gap:9px}label{font-size:13px;color:var(--muted)}input,button{font:inherit}input[type=date],input[type=number],input[type=file]{display:block;background:#0e1628;color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:10px;max-width:100%}button{background:var(--blue);border:0;border-radius:9px;padding:10px 15px;font-weight:700;color:white;cursor:pointer}button.secondary{background:#293d5a}button:disabled{opacity:.45;cursor:wait}.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px;min-width:650px}th,td{padding:10px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:right}th:first-child,td:first-child{text-align:left}th{color:var(--muted)}.good{color:#70e7aa}.bad{color:#ff9ca7}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.stat{background:#0e1628;border:1px solid var(--line);padding:12px;border-radius:10px}.stat small{display:block;color:var(--muted);font-size:12px}.stat strong{display:block;font-size:19px}.note{background:#102039;border-left:3px solid #7697f6;border-radius:7px;padding:12px;font-size:13px;color:#c5d5f7}.status{white-space:pre-wrap;font-size:13px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.heading{font-weight:700;color:var(--green)}
-@media(max-width:650px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.controls{align-items:stretch}}
-</style></head><body><main>
-<a href="/">← V2 실전 스캐너로 돌아가기</a>
-<h1>🔬 C5 차트 흐름 분석실</h1>
-<p class="muted">V2 별도 연구 메뉴 · CSV를 선택했을 때만 분석 · 실전 BUY/WATCH 신호는 변경하지 않음</p>
-<section class="panel"><h2>먼저 기존 CSV로 빠르게 분석하기</h2>
-<p class="muted">V11.14.19에서 내려받은 「BUY 이전 패턴 CSV」를 선택해 줘. 11월 10일·11일 등 여러 날짜를 동시에 넣어도 돼.</p>
-<div class="controls"><label>CSV 파일 선택<input type="file" id="csvFiles" accept=".csv,text/csv" multiple></label><button id="readCsv">CSV 분석</button><button id="clear" class="secondary">분석 결과 지우기</button></div>
-<p class="muted">CSV는 이 휴대폰 브라우저 안에서만 분석해. 서버 전송·자동 스캔 없음. 실전 V2 화면과 BUY 조건은 그대로야.</p>
-</section>
-<p class="muted">새 날짜의 CSV가 필요하면 <a href="/backtest-winrate-patterns" target="_blank" rel="noopener">기존 공통 패턴 검증실</a>에서 따로 생성해 줘. 이 화면은 CSV를 읽을 때만 계산하며 빗썸 API를 호출하지 않아.</p>
-<section class="panel"><h2>분석 상태</h2><div class="status" id="status">CSV를 선택하거나 검사 날짜를 지정해 줘.</div>
-<div class="stats" id="stats" style="margin-top:12px"></div>
-</section>
-<section class="panel"><h2>4가지 차트 흐름 분류 기준 (고정)</h2>
-<div class="note">신호가 확정된 시점까지의 자료만 사용해. <b>A</b>: 직전 60분 상승률 +0.5% 이상, 최근 고점 대비 이격 1.5% 미만. <b>B</b>: 직전 60분 상승률 +0.5% 이상, 최근 고점 대비 이격 1.5% 이상. <b>C</b>: 직전 60분 상승률 -0.5% 이하. <b>D</b>: 그 사이 횡보. 기준 수치는 검증된 BUY 조건이 아니라 연구용 고정 구간이야.</div>
-<div class="scroll"><table><thead><tr><th>유형</th><th>거래</th><th>판정</th><th>익절</th><th>손절</th><th>시간 종료 수익</th><th>시간 종료 손실</th><th>익절률</th><th>손절률</th><th>평균 순손익</th></tr></thead><tbody id="flowRows"><tr><td colspan="10">분석 대기</td></tr></tbody></table></div>
-<p class="muted">익절률·손절률은 판정 완료 거래 기준. 같은 종목의 반복 BUY도 포함되며 미래 성과를 보장하지 않아.</p>
-</section>
-<section class="panel"><h2>날짜별 비교</h2>
-<div class="scroll"><table><thead><tr><th>날짜</th><th>유형</th><th>판정</th><th>익절률</th><th>손절률</th><th>평균 순손익</th></tr></thead><tbody id="dayRows"><tr><td colspan="6">분석 대기</td></tr></tbody></table></div></section>
-<section class="panel"><h2>익절과 손절의 진입 전 특징</h2>
-<div class="scroll"><table><thead><tr><th>유형</th><th>익절 전 30분 수익률 중앙값</th><th>손절 전 30분 수익률 중앙값</th><th>익절 전 60분 변동폭 중앙값</th><th>손절 전 60분 변동폭 중앙값</th></tr></thead><tbody id="medianRows"><tr><td colspan="5">분석 대기</td></tr></tbody></table></div>
-<div class="actions"><button id="export" class="secondary" disabled>유형별 거래 CSV 다운로드</button></div>
-</section>
-<p class="muted">이번 연구실은 과거 C5 신호의 흐름을 설명하는 탐색용 분석이며, V2 실전 BUY 필터를 변경하지 않아. 같은 종목의 여러 신호가 반복될 수 있어 날짜별 결과가 안정적인지 확인해야 해.</p>
-</main>
-<script>
-'use strict';
-const el=id=>document.getElementById(id);
-const TYPES=[['A','상승 후 얕은 눌림'],['B','상승 후 깊은 눌림'],['C','하락 중 반등'],['D','횡보 중 반등'],['U','자료 부족']];
-let items=[],keys=new Set(),running=false,stop=false;
-const fmt=(v,d=2)=>Number.isFinite(v)?v.toFixed(d)+'%':'—';
-const num=v=>v===null||v===undefined||String(v).trim()===''?null:(Number.isFinite(Number(v))?Number(v):null);
-function flow(e){const r=num(e.pre_60m_return_pct),p=num(e.pre_peak_distance_pct);if(r===null||p===null)return 'U';if(r>=0.5)return p<=-1.5?'B':'A';if(r<=-0.5)return 'C';return 'D';}
-function median(xs){const a=xs.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;return a.length%2?a[Math.floor(a.length/2)]:(a[a.length/2-1]+a[a.length/2])/2;}
-function summarize(xs){const valid=xs.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(e.net_pct));const tp=valid.filter(e=>e.outcome==='TP').length,sl=valid.filter(e=>e.outcome==='SL').length;return {signals:xs.length,n:valid.length,tp,sl,timeWin:valid.filter(e=>e.outcome==='TIME'&&e.net_pct>0).length,timeLoss:valid.filter(e=>e.outcome==='TIME'&&e.net_pct<=0).length,unknown:xs.length-valid.length,tpRate:valid.length?tp/valid.length*100:null,slRate:valid.length?sl/valid.length*100:null,mean:valid.length?valid.reduce((s,e)=>s+e.net_pct,0)/valid.length:null};}
-function add(record){if(!record||String(record.strategy).toUpperCase()!=='C5'||!/^KRW-[A-Z0-9]+$/.test(String(record.market||''))||!/^\d{4}-\d{2}-\d{2}$/.test(String(record.date||''))||!String(record.signal_time_kst||''))return false;const id=[record.date,record.market,record.signal_time_kst].join('|');if(keys.has(id))return false;keys.add(id);const x={date:String(record.date),market:String(record.market),strategy:'C5',signal_time_kst:String(record.signal_time_kst),outcome:String(record.outcome||'UNKNOWN').toUpperCase(),net_pct:num(record.net_pct),pre_30m_return_pct:num(record.pre_30m_return_pct),pre_60m_return_pct:num(record.pre_60m_return_pct),pre_60m_range_pct:num(record.pre_60m_range_pct),pre_peak_distance_pct:num(record.pre_peak_distance_pct)};x.flow=flow(x);items.push(x);return true;}
-function setStatus(msg){el('status').textContent=msg;}
-function td(row,v){const c=document.createElement('td');c.textContent=String(v);row.appendChild(c);return c;}
-function addRow(tbody,arr){const row=document.createElement('tr');for(const v of arr)td(row,v);tbody.appendChild(row);return row;}
-function render(){const all=summarize(items);el('stats').replaceChildren();for(const [k,v] of [['C5 전체 신호',all.signals+'건'],['손익 판정',all.n+'건'],['전체 평균 순손익',fmt(all.mean,3)],['분류 불가',items.filter(x=>x.flow==='U').length+'건']]){const d=document.createElement('div');d.className='stat';const s=document.createElement('small');s.textContent=k;const b=document.createElement('strong');b.textContent=v;d.append(s,b);el('stats').appendChild(d);}const body=el('flowRows');body.replaceChildren();if(!items.length)addRow(body,['분석 대기','','','','','','','','','']);for(const [id,name] of TYPES){const g=items.filter(x=>x.flow===id),s=summarize(g);addRow(body,[`${id} · ${name}`,s.signals,s.n,s.tp,s.sl,s.timeWin,s.timeLoss,fmt(s.tpRate,1),fmt(s.slRate,1),fmt(s.mean,3)]);}const days=[...new Set(items.map(x=>x.date))].sort(),db=el('dayRows');db.replaceChildren();if(!days.length)addRow(db,['분석 대기','','','','','']);for(const day of days)for(const [id,name] of TYPES){const g=items.filter(x=>x.date===day&&x.flow===id);if(!g.length)continue;const s=summarize(g);addRow(db,[day,`${id} · ${name}`,s.n,fmt(s.tpRate,1),fmt(s.slRate,1),fmt(s.mean,3)]);}const mb=el('medianRows');mb.replaceChildren();if(!items.length)addRow(mb,['분석 대기','','','','']);for(const [id,name] of TYPES){const es=items.filter(x=>x.flow===id);if(!es.length)continue;const tp=es.filter(x=>x.outcome==='TP'),sl=es.filter(x=>x.outcome==='SL');addRow(mb,[`${id} · ${name}`,fmt(median(tp.map(x=>x.pre_30m_return_pct))),fmt(median(sl.map(x=>x.pre_30m_return_pct))),fmt(median(tp.map(x=>x.pre_60m_range_pct))),fmt(median(sl.map(x=>x.pre_60m_range_pct)))]);}el('export').disabled=!items.length;}
-function parseCsv(data){const rows=[];let row=[],val='',quote=false;data=String(data).replace(/^\uFEFF/,'');for(let i=0;i<data.length;i++){const ch=data[i];if(quote){if(ch==='"'&&data[i+1]==='"'){val+='"';i++;}else if(ch==='"'){quote=false;}else val+=ch;}else if(ch==='"'){quote=true;}else if(ch===','){row.push(val);val='';}else if(ch==='\n'||ch==='\r'){if(ch==='\r'&&data[i+1]==='\n')i++;row.push(val);if(row.some(x=>x!==''))rows.push(row);row=[];val='';}else val+=ch;}if(quote)throw Error('닫히지 않은 따옴표가 있습니다');row.push(val);if(row.some(x=>x!==''))rows.push(row);return rows;}
-el('readCsv').onclick=async()=>{if(running)return;const files=[...(el('csvFiles').files||[])];if(!files.length){setStatus('⚠️ CSV를 선택해 줘.');return;}let added=0,failed=[];for(const f of files){try{if(f.size>10*1024*1024)throw Error('10MB 초과');const rows=parseCsv(await f.text());if(rows.length<2)throw Error('데이터 없음');const headers=rows[0].map(x=>String(x).trim());for(const key of ['date','market','strategy','signal_time_kst','outcome','net_pct','pre_60m_return_pct','pre_peak_distance_pct'])if(!headers.includes(key))throw Error(key+' 열 누락');for(const row of rows.slice(1)){const o={};headers.forEach((h,i)=>o[h]=row[i]??'');if(add(o))added++;}}catch(e){failed.push(f.name+' ('+String(e.message||e)+')');}}render();setStatus('✅ CSV '+files.length+'개 확인 · 새 C5 신호 '+added+'건 추가 · 현재 '+items.length+'건'+(failed.length?'\n⚠️ '+failed.join('\n'):''));};
-el('clear').onclick=()=>{if(running)return;items=[];keys.clear();el('csvFiles').value='';render();setStatus('결과를 지웠어. 기존 휴대폰 CSV 파일은 삭제되지 않았어.');};
-function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
-el('export').onclick=()=>{if(!items.length)return;const fields=['date','market','signal_time_kst','flow','outcome','net_pct','pre_30m_return_pct','pre_60m_return_pct','pre_60m_range_pct','pre_peak_distance_pct'];const lines=[fields.join(','),...items.map(x=>fields.map(k=>csvCell(x[k])).join(','))];const blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='bithumb_V2_C5_flow_patterns.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1500);};
-render();
-</script></body></html>"""
-
-
-@app.get('/research-c5-flow')
-def research_c5_flow_page():
-    return render_template_string(V2_C5_FLOW_PAGE)
-
 from daytrade_review import register_daytrade_review
 register_daytrade_review(app, globals())
 if __name__ == "__main__":
