@@ -8294,3 +8294,354 @@ _v111425_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111425_register_daytrade_review(app,deps)
     register_c5_btc_v111426_lab(app,deps)
+ 
+
+# ---------------------------------------------------------------------------
+# V11.14.27 - C5 + Volman-inspired compression: conservative exit lab.
+# Frozen 214 accepted Volman signals from the user's V11.14.22 CSV exports,
+# 2026-11-06..12. Entry signals are NOT recalculated or optimized.
+# 5M OHLC bars are fetched at the historical signal/exit window only.
+# V2 app.py and prior research labs are untouched.
+# ---------------------------------------------------------------------------
+import base64 as _exit27_b64
+import zlib as _exit27_zlib
+import json as _exit27_json
+from hashlib import sha256 as _exit27_sha256
+
+C5_EXIT_V111427_SHA = 'c6c459b7c0f485df71d99da307485348bfb2b93442ceeb39a445a807d0562d43'
+C5_EXIT_V111427_COMPRESSED = (
+    'eNrNndtuG0cShl8l0HU86Ko+646SuBIjimJ0iOQsFoaxMRZBHAdInIvFYt89Mxxxpqc5Zv0cNb17K3SSL82a+qurqqv//p+Tn386'
+    'OVXfnvz0/vOHk9MTVuzeEL1R7uTbk1/f//7Lh8/1X6/vnt7Mnhf39d/++Plfn95/fPf5518/vPvlj8+Df+QbplO29aIPnz7//u8v'
+    'r9GqXvPbx5/e/fbn53/+9mvz371fvvzpU/MffEMV+dD+YfPvOjklbyv1329bXgJ4zx7OJVylT0kJuM0au4P7sLiZp8CqUuzNEFhp'
+    'a1kp1WNzGWwKp0rCbtZg2Nbl2IrDAFsD2Od3t+JuG2C3DbLbb1SlQ4wDbucqa7bEphBxOLWSOavY/hjSRgdmPQS2le+ALQB8cXs5'
+    '/5oWbdjQgDj6ytKW2JUiLmYVquKQOY0YKt4C+0LAxO2Xtffr4/Z/SjTjEEjnxBS3yKEQcu1yRYfRrIG+POdtTuz9ljiWIn6x0b3E'
+    '+pSRL49sbsehct2XR4j2ze9molko2VcQjfqKdcpLlaZ8h13lOjMmRPvmD1dfz1PUNqEoEz+tvB5oCHEh7JIi4rThHNsNsXUZ7HKS'
+    'XWMT5Zuts81G9O/yab74mpGGV2YYabCuOr9BiABezeYXs6XI7ABmhzDXQWiwfrjVdZRhO2hEA6/OZnfH+xYfV9er26dVSv3pz48f'
+    'B8zNHzpkXwi5dr4acNBmQqQfdRV7d4do4GL1nWgVwBZTmS1GNHBx9/b+/8cqWBVCJtv+4nt3uV5TABmRwevZAtFtLSKr1thfiYxI'
+    '4PL+GrALMQDd2s4riRH1u5nfiT6ZWd7kZo093FuYWsa7gJlNKeDjubcGuONFZO9mvXwWrTgC7i2OhkVS9ElKJxkMRPJWc1k/agU2'
+    'gEobSKXJDZGtUkmyiBHNu11d3B7PVYzkXcj5jDkkyKEQ8hHt2JJJgCMEfHm8U9Shvk0jmreery4fRWYj73G9xkAJAbJ+aBcxycMh'
+    'mrd+C5xGqP2whF22ELH2YXgcCbYyoWNGRO9+troQVS/KYX2z5vU6rRHVu79dAsGQmMOo1zC0yypmdkFMbpCkNWWoj+gxiLUfIFsI'
+    '+XYF2AYDeVpdwGsg+nf/uDheGuNgYl+GeLpdjCVegslMg4JLDAORv4e7x5v1EfOIYlzknE+QEQF8vAc8s5y8QDO1KkteuKpLXRgF'
+    '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'
+    '2wDn9mw2F5j+8ReoZ0zL'
+)
+C5_EXIT_V111427_ARMS = (
+    ('BASE', 1.5, 1.0, 60, '기존: 익절 1.5 / 손절 1.0 / 60분'),
+    ('STOP075', 1.5, 0.75, 60, '손절 0.75 / 60분'),
+    ('STOP125', 1.5, 1.25, 60, '손절 1.25 / 60분'),
+    ('HOLD30', 1.5, 1.0, 30, '보유 30분'),
+    ('HOLD90', 1.5, 1.0, 90, '보유 90분'),
+    ('TP200', 2.0, 1.0, 60, '익절 2.0 / 60분'),
+)
+C5_EXIT_V111427_FEE = 0.04
+C5_EXIT_V111427_SLIP = 0.05
+
+def c5_exit_v111427_events():
+    raw = _exit27_zlib.decompress(_exit27_b64.b64decode(C5_EXIT_V111427_COMPRESSED))
+    if _exit27_sha256(raw).hexdigest() != C5_EXIT_V111427_SHA:
+        raise RuntimeError('V11.14.22 볼먼 CSV 원본 식별 실패')
+    events = _exit27_json.loads(raw)
+    if len(events) != 214 or len({(e['date'], e['market'], e['signal_time_kst']) for e in events}) != 214:
+        raise RuntimeError('볼먼 214건 원본 자료 수량 불일치')
+    return events
+
+C5_EXIT_V111427_EVENTS = c5_exit_v111427_events()
+C5_EXIT_V111427_GROUPS = {}
+for _e in C5_EXIT_V111427_EVENTS:
+    C5_EXIT_V111427_GROUPS.setdefault((_e['date'],_e['market']),[]).append(_e)
+
+
+def c5_exit_v111427_fetch(api_get, group, kst):
+    """Fetch ACTUAL 5-minute OHLC, covering all group's historical signals +90m.
+
+    Bithumb's 'to' cursor is exclusive. For a signal opening at t, next 5m
+    candle entry opens at t+5m; 90m hold checks candles t+5m..t+90m.
+    Thus a cursor of latest_signal+95m admits the final required bar.
+    """
+    events = group
+    market = events[0]['market']
+    sig_times = [local_time(e['signal_time_kst'], kst) for e in events]
+    earliest, latest = min(sig_times),max(sig_times)
+    end_excl = latest + timedelta(minutes=95)
+    cursor = end_excl
+    seen = {}
+    pages = 0
+    oldest_complete = False
+    for _ in range(5):
+        raw = api_get('/v1/candles/minutes/5', {
+            'market':market, 'count':200, 'to':cursor.strftime('%Y-%m-%d %H:%M:%S')
+        })
+        pages += 1
+        if not isinstance(raw, list):
+            raise ValueError('5분봉 데이터 응답 오류')
+        oldest = None
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                t = local_time(item['candle_date_time_kst'],kst)
+                o,h,l,c = (float(item[k]) for k in (
+                    'opening_price','high_price','low_price','trade_price'))
+                if not all(isfinite(x) and x>0 for x in (o,h,l,c)):
+                    continue
+                if l>min(o,c) or h<max(o,c) or l>h:
+                    continue
+                if earliest <= t < end_excl:
+                    seen[t] = {'o':o,'h':h,'l':l,'c':c}
+                oldest = t if oldest is None or t < oldest else oldest
+            except (ValueError, KeyError, TypeError, OverflowError):
+                continue
+        if oldest is None:
+            break
+        if oldest <= earliest:
+            oldest_complete = True
+            break
+        if len(raw) < 200:
+            break
+        if oldest >= cursor:
+            raise ValueError('5분봉 시간 역순 페이지 오류')
+        cursor = oldest
+    return seen, pages, oldest_complete
+
+
+def c5_exit_v111427_simulate(bars, signal, entry, tp, sl, minutes):
+    """Next-bar-open entry; earliest exit on observed contiguous 5m bars.
+
+    UNKNOWN when a required candle is missing before exit, never synthetic
+    candles. SL has priority on same bar. Gap-down stop uses bar's open.
+    Time exit uses final bar close. Uses original 0.04% fee +0.05% slippage
+    EACH SIDE and exact original net-return convention.
+    """
+    target = entry*(1+tp/100)
+    stop = entry*(1-sl/100)
+    step = timedelta(minutes=5)
+    for j in range(1,minutes//5+1):
+        bar = bars.get(signal + j*step)
+        if bar is None:
+            return {'outcome':'UNKNOWN','reason':f'MISSING_{j*5}M', 'net_pct':None,
+                    'minutes':None,'exit':None}
+        if bar['l'] <= stop:
+            code,exit_price='SL',min(stop,bar['o'])
+        elif bar['h'] >= target:
+            code,exit_price='TP',target
+        elif j == minutes//5:
+            code,exit_price='TIME',bar['c']
+        else:
+            continue
+        cost=(C5_EXIT_V111427_FEE+C5_EXIT_V111427_SLIP)/100
+        net=(exit_price*(1-cost)/(entry*(1+cost))-1)*100
+        return {'outcome':code,'reason':'','net_pct':round(net,4),
+                'minutes':j*5,'exit':round(exit_price,10)}
+    return {'outcome':'UNKNOWN','reason':'NO_EXIT','net_pct':None,
+            'minutes':None,'exit':None}
+
+
+def c5_exit_v111427_group_result(api_get,group,kst):
+    seen,pages,oldest_complete=c5_exit_v111427_fetch(api_get,group,kst)
+    out=[]
+    for event in group:
+        t=local_time(event['signal_time_kst'],kst)
+        start=t+timedelta(minutes=5)
+        source_entry=event['old_entry']
+        if t not in seen:
+            entry=None
+            err='SIGNAL_BAR_MISSING'
+        elif start not in seen:
+            entry=None
+            err='ENTRY_BAR_MISSING'
+        else:
+            entry=seen[start]['o']
+            # Original CSV entry is an external cross-check, not a replacement.
+            if source_entry is not None and abs(entry/source_entry-1)>1e-7:
+                err='ENTRY_PRICE_MISMATCH'
+            else:
+                err=''
+        arms={}
+        for name,tp,sl,horizon,_ in C5_EXIT_V111427_ARMS:
+            if entry is None or err:
+                arms[name]={'outcome':'UNKNOWN','reason':err,'net_pct':None,
+                            'minutes':None,'exit':None}
+            else:
+                arms[name]=c5_exit_v111427_simulate(seen,t,entry,tp,sl,horizon)
+        original=event['old_outcome']
+        orig_net=event['old_net']
+        replay=arms['BASE']
+        if original=='UNKNOWN' or replay['outcome']=='UNKNOWN':
+            match='UNVERIFIABLE'
+        elif replay['outcome']==original and abs(replay['net_pct']-orig_net) <= .0003:
+            match='MATCH'
+        else:
+            match='MISMATCH'
+        out.append({'id':event['id'],'date':event['date'],'market':event['market'],
+                    'signal_time_kst':event['signal_time_kst'],
+                    'old_outcome':original,'old_net_pct':orig_net,
+                    'old_entry':source_entry,'replay_entry':entry,
+                    'base_match':match,'entry_reason':err,'arms':arms})
+    return {'date':group[0]['date'],'market':group[0]['market'],
+            'pages':pages,'bars':len(seen),'range_covered':oldest_complete,
+            'events':out}
+
+
+C5_EXIT_V111427_PAGE = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.27 · C5 볼먼 청산 전략 비교</title>
+<style>/*BASE_STYLE*/
+.note27{padding:13px;border-radius:9px;background:#15223a;line-height:1.75;font-size:13px}
+.warn27{border-left:3px solid #f8c576;padding:10px 12px;background:#282334;line-height:1.7;font-size:13px}
+button{margin:4px 5px 4px 0}
+.wide27{overflow-x:auto}
+.small27{font-size:12px;opacity:.87}
+</style></head><body><main>
+<h1>🧪 V11.14.27 · 볼먼 압축 돌파 청산 비교</h1>
+<p class="muted">C5 + 볼먼 조건 통과 214건 · 2026년 11월 6~12일 · 과거 실제 5분봉 재조회</p>
+<section class="panel"><h2>고정 검증 기준</h2>
+<div class="note27"><b>기존 BUY 신호는 그대로:</b> V11.14.22 CSV의 볼먼 통과 214건만 사용.<br>
+<b>진입:</b> C5 신호 확정 후 다음 5분봉 시가.<br>
+<b>익절 1.5% 유지:</b> 손절 0.75/1.0/1.25%, 30/60/90분 보유, 익절 2.0% 추가 비교.<br>
+<b>비용:</b> 편도 수수료 0.04% + 슬리피지 0.05% (왕복 반영).<br>
+<b>보수적 체결:</b> 같은 봉의 익절·손절 동시 터치는 손절 우선, 손절 아래 갭 시 시가 체결.<br>
+<b>누락 캔들:</b> 임의 보간하지 않고 미확정. 기존 CSV의 원래 익절·손절 기록과 재현 결과도 대조.<br>
+<b>주의:</b> 90분 보유는 같은 코인의 이후 60분 간격 신호와 포지션이 겹칠 수 있어. 자본금 운용 성과가 아닌 <b>신호별 독립 시뮬레이션</b>이야.</div>
+<p class="warn27">⚠️ 7일은 이미 전략을 골랐던 연구 기간이므로 독립 검증이 아니야. <b>평균 순손익은 수수료·슬리피지 반영 후 %</b>이며, 더 높은 승률만으로 전략을 채택하지 않아. 반드시 <b>동일 거래가 양쪽 모두 확정된 경우의 순손익 차이</b>를 함께 봐야 해.</p></section>
+<section class="panel"><h2>검증 실행</h2>
+<p class="muted">종목·날짜별 151개 묶음으로 나눠 조회해. 진행 기록은 이 기기의 브라우저에 자동 저장돼.</p>
+<div class="actions"><button id="run" disabled>214건 일괄 재검증 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary" disabled>이 검증만 초기화</button><button id="csv" class="secondary" disabled>전체 결과 CSV 저장</button></div>
+<progress id="progress" max="151" value="0"></progress>
+<div id="status" class="status">불러오는 중...</div></section>
+<section class="panel"><h2>1. 진행 및 데이터 품질</h2><div id="coverage" class="stats">검사 전</div></section>
+<section class="panel"><h2>2. 청산 전략별 성적 · 전체</h2><div id="summary" class="wide27">검사 전</div>
+<p class="small27">전체 재조회 결과를 보는 참고 표야. 원본 불일치·원본 미확정 신호도 포함될 수 있어. <b>최종 비교는 아래 '같은 신호끼리 비교' 표를 우선해.</b> 90분은 추가 캔들 부족으로 확정 건수가 달라질 수 있어.</p></section>
+<section class="panel"><h2>3. 같은 신호끼리 비교</h2><div id="paired" class="wide27">검사 전</div>
+<p class="small27">기존 CSV 원본과 기본 청산이 일치(MATCH)하고, 두 전략 모두 손익이 확정된 <b>동일한 신호만</b> 비교해. 새 전략 - 기본 전략의 평균 순손익 차이(%p).</p></section>
+<section class="panel"><h2>4. 날짜별 성적과 원본 검증</h2><div id="daily" class="wide27">검사 전</div></section>
+<section class="panel"><h2>5. 최근 개별 신호 (50건)</h2><div id="examples" class="wide27">검사 전</div></section>
+</main><script>
+'use strict';
+const API='/api/winrate14c5exit', KEY='bithumb_c5_exit_v111427_1';
+const ARMS=[['BASE','기존 1.5/1.0·60분'],['STOP075','손절 0.75'],['STOP125','손절 1.25'],['HOLD30','보유 30분'],['HOLD90','보유 90분'],['TP200','익절 2.0']];
+const DAYS=['2026-11-06','2026-11-07','2026-11-08','2026-11-09','2026-11-10','2026-11-11','2026-11-12'];
+const $=id=>document.getElementById(id);
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pct=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+const num=x=>x==null||x===''?NaN:Number(x);
+const td=x=>'<td>'+esc(x)+'</td>';
+const row=items=>'<tr>'+items.map(td).join('')+'</tr>';
+const table=(header,rows)=>'<table><thead><tr>'+header.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody></table>';
+const card=(h,v)=>'<div><small>'+esc(h)+'</small><strong>'+esc(v)+'</strong></div>';
+let meta=null,state=null,running=false,stop=false,failCount=0;
+const gid=(day,market)=>day+'|'+market;
+function load(){try{let a=JSON.parse(localStorage.getItem(KEY)||'null');return a&&a.version===1&&a.source_sha===meta.source_sha&&a.groups&&typeof a.groups==='object'?a:null;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function all(){return Object.values(state?.groups||{}).flatMap(g=>g.events||[]);}
+function finished(){return !!state&&meta&&Object.keys(state.groups).length===meta.groups.length;}
+function calc(items,key){let valid=items.filter(e=>e.arms[key]?.outcome!=='UNKNOWN'&&Number.isFinite(num(e.arms[key]?.net_pct)));
+let nums=valid.map(e=>num(e.arms[key].net_pct));return {total:items.length,n:valid.length,unknown:items.length-valid.length,win:nums.filter(x=>x>0).length,
+sl:valid.filter(e=>e.arms[key].outcome==='SL').length,tp:valid.filter(e=>e.arms[key].outcome==='TP').length,time:valid.filter(e=>e.arms[key].outcome==='TIME').length,
+avg:nums.length?nums.reduce((a,b)=>a+b,0)/nums.length:NaN,rate:nums.length?100*nums.filter(x=>x>0).length/nums.length:NaN};}
+function same(e,k){return e.base_match==='MATCH'&&e.arms.BASE?.outcome!=='UNKNOWN'&&e.arms[k]?.outcome!=='UNKNOWN'&&Number.isFinite(num(e.arms.BASE?.net_pct))&&Number.isFinite(num(e.arms[k]?.net_pct));}
+function paired(events,k){let a=events.filter(e=>same(e,k));let base=a.reduce((s,e)=>s+num(e.arms.BASE.net_pct),0),arm=a.reduce((s,e)=>s+num(e.arms[k].net_pct),0);
+return {n:a.length,base:a.length?base/a.length:NaN,arm:a.length?arm/a.length:NaN,delta:a.length?(arm-base)/a.length:NaN};}
+function paint(){if(!meta||!state)return;let events=all(),keys=Object.keys(state.groups),original=events.filter(e=>e.old_outcome!=='UNKNOWN'),matches=events.filter(e=>e.base_match==='MATCH'),bad=events.filter(e=>e.base_match==='MISMATCH');
+$('progress').max=meta.groups.length;$('progress').value=keys.length;
+$('coverage').innerHTML=card('진행 묶음',keys.length+' / '+meta.groups.length)+card('수집 신호',events.length+' / '+meta.total)+card('원본과 일치',matches.length+' / '+original.length)+card('원본 불일치',bad.length)+card('재현 기본 미확정',events.filter(e=>e.arms.BASE?.outcome==='UNKNOWN').length)+card('조회 오류',failCount);
+$('csv').disabled=!events.length;
+$('status').textContent=(finished()?'✅ 7일 전체 청산 비교 완료':running?'⏳ 과거 캔들 확인 중':'검사 준비 / 이어하기 가능')+' · '+keys.length+'/'+meta.groups.length+'개 묶음 완료'+(failCount?'\n일부 조회 실패. 중지 후 다시 누르면 남은 묶음만 검사할 수 있어.':'')+(bad.length?'\n⚠️ 기존 CSV와 재현 손익이 다른 신호 '+bad.length+'건이 있어. 새 전략 판단 전에 별도 점검이 필요해.':'');
+let sRows=ARMS.map(([key,label])=>{let s=calc(events,key);return row([label,s.total,s.n,s.unknown,s.win,s.tp,s.sl,s.time,pct(s.avg),pct(s.rate)]);});
+$('summary').innerHTML=table(['전략','신호','확정','미확정','수익 거래','익절','손절','시간 만료','평균 순손익','수익 거래 비율'],sRows);
+$('paired').innerHTML=table(['전략','공통 확정','기본 평균','새 조건 평균','차이(%p)'],ARMS.slice(1).map(([key,label])=>{let p=paired(events,key);return row([label,p.n,pct(p.base),pct(p.arm),pct(p.delta)]);}));
+$('daily').innerHTML=table(['날짜','기존 확정','기존 평균','손절 0.75 차이','손절 1.25 차이','30분 차이','90분 차이','익절 2.0 차이'],DAYS.map(d=>{let a=events.filter(e=>e.date===d),b=calc(a,'BASE');return row([d,b.n,pct(b.avg),...ARMS.slice(1).map(([key])=>{let p=paired(a,key);return pct(p.delta)+' ('+p.n+')';})]);}));
+let recent=[...events].sort((a,b)=>b.signal_time_kst.localeCompare(a.signal_time_kst)).slice(0,50);
+$('examples').innerHTML=recent.length?table(['시각','종목','원본 일치','기존','손절 0.75','손절 1.25','30분','90분','익절 2.0'],recent.map(e=>row([e.signal_time_kst,e.market,e.base_match,...ARMS.map(([k])=>pct(num(e.arms[k]?.net_pct)))]))):'아직 결과 없음';
+}
+async function fetchJson(path,opts={}){let a=new AbortController(),timer=setTimeout(()=>a.abort(),90000);try{let res=await fetch(path,{...opts,cache:'no-store',signal:a.signal});let v=await res.json();if(!res.ok||!v.ok)throw Error(v.error||'HTTP '+res.status);return v;}finally{clearTimeout(timer);}}
+async function init(){meta=await fetchJson(API+'/seed');if(meta.total!==214||meta.groups.length!==151)throw Error('볼먼 신호 원본 수량 불일치');state=load()||{version:1,source_sha:meta.source_sha,groups:{}};paint();$('run').disabled=false;$('reset').disabled=false;}
+async function run(){if(running||!meta)return;running=true;stop=false;failCount=0;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;let jobs=meta.groups.filter(g=>!state.groups[gid(g.day,g.market)]),cursor=0;
+async function worker(){while(!stop){let i=cursor++;if(i>=jobs.length)break;let g=jobs[i];try{let x=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({day:g.day,market:g.market})});
+if(x.date!==g.day||x.market!==g.market||x.events.length!==g.count)throw Error('서버 원본 수량 불일치');state.groups[gid(g.day,g.market)]=x;save();}catch(e){failCount++;$('status').textContent='⚠️ '+g.day+' '+g.market+' : '+String(e.message||e);if(failCount>=8)stop=true;}paint();}}
+try{await Promise.all([worker(),worker()]);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;paint();}}
+$('run').onclick=run;$('pause').onclick=()=>{stop=true;$('pause').disabled=true;};
+$('reset').onclick=()=>{if(running||!meta)return;if(!confirm('V11.14.27 청산 비교 기록만 초기화할까?'))return;state={version:1,source_sha:meta.source_sha,groups:{}};failCount=0;save();paint();};
+function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{let cols=['version','date','market','signal_time_kst','base_match','old_outcome','old_net_pct','old_entry','replay_entry','entry_reason'];for(let [k] of ARMS)cols.push(k+'_outcome',k+'_net_pct',k+'_minutes',k+'_reason');
+let lines=[cols.join(',')];for(let e of all()){let d={version:'V11.14.27',...e};for(let [k] of ARMS){let a=e.arms[k];d[k+'_outcome']=a.outcome;d[k+'_net_pct']=a.net_pct;d[k+'_minutes']=a.minutes;d[k+'_reason']=a.reason;}lines.push(cols.map(k=>csvCell(d[k])).join(','));}
+let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='bithumb_C5_VOLMAN_EXIT_V111427.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);};
+init().catch(e=>{$('status').textContent='⚠️ '+String(e.message||e);});
+</script></body></html>""".replace('/*BASE_STYLE*/',C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
+
+
+def register_c5_exit_v111427_lab(app,deps):
+    api_get,kst=deps['api_get'],deps['KST']
+
+    @app.get('/backtest-winrate-c5-exit-compare')
+    def c5_exit_v111427_page():
+        return render_template_string(C5_EXIT_V111427_PAGE)
+
+    @app.get('/api/winrate14c5exit/seed')
+    def c5_exit_v111427_seed():
+        groups=[{'day':day,'market':market,'count':len(seq)}
+                for (day,market),seq in sorted(C5_EXIT_V111427_GROUPS.items())]
+        return jsonify({'ok':True,'version':'V11.14.27','total':len(C5_EXIT_V111427_EVENTS),
+                        'groups':groups,'source_sha':C5_EXIT_V111427_SHA})
+
+    @app.post('/api/winrate14c5exit/evaluate')
+    def c5_exit_v111427_evaluate():
+        try:
+            data=request.get_json(silent=True)
+            if not isinstance(data,dict):raise ValueError('요청 형식 오류')
+            day,market=data.get('day'),data.get('market')
+            if not isinstance(day,str) or not isinstance(market,str):
+                raise ValueError('날짜/종목 형식 오류')
+            group=C5_EXIT_V111427_GROUPS.get((day,market))
+            if not group:raise ValueError('대상 목록에 없는 날짜·종목')
+            result=c5_exit_v111427_group_result(api_get,group,kst)
+            return jsonify({'ok':True,'version':'V11.14.27',**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':str(exc)[:180]}),400
+
+
+_v111426_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111426_register_daytrade_review(app,deps)
+    register_c5_exit_v111427_lab(app,deps)
