@@ -6851,3 +6851,304 @@ _v111420_register_daytrade_review = register_daytrade_review
 def register_daytrade_review(app, deps):
     _v111420_register_daytrade_review(app, deps)
     register_c5_trend_v111421_lab(app, deps)
+
+# ---------------------------------------------------------------------------
+# V11.14.22 - C5 × two classic scalping concepts (RESEARCH ONLY).
+# APPEND-ONLY: all V11.14.21 and older endpoints remain unchanged.
+#  - Raschke-inspired: Wilder ADX(14) > 30 in +DI uptrend, ADX expansion
+#    recently seen, EMA(20) pullback contact, then bar-close confirmation.
+#  - Volman-inspired: six preceding 5m bars compress into <= 1.2% range,
+#    EMA(20) near the box, then signal CLOSE breaks the range high.
+# These are explicit mechanical filters on SAME existing C5 entry/exit events,
+# NOT independent reproductions of the discretionary original strategies.
+# Prices/indicators stop at the completed C5 signal bar; never use future bars.
+# ---------------------------------------------------------------------------
+
+C5_EXPERT_V111422_ARMS = (
+    ('base', '기존 C5'),
+    ('trend', 'C5 + 15분 상승 (기존)'),
+    ('structure', 'C5 + 가격 구조 (기존)'),
+    ('both', 'C5 + 기존 두 조건'),
+    ('raschke', 'C5 + ADX/EMA20 눌림'),
+    ('volman', 'C5 + 압축 후 돌파'),
+)
+
+
+def c5_expert_v111422_gates(rows, signal_i):
+    """Mechanical retrospective classifications using no bars after signal_i.
+
+    Unknown if there is not enough contiguous 5-minute history. For Wilder
+    ADX(14), the first valid ADX corresponds to bar 27 (0-based), and the
+    first rise comparison needs bar 28. EMA20 seeds with the first SMA20.
+    """
+    n_all = len(rows)
+    if not 0 <= signal_i < n_all:
+        raise ValueError('C5 신호 위치 오류')
+
+    start = signal_i
+    # Start from contiguous history only. Truncation keeps calculations fast;
+    # EMA warmup remains fixed and deterministic, with a generous 200 bars.
+    while (start > 0 and signal_i - start < 199 and
+           rows[start]['t'] - rows[start-1]['t'] == timedelta(minutes=5)):
+        start -= 1
+    win = rows[start:signal_i+1]
+    size = len(win)
+    close = [b['c'] for b in win]
+    high = [b['h'] for b in win]
+    low = [b['l'] for b in win]
+    ema = [None] * size
+    if size >= 20:
+        ema[19] = sum(close[:20]) / 20
+        k = 2 / 21
+        for j in range(20, size):
+            ema[j] = ema[j-1] + k * (close[j] - ema[j-1])
+
+    adx = [None] * size
+    pdi = [None] * size
+    mdi = [None] * size
+    if size >= 28:
+        tr, pdm, mdm = [0.] * size, [0.] * size, [0.] * size
+        for j in range(1, size):
+            up = high[j] - high[j-1]
+            down = low[j-1] - low[j]
+            pdm[j] = up if up > down and up > 0 else 0.
+            mdm[j] = down if down > up and down > 0 else 0.
+            tr[j] = max(high[j]-low[j], abs(high[j]-close[j-1]),
+                        abs(low[j]-close[j-1]))
+        # Wilder's 14-bar smoothed sums of TR, +DM, -DM.
+        atr_sum, pos_sum, neg_sum = sum(tr[1:15]), sum(pdm[1:15]), sum(mdm[1:15])
+        dx = [None] * size
+        for j in range(14, size):
+            if j > 14:
+                atr_sum = atr_sum - atr_sum/14 + tr[j]
+                pos_sum = pos_sum - pos_sum/14 + pdm[j]
+                neg_sum = neg_sum - neg_sum/14 + mdm[j]
+            pos = (100*pos_sum/atr_sum) if atr_sum > 0 else 0.
+            neg = (100*neg_sum/atr_sum) if atr_sum > 0 else 0.
+            pdi[j], mdi[j] = pos, neg
+            dx[j] = 100*abs(pos-neg)/(pos+neg) if pos+neg > 0 else 0.
+            if j == 27:
+                adx[j] = sum(dx[14:28])/14
+            elif j > 27:
+                adx[j] = (adx[j-1]*13 + dx[j])/14
+
+    raschke = None
+    recent_adx_rise = None
+    ema_touch_4 = None
+    if size >= 30 and ema[-2] is not None and adx[-1] is not None:
+        recent_adx_rise = any(
+            adx[j] is not None and adx[j-1] is not None and
+            adx[j] > 30 and adx[j] > adx[j-1]
+            for j in range(max(28, size-7), size)
+        )
+        ema_touch_4 = any(
+            ema[j] is not None and low[j] <= ema[j]*1.002 and
+            high[j] >= ema[j]*0.998
+            for j in range(max(0, size-5), size-1)
+        )
+        raschke = bool(
+            adx[-1] > 30 and pdi[-1] > mdi[-1] and recent_adx_rise
+            and ema_touch_4 and ema[-1] > ema[-2]
+            and close[-1] > ema[-1] and close[-1] > high[-2]
+        )
+
+    volman = None
+    squeeze_range_pct, squeeze_top, squeeze_bottom, ema_near_box = None, None, None, None
+    if size >= 21 and ema[-2] is not None:
+        prior = win[-7:-1]  # six completely closed bars BEFORE C5 signal
+        squeeze_top = max(b['h'] for b in prior)
+        squeeze_bottom = min(b['l'] for b in prior)
+        reference = sum(b['c'] for b in prior)/6
+        squeeze_range_pct = (squeeze_top-squeeze_bottom)/reference*100
+        ema_near_box = bool(squeeze_bottom*0.997 <= ema[-2] <= squeeze_top*1.003)
+        volman = bool(squeeze_range_pct <= 1.2 and ema_near_box
+                      and close[-1] > squeeze_top and close[-1] > win[-1]['o'])
+
+    def num(v):
+        return round(v, 6) if v is not None and isfinite(v) else None
+
+    return {
+        'raschke': raschke, 'volman': volman,
+        'adx14': num(adx[-1]), 'plus_di14': num(pdi[-1]),
+        'minus_di14': num(mdi[-1]), 'ema20': num(ema[-1]),
+        'adx_rise_recent': recent_adx_rise, 'ema_touch_4': ema_touch_4,
+        'squeeze_range_pct': num(squeeze_range_pct),
+        'squeeze_top': num(squeeze_top), 'squeeze_bottom': num(squeeze_bottom),
+        'ema_near_box': ema_near_box,
+    }
+
+
+def c5_expert_v111422_evaluate_symbol(api_get, market, cfg, kst):
+    """Reuse exact V11.14.21 C5 entries and exits; capture existing 5m data.
+
+    This wrapper adds no extra upstream requests: the underlying evaluator
+    makes its usual candle queries, whose responses are reused for new gates.
+    """
+    captured = {}
+
+    def intercept(path, params):
+        raw = api_get(path, params)
+        if path == '/v1/candles/minutes/5' and isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    t = local_time(item['candle_date_time_kst'], kst)
+                    op, hi, lo, c = [float(item[k]) for k in
+                                     ('opening_price', 'high_price', 'low_price', 'trade_price')]
+                    v = float(item['candle_acc_trade_volume'])
+                    if (all(isfinite(x) and x > 0 for x in (op, hi, lo, c))
+                            and isfinite(v) and v >= 0
+                            and lo <= min(op, c) and hi >= max(op, c)):
+                        captured[t] = {'t': t, 'o': op, 'h': hi, 'l': lo, 'c': c, 'v': v}
+                except (KeyError, ValueError, TypeError, OverflowError):
+                    continue
+        return raw
+
+    baseline = c5_trend_v111421_evaluate_symbol(intercept, market, cfg, kst)
+    ordered = [captured[t] for t in sorted(captured)]
+    positions = {b['t']: i for i, b in enumerate(ordered)}
+    for event in baseline['events']:
+        ts = local_time(event['signal_time_kst'], kst)
+        if ts not in positions:
+            raise ValueError('전문가 비교: 원본 C5 신호 위치를 찾을 수 없습니다')
+        event['gates'].update(c5_expert_v111422_gates(ordered, positions[ts]))
+    if any('raschke' not in e['gates'] or 'volman' not in e['gates']
+           for e in baseline['events']):
+        raise ValueError('전문가 필터 계산 오류')
+    return baseline
+
+
+
+C5_EXPERT_V111422_PAGE = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V11.14.22 · C5 + ADX/EMA20 / 가격 압축 검증실</title>
+<style>/*REPLACE_STYLE*/
+.note{border-radius:10px;padding:12px;background:#10182d;line-height:1.75;font-size:13px}
+.notice{border-left:3px solid #ffca7a;padding:11px 12px;background:#252339;font-size:13px;line-height:1.75}
+fieldset{border:0;padding:0;margin:0}.smaller{font-size:12px}
+select{padding:10px;background:#111a2e;border:1px solid #35435e;color:#f3f6ff;border-radius:8px;width:100%;min-width:0;font:inherit}
+</style></head><body><main>
+<h1>🧪 V11.14.22 · C5 전문가 기법 2종 추가</h1>
+<p class="muted">빗썸 KRW 과거 5분봉 · 15분 추세 / 캔들 구조 / ADX+EMA20 / 가격 압축 · V2 스캐너 변경 없음</p>
+<section class="panel"><h2>이번 실험의 기준</h2>
+<div class="note"><b>① 기존 C5:</b> 직전 종가 5이평 아래 → 현재 양봉이 5이평 위 첫 회복 → 5이평 상승.<br>
+<b>② C5 + 15분 상승:</b> 신호 확정 시점까지 <b>완성된 15분봉</b> 6개에서, 최근 종가가 15분봉 5이평 위이고 그 5이평도 상승 중.<br>
+<b>③ C5 + 상승 저점·고점 돌파:</b> 신호 전 4개 봉의 최저가가 그 앞 4개 봉의 최저가보다 높고, 신호 종가가 이전 3개 봉의 최고가 위.<br>
+<b>④ C5 + 두 조건 모두:</b> ②와 ③이 동시에 참인 C5만 통과.<br>
+<b>⑤ C5 + ADX/EMA20 (라슈키 원칙 응용):</b> Wilder ADX(14) > 30, +DI > -DI, 최근 ADX 상승 경험, 지난 4봉 중 EMA20 접촉, EMA20 상승 및 신호 종가가 EMA20과 직전 봉 고가 위.<br>
+<b>⑥ C5 + 압축 돌파 (볼먼 원칙 응용):</b> 신호 이전 6개 5분봉 전체 가격 폭 1.2% 이내, EMA20이 가격 박스 부근, 신호 양봉 종가가 이전 6봉의 최고가를 돌파.<br>
+<b>모든 방식 공통:</b> 동일 C5 신호 목록과 60분 신호 제한·다음 봉 시가 진입·익절 +1.5% / 손절 -1.0% / 최대 60분 종료·편도 거래 비용.</div>
+<p class="hint">신호와 청산 결과는 기존 V11.14.17/19 검증 코드에서 가져옵니다. 15분봉은 5분봉을 3개씩 묶습니다. ADX/EMA20/압축 필터에도 누락 봉을 임의로 채우지 않습니다. 데이터가 부족하면 미확인으로 표시합니다. <b>필터가 제외한 신호도 원래 손익을 유지</b>해 놓친 수익 기회도 함께 확인합니다.</p>
+<div class="notice">⚠️ 이 실험은 트레이더의 원전 전략 자체가 아니라 C5에 적용한 <b>기계식 필터</b>의 거래당 성과 비교입니다. 신호를 제거하고 다른 BUY로 자동 대체하지 않습니다. 과거 OHLC의 동일 봉 익절·손절 동시 터치는 기존 코드대로 손절 우선입니다. 실전 수익이 보장되지는 않습니다.</div></section>
+<section class="panel"><h2>검증 설정</h2>
+<div class="controls">
+<label class="field">검증 날짜 · 한국시간<input id="date" type="date"></label>
+<label class="field">검사 범위<select id="scope"><option value="40">빠른 예비검증 · 40종목</option><option value="all">전체 KRW 종목</option></select></label>
+<label class="field">편도 수수료 (%)<input id="fee" type="number" value="0.04" min="0" max="0.5" step="0.01"></label>
+<label class="field">편도 슬리피지 (%)<input id="slip" type="number" value="0.05" min="0" max="0.5" step="0.01"></label>
+</div>
+<p class="hint">40종목 예비검증은 이름순 전체 목록에서 일정 간격으로 고른 <b>기능 점검용 부분 표본</b>이며 전체 시장의 대표 표본이 아닙니다. 전 종목 결과는 반드시 '전체 KRW 종목'으로 따로 검사해 주세요. 검사 날짜나 범위를 바꾸면 이 V11.14.22 실험의 저장 기록만 초기화됩니다.</p>
+<div class="actions"><button id="run">검사 시작 / 이어하기</button><button id="pause" class="secondary" disabled>일시 중지</button><button id="reset" class="secondary">이 실험만 초기화</button><button id="csv" class="secondary" disabled>전체 신호·필터 결과 CSV 저장</button></div>
+<progress id="progress" max="1" value="0"></progress><div id="status" class="status">검사 전</div></section>
+<section class="panel"><h2>1. 데이터 범위</h2><div id="coverage" class="stats">검사 전</div><p class="hint">현재 상장된 종목의 과거 데이터만 조회합니다. 상장폐지 종목, 충분한 과거 봉이 없는 종목은 누락될 수 있으며 미래 데이터는 신호 판정에 사용하지 않습니다.</p></section>
+<section class="panel"><h2>2. C5 대비 전략별 성과</h2><div id="summary" class="scroll">검사 전</div><p class="hint">수익률은 수수료·슬리피지를 반영한 <b>거래당 평균 순손익</b>입니다. 판정 완료 신호만 수익 계산에 포함하고 미판정 건수는 별도로 표시합니다.</p></section>
+<section class="panel"><h2>3. 필터가 거른 신호 결과</h2><div id="blocked" class="scroll">검사 전</div><p class="hint">원래 C5에서 수익이 났던 신호를 제외하면 기회도 함께 놓친 것입니다. 필터를 통과한 신호와 거른 신호의 결과를 모두 기록합니다.</p></section>
+<section class="panel"><h2>4. 종목별 상세 비교</h2><div id="examples" class="scroll">검사 전</div><p class="hint">날짜가 달라지면 결과를 CSV로 저장한 뒤 다음 날짜를 검사하세요. 과거 조건을 맞춘 구간과 별도 검증 구간을 나눠 비교하세요.</p></section>
+</main><script>
+'use strict';
+const API='/api/winrate14c5experts',KEY='bithumb_v111422_c5_experts_v1';
+const $=id=>document.getElementById(id);
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const asNum=v=>(v===null||v===undefined||v==='')?NaN:Number(v);
+const pct=v=>Number.isFinite(v)?v.toFixed(3)+'%':'—';
+const ARMS=[['base','기존 C5'],['trend','C5 + 15분 상승'],['structure','C5 + 저점·고점 구조'],['both','C5 + 기존 두 조건'],['raschke','C5 + ADX/EMA20 눌림'],['volman','C5 + 압축 후 돌파']];
+let state=null,running=false,stopRequested=false,storeFailed=false;
+function kstDate(d){const a=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d),g=k=>a.find(x=>x.type===k).value;return `${g('year')}-${g('month')}-${g('day')}`;}
+const yesterday=()=>kstDate(new Date(Date.now()-86400000));
+$('date').max=yesterday();$('date').value=yesterday();
+function config(){const date=$('date').value,fee=asNum($('fee').value),slip=asNum($('slip').value),scope=$('scope').value;if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||date>yesterday())throw Error('완전히 종료된 과거 날짜를 선택해줘');if(!Number.isFinite(fee)||!Number.isFinite(slip)||fee<0||fee>0.5||slip<0||slip>0.5)throw Error('편도 비용은 0~0.5% 범위로 입력해줘');if(!['40','all'].includes(scope))throw Error('검사 범위 오류');return {date,fee,slip,scope};}
+const signature=c=>JSON.stringify([c.date,c.fee,c.slip,c.scope]);
+function load(){try{const s=JSON.parse(localStorage.getItem(KEY)||'null');if(!s||s.version!==1||!s.config||!Array.isArray(s.markets)||!s.markets.length||!s.results||typeof s.results!=='object'||new Set(s.markets).size!==s.markets.length||s.markets.some(m=>!/^KRW-[A-Z0-9]+$/.test(m)))return null;return s;}catch{return null;}}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function records(){return state?state.markets.filter(m=>Object.prototype.hasOwnProperty.call(state.results,m)).map(m=>state.results[m]):[];}
+function finished(){return !!(state&&state.markets.length&&records().length===state.markets.length&&state.failed===0);}
+function accepted(e,k){if(k==='base')return true;if(k==='trend')return e.gates.trend_15m===true;if(k==='structure')return e.gates.structure===true;if(k==='both')return e.gates.trend_15m===true&&e.gates.structure===true;if(k==='raschke')return e.gates.raschke===true;if(k==='volman')return e.gates.volman===true;return false;}
+function missingFeature(e,k){const g=e.gates;if(!g)return true;if(k==='trend')return g.trend_15m===null;if(k==='structure')return g.structure===null;if(k==='both')return g.trend_15m===null||g.structure===null;if(k==='raschke')return g.raschke===null;if(k==='volman')return g.volman===null;return false;}
+function events(rs,key,allow=true){const out=[];for(const r of rs)for(const ev of r.events)if(accepted(ev,key)===allow)out.push({...ev,market:r.market});return out;}
+function stat(es){const judged=es.filter(e=>e.outcome!=='UNKNOWN'&&Number.isFinite(asNum(e.net_pct)));const n=judged.length,profits=judged.filter(e=>asNum(e.net_pct)>0).length;return {signals:es.length,judged:n,unknown:es.length-n,profit:profits,tp:judged.filter(e=>e.outcome==='TP').length,sl:judged.filter(e=>e.outcome==='SL').length,tm:judged.filter(e=>e.outcome==='TIME').length,rate:n?profits/n*100:NaN,avg:n?judged.reduce((s,e)=>s+asNum(e.net_pct),0)/n:NaN};}
+function row(cells){return '<tr>'+cells.map(x=>`<td>${esc(x)}</td>`).join('')+'</tr>';}
+function table(headers,body){return '<table><thead><tr>'+headers.map(x=>`<th>${esc(x)}</th>`).join('')+'</tr></thead><tbody>'+body+'</tbody></table>';}
+function card(label,v){return `<div class="stat"><small>${esc(label)}</small><strong>${esc(v)}</strong></div>`;}
+function paintSummary(rs){let body='';const b=stat(events(rs,'base'));for(const [k,name] of ARMS){const s=stat(events(rs,k)),delta=Number.isFinite(s.avg)&&Number.isFinite(b.avg)?s.avg-b.avg:NaN;body+=row([name,s.signals,s.judged,s.unknown,s.profit,pct(s.rate),pct(s.avg),pct(delta),`${s.tp} / ${s.sl} / ${s.tm}`,k==='base'?0:events(rs,k,false).length]);}return table(['전략','신호','판정','미판정','수익','수익 거래 비율','평균 순손익','기존 대비 %p','TP / SL / TIME','제외'],body);}
+function paintBlocked(rs){let body='';for(const [k,name] of ARMS.slice(1)){const blocked=events(rs,k,false),s=stat(blocked),unknown=blocked.filter(e=>missingFeature(e,k)).length;body+=row([name,blocked.length,s.judged,s.unknown,s.tp,s.sl,s.profit,pct(s.avg),unknown]);}return table(['전략','제외 건수','제외 신호 판정','미판정','놓친 TP','제외한 SL','놓친 수익 거래','제외 신호 평균','조건 결측 포함'],body);}
+function paintExamples(rs){const items=events(rs,'base').filter(e=>e.gates).sort((a,b)=>b.entry_time_kst.localeCompare(a.entry_time_kst)).slice(0,70);const flag=v=>v===null?'자료부족':v?'O':'X';return items.length?table(['종목','C5 진입 시각','결과','순손익','15분 상승','캔들 구조','ADX/EMA20','압축 돌파','ADX14','압축폭 %'],items.map(e=>row([e.market,e.entry_time_kst,e.outcome,pct(asNum(e.net_pct)),flag(e.gates.trend_15m),flag(e.gates.structure),flag(e.gates.raschke),flag(e.gates.volman),Number.isFinite(asNum(e.gates.adx14))?asNum(e.gates.adx14).toFixed(2):'—',pct(asNum(e.gates.squeeze_range_pct))])).join('')):'신호 없음';}
+function paint(){const rs=records(),total=state?.markets.length||0,full=finished(),base=events(rs,'base');$('progress').max=total||1;$('progress').value=rs.length;$('csv').disabled=!full;$('coverage').innerHTML=card('검사 완료',`${rs.length} / ${total}`)+card('기존 C5 신호',String(base.length))+card('C5 판정 / 미판정',`${stat(base).judged} / ${stat(base).unknown}`)+card('15분 상승 통과',String(base.filter(e=>e.gates.trend_15m===true).length))+card('구조 통과',String(base.filter(e=>e.gates.structure===true).length))+card('ADX/EMA20 통과',String(base.filter(e=>e.gates.raschke===true).length))+card('압축 돌파 통과',String(base.filter(e=>e.gates.volman===true).length))+card('원본 과거 봉 제한',String(rs.filter(r=>r.truncated).length));if(full){$('summary').innerHTML=paintSummary(rs);$('blocked').innerHTML=paintBlocked(rs);$('examples').innerHTML=paintExamples(rs);}else for(const id of ['summary','blocked','examples'])$(id).textContent='선택한 검사 범위 완료 후 공개';$('status').textContent=(full?'✅ 검증 완료':running?'⏳ 과거 기록 분석 중':'검사 대기 / 일시 중지')+` · ${rs.length}/${total}종목`+(state?.failed?' · 일부 API 오류, 이어하기 가능':'')+(full?`\n${state.config.scope==='40'?'⚠️ 40종목 예비 표본 결과이며 전체 시장 결론이 아닙니다.':'전 KRW 종목 검사 완료. 과거 모의 성적입니다.'}`:'\n전체 범위가 끝나면 전략별 결과를 공개합니다.');}
+async function fetchJson(url,opts){const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),115000);try{const res=await fetch(url,{...opts,cache:'no-store',signal:ac.signal});const data=await res.json();if(!res.ok||!data.ok)throw Error(data.error||'HTTP '+res.status);return data;}finally{clearTimeout(timer);}}
+async function init(cfg){const d=await fetchJson(API+'/universe');if(!Array.isArray(d.items)||!d.items.length)throw Error('빗썸 KRW 목록을 불러오지 못했어');const all=d.items,markets=cfg.scope==='40'&&all.length>40?Array.from({length:40},(_,i)=>all[Math.floor((i+.5)*all.length/40)]):all;state={version:1,config:cfg,markets,results:{},failed:0};save();}
+function validResponse(d,market){if(d.scanned!==1||d.errors!==0||!Array.isArray(d.results)||d.results.length!==1)return false;const r=d.results[0];return r.market===market&&Number.isInteger(r.original_c5_signals)&&Number.isInteger(r.original_c5_unknown)&&Array.isArray(r.events)&&r.events.length===r.original_c5_signals&&r.events.filter(e=>e.outcome==='UNKNOWN').length===r.original_c5_unknown&&r.events.every(e=>e.gates&&[true,false,null].includes(e.gates.trend_15m)&&[true,false,null].includes(e.gates.structure)&&[true,false,null].includes(e.gates.raschke)&&[true,false,null].includes(e.gates.volman)&&['TP','SL','TIME','UNKNOWN'].includes(e.outcome)&&typeof e.signal_time_kst==='string'&&typeof e.entry_time_kst==='string');}
+async function run(){if(running)return;let cfg;try{cfg=config();}catch(e){$('status').textContent='⚠️ '+e.message;return;}if(state&&signature(cfg)!==signature(state.config)){if(!confirm('검증 날짜/비용/범위가 달라졌어. 이 실험의 저장 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);}running=true;stopRequested=false;storeFailed=false;$('run').disabled=true;$('pause').disabled=false;$('reset').disabled=true;try{if(!state)await init(cfg);state.failed=0;save();paint();const pending=state.markets.filter(m=>!Object.prototype.hasOwnProperty.call(state.results,m));let cursor=0,failed=0;async function worker(){while(!stopRequested&&!storeFailed){const market=pending[cursor++];if(!market)return;let pass=false;for(let tryN=0;tryN<3&&!stopRequested;tryN++){try{const data=await fetchJson(API+'/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.config,markets:[market]})});if(!validResponse(data,market))throw Error('응답 구조 검증 실패');state.results[market]=data.results[0];try{save();}catch(e){delete state.results[market];storeFailed=true;$('status').textContent='⚠️ 휴대폰 저장공간 부족, 검사를 멈췄어';break;}pass=true;paint();break;}catch(e){if(tryN===2){failed++;$('status').textContent='⚠️ '+market+': '+String(e.message||e);}else await new Promise(resolve=>setTimeout(resolve,1000*(tryN+1)));}}if(!pass&&failed>=4){stopRequested=true;break;}}}await Promise.all([worker(),worker()]);state.failed=failed;try{save();}catch{}paint();if(stopRequested)$('status').textContent+='\n일시 중지: 다시 누르면 미완료 종목부터 계속 검사';}catch(e){$('status').textContent='⚠️ '+String(e.message||e);}finally{running=false;$('run').disabled=false;$('pause').disabled=true;$('reset').disabled=false;}}
+$('run').onclick=run;$('pause').onclick=()=>{stopRequested=true;$('pause').disabled=true;};$('reset').onclick=()=>{if(running)return;if(!confirm('V11.14.22 실험 진행 기록만 초기화할까?'))return;state=null;localStorage.removeItem(KEY);paint();};
+function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
+$('csv').onclick=()=>{if(!finished())return;const columns=['version','date','market','strategy','status','filter_reason','outcome','net_pct','signal_time_kst','entry_time_kst','is_first_signal','entry','exit','minutes','reason','trend_15m','structure','raschke','volman','adx14','plus_di14','minus_di14','ema20','adx_rise_recent','ema_touch_4','squeeze_range_pct','squeeze_top','squeeze_bottom','ema_near_box','trend_15m_close','trend_15m_sma5','trend_15m_sma5_slope_pct','older_4_low','recent_4_low','previous_3_high','signal_close','fee_pct_side','slip_pct_side','tp_pct','sl_pct','horizon_minutes'];const lines=[columns.join(',')];for(const r of records())for(const [key] of ARMS){const pre={version:'V11.14.22',date:state.config.date,market:r.market,strategy:key,fee_pct_side:state.config.fee,slip_pct_side:state.config.slip,tp_pct:1.5,sl_pct:1,horizon_minutes:60};for(const ev of r.events.length?r.events:[{status:'NO_SIGNAL'}]){const ok=ev.gates?accepted(ev,key):false,missing=ev.gates&&missingFeature(ev,key);const reason=ok?'':missing?'FEATURE_UNAVAILABLE':ev.gates?'FILTER_FAIL':'NO_SIGNAL';const item={...pre,...ev,...(ev.gates||{}),status:ev.status|| (ok?'ACCEPTED':'BLOCKED'),filter_reason:reason};lines.push(columns.map(k=>csvCell(item[k])).join(','));}}const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`bithumb_C5_experts_${state.config.date}_v111422.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),2500);};
+state=load();if(state){for(const key of ['date','fee','slip','scope'])$(key).value=state.config[key];}paint();
+</script></body></html>
+'''.replace('/*REPLACE_STYLE*/', C5_V111417_PAGE.split('<style>',1)[1].split('</style>',1)[0])
+
+
+def register_c5_expert_v111422_lab(app, deps):
+    api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
+    cached = {'markets': None, 'at': 0}
+    lock = Lock()
+
+    def listed():
+        with lock:
+            if cached['markets'] is None or time.time() - cached['at'] > 600:
+                items = sorted({m for m in get_markets()
+                                if isinstance(m, str) and MARKET_RE.fullmatch(m)})
+                if not items:
+                    raise ValueError('KRW 종목을 조회하지 못했습니다')
+                cached.update(markets=items, at=time.time())
+            return cached['markets']
+
+    @app.get('/backtest-winrate-c5-experts')
+    def c5_expert_v111422_page():
+        return render_template_string(C5_EXPERT_V111422_PAGE)
+
+    @app.get('/api/winrate14c5experts/universe')
+    def c5_expert_v111422_universe():
+        try:
+            items = listed()
+            return jsonify({'ok': True, 'items': items, 'count': len(items),
+                            'rule_version': 'V11.14.22',
+                            'universe_type': 'currently_listed_KRW'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+    @app.post('/api/winrate14c5experts/evaluate')
+    def c5_expert_v111422_evaluate():
+        try:
+            raw = request.get_json(silent=True)
+            cfg = c5_v111417_config(raw, kst)
+            markets = raw.get('markets') if isinstance(raw, dict) else None
+            if (not isinstance(markets, list) or len(markets) != 1
+                    or not isinstance(markets[0], str)
+                    or not MARKET_RE.fullmatch(markets[0])):
+                raise ValueError('한 번에 KRW 종목 1개만 검증할 수 있습니다')
+            if markets[0] not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 종목입니다')
+            result = c5_expert_v111422_evaluate_symbol(
+                api_get, markets[0], cfg, kst)
+            return jsonify({'ok': True, 'scanned': 1, 'results': [result],
+                            'errors': 0, 'error_markets': [],
+                            'rule_version': 'V11.14.22'})
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)[:160]}), 400
+
+
+_v111421_register_daytrade_review = register_daytrade_review
+
+
+def register_daytrade_review(app, deps):
+    _v111421_register_daytrade_review(app, deps)
+    register_c5_expert_v111422_lab(app, deps)
