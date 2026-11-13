@@ -10431,3 +10431,343 @@ _v111431_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111431_register_daytrade_review(app,deps)
     register_c5_h2_v111432_lab(app,deps)
+
+
+# =============================================================================
+# V11.14.33 — RESEARCH-ONLY H2 VOLUME / EMA SHADOW FILTERS
+# A/B/C evaluation unchanged. D/E/F are *paper selection* of the C event
+# already simulated, NEVER independent signals, fills, or V2 BUY conditions.
+# Thresholds selected after inspecting Nov 11–12, 2026: evaluate on other
+# dates, not just the dates that suggested these exploratory thresholds.
+# =============================================================================
+
+C5_H2_V111433_FILTERS = (
+    ('D', '거래량 2.0배 이상', 'volume'),
+    ('E', '20EMA 기울기 0.8% 이상', 'ema'),
+    ('F', '거래량 + EMA 동시', 'both'),
+)
+C5_H2_V111433_VOLUME_MIN = 2.0
+C5_H2_V111433_EMA_SLOPE_MIN = 0.8
+C5_H2_V111433_TRAIN_DATES = ('2026-11-11', '2026-11-12')
+
+
+def c5_h2_v111433_coverage(rows, cfg, kst, truncated, h2_eligible_windows):
+    '''Observed data coverage only: absence is not assumed to be no trade.
+
+    Exchange candle endpoints may omit empty intervals or omit historical data.
+    Timestamp gaps alone cannot distinguish no trades from API omissions.
+    '''
+    from datetime import datetime as _dt, time as _tm
+    start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=start+timedelta(days=1)
+    daily=[r for r in rows if start<=r['t']<end]
+    history=sum(1 for r in rows if r['t']<start)
+    gaps=0;missing_between=0;max_gap=0;streak=0;longest=0
+    previous=None
+    for bar in daily:
+        if previous is None:
+            streak=1
+        else:
+            gap=int((bar['t']-previous).total_seconds()//300)
+            if gap==1:
+                streak+=1
+            else:
+                gaps+=1
+                missing_between+=max(0,gap-1)
+                max_gap=max(max_gap,max(0,5*(gap-1)))
+                streak=1
+        longest=max(longest,streak)
+        previous=bar['t']
+    # One past day always has 288 scheduled 5-minute positions.
+    return {
+        'day_observed_bars':len(daily),
+        'day_unobserved_slots':max(0,288-len({r['t'] for r in daily})),
+        'day_internal_gap_count':gaps,
+        'day_internal_missing_slots':missing_between,
+        'day_max_unobserved_gap_minutes':max_gap,
+        'day_longest_contiguous_bars':longest,
+        'pre_day_observed_bars':history,
+        'h2_eligible_windows':h2_eligible_windows,
+        'api_page_limit_reached':bool(truncated),
+        'first_day_bar_kst':daily[0]['t'].strftime('%Y-%m-%d %H:%M') if daily else None,
+        'last_day_bar_kst':daily[-1]['t'].strftime('%Y-%m-%d %H:%M') if daily else None,
+        'coverage_status': ('API_PAGE_LIMIT' if truncated else
+                            'NO_DAY_BARS' if not daily else
+                            'NO_66_BAR_WINDOW' if not h2_eligible_windows else
+                            'PARTIAL_BARS' if len(daily)<288 else 'FULL_DAY'),
+    }
+
+
+def c5_h2_v111433_shadow_c(c_event, arm):
+    '''Copy of original C event, filtered using signal-time-only features.
+
+    Rejected examples have NO simulated entry/PnL under D/E/F.  Original C
+    outcome is separately retained for opportunity-cost accounting.
+    '''
+    vol=c_event.get('volume_ratio')
+    slope=c_event.get('h2_ema20_slope_pct')
+    try:
+        vol_ok=(vol is not None and float(vol)>=C5_H2_V111433_VOLUME_MIN)
+        ema_ok=(slope is not None and float(slope)>=C5_H2_V111433_EMA_SLOPE_MIN)
+    except (ValueError,TypeError,OverflowError):
+        vol_ok=ema_ok=False
+    accepted={'D':vol_ok,'E':ema_ok,'F':vol_ok and ema_ok}[arm]
+    ev=dict(c_event)
+    ev['strategy']=arm
+    ev['shadow_parent_strategy']='C'
+    ev['shadow_rule']=dict((x,lab) for x,lab,_ in C5_H2_V111433_FILTERS)[arm]
+    ev['shadow_volume_ok']=vol_ok
+    ev['shadow_ema_ok']=ema_ok
+    ev['shadow_accepted']=accepted
+    ev['shadow_parent_outcome']=c_event.get('outcome')
+    ev['shadow_parent_net_pct']=c_event.get('net_pct')
+    if not accepted:
+        ev.update({'outcome':'SHADOW_REJECT','entry':None,'exit':None,
+                   'entry_time_kst':None,'entry_delay_minutes':None,
+                   'net_pct':None,'minutes':None,
+                   'reason':'실험 필터로 제외 — C형 기존 가상 결과는 부모 결과 칼럼 참조'})
+    else:
+        ev['reason']='실험 필터 통과 — 기존 C형 거래 결과 재사용 (신규 주문 아님)'
+    return ev
+
+
+def c5_h2_v111433_evaluate_rows(rows,cfg,market,kst,truncated=False):
+    '''V11.14.32 authority. Original A/B/C event dictionaries are untouched.'''
+    result=c5_h2_v111432_evaluate_rows(rows,cfg,market,kst)
+    originals=result['events']['C']
+    shadow={arm:[c5_h2_v111433_shadow_c(e,arm) for e in originals]
+            for arm,_,_ in C5_H2_V111433_FILTERS}
+    for arm,_,_ in C5_H2_V111433_FILTERS:
+        if len(shadow[arm])!=len(originals):
+            raise RuntimeError('V11.14.33 H2 짝비교 행 수 불일치')
+        for parent,trial in zip(originals,shadow[arm]):
+            if trial['base_id']!=parent['base_id'] or trial['signal_time_kst']!=parent['signal_time_kst']:
+                raise RuntimeError('V11.14.33 H2 원본 사건 ID 불일치')
+            if trial['shadow_accepted']:
+                for key in ('entry','exit','outcome','net_pct','minutes'):
+                    if trial.get(key)!=parent.get(key):
+                        raise RuntimeError('V11.14.33 H2 가상결과 불일치')
+    result['shadow_events']=shadow
+    result['h2_data_coverage']=c5_h2_v111433_coverage(
+        rows,cfg,kst,truncated,result['h2_eligible_windows'])
+    return result
+
+
+def c5_h2_v111433_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated=lab_fetch_5m(api_get,market,cfg,kst)
+    result=c5_h2_v111433_evaluate_rows(rows,cfg,market,kst,truncated)
+    result['truncated']=truncated
+    return result
+
+
+def c5_h2_v111433_make_page():
+    '''Add dedicated shadow experiment; retain older pages and storage.'''
+    page=C5_H2_V111432_PAGE.replace('V11.14.32','V11.14.33')
+    def one(old,new):
+        nonlocal page
+        if page.count(old)!=1:
+            raise RuntimeError('V11.14.33 화면 교체 대상 누락 또는 중복: '+old[:110])
+        page=page.replace(old,new,1)
+    one('<title>V11.14.33 · BROOKS H2 단계별 정밀 진단</title>',
+        '<title>V11.14.33 · BROOKS H2 거래량·EMA 그림자 필터 비교</title>')
+    one('<h1>🧪 V11.14.33 · BROOKS H2 정밀 진단</h1>',
+        '<h1>🧪 V11.14.33 · BROOKS H2 필터 비교 실험</h1>')
+    one('진입 변경 없는 H2 진단 연구실 · VOLMAN / BEGGS / H2 기존 결과 보존',
+        '기존 A/B/C 유지 · D 거래량 / E EMA / F 동시 필터 가상 검증')
+    one("const API='/api/winrate14c5h2diag', KEY='bithumb_c5_h2diag_v111432_v1';",
+        "const API='/api/winrate14c5shadow', KEY='bithumb_c5_shadow_v111433_v1';")
+    one("const DB_NAME='bithumb_c5_h2diag_v111432_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_shadow_v111433_indexeddb_v1';")
+    marker='<section class="panel"><h2>신호·진입·청산은 V11.14.31과 동일</h2>'
+    if page.count(marker)!=1:raise RuntimeError('V11.14.33 설명 영역 확인 실패')
+    intro='''<section class="panel"><h2>V11.14.33 — 기존 H2 원본과 거래량·EMA 강화형 3종 비교</h2>
+<div class="alert28">
+<b>A VOLMAN · B BEGGS · C BROOKS H2:</b> V11.14.32 매수·청산 로직을 변경하지 않아. 기존 정밀 진단도 유지.<br>
+<b>D 거래량 강화:</b> C H2 신호 당시 거래량 ÷ 이전 20개 완료봉 평균 거래량이 <b>2.0배 이상</b>일 때만 C의 기존 결과를 가상 채택.<br>
+<b>E 추세 강화:</b> C H2 신호가 발생하기 전의 EMA20 6개 봉 기울기(기준 EMA[i-3]/EMA[i-9]-1)가 <b>+0.8% 이상</b>일 때만 가상 채택.<br>
+<b>F 동시 강화:</b> D와 E를 모두 통과할 때만 가상 채택.<br>
+<b>임계값 선정:</b> 2026-11-11~12 관찰을 바탕으로 선정한 가설이며 이미 사용한 날짜에서는 독립 검증이 아니야. 그 외 날짜에서 재검증해 보자.<br>
+<b>해석:</b> D/E/F는 새 BUY 진입을 생성하지 않고, C형 결과를 선별해 보는 <b>그림자(가상) 필터</b>야. 원래 수익 신호를 놓친 건수도 계산해. 완결되지 않은 거래는 UNKNOWN으로 남겨.</div>
+<p class="alert28 warn">⚠️ 이 값은 알 브룩스의 공식 수치가 아니야. 슬리피지·시장충격·부분체결은 과거 5분봉으로 완전히 재현할 수 없어. 데이터 공백은 <b>거래가 없었던 것인지 API가 반환하지 않은 것인지</b> 단정하지 않아. 실전 BUY 및 이전 검증실은 수정하지 않아.</p>
+</section>\n'''
+    page=page.replace(marker,intro+marker,1)
+    panels='''<section class="panel"><h2>8. H2 가상 필터 D/E/F 비교 — C 원본의 부분집합</h2>
+<p class="small28">D/E/F는 원본 C 거래를 분류할 뿐 새로운 신호를 만들지 않음. 제외된 거래의 손익은 가상 필터 성과에 합산하지 않으며 놓친 수익·피한 손실을 별도 표시합니다.</p>
+<div id="h2_shadow_summary" class="wide28">검사 후 표시</div>
+<h3>날짜별 가상 필터 비교</h3><div id="h2_shadow_daily" class="wide28">검사 후 표시</div>
+</section>
+<section class="panel"><h2>9. H2 연속 5분봉 데이터 확보 진단</h2>
+<p class="small28">하루 288개 5분 슬롯 중 API에서 관측한 봉 수와 연속 봉 확보 상태를 보여줘. 누락 슬롯이 무거래인지 API 누락인지는 이 자료만으로 구분할 수 없어.</p>
+<div id="h2_shadow_coverage" class="wide28">검사 후 표시</div>
+</section>'''
+    one('</main>',panels+'\n</main>')
+    additions=r'''function paintH2Shadow(){
+ const rs=Object.values(state.results||{});
+ const decimals=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+ const arms=[['C','기존 BROOKS H2'],['D','D · 거래량 ≥2.0배'],['E','E · EMA20 기울기 ≥0.8%'],['F','F · D와 E 동시']];
+ function groupEvents(key,date){
+  const out=[];for(const r of rs){if(date&&r.date!==date)continue;
+   const arr=key==='C'?r.events?.C:r.shadow_events?.[key];
+   for(const e of arr||[])out.push({...e,date:r.date});}return out;
+ }
+ function summarize(key,date){
+  const es=groupEvents(key,date),accepted=key==='C'?es:es.filter(e=>e.shadow_accepted===true);
+  const done=accepted.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const p=done.map(e=>num(e.net_pct)),profit=p.filter(x=>x>0).length;
+  const mean=p.length?p.reduce((a,b)=>a+b,0)/p.length:NaN;
+  const skip=key==='C'?[]:es.filter(e=>e.outcome==='SHADOW_REJECT');
+  const missedWin=skip.filter(e=>['TP','SL','TIME'].includes(e.shadow_parent_outcome)&&Number.isFinite(num(e.shadow_parent_net_pct))&&num(e.shadow_parent_net_pct)>0).length;
+  const avoidedLoss=skip.filter(e=>['TP','SL','TIME'].includes(e.shadow_parent_outcome)&&Number.isFinite(num(e.shadow_parent_net_pct))&&num(e.shadow_parent_net_pct)<=0).length;
+  const missing=accepted.filter(e=>e.outcome==='UNKNOWN').length;
+  return {signal:es.length,chosen:accepted.length,done:done.length,win:profit,tp:done.filter(e=>e.outcome==='TP').length,
+   sl:done.filter(e=>e.outcome==='SL').length,unknown:missing,mean,missedWin,avoidedLoss};
+ }
+ const rows=arms.map(([k,label])=>{const v=summarize(k);
+  return tr([label,v.signal,v.chosen,v.done,v.unknown,v.win,v.tp,v.sl,
+    v.done?(100*v.win/v.done).toFixed(1)+'%':'—',decimals(v.mean),v.avoidedLoss,v.missedWin]);});
+ $('h2_shadow_summary').innerHTML=tbl(['형태','C 후보','통과','결과 확정','미확정','순수익 거래','TP','SL','수익 거래 비율','평균 순손익','피한 손실/본전','놓친 수익'],rows);
+ const dates=[...new Set(rs.map(r=>r.date))].sort();
+ $('h2_shadow_daily').innerHTML=tbl(['날짜','구분','C 평균','D 평균','E 평균','F 평균','C 종료','D 종료','E 종료','F 종료'],
+  dates.map(d=>{const vs=arms.map(([k])=>summarize(k,d));return tr([d,
+   ['2026-11-11','2026-11-12'].includes(d)?'조건 선정 날짜':'별도 비교 날짜',
+   ...vs.map(v=>decimals(v.mean)),...vs.map(v=>v.done)]);}));
+}
+function paintH2Coverage(){
+ const rs=Object.values(state.results||{});
+ const co=rs.map(r=>r.h2_data_coverage||{});
+ const sum=k=>co.reduce((a,c)=>a+(Number(c[k])||0),0);
+ const noWindow=co.filter(c=>c.h2_eligible_windows===0).length;
+ const limited=co.filter(c=>c.api_page_limit_reached===true).length;
+ const none=co.filter(c=>c.day_observed_bars===0).length;
+ const gaps=co.filter(c=>(c.day_unobserved_slots||0)>0).length;
+ const row=tr(['조회 종목×날짜',rs.length])+tr(['H2 66연속봉 평가 불가',noWindow])+
+  tr(['API 페이지 한도 도달',limited])+tr(['해당 날짜 관측 봉 0',none])+
+  tr(['하루 288 슬롯 미달 종목×날짜',gaps])+tr(['관측된 당일 5분봉 총합',sum('day_observed_bars')])+
+  tr(['미관측 5분 슬롯 총합',sum('day_unobserved_slots')])+tr(['당일 내부 공백 구간 수',sum('day_internal_gap_count')]);
+ const details=rs.filter(r=>r.h2_data_coverage?.h2_eligible_windows===0 || r.h2_data_coverage?.api_page_limit_reached)
+  .slice(0,40).map(r=>{const c=r.h2_data_coverage;return tr([r.date,r.market,c.day_observed_bars,c.day_longest_contiguous_bars,
+   c.h2_eligible_windows,c.api_page_limit_reached?'한도 도달':'—',c.coverage_status]);});
+ $('h2_shadow_coverage').innerHTML=tbl(['데이터 커버리지 측정','값'],[row])+
+  '<p class="small28">아래는 H2 평가 불가 또는 API 페이지 한도 도달 사례 중 최대 40개</p>'+
+  (details.length?tbl(['날짜','종목','당일 관측 봉','최대 연속 봉','H2 검사 위치','API 페이지 한도','유형'],details):'데이터 부족 사례 없음');
+}
+'''
+    hook=' paintH2Diagnostics();\n}'
+    one(hook,' paintH2Diagnostics();\n paintH2Shadow();\n paintH2Coverage();\n}')
+    marker='function paintH2Diagnostics(){'
+    if page.count(marker)!=1: raise RuntimeError('V11.14.33 진단 JS 위치 불일치')
+    page=page.replace(marker,additions+marker,1)
+    start=page.index("$('csv').onclick=()=>{")
+    end=page.index('(async()=>{try{let old=await load()',start)
+    exporter=r'''$('csv').onclick=()=>{
+ if(!state)return;
+ const stages=['trend','volatility','trigger','volume','h1','pullback','ema','signal'];
+ const rejects=['indicators','trend','volatility','trigger','volume','h1','pullback','ema','cooldown'];
+ const passCols=stages.map(k=>'h2_pass_'+k),rejectCols=rejects.map(k=>'h2_reject_'+k);
+ const cols=['version','date','market','strategy','base_id','base_signal_time_kst',
+  'signal_time_kst','entry_time_kst','entry_delay_minutes','box_high',
+  'close_position','body_ratio','upper_wick_ratio','break_margin_pct',
+  'h1_time_kst','second_pullback_time_kst','ema20','ema50','atr_pct',
+  'volume_ratio','pullback_depth_atr','resistance_room_pct','h1_to_h2_bars',
+  'h2_ema_gap_pct','h2_ema20_slope_pct','h2_close_vs_ema20_atr',
+  'h2_close_vs_ema50_atr','h2_first_pullback_atr','h2_second_pullback_atr',
+  'h2_pullback_vs_ema20_atr','h2_signal_body_ratio',
+  'h2_signal_close_position','h2_prior_high_room_pct',
+  'outcome','entry','exit','net_pct','minutes','reason',
+  'eligible_windows','h2_eligible_windows','observed_5m','c5_watches',
+  'baseline_signals','h2_signals','truncated','scope','period','fee_pct_side','slip_pct_side',
+  'h2_day_positions','h2_diagnosed','h2_cooldown',...passCols,...rejectCols,
+  'diag_passed_stage','diag_failed_stage',
+  'shadow_parent_strategy','shadow_rule','shadow_accepted','shadow_volume_ok','shadow_ema_ok',
+  'shadow_parent_outcome','shadow_parent_net_pct','shadow_volume_threshold','shadow_ema_threshold',
+  'day_observed_bars','day_unobserved_slots','day_internal_gap_count',
+  'day_internal_missing_slots','day_longest_contiguous_bars','day_max_unobserved_gap_minutes',
+  'pre_day_observed_bars','api_page_limit_reached','coverage_status',
+  'first_day_bar_kst','last_day_bar_kst','comparison_group'];
+ const lines=[cols.join(',')];
+ for(const r of Object.values(state.results)){
+  const d=r.h2_diagnostics||{},c=r.h2_data_coverage||{};
+  const base={version:'V11.14.33',date:r.date,market:r.market,
+   eligible_windows:r.eligible_windows,h2_eligible_windows:r.h2_eligible_windows,
+   observed_5m:r.observed_5m,c5_watches:r.c5_watches,
+   baseline_signals:r.baseline_signals,h2_signals:r.h2_signals,
+   truncated:r.truncated,scope:state.cfg.scope,period:state.cfg.period,
+   fee_pct_side:state.cfg.fee,slip_pct_side:state.cfg.slip,
+   h2_day_positions:d.day_positions,h2_diagnosed:d.diagnosed,h2_cooldown:d.cooldown,
+   shadow_volume_threshold:2.0,shadow_ema_threshold:0.8,
+   comparison_group:['2026-11-11','2026-11-12'].includes(r.date)?'TRAIN':'OTHER_DATE',
+   ...c};
+  for(const k of stages)base['h2_pass_'+k]=d.passed?.[k]??'';
+  for(const k of rejects)base['h2_reject_'+k]=d.rejected?.[k]??'';
+  const add=v=>lines.push(cols.map(col=>csvCell(v[col])).join(','));
+  add({...base,strategy:'COVERAGE'});
+  for(const [key] of ARMS)for(const e of r.events?.[key]||[])add({...base,...e,strategy:key});
+  for(const key of ['D','E','F'])for(const e of r.shadow_events?.[key]||[])add({...base,...e,strategy:key});
+  for(const e of d.near_misses||[])add({...base,strategy:'H2_NEAR_MISS',
+   signal_time_kst:e.signal_time_kst,diag_passed_stage:e.passed_stage,
+   diag_failed_stage:e.failed_stage,atr_pct:e.atr_pct,
+   outcome:'NOT_A_SIGNAL',reason:'진단용 탈락 봉 — 매수 신호 아님'});
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='bithumb_C5_VOLMAN_BEGGS_BROOKS_SHADOW_v111433.csv';a.click();
+ setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+'''
+    page=page[:start]+exporter+page[end:]
+    if "const API='/api/winrate14c5shadow'" not in page or 'bithumb_c5_h2diag_v111432_indexeddb_v1' in page:
+        raise RuntimeError('V11.14.33 신규 API/DB 변경 실패')
+    if page.count('function paintH2Shadow(){')!=1:raise RuntimeError('V11.14.33 화면 JS 중복')
+    return page
+
+
+C5_H2_V111433_PAGE=c5_h2_v111433_make_page()
+
+
+def register_c5_h2_v111433_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0}
+    lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                items=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not items:
+                    raise ValueError('현재 빗썸 KRW 시장 목록을 조회하지 못했어')
+                cache.update(items=items,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-h2-shadow')
+    def c5_h2_v111433_page():
+        return render_template_string(C5_H2_V111433_PAGE)
+
+    @app.get('/api/winrate14c5shadow/universe')
+    def c5_h2_v111433_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.33'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5shadow/evaluate')
+    def c5_h2_v111433_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):raise ValueError('현재 KRW 목록에 없는 코인')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_h2_v111433_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.33',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111432_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111432_register_daytrade_review(app,deps)
+    register_c5_h2_v111433_lab(app,deps)
