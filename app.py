@@ -167,14 +167,6 @@ footer{margin-top:18px;color:var(--muted);font-size:11px}
 
 <div class="panel">
 <h2>스캔 설정</h2>
-<div style="margin:10px 0 12px;">
-  <a href="/research-c5-flow"
-     style="display:inline-block;padding:10px 12px;background:#123d35;
-            border:1px solid #2b8a68;color:#7bedbb;border-radius:9px;
-            text-decoration:none;font-weight:700;">
-    🔬 C5 차트 흐름 분석실
-  </a>
-</div>
 <div style="margin:10px 0 14px;">
   <a href="/backtest-daytrade"
      style="display:inline-block;
@@ -4008,80 +4000,6 @@ def scan():
                         "updated":f"{datetime.now(KST):%H:%M:%S} KST · {time.perf_counter()-scan_start:.1f}초"})
     except Exception as e:
         return jsonify({"error":str(e)}), 502
-
-
-# V2 C5 flow research page: isolated from all /api/scan functions.
-# Depends on existing V11.14.19 pattern evaluation API, already registered
-# by daytrade_review.py. Original live signal logic is unchanged.
-V2_C5_FLOW_PAGE = r"""<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V2 연구실 · C5 차트 흐름별 성적</title>
-<style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#141c2f;--line:#34405a;--fg:#edf3ff;--muted:#aab7d0;--green:#69e6a9;--blue:#4266e8}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,"Noto Sans KR",sans-serif}main{max-width:1080px;margin:auto;padding:18px 14px 60px}h1{font-size:24px;margin:14px 0 6px}h2{font-size:17px;margin:0 0 12px}a{color:#b9cdff}p{margin:8px 0}.muted{color:var(--muted);font-size:13px}.panel{padding:15px;border:1px solid var(--line);border-radius:14px;background:var(--panel);margin-top:13px}.controls{display:flex;flex-wrap:wrap;align-items:end;gap:9px}label{font-size:13px;color:var(--muted)}input,button{font:inherit}input[type=date],input[type=number],input[type=file]{display:block;background:#0e1628;color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:10px;max-width:100%}button{background:var(--blue);border:0;border-radius:9px;padding:10px 15px;font-weight:700;color:white;cursor:pointer}button.secondary{background:#293d5a}button:disabled{opacity:.45;cursor:wait}.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px;min-width:650px}th,td{padding:10px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:right}th:first-child,td:first-child{text-align:left}th{color:var(--muted)}.good{color:#70e7aa}.bad{color:#ff9ca7}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.stat{background:#0e1628;border:1px solid var(--line);padding:12px;border-radius:10px}.stat small{display:block;color:var(--muted);font-size:12px}.stat strong{display:block;font-size:19px}.note{background:#102039;border-left:3px solid #7697f6;border-radius:7px;padding:12px;font-size:13px;color:#c5d5f7}.status{white-space:pre-wrap;font-size:13px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.heading{font-weight:700;color:var(--green)}
-@media(max-width:650px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.controls{align-items:stretch}}
-</style></head><body><main>
-<a href="/">← V2 실전 스캐너로 돌아가기</a>
-<h1>🔬 C5 차트 흐름 분석실</h1>
-<p class="muted">V2 별도 연구 메뉴 · 기존 BUY/WATCH 신호·실시간 속도에 영향 없음</p>
-<section class="panel"><h2>먼저 기존 CSV로 빠르게 분석하기</h2>
-<p class="muted">V11.14.19 공통 패턴 분석실에서 내려받은 CSV를 1개 이상 선택해 줘. 여러 날짜를 동시에 비교할 수 있어.</p>
-<div class="controls"><label>CSV 파일 선택<input type="file" id="csvFiles" accept=".csv,text/csv" multiple></label><button id="readCsv">CSV 분석</button><button id="clear" class="secondary">분석 결과 지우기</button></div>
-<p class="muted">원본 CSV 파일은 브라우저에서 읽기만 하며 서버로 업로드하지 않아.</p>
-</section>
-<section class="panel"><h2>새로운 날짜로 직접 검사하기 (선택)</h2>
-<p class="muted">CSV가 없다면 이전에 만든 V11.14.19 API를 이용해 검사할 수도 있어. 약 489종목이라 시간이 걸릴 수 있으니 CSV 분석을 우선 추천해.</p>
-<div class="controls"><label>검사 날짜<input type="date" id="day" min="2025-01-01"></label><button id="run" class="secondary">이 날짜 검사</button><button id="pause" class="secondary" disabled>검사 중지</button></div>
-<p class="muted"><a href="/backtest-winrate-patterns" target="_blank" rel="noopener">기존 V11.14.19 공통 패턴 검증실 열기</a> · 새 검사는 다른 연구실과 독립적으로 실행돼.</p>
-</section>
-<section class="panel"><h2>분석 상태</h2><div class="status" id="status">CSV를 선택하거나 검사 날짜를 지정해 줘.</div>
-<div class="stats" id="stats" style="margin-top:12px"></div>
-</section>
-<section class="panel"><h2>4가지 차트 흐름 분류 기준 (고정)</h2>
-<div class="note">신호가 확정된 시점까지의 자료만 사용해. <b>A</b>: 직전 60분 상승률 +0.5% 이상, 최근 고점 대비 이격 1.5% 미만. <b>B</b>: 직전 60분 상승률 +0.5% 이상, 최근 고점 대비 이격 1.5% 이상. <b>C</b>: 직전 60분 상승률 -0.5% 이하. <b>D</b>: 그 사이 횡보. 기준 수치는 검증된 BUY 조건이 아니라 연구용 고정 구간이야.</div>
-<div class="scroll"><table><thead><tr><th>유형</th><th>거래</th><th>판정</th><th>익절</th><th>손절</th><th>시간 종료 수익</th><th>시간 종료 손실</th><th>익절률</th><th>손절률</th><th>평균 순손익</th></tr></thead><tbody id="flowRows"><tr><td colspan="10">분석 대기</td></tr></tbody></table></div>
-<p class="muted">익절률·손절률은 판정 완료 거래 기준. 같은 종목의 반복 BUY도 포함되며 미래 성과를 보장하지 않아.</p>
-</section>
-<section class="panel"><h2>날짜별 비교</h2>
-<div class="scroll"><table><thead><tr><th>날짜</th><th>유형</th><th>판정</th><th>익절률</th><th>손절률</th><th>평균 순손익</th></tr></thead><tbody id="dayRows"><tr><td colspan="6">분석 대기</td></tr></tbody></table></div></section>
-<section class="panel"><h2>익절과 손절의 진입 전 특징</h2>
-<div class="scroll"><table><thead><tr><th>유형</th><th>익절 전 30분 수익률 중앙값</th><th>손절 전 30분 수익률 중앙값</th><th>익절 전 60분 변동폭 중앙값</th><th>손절 전 60분 변동폭 중앙값</th></tr></thead><tbody id="medianRows"><tr><td colspan="5">분석 대기</td></tr></tbody></table></div>
-<div class="actions"><button id="export" class="secondary" disabled>유형별 거래 CSV 다운로드</button></div>
-</section>
-<p class="muted">이번 연구실은 기존 실전 전략에 필터를 적용하지 않아. 날짜별 결과가 충분히 반복되기 전에는 어떤 유형도 우수하다고 단정할 수 없어.</p>
-</main>
-<script>
-'use strict';
-const el=id=>document.getElementById(id);
-const TYPES=[['A','상승 후 얕은 눌림'],['B','상승 후 깊은 눌림'],['C','하락 중 반등'],['D','횡보 중 반등'],['U','자료 부족']];
-let items=[],keys=new Set(),running=false,stop=false;
-const fmt=(v,d=2)=>Number.isFinite(v)?v.toFixed(d)+'%':'—';
-const num=v=>v===null||v===undefined||String(v).trim()===''?null:(Number.isFinite(Number(v))?Number(v):null);
-function flow(e){const r=num(e.pre_60m_return_pct),p=num(e.pre_peak_distance_pct);if(r===null||p===null)return 'U';if(r>=0.5)return p<=-1.5?'B':'A';if(r<=-0.5)return 'C';return 'D';}
-function median(xs){const a=xs.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;return a.length%2?a[Math.floor(a.length/2)]:(a[a.length/2-1]+a[a.length/2])/2;}
-function summarize(xs){const valid=xs.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(e.net_pct));const tp=valid.filter(e=>e.outcome==='TP').length,sl=valid.filter(e=>e.outcome==='SL').length;return {signals:xs.length,n:valid.length,tp,sl,timeWin:valid.filter(e=>e.outcome==='TIME'&&e.net_pct>0).length,timeLoss:valid.filter(e=>e.outcome==='TIME'&&e.net_pct<=0).length,unknown:xs.length-valid.length,tpRate:valid.length?tp/valid.length*100:null,slRate:valid.length?sl/valid.length*100:null,mean:valid.length?valid.reduce((s,e)=>s+e.net_pct,0)/valid.length:null};}
-function add(record){if(!record||String(record.strategy).toUpperCase()!=='C5'||!/^KRW-[A-Z0-9]+$/.test(String(record.market||''))||!/^\d{4}-\d{2}-\d{2}$/.test(String(record.date||''))||!String(record.signal_time_kst||''))return false;const id=[record.date,record.market,record.signal_time_kst].join('|');if(keys.has(id))return false;keys.add(id);const x={date:String(record.date),market:String(record.market),strategy:'C5',signal_time_kst:String(record.signal_time_kst),outcome:String(record.outcome||'UNKNOWN').toUpperCase(),net_pct:num(record.net_pct),pre_30m_return_pct:num(record.pre_30m_return_pct),pre_60m_return_pct:num(record.pre_60m_return_pct),pre_60m_range_pct:num(record.pre_60m_range_pct),pre_peak_distance_pct:num(record.pre_peak_distance_pct)};x.flow=flow(x);items.push(x);return true;}
-function setStatus(msg){el('status').textContent=msg;}
-function td(row,v){const c=document.createElement('td');c.textContent=String(v);row.appendChild(c);return c;}
-function addRow(tbody,arr){const row=document.createElement('tr');for(const v of arr)td(row,v);tbody.appendChild(row);return row;}
-function render(){const all=summarize(items);el('stats').replaceChildren();for(const [k,v] of [['C5 전체 신호',all.signals+'건'],['손익 판정',all.n+'건'],['전체 평균 순손익',fmt(all.mean,3)],['분류 불가',items.filter(x=>x.flow==='U').length+'건']]){const d=document.createElement('div');d.className='stat';const s=document.createElement('small');s.textContent=k;const b=document.createElement('strong');b.textContent=v;d.append(s,b);el('stats').appendChild(d);}const body=el('flowRows');body.replaceChildren();if(!items.length)addRow(body,['분석 대기','','','','','','','','','']);for(const [id,name] of TYPES){const g=items.filter(x=>x.flow===id),s=summarize(g);addRow(body,[`${id} · ${name}`,s.signals,s.n,s.tp,s.sl,s.timeWin,s.timeLoss,fmt(s.tpRate,1),fmt(s.slRate,1),fmt(s.mean,3)]);}const days=[...new Set(items.map(x=>x.date))].sort(),db=el('dayRows');db.replaceChildren();if(!days.length)addRow(db,['분석 대기','','','','','']);for(const day of days)for(const [id,name] of TYPES){const g=items.filter(x=>x.date===day&&x.flow===id);if(!g.length)continue;const s=summarize(g);addRow(db,[day,`${id} · ${name}`,s.n,fmt(s.tpRate,1),fmt(s.slRate,1),fmt(s.mean,3)]);}const mb=el('medianRows');mb.replaceChildren();if(!items.length)addRow(mb,['분석 대기','','','','']);for(const [id,name] of TYPES){const es=items.filter(x=>x.flow===id);if(!es.length)continue;const tp=es.filter(x=>x.outcome==='TP'),sl=es.filter(x=>x.outcome==='SL');addRow(mb,[`${id} · ${name}`,fmt(median(tp.map(x=>x.pre_30m_return_pct))),fmt(median(sl.map(x=>x.pre_30m_return_pct))),fmt(median(tp.map(x=>x.pre_60m_range_pct))),fmt(median(sl.map(x=>x.pre_60m_range_pct)))]);}el('export').disabled=!items.length;}
-function parseCsv(data){const rows=[];let row=[],val='',quote=false;data=String(data).replace(/^\uFEFF/,'');for(let i=0;i<data.length;i++){const ch=data[i];if(quote){if(ch==='"'&&data[i+1]==='"'){val+='"';i++;}else if(ch==='"'){quote=false;}else val+=ch;}else if(ch==='"'){quote=true;}else if(ch===','){row.push(val);val='';}else if(ch==='\n'||ch==='\r'){if(ch==='\r'&&data[i+1]==='\n')i++;row.push(val);if(row.some(x=>x!==''))rows.push(row);row=[];val='';}else val+=ch;}if(quote)throw Error('닫히지 않은 따옴표가 있습니다');row.push(val);if(row.some(x=>x!==''))rows.push(row);return rows;}
-el('readCsv').onclick=async()=>{if(running)return;const files=[...(el('csvFiles').files||[])];if(!files.length){setStatus('⚠️ CSV를 선택해 줘.');return;}let added=0,failed=[];for(const f of files){try{if(f.size>10*1024*1024)throw Error('10MB 초과');const rows=parseCsv(await f.text());if(rows.length<2)throw Error('데이터 없음');const headers=rows[0].map(x=>String(x).trim());for(const key of ['date','market','strategy','signal_time_kst','outcome','net_pct','pre_60m_return_pct','pre_peak_distance_pct'])if(!headers.includes(key))throw Error(key+' 열 누락');for(const row of rows.slice(1)){const o={};headers.forEach((h,i)=>o[h]=row[i]??'');if(add(o))added++;}}catch(e){failed.push(f.name+' ('+String(e.message||e)+')');}}render();setStatus('✅ CSV '+files.length+'개 확인 · 새 C5 신호 '+added+'건 추가 · 현재 '+items.length+'건'+(failed.length?'\n⚠️ '+failed.join('\n'):''));};
-el('clear').onclick=()=>{if(running)return;items=[];keys.clear();el('csvFiles').value='';render();setStatus('결과를 지웠어. 기존 휴대폰 CSV 파일은 삭제되지 않았어.');};
-function timeoutFetch(url,opt={}){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),110000);return fetch(url,{...opt,cache:'no-store',signal:controller.signal}).then(async r=>{const j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||`HTTP ${r.status}`);return j;}).finally(()=>clearTimeout(timer));}
-el('run').onclick=async()=>{if(running)return;const date=el('day').value;if(!/^\d{4}-\d{2}-\d{2}$/.test(date)){setStatus('⚠️ 검사 날짜를 지정해 줘.');return;}running=true;stop=false;el('run').disabled=true;el('pause').disabled=false;let done=0,total=0,added=0,errors=[];try{setStatus('KRW 종목 목록 조회 중...');const u=await timeoutFetch('/api/winrate14patterns/universe');const markets=u.items;if(!Array.isArray(markets)||!markets.length)throw Error('종목 목록이 없어');total=markets.length;let next=0;async function worker(){while(!stop){const m=markets[next++];if(!m)break;let success=false;for(let tries=0;tries<2&&!stop;tries++){try{const d=await timeoutFetch('/api/winrate14patterns/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date,markets:[m],fee:0.04,slip:0.05})});if(d.scanned!==1||d.errors||!Array.isArray(d.results)||d.results.length!==1||d.results[0].market!==m||!d.results[0].c5||!Array.isArray(d.results[0].c5.events))throw Error('응답 누락');for(const ev of d.results[0].c5.events){if(add({date,market:m,strategy:'C5',...ev,...(ev.features||{})}))added++;}success=true;break;}catch(e){if(tries===1)errors.push(`${m} ${String(e.message||e).slice(0,60)}`);}}done++;if(done%10===0||done===total)setStatus(`⏳ ${date} 검사 중: ${done}/${total}종목 · C5 신호 ${added}건 · 요청 오류 ${errors.length}종목`);}}
-await Promise.all([worker(),worker()]);render();setStatus((stop?'⏸ 검사 중지':'✅ 검사 요청 종료')+` · ${date} · ${done}/${total}종목 · C5 신호 ${added}건 · 요청 오류 ${errors.length}종목`+(errors.length?'\n⚠️ 누락 종목이 있어 전체 통계로 해석하지 마. 다시 검사하거나 V11.14.19 CSV를 사용해.':'')+'\n※ 같은 날짜를 다시 검사하면 중복 신호는 자동 제외돼.');}catch(e){setStatus('⚠️ 검사 오류: '+String(e.message||e));}finally{running=false;el('run').disabled=false;el('pause').disabled=true;}};
-el('pause').onclick=()=>{stop=true;el('pause').disabled=true;setStatus('검사 중지 요청 · 진행 중인 종목이 끝나면 멈춰.');};
-function csvCell(v){let s=String(v??'');if(/^[\s]*[=+@]/.test(s)||(/^[\s]*-/.test(s)&&!/^[\s]*-\d+(?:\.\d+)?\s*$/.test(s)))s="'"+s;return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
-el('export').onclick=()=>{if(!items.length)return;const fields=['date','market','signal_time_kst','flow','outcome','net_pct','pre_30m_return_pct','pre_60m_return_pct','pre_60m_range_pct','pre_peak_distance_pct'];const lines=[fields.join(','),...items.map(x=>fields.map(k=>csvCell(x[k])).join(','))];const blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='bithumb_V2_C5_flow_patterns.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1500);};
-const now=new Date(Date.now()-24*60*60*1000);el('day').value=new Date(now.getTime()+9*60*60*1000).toISOString().slice(0,10);render();
-</script></body></html>"""
-
-
-@app.get('/research-c5-flow')
-def research_c5_flow_page():
-    return render_template_string(V2_C5_FLOW_PAGE)
-
 from daytrade_review import register_daytrade_review
 register_daytrade_review(app, globals())
 if __name__ == "__main__":
