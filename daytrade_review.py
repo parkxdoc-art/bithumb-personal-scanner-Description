@@ -11791,3 +11791,330 @@ def register_daytrade_review(app,deps):
     _v111435_register_daytrade_review(app,deps)
     register_c5_new_v111436_lab(app,deps)
 
+# =============================================================================
+# V11.14.37 - RESEARCH ONLY. TWO INDEPENDENT SCALPING ADAPTATIONS.
+# K: Larry Connors RSI(2) oversold recovery, *5m SMA50 trend proxy*.
+#    The source method is DAILY SMA200/RSI2; this is NOT that daily system.
+# L: John Carter TTM Squeeze-inspired BB20/KC20 expansion after compression,
+#    with 20-bar linear-regression histogram. The parameters and exits are
+#    explicitly a fixed research hypothesis for Bithumb 5m candles.
+# Frozen historical A~J outputs/legacy routes. No real V2 BUY changes.
+# Both enter at NEXT observed 5m open; use frozen TP/SL/cost/horizon model.
+# No future-data indicators, no invented missing candles.
+# =============================================================================
+
+
+def c5_v111437_rsi2_wilder(closes):
+    """Return last two Wilder RSI(2) values from a *continuous* close list.
+
+    Seed gains/losses from first two deltas, then recursively smooth.
+    No future closes and no prior segment through a missing candle.
+    """
+    if len(closes) < 4:
+        return (None,None)
+    changes=[closes[j]-closes[j-1] for j in range(1,len(closes))]
+    gain=(max(changes[0],0)+max(changes[1],0))/2
+    loss=(max(-changes[0],0)+max(-changes[1],0))/2
+    def value():
+        if gain==0 and loss==0:return 50.0
+        if loss==0:return 100.0
+        if gain==0:return 0.0
+        return 100.0-100.0/(1.0+gain/loss)
+    prior=value()
+    current=prior
+    for delta in changes[2:]:
+        gain=(gain+max(delta,0))/2
+        loss=(loss+max(-delta,0))/2
+        prior,current=current,value()
+    return prior,current
+
+
+def c5_v111437_connors_signal(rows,i):
+    """5m hypothesis: SMA50 rising, RSI2 crosses UP through 10 after oversold.
+
+    Requires >=55 consecutive observed 5m bars to calculate SMA50 at i-3.
+    Uses the actual *5-minute* SMA50, not Connors's *daily* SMA200.
+    """
+    if i<54 or not lab_contiguous(rows,i-54,i):
+        return None
+    recent=rows[i-54:i+1]
+    closes=[x['c'] for x in recent]
+    ma50=sum(closes[-50:])/50
+    prev_ma50=sum(closes[-53:-3])/50
+    if ma50<=0 or prev_ma50<=0:
+        return None
+    b=rows[i]
+    if not (ma50>prev_ma50 and b['c']>ma50 and b['c']>b['o']
+            and b['c']>rows[i-1]['c']):
+        return None
+    rsi_prev,rsi_now=c5_v111437_rsi2_wilder(closes)
+    if (rsi_prev is None or rsi_now is None
+            or not (rsi_prev<=10.0 and 10.0<rsi_now<=75.0)):
+        return None
+    vavg=sum(x['v'] for x in rows[i-20:i])/20
+    if vavg<=0:return None
+    vr=b['v']/vavg
+    if vr<0.75:return None
+    return {'pattern_name':'CONNORS_RSI2_5M_SMA50_ADAPTATION',
+            'connors_rsi2_before':round(rsi_prev,4),
+            'connors_rsi2_signal':round(rsi_now,4),
+            'connors_sma50':round(ma50,10),
+            'connors_sma50_slope3_pct':round(100*(ma50/prev_ma50-1),5),
+            'connors_close_vs_sma50_pct':round(100*(b['c']/ma50-1),5),
+            'pattern_volume_ratio':round(vr,4)}
+
+
+def c5_v111437_squeeze_state(rows,i):
+    """BB(20,2) vs KC(20,1.5) using *SMA20 true range* (no future)."""
+    if i<20:return None
+    closes=[x['c'] for x in rows[i-19:i+1]]
+    mid=sum(closes)/20
+    variance=sum((c-mid)**2 for c in closes)/20
+    std=variance**0.5
+    tr=[]
+    for j in range(i-19,i+1):
+        b,p=rows[j],rows[j-1]
+        tr.append(max(b['h']-b['l'],abs(b['h']-p['c']),abs(b['l']-p['c'])))
+    atr=sum(tr)/20
+    if mid<=0 or atr<=0:return None
+    bb_up,bb_lo=mid+2*std,mid-2*std
+    kc_up,kc_lo=mid+1.5*atr,mid-1.5*atr
+    return {'on': bb_lo>kc_lo and bb_up<kc_up,
+            'mid':mid,'bb_width_pct':100*4*std/mid,
+            'kc_width_pct':100*3*atr/mid}
+
+
+def c5_v111437_linreg_last(values):
+    """OLS fit evaluated at last index; mirrors common Squeeze histogram proxy."""
+    n=len(values)
+    if n<2:return None
+    xm=(n-1)/2
+    ym=sum(values)/n
+    denom=sum((j-xm)**2 for j in range(n))
+    slope=sum((j-xm)*(v-ym) for j,v in enumerate(values))/denom
+    return ym+slope*((n-1)-xm)
+
+
+def c5_v111437_squeeze_momentum(rows,i):
+    """20-period linreg of close minus Donchian/SMA anchor at i."""
+    if i<38:return None
+    vals=[]
+    for j in range(i-19,i+1):
+        win=rows[j-19:j+1]
+        ma=sum(b['c'] for b in win)/20
+        dc=(max(b['h'] for b in win)+min(b['l'] for b in win))/2
+        vals.append(rows[j]['c']-(dc+ma)/2)
+    return c5_v111437_linreg_last(vals)
+
+
+def c5_v111437_carter_signal(rows,i):
+    """Compression at prior close, release at i with rising positive momentum."""
+    if i<40 or not lab_contiguous(rows,i-40,i):
+        return None
+    prev=c5_v111437_squeeze_state(rows,i-1)
+    now=c5_v111437_squeeze_state(rows,i)
+    if prev is None or now is None or not (prev['on'] and not now['on']):
+        return None
+    mo_prev=c5_v111437_squeeze_momentum(rows,i-1)
+    mo_now=c5_v111437_squeeze_momentum(rows,i)
+    b=rows[i]
+    if mo_prev is None or mo_now is None or b['c']<=0 or not(
+            mo_now>0 and mo_now>mo_prev and b['c']>b['o']):
+        return None
+    vavg=sum(x['v'] for x in rows[i-20:i])/20
+    if vavg<=0:return None
+    vr=b['v']/vavg
+    if vr<0.8:return None
+    return {'pattern_name':'CARTER_TTM_SQUEEZE_5M_ADAPTATION',
+            'carter_squeeze_prior_on':True,
+            'carter_squeeze_release':True,
+            'carter_bb_width_pct':round(now['bb_width_pct'],5),
+            'carter_kc_width_pct':round(now['kc_width_pct'],5),
+            'carter_momentum_previous':round(mo_prev/b['c']*100,5),
+            'carter_momentum_now':round(mo_now/b['c']*100,5),
+            'pattern_volume_ratio':round(vr,4)}
+
+
+def c5_v111437_study(rows6,cfg,market,kst):
+    """Independent K/L long-only experiments using six-hour observed rows."""
+    from datetime import datetime as _dt,time as _tm
+    day=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=day+timedelta(days=1)
+    detectors=(('K',c5_v111437_connors_signal,54),
+               ('L',c5_v111437_carter_signal,40))
+    events={'K':[],'L':[]}
+    eligible={'K':0,'L':0}
+    last={'K':-1000000,'L':-1000000}
+    for i in range(40,len(rows6)-1):
+        bar=rows6[i]
+        if not (day<=bar['t']<end):continue
+        when=bar['t'].strftime('%Y-%m-%d %H:%M')
+        for key,detector,history in detectors:
+            if i<history or not lab_contiguous(rows6,i-history,i):continue
+            eligible[key]+=1
+            if i-last[key]<cfg['bars']:continue
+            info=detector(rows6,i)
+            if info is None:continue
+            last[key]=i
+            e={'market':market,'strategy':key,
+               'base_id':market+'|'+key+'|'+when,
+               'base_signal_time_kst':when,'signal_time_kst':when,
+               'entry_time_kst':(bar['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+               'entry_delay_minutes':0,'hypothetical_only':True,
+               'comparison_group':'V111437_NEW_TRADER_INDEPENDENT',
+               'reason':('코너스 응용: 5분봉 상승추세 RSI(2) 과매도 회복' if key=='K'
+                         else '카터 응용: TTM Squeeze 압축 해제·상승 모멘텀'),
+               **info}
+            e.update(lab_outcome_v11145(rows6,i,cfg))
+            events[key].append(e)
+    return {'v111437_new_events':events,
+            'v111437_coverage':{
+                'connors_k_eligible_positions':eligible['K'],
+                'carter_l_eligible_positions':eligible['L'],
+                'connors_k_signals':len(events['K']),
+                'carter_l_signals':len(events['L']),
+                'new_traders_no_missing_bar_fill':True}}
+
+
+def c5_v111437_evaluate_rows(rows6,cfg,market,kst,truncated=False,fetch_info=None):
+    baseline=c5_new_v111436_evaluate_rows(rows6,cfg,market,kst,truncated,fetch_info)
+    addition=c5_v111437_study(rows6,cfg,market,kst)
+    if not addition.keys().isdisjoint(baseline):
+        raise RuntimeError('V11.14.37 이전 전략 결과 키 충돌')
+    return {**baseline,**addition}
+
+
+def c5_v111437_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    return c5_v111437_evaluate_rows(rows,cfg,market,kst,truncated,meta)
+
+
+def c5_v111437_make_page():
+    """Use the stable V11.14.36 screen while isolating API, DB and CSV."""
+    page=C5_NEW_V111436_PAGE.replace('V11.14.36','V11.14.37')
+    def one(old,new):
+        nonlocal page
+        ct=page.count(old)
+        if ct!=1:raise RuntimeError('V11.14.37 UI 교체 기준 불일치: '+str(ct)+' '+old[:85])
+        page=page.replace(old,new,1)
+    one('<title>V11.14.37 · 신규 트레이더 2종 vs 볼먼 비교</title>',
+        '<title>V11.14.37 · 볼먼 vs 코너스 RSI2 vs 카터 Squeeze</title>')
+    one('<h1>🧪 V11.14.37 · 볼먼 vs 라쉬케 vs 크레이블</h1>',
+        '<h1>🧪 V11.14.37 · 볼먼 vs 코너스 vs 카터</h1>')
+    one('기존 A~H 보존 · Turtle Soup 응용 / NR7 응용 독립 성과 비교',
+        '기존 A~J 보존 · RSI(2) / TTM Squeeze 신규 독립 검증')
+    one("const API='/api/winrate14c5newtraders', KEY='bithumb_c5_newtraders_v111436_v1';",
+        "const API='/api/winrate14c5connorscarter', KEY='bithumb_c5_connors_carter_v111437_v1';")
+    one("const DB_NAME='bithumb_c5_newtraders_v111436_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_connors_carter_v111437_indexeddb_v1';")
+    one('<input type="date" id="day" value="2026-11-05">',
+        '<input type="date" id="day" value="2026-11-01">')
+    introduction="""<section class="panel"><h2>핵심 연구 — 볼먼 A vs 코너스 K vs 카터 L</h2>
+<div class="alert28"><b>A · 볼먼:</b> 기존 VOLMAN 그대로. <b>K · 래리 코너스 RSI(2) 응용:</b> 5분봉 SMA50의 3봉 기울기 상승, 가격이 SMA50 위, 이전 RSI(2) ≤10에서 현재 10 초과 회복, 양봉/거래량 보조 확인. 원본 <b>일봉 SMA200</b>와 달리 5분봉 전용 가설이야.<br>
+<b>L · 존 카터 TTM Squeeze 응용:</b> BB(20,2)가 KC(20,1.5) 안에 있다가 빠져나오는 첫 봉, 20봉 회귀 모멘텀 양수·증가, 양봉/거래량 조건. KC는 TR20 단순평균을 사용.<br>
+<b>공통:</b> 다음 5분봉 시가 진입, TP +1.5% / SL -1.0% / 최대 60분, 기존 수수료·슬리피지 기준. 실제 V2 BUY 미변경. 미래 봉 참조 없음. 데이터 공백은 보간하지 않음.</div>
+<p class="alert28 warn">⚠️ 두 기법 모두 원저자의 원본 전략이 아닌 <b>5분봉 연구용 변형</b>이야. 이미 연구에 사용한 11월 6~12일은 참고용이고 새로운 날짜에서 별도 검증해야 해. 신호가 없는 날짜나 미확인 거래도 함께 표시해.</p>
+<div id="connors_carter_comparison" class="wide28">검사 후 비교 표시</div></section>"""
+    one('<section class="panel"><h2>핵심 연구 — 볼먼 A vs 라쉬케 I vs 크레이블 J · 날짜별 성과</h2>',
+        introduction+'\n<section class="panel"><h2>이전 연구 — 볼먼 A vs 라쉬케 I vs 크레이블 J · 날짜별 성과</h2>')
+    js=r"""function paintConnorsCarter(){
+ const rs=Object.values(state.results||{}), keys=[['A','볼먼 A'],['K','코너스 K'],['L','카터 L']];
+ const ev=(k,d)=>rs.filter(r=>!d||r.date===d).flatMap(r=>
+   (k==='A'?(r.events?.A||[]):(r.v111437_new_events?.[k]||[])).map(e=>({...e,date:r.date})));
+ const stat=arr=>{const done=arr.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const wins=done.filter(e=>num(e.net_pct)>0).length;
+  return {signals:arr.length,done:done.length,wins,loss:done.length-wins,
+   tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,
+   unknown:arr.filter(e=>e.outcome==='UNKNOWN').length,
+   avg:done.length?done.reduce((sum,e)=>sum+num(e.net_pct),0)/done.length:NaN};};
+ const fmt=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+ const overall=keys.map(([k,name])=>{const x=stat(ev(k));return tr([name,x.signals,x.done,x.wins,x.loss,x.tp,x.sl,x.unknown,
+  x.done?(100*x.wins/x.done).toFixed(1)+'%':'—',fmt(x.avg)]);});
+ const daily=[];
+ for(const d of [...new Set(rs.map(r=>r.date))].sort())for(const [k,name] of keys){const x=stat(ev(k,d));
+  daily.push(tr([d,name,x.signals,x.wins,x.loss,x.unknown,fmt(x.avg)]));}
+ const sum=(name)=>rs.reduce((a,r)=>a+Number(r.v111437_coverage?.[name]||0),0);
+ const details=[...ev('K'),...ev('L')].sort((a,b)=>(a.date+a.signal_time_kst).localeCompare(b.date+b.signal_time_kst));
+ $('connors_carter_comparison').innerHTML='<p class="small28">5분봉 평가 가능 위치 — K: '+sum('connors_k_eligible_positions')+' · L: '+sum('carter_l_eligible_positions')+' / 연구 신호만</p>'+
+  tbl(['전략','신호','완료','수익','손실','TP','SL','미확인','수익 거래율','평균 순수익률'],overall)+
+  '<h3>날짜별 비교</h3>'+tbl(['날짜','전략','신호','수익','손실','미확인','평균 순수익률'],daily)+
+  '<h3>신규 연구 신호 상세 (최대 100건)</h3>'+
+  (details.length?tbl(['날짜','종목','전략','신호 시각','결과','순수익률'],details.slice(0,100).map(e=>tr([
+   e.date,e.market,e.strategy,e.signal_time_kst,e.outcome||'UNKNOWN',
+   Number.isFinite(num(e.net_pct))?num(e.net_pct).toFixed(3)+'%':'—']))):'<p class="small28">신호 없음</p>');
+}
+"""
+    one('function paintNewTradersStudy(){',js+'function paintNewTradersStudy(){')
+    one(' paintNewTradersStudy();\n}', ' paintNewTradersStudy();\n paintConnorsCarter();\n}')
+    one("'pattern_setup_range_pct','pattern_breakout_pct','pattern_close_vs_ema20_pct'];",
+        "'pattern_setup_range_pct','pattern_breakout_pct','pattern_close_vs_ema20_pct',\n"
+        "  'connors_k_eligible_positions','carter_l_eligible_positions',\n"
+        "  'connors_k_signals','carter_l_signals','new_traders_no_missing_bar_fill',\n"
+        "  'connors_rsi2_before','connors_rsi2_signal','connors_sma50',\n"
+        "  'connors_sma50_slope3_pct','connors_close_vs_sma50_pct',\n"
+        "  'carter_squeeze_prior_on','carter_squeeze_release',\n"
+        "  'carter_bb_width_pct','carter_kc_width_pct',\n"
+        "  'carter_momentum_previous','carter_momentum_now'];")
+    one('...(r.new_traders_coverage||{})};',
+        '...(r.new_traders_coverage||{}),...(r.v111437_coverage||{})};')
+    one("  for(const key of ['I','J'])for(const e of r.new_traders_events?.[key]||[])add({...base,...e,strategy:key});",
+        "  for(const key of ['I','J'])for(const e of r.new_traders_events?.[key]||[])add({...base,...e,strategy:key});\n"
+        "  for(const key of ['K','L'])for(const e of r.v111437_new_events?.[key]||[])add({...base,...e,strategy:key});")
+    one('bithumb_C5_VOLMAN_BEGGS_RASCHKE_CRABEL_v111436.csv',
+        'bithumb_C5_VOLMAN_CONNORS_CARTER_v111437.csv')
+    if '/api/winrate14c5newtraders' in page or 'bithumb_c5_newtraders_v111436_indexeddb_v1' in page:
+        raise RuntimeError('V11.14.37 새 연구실 API/DB 분리 실패')
+    if page.count('function paintConnorsCarter(){')!=1:
+        raise RuntimeError('V11.14.37 화면 함수 연결 누락')
+    return page
+
+
+C5_V111437_PAGE=c5_v111437_make_page()
+
+
+def register_c5_v111437_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                markets=sorted({m for m in get_markets()
+                                if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not markets:raise ValueError('현재 빗썸 KRW 종목을 조회하지 못했어')
+                cache.update(items=markets,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-connors-carter')
+    def c5_v111437_page():
+        return render_template_string(C5_V111437_PAGE)
+
+    @app.get('/api/winrate14c5connorscarter/universe')
+    def c5_v111437_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.37'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5connorscarter/evaluate')
+    def c5_v111437_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_v111437_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.37',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111436_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111436_register_daytrade_review(app,deps)
+    register_c5_v111437_lab(app,deps)
