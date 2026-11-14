@@ -11495,3 +11495,299 @@ _v111434_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111434_register_daytrade_review(app,deps)
     register_c5_h2_v111435_lab(app,deps)
+
+# =============================================================================
+# V11.14.36 RESEARCH ONLY — TWO DIFFERENT TRADERS, INDEPENDENT LONG SIGNALS
+# Keep all V11.14.35 A~H unchanged. New I: Raschke & Connors Turtle Soup-
+# inspired 20-BAR (not 20-DAY) failed low sweep and reclaim, 5m adaptation.
+# New J: Toby Crabel NR7-inspired 7-BAR (not 7-DAY) range contraction /
+# bullish close breakout. Both are independent, hypothetical long signals.
+# They are NOT faithful representations of the original discretionary trade
+# management, intrabar stop-entry, session structure, or exact daily rules.
+# Precommitted rules: do not tune them on previously observed P&L.
+# Same backtest outcomes/fees/holding horizon as previous A~H experiments.
+# No missing candle interpolation, no future bars in signal conditions.
+# =============================================================================
+
+
+def c5_new_v111436_raschke_signal(rows, i, ind):
+    """20 *five-minute*-bar low sweep + close back above prior low.
+
+    Last occurrence of the old lowest low must be >=4 bars old. A closed
+    5m bullish reclaim (not the original intrabar stop order) triggers a
+    *hypothetical* entry at the next observed 5m open.
+    """
+    if i < 20 or not lab_contiguous(rows,i-20,i):
+        return None
+    ref=rows[i-20:i]
+    old_low=min(b['l'] for b in ref)
+    last_old_idx=max(k for k,b in enumerate(ref) if b['l']==old_low)
+    old_age_bars=20-last_old_idx
+    if old_age_bars<4 or old_low<=0:
+        return None
+    b=rows[i]
+    width=b['h']-b['l']
+    if width<=0 or b['c']<=0:
+        return None
+    # Deliberate sweep, recovery and bullish close. Cutoffs are OUR hypothesis.
+    sweep_pct=100*(old_low-b['l'])/old_low
+    rebound_pct=100*(b['c']/old_low-1)
+    close_loc=(b['c']-b['l'])/width
+    if not (sweep_pct>=0.03 and rebound_pct>=0.01
+            and b['c']>b['o'] and close_loc>=0.60):
+        return None
+    vavg=sum(x['v'] for x in ref)/20
+    if vavg<=0:
+        return None
+    volume_ratio=b['v']/vavg
+    if volume_ratio<0.8:
+        return None
+    atr=ind['atr14'][i]
+    return {'pattern_name':'RASCHKE_TURTLE_SOUP_INSPIRED_5M',
+            'pattern_reference_price':round(old_low,10),
+            'pattern_previous_low_age_bars':old_age_bars,
+            'pattern_sweep_pct':round(sweep_pct,5),
+            'pattern_reclaim_pct':round(rebound_pct,5),
+            'pattern_close_position':round(close_loc,5),
+            'pattern_volume_ratio':round(volume_ratio,4),
+            'pattern_atr_pct':round(100*atr/b['c'],4) if atr is not None else None}
+
+
+def c5_new_v111436_crabel_signal(rows, i, ind):
+    """NR7-inspired 5m one-bar high breakout, long-only close confirmation.
+
+    Signal i uses setup bar i-1, the narrowest of preceding seven CLOSED
+    five-minute bars; subsequent bar i must close bullish over setup high.
+    This is not Crabel's session opening-range stop-entry execution.
+    """
+    if i<20 or not lab_contiguous(rows,i-20,i):
+        return None
+    setup=rows[i-1]
+    prior_seven=rows[i-7:i]
+    widths=[b['h']-b['l'] for b in prior_seven]
+    sw=widths[-1]
+    if sw<=0 or any(w<0 for w in widths) or sw>min(widths):
+        return None
+    b=rows[i]
+    e20=ind['ema20'][i]
+    if e20 is None or b['c']<=0 or setup['h']<=0:
+        return None
+    margin=100*(b['c']/setup['h']-1)
+    if not (b['c']>b['o'] and margin>=0.02 and b['c']>e20):
+        return None
+    vavg=sum(x['v'] for x in rows[i-20:i])/20
+    if vavg<=0:
+        return None
+    volume_ratio=b['v']/vavg
+    if volume_ratio<1.0:
+        return None
+    return {'pattern_name':'CRABEL_NR7_INSPIRED_5M',
+            'pattern_reference_price':round(setup['h'],10),
+            'pattern_nr7_setup_time_kst':setup['t'].strftime('%Y-%m-%d %H:%M'),
+            'pattern_setup_range_pct':round(100*sw/setup['c'],5),
+            'pattern_breakout_pct':round(margin,5),
+            'pattern_close_vs_ema20_pct':round(100*(b['c']/e20-1),5),
+            'pattern_volume_ratio':round(volume_ratio,4)}
+
+
+def c5_new_v111436_study(rows6,cfg,market,kst):
+    """Evaluate new I/J on identical real 6h historical 5m observations.
+
+    Each experiment has its own cooldown. Keep the baseline A, all old
+    A~H outputs, and legacy endpoints exactly as returned by V11.14.35.
+    """
+    from datetime import datetime as _dt, time as _tm
+    day=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=day+timedelta(days=1)
+    ind=c5_brooks_v111431_indicators(rows6)
+    events={'I':[],'J':[]}
+    counts={'I':0,'J':0}
+    last={'I':-1000000,'J':-1000000}
+    eligible=0
+    for i in range(20,len(rows6)-1):
+        b=rows6[i]
+        if not (day<=b['t']<end) or not lab_contiguous(rows6,i-20,i):
+            continue
+        eligible+=1
+        when=b['t'].strftime('%Y-%m-%d %H:%M')
+        for key,detector in (('I',c5_new_v111436_raschke_signal),
+                             ('J',c5_new_v111436_crabel_signal)):
+            if i-last[key]<cfg['bars']:
+                continue
+            features=detector(rows6,i,ind)
+            if features is None:
+                continue
+            last[key]=i
+            counts[key]+=1
+            event={'market':market,'strategy':key,
+                   'base_id':market+'|'+key+'|'+when,
+                   'base_signal_time_kst':when,
+                   'signal_time_kst':when,
+                   'entry_time_kst':(b['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                   'entry_delay_minutes':0,'hypothetical_only':True,
+                   'reason':('라쉬케/코너스 Turtle Soup 20봉 저점 이탈 회복 연구' if key=='I'
+                             else '크레이블 NR7 5분봉 수축 돌파 연구'),
+                   'comparison_group':'NEW_TRADER_INDEPENDENT',
+                   **features}
+            event.update(lab_outcome_v11145(rows6,i,cfg))
+            events[key].append(event)
+    return {'new_traders_events':events,
+            'new_traders_coverage':{'new_traders_eligible_positions':eligible,
+                                    'new_traders_market_eligible':eligible>0,
+                                    'raschke_i_signals':counts['I'],
+                                    'crabel_j_signals':counts['J'],
+                                    'new_traders_20bar_observed_only':True}}
+
+
+def c5_new_v111436_evaluate_rows(rows6,cfg,market,kst,truncated=False,fetch_info=None):
+    baseline=c5_h2_v111435_evaluate_rows(rows6,cfg,market,kst,truncated,fetch_info)
+    original_keys=set(baseline)
+    result=c5_new_v111436_study(rows6,cfg,market,kst)
+    if not result.keys().isdisjoint(original_keys):
+        raise RuntimeError('V11.14.36 기존 결과 키와 충돌')
+    return {**baseline,**result}
+
+
+def c5_new_v111436_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    return c5_new_v111436_evaluate_rows(rows,cfg,market,kst,truncated,meta)
+
+
+def c5_new_v111436_make_page():
+    """Clone stable V11.14.35 UI and append new independent lab section."""
+    page=C5_H2_V111435_PAGE.replace('V11.14.35','V11.14.36')
+
+    def one(old,new):
+        nonlocal page
+        ct=page.count(old)
+        if ct!=1:
+            raise RuntimeError('V11.14.36 예상 교체 기준 불일치 '+str(ct)+': '+old[:85])
+        page=page.replace(old,new,1)
+
+    one('<title>V11.14.36 · H2 50봉 / 66봉 독립 비교 실험</title>',
+        '<title>V11.14.36 · 신규 트레이더 2종 vs 볼먼 비교</title>')
+    one('<h1>🧪 V11.14.36 · H2 50봉 / 66봉 검증실</h1>',
+        '<h1>🧪 V11.14.36 · 볼먼 vs 라쉬케 vs 크레이블</h1>')
+    one('기존 A~G 보존 · H 50봉+EMA35 대 66봉+EMA50 독립 검증',
+        '기존 A~H 보존 · Turtle Soup 응용 / NR7 응용 독립 성과 비교')
+    one("const API='/api/winrate14c5window', KEY='bithumb_c5_window_v111435_v1';",
+        "const API='/api/winrate14c5newtraders', KEY='bithumb_c5_newtraders_v111436_v1';")
+    one("const DB_NAME='bithumb_c5_window_v111435_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_newtraders_v111436_indexeddb_v1';")
+    one('<input type="date" id="day" value="2026-11-12">',
+        '<input type="date" id="day" value="2026-11-05">')
+    one('먼저 11월 9~10일 · 전체 종목으로 기존 A~F 결과를 대조해 보고,',
+        '신규 트레이더는 11월 5~6일 · 전체 KRW 종목에서 먼저 비교하고,')
+
+    section="""<section class="panel"><h2>핵심 연구 — 볼먼 A vs 라쉬케 I vs 크레이블 J · 날짜별 성과</h2>
+<div class="alert28">
+<b>A · 밥 볼먼:</b> V11.14.35 원본 A를 그대로 비교 기준으로 사용. <b>I · 린다 라쉬케 & 로렌스 코너스:</b> 5분봉 이전 20봉 저점 이탈 → 같은 봉 종가 재회복, 최소 4봉 전에 형성된 저점. <b>J · 토비 크레이블:</b> 이전 7개의 5분봉 중 NR7 수축봉을 찾고 다음 봉의 종가가 상단을 넘으면 연구 진입. 둘 다 매수 전용 실험이며 본래 일봉·세션 전략을 5분봉에 응용한 <b>변형 가설</b>이야.<br>
+<b>공통:</b> 다음 실제 5분봉 시가 진입, 목표 +1.5%, 손절 -1%, 60분 보유, 같은 비용과 동일 청산 모형. 신호 탐지에 미래 봉 사용 없음. 5분봉 공백은 채우지 않음.<br>
+<b>주의:</b> 다른 종목·서로 다른 시간의 신호는 짝비교가 아니며, 중복 신호를 수익으로 중복 합산하지 않아. 미확인 거래는 평균에서 제외하고 별도로 표시해.</div>
+<p class="alert28 warn">⚠️ 기존 11월 7~12일은 모델 연구에 참고한 구간이므로 후보 탐색용으로만 쓰고, 우선 2026-11-05와 11-06을 비교해서 별도 날짜 성능을 보자. 어느 전략도 실전 BUY/주문에 연결되지 않아.</p>
+<div id="new_traders_comparison" class="wide28">검사 후 비교 표시</div>
+</section>"""
+    primary='<section class="panel"><h2>2. VOLMAN / BEGGS / 독립 H2 성과 비교</h2>'
+    one(primary,section+'\n'+primary)
+    js=r"""function paintNewTradersStudy(){
+ const rs=Object.values(state.results||{});
+ const keys=[['A','볼먼 A'],['I','라쉬케 I'],['J','크레이블 J']];
+ const fmt=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+ const arr=(key,date)=>rs.filter(r=>!date||r.date===date).flatMap(r=>
+  (key==='A'?(r.events?.A||[]):(r.new_traders_events?.[key]||[])).map(e=>({...e,date:r.date})));
+ const score=es=>{const done=es.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const wins=done.filter(e=>num(e.net_pct)>0).length;
+  return {signals:es.filter(e=>e.outcome!=='NO_ENTRY').length,done:done.length,wins,
+   losses:done.length-wins,unknown:es.filter(e=>e.outcome==='UNKNOWN').length,
+   tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,
+   avg:done.length?done.reduce((a,e)=>a+num(e.net_pct),0)/done.length:NaN};};
+ const totals=keys.map(([k,label])=>{const x=score(arr(k));return tr([label,x.signals,x.done,x.wins,x.losses,
+  x.tp,x.sl,x.unknown,x.done?(100*x.wins/x.done).toFixed(1)+'%':'—',fmt(x.avg)]);});
+ const dates=[...new Set(rs.map(r=>r.date))].sort();
+ const daily=[];
+ for(const date of dates)for(const [k,label] of keys){const x=score(arr(k,date));
+  daily.push(tr([date,label,x.signals,x.wins,x.losses,x.unknown,fmt(x.avg)]));}
+ const audit=rs.map(r=>r.new_traders_coverage||{});
+ const elig=audit.reduce((s,x)=>s+(x.new_traders_eligible_positions||0),0);
+ const results=[...arr('I'),...arr('J')].sort((a,b)=>(a.date+a.signal_time_kst).localeCompare(b.date+b.signal_time_kst)).slice(0,100);
+ $('new_traders_comparison').innerHTML='<p class="small28">20개 연속 5분봉으로 검사 가능한 위치: '+elig+'개 · 동일 6시간 확보 데이터 · 연구 신호만</p>'+
+  tbl(['전략','신호','종료 거래','수익 거래','손실 거래','TP','SL','미확인','수익거래 비율','거래당 평균 순수익률'],totals)+
+  '<h3>날짜별 직접 비교</h3>'+
+  tbl(['날짜','전략','신호','수익','손실','미확인','평균 순수익률'],daily)+
+  '<h3>신규 트레이더 매매 기록 (최대 100건)</h3>'+
+  (results.length?tbl(['날짜','종목','유형','신호 시각','결과','순수익률'],results.map(e=>tr([
+    e.date,e.market,e.strategy,e.signal_time_kst,e.outcome||'UNKNOWN',
+    Number.isFinite(num(e.net_pct))?num(e.net_pct).toFixed(3)+'%':'—']))):
+   '<p class="small28">신규 트레이더 신호 없음</p>');
+}
+"""
+    one('function paintH2WindowStudy(){',js+'function paintH2WindowStudy(){')
+    one(' paintH2WindowStudy();\n}', ' paintH2WindowStudy();\n paintNewTradersStudy();\n}')
+    one("'h2_50_changed_slow_indicator'];",
+        "'h2_50_changed_slow_indicator',\n"
+        "  'new_traders_eligible_positions','new_traders_market_eligible',\n"
+        "  'raschke_i_signals','crabel_j_signals','new_traders_20bar_observed_only',\n"
+        "  'pattern_name','pattern_reference_price','pattern_previous_low_age_bars',\n"
+        "  'pattern_sweep_pct','pattern_reclaim_pct','pattern_close_position',\n"
+        "  'pattern_volume_ratio','pattern_atr_pct','pattern_nr7_setup_time_kst',\n"
+        "  'pattern_setup_range_pct','pattern_breakout_pct','pattern_close_vs_ema20_pct'];")
+    one("...(r.h2_50_audit||{})};", "...(r.h2_50_audit||{}),...(r.new_traders_coverage||{})};")
+    one("  for(const e of r.h2_50_reference_events||[])add({...base,...e,strategy:'H_REF_66'});",
+        "  for(const e of r.h2_50_reference_events||[])add({...base,...e,strategy:'H_REF_66'});\n"
+        "  for(const key of ['I','J'])for(const e of r.new_traders_events?.[key]||[])add({...base,...e,strategy:key});")
+    one('bithumb_C5_VOLMAN_BEGGS_BROOKS_WINDOW_v111435.csv',
+        'bithumb_C5_VOLMAN_BEGGS_RASCHKE_CRABEL_v111436.csv')
+    if '/api/winrate14c5window' in page or 'bithumb_c5_window_v111435_indexeddb_v1' in page:
+        raise RuntimeError('V11.14.36 새로운 연구 화면에서 이전 API/DB 잔존')
+    return page
+
+
+C5_NEW_V111436_PAGE=c5_new_v111436_make_page()
+
+
+def register_c5_new_v111436_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                items=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not items:raise ValueError('현재 빗썸 KRW 종목을 조회하지 못했어')
+                cache.update(items=items,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-new-traders')
+    def c5_new_v111436_page():
+        return render_template_string(C5_NEW_V111436_PAGE)
+
+    @app.get('/api/winrate14c5newtraders/universe')
+    def c5_new_v111436_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.36'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5newtraders/evaluate')
+    def c5_new_v111436_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):raise ValueError('현재 KRW 목록에 없는 코인')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_new_v111436_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.36',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111435_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111435_register_daytrade_review(app,deps)
+    register_c5_new_v111436_lab(app,deps)
+
