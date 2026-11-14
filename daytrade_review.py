@@ -12753,3 +12753,356 @@ _v111438_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111438_register_daytrade_review(app,deps)
     register_c5_v111439_lab(app,deps)
+
+
+# =============================================================================
+# V11.14.40 - RESEARCH ONLY: independent Shannon AVWAP and Cameron bull flag
+# Preserve the entire V11.14.39 baseline A~O with identical fetched bars,
+# config, output fields, and settlement logic. Additional P/Q decisions ONLY
+# use observed 5m bars at or BEFORE the closed signal bar. No synthetic bars,
+# no actual orders, and never change the V2 live scanner BUY rule.
+# These are OUR OHLCV-only 5m adaptations, NOT the traders' precise systems.
+# =============================================================================
+
+
+def c5_v111440_shannon_signal(rows, i):
+    """Confirmed pivot-low anchored OHLCV approximate VWAP reclaim.
+
+    The anchor is a local low at least six bars old, confirmed with two
+    subsequent 5m bars at signal time. It is chosen solely from existing
+    historical data; the signal candle itself cannot move an old anchor.
+    VWAP uses typical price * candle volume; true tick/transaction AVWAP is
+    not recoverable from candle OHLCV alone.
+    """
+    if i < 55 or not lab_contiguous(rows, i-55, i):
+        return None
+    b, previous = rows[i], rows[i-1]
+    if b['c'] <= b['o'] or b['c'] <= previous['c']:
+        return None
+    mean_volume = sum(r['v'] for r in rows[i-20:i]) / 20
+    if mean_volume <= 0 or b['v'] < mean_volume * 1.05:
+        return None
+    # Fix an anchor before calculating the current bar's AVWAP; use only
+    # already-confirmed low pivots and take the most recent qualifying one.
+    anchor = None
+    for j in range(i-6, i-46, -1):
+        if j-2 < 0 or j+2 >= i:
+            continue
+        low = rows[j]['l']
+        if (low <= min(rows[j-2]['l'], rows[j-1]['l']) and
+            low < min(rows[j+1]['l'], rows[j+2]['l']) and
+            max(r['h'] for r in rows[j:i]) >= low * 1.008):
+            anchor = j
+            break
+    if anchor is None:
+        return None
+    avwap_num = 0.0
+    avwap_den = 0.0
+    prev_avwap = None
+    for j in range(anchor, i+1):
+        r = rows[j]
+        avwap_num += ((r['h'] + r['l'] + r['c']) / 3.0) * r['v']
+        avwap_den += r['v']
+        if j == i-1 and avwap_den > 0:
+            prev_avwap = avwap_num / avwap_den
+    if avwap_den <= 0 or not prev_avwap or prev_avwap <= 0:
+        return None
+    avwap = avwap_num / avwap_den
+    # Reclaim a meaningful weighted-price zone on a completed bullish bar.
+    if not (previous['c'] <= prev_avwap * 1.0025 and
+            b['c'] > avwap * 1.0005 and
+            b['l'] <= avwap * 1.008 and
+            b['c'] > previous['h'] and
+            avwap >= prev_avwap * 0.999):
+        return None
+    return {'pattern_name':'SHANNON_CONFIRMED_SWING_LOW_AVWAP_RECLAIM_5M_ADAPTATION',
+            'shannon_anchor_time_kst':rows[anchor]['t'].strftime('%Y-%m-%d %H:%M'),
+            'shannon_anchor_age_bars':i-anchor,
+            'shannon_anchor_low':round(rows[anchor]['l'],10),
+            'shannon_ohlcv_avwap':round(avwap,10),
+            'shannon_prev_ohlcv_avwap':round(prev_avwap,10),
+            'shannon_avwap_change_pct':round(100*(avwap/prev_avwap-1),5),
+            'shannon_reclaim_pct':round(100*(b['c']/avwap-1),5),
+            'shannon_volume_ratio':round(b['v']/mean_volume,5),
+            'shannon_ohlcv_approximation':True}
+
+
+def c5_v111440_cameron_signal(rows, i):
+    """A bullish impulse, 2-4 candle compact pullback, and re-breakout.
+
+    All rules use completed 5-minute OHLCV bars. Order-book spread, tape,
+    intrabar triggering, news, and real-time liquidity cannot be reproduced.
+    The next opening price is simulated by frozen lab_outcome_v11145.
+    """
+    if i < 40 or not lab_contiguous(rows, i-40, i):
+        return None
+    b = rows[i]
+    span = b['h'] - b['l']
+    if span <= 0 or b['c'] <= b['o'] or (b['c'] - b['l'])/span < 0.62:
+        return None
+    avg_current = sum(x['v'] for x in rows[i-20:i]) / 20.0
+    if avg_current <= 0 or b['v'] / avg_current < 1.15:
+        return None
+    for length in (2, 3, 4):
+        impulse_idx = i-length-1
+        impulse = rows[impulse_idx]
+        if impulse['o'] <= 0 or impulse['h'] <= impulse['l']:
+            continue
+        impulse_body = impulse['c']-impulse['o']
+        width = impulse['h']-impulse['l']
+        if impulse_body <= 0 or impulse_body/impulse['o'] < .006 or impulse_body/width < .55:
+            continue
+        avg_pre = sum(x['v'] for x in rows[impulse_idx-20:impulse_idx]) / 20.0
+        if avg_pre <= 0 or impulse['v'] / avg_pre < 1.60:
+            continue
+        flag = rows[impulse_idx+1:i]
+        if len(flag) != length:
+            continue
+        if sum(x['c'] < x['o'] for x in flag) < 1:
+            continue
+        if max(x['h'] for x in flag) > impulse['h'] * 1.004:
+            continue
+        # At most 55% of the impulse's body retraced by flag lows.
+        min_low = min(x['l'] for x in flag)
+        if min_low < impulse['c'] - impulse_body * .55:
+            continue
+        if sum(x['v'] for x in flag)/length > impulse['v'] * .92:
+            continue
+        flag_high = max(x['h'] for x in flag)
+        if not (b['c'] > flag_high * 1.0002 and
+                b['h'] > flag_high and b['c'] >= impulse['o'] * 1.006):
+            continue
+        return {'pattern_name':'CAMERON_RVOL_BULL_FLAG_REBREAK_5M_ADAPTATION',
+                'cameron_flag_bars':length,
+                'cameron_impulse_time_kst':impulse['t'].strftime('%Y-%m-%d %H:%M'),
+                'cameron_impulse_body_pct':round(100*(impulse['c']/impulse['o']-1),5),
+                'cameron_impulse_volume_ratio':round(impulse['v']/avg_pre,5),
+                'cameron_break_volume_ratio':round(b['v']/avg_current,5),
+                'cameron_flag_depth_pct':round(100*(impulse['c']/min_low-1),5),
+                'cameron_flag_high':round(flag_high,10),
+                'cameron_breakout_pct':round(100*(b['c']/flag_high-1),5)}
+    return None
+
+
+def c5_v111440_study(rows, cfg, market, kst):
+    """Separate P/Q signal arrays; NEVER filter or rewrite A~O records."""
+    from datetime import datetime as _dt, time as _tm
+    day_start = _dt.combine(cfg['day'], _tm.min, tzinfo=kst)
+    day_end = day_start + timedelta(days=1)
+    arms = (('P', c5_v111440_shannon_signal, 56,
+             '섀넌 응용: 확정 피벗 저점 Anchored VWAP 회복'),
+            ('Q', c5_v111440_cameron_signal, 41,
+             '캐머런 응용: 상승 임펄스·2~4봉 눌림·재돌파'))
+    events = {'P': [], 'Q': []}
+    eligible = {'P':0, 'Q':0}
+    insufficient = {'P':0, 'Q':0}
+    signal_candidates = {'P':0, 'Q':0}
+    for key, detector, minimum_streak, description in arms:
+        streak = 0
+        last = -1000000
+        for i, bar in enumerate(rows[:-1]):
+            if i and bar['t']-rows[i-1]['t']==timedelta(minutes=5):
+                streak += 1
+            else:
+                streak = 1
+            if not day_start <= bar['t'] < day_end:
+                continue
+            if streak < minimum_streak:
+                insufficient[key] += 1
+                continue
+            eligible[key] += 1
+            features = detector(rows, i)
+            if features is None:
+                continue
+            signal_candidates[key] += 1
+            if i-last < cfg['bars']:
+                continue
+            last = i
+            stamp = bar['t'].strftime('%Y-%m-%d %H:%M')
+            event = {'market':market,'strategy':key,
+                     'base_id':market+'|'+key+'|'+stamp,
+                     'base_signal_time_kst':stamp,'signal_time_kst':stamp,
+                     'entry_time_kst':(bar['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                     'entry_delay_minutes':0,'hypothetical_only':True,
+                     'comparison_group':'V111440_INDEPENDENT_SHANNON_CAMERON',
+                     'reason':description, **features}
+            event.update(lab_outcome_v11145(rows,i,cfg))
+            events[key].append(event)
+    return {'v111440_new_events': events,
+            'v111440_coverage': {
+                'shannon_p_eligible_positions':eligible['P'],
+                'cameron_q_eligible_positions':eligible['Q'],
+                'shannon_p_short_history_positions':insufficient['P'],
+                'cameron_q_short_history_positions':insufficient['Q'],
+                'shannon_p_pre_cooldown_candidates':signal_candidates['P'],
+                'cameron_q_pre_cooldown_candidates':signal_candidates['Q'],
+                'shannon_p_signals':len(events['P']),
+                'cameron_q_signals':len(events['Q']),
+                'v111440_no_synthetic_candles':True,
+                'v111440_live_buy_unchanged':True}}
+
+
+def c5_v111440_evaluate_rows(rows6,cfg,market,kst,truncated=False,meta=None,
+                               rowsN=None,nmeta=None):
+    # Carry entire prior V11.14.39 output over UNMODIFIED.
+    baseline=c5_v111439_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+    added=c5_v111440_study(rows6,cfg,market,kst)
+    if not set(added).isdisjoint(baseline):
+        raise RuntimeError('V11.14.40 previous strategy output collision')
+    return {**baseline,**added}
+
+
+def c5_v111440_evaluate_symbol(api_get,market,cfg,kst):
+    rows6,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    # Keep N prehistory behavior exactly as in V11.14.39.
+    try:
+        rowsN,nmeta=c5_v111438_fetch_velez_prehistory(api_get,market,cfg,kst,rows6)
+    except Exception as exc:
+        rowsN=rows6
+        nmeta={'velez_fetch_status':'EXTRA_FETCH_FAILED',
+               'velez_fetch_error':(type(exc).__name__+': '+str(exc))[:120],
+               'velez_extra_pages':0,'velez_extra_raw':0}
+    return c5_v111440_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+
+
+def c5_v111440_make_page():
+    """Isolate browser checkpoint and add four-strategy comparison to O lab UI."""
+    page=C5_V111439_PAGE.replace('V11.14.39','V11.14.40')
+    def one(old,new):
+        nonlocal page
+        matches=page.count(old)
+        if matches!=1:
+            raise RuntimeError('V11.14.40 UI expected unique marker '+str(matches)+' '+old[:90])
+        page=page.replace(old,new,1)
+
+    one('<title>V11.14.40 · 4인 신호 중복 확인 · 15분 검증</title>',
+        '<title>V11.14.40 · 섀넌 AVWAP vs 캐머런 모멘텀 스캘핑</title>')
+    one('<h1>🧪 V11.14.40 · 4인 신호 중복 검증</h1>',
+        '<h1>🧪 V11.14.40 · 섀넌 · 캐머런 스캘핑 비교</h1>')
+    one('기존 A~N 보존 · O형 15분 내 2인 이상 중복신호 독립 검증',
+        '기존 A~O 보존 · P 섀넌 AVWAP / Q 캐머런 Bull Flag 독립 연구')
+    one("const API='/api/winrate14c5overlap', KEY='bithumb_c5_overlap_v111439_v1';",
+        "const API='/api/winrate14c5shannoncameron', KEY='bithumb_c5_shannon_cameron_v111440_v1';")
+    one("const DB_NAME='bithumb_c5_overlap_v111439_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_shannon_cameron_v111440_indexeddb_v1';")
+    one('11월 7~13일 전체 7일','11월 7~13일 전체 7일 · 4인 공정 비교')
+    one('신호 중복은 11월 7~13일 · 전체 KRW 종목에서 먼저 비교하고,',
+        '섀넌·캐머런은 11월 7~13일 · 전체 KRW 종목으로 볼먼·카터와 비교하고,')
+    introduction='''<section class="panel"><h2>NEW · P형 섀넌 AVWAP / Q형 캐머런 Bull Flag</h2>
+<div class="alert28"><b>A · 볼먼:</b> 기존 가격 압축 돌파 그대로 유지.<br>
+<b>L · 카터:</b> 기존 TTM Squeeze 그대로 유지.<br>
+<b>P · 섀넌 응용:</b> 신호 봉보다 최소 6봉 앞에서 확정된 국소 저점을 AVWAP 기준점으로 선정. 각 봉 (고가+저가+종가)/3 × 거래량의 누적 평균을 사용해, 5분봉이 AVWAP 부근을 회복하고 거래량이 직전 20봉 평균의 1.05배 이상이면 후보. 이는 거래체결 단위의 진짜 AVWAP가 아닌 <b>OHLCV 근삿값</b>.<br>
+<b>Q · 캐머런 응용:</b> 거래량이 직전 20봉 평균의 1.60배 이상인 강한 상승봉 → 2~4봉의 짧은 눌림 → 눌림 고점 상향 돌파와 거래량 1.15배 확인. 호가창·뉴스·스프레드 판단 없이 5분봉만으로 만든 가설.<br>
+<b>공통:</b> 완료 5분봉 이후 다음 실제 5분봉 시가 진입, 익절 +1.5%, 손절 -1%, 최대 60분. 편도 수수료 0.04% / 슬리피지 0.05% 기본. 미관측 봉은 생성하지 않고 UNKNOWN으로 기록. <b>실전 V2 BUY 변경 없음.</b></div>
+<p class="alert28 warn">⚠️ 이 조건들은 원 트레이더의 모든 매매 판단을 그대로 복제한 것이 아니라, 빗썸 5분봉으로 객관 검증할 실험용 규칙이야. 기존 결과와 공정 비교 후에는 별도 날짜에서 재검증하자.</p>
+<div id="shannon_cameron_comparison" class="wide28">검사 후 A·L·P·Q 비교 결과 표시</div></section>'''
+    one('<section class="panel"><h2>NEW · O형 — 15분 내 서로 다른 2명 이상 동시 확인</h2>',
+        introduction+'\n<section class="panel"><h2>이전 연구 · O형 — 15분 내 서로 다른 2명 이상 동시 확인</h2>')
+
+    js=r'''function paintShannonCameron(){
+ const rs=Object.values(state.results||{}), keys=[['A','볼먼 A'],['L','카터 L'],['P','섀넌 P'],['Q','캐머런 Q']];
+ const items=(key,day)=>rs.filter(r=>!day||r.date===day).flatMap(r=>(
+   key==='A'?(r.events?.A||[]):key==='L'?(r.v111437_new_events?.L||[]):
+   (r.v111440_new_events?.[key]||[])
+ ).filter(e=>e.outcome!=='NO_ENTRY').map(e=>({...e,date:r.date})));
+ const stats=arr=>{const done=arr.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const wins=done.filter(e=>num(e.net_pct)>0).length;
+  return {signals:arr.length,done:done.length,wins,loss:done.length-wins,
+   tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,
+   unknown:arr.filter(e=>e.outcome==='UNKNOWN').length,
+   avg:done.length?done.reduce((s,e)=>s+num(e.net_pct),0)/done.length:NaN};};
+ const fmt=n=>Number.isFinite(n)?n.toFixed(3)+'%':'—';
+ const totals=keys.map(([key,name])=>{const s=stats(items(key));return tr([name,s.signals,s.done,s.wins,s.loss,s.tp,s.sl,s.unknown,
+   s.done?(100*s.wins/s.done).toFixed(1)+'%':'—',fmt(s.avg)]);});
+ const dates=[...new Set(rs.map(r=>r.date))].sort(),daily=[];
+ for(const date of dates)for(const [key,name] of keys){const s=stats(items(key,date));
+   daily.push(tr([date,name,s.signals,s.wins,s.loss,s.unknown,fmt(s.avg)]));}
+ const coverage=key=>rs.reduce((total,r)=>total+Number(r.v111440_coverage?.[key]||0),0);
+ const details=[...items('P'),...items('Q')].sort((a,b)=>(a.date+a.signal_time_kst).localeCompare(b.date+b.signal_time_kst));
+ $('shannon_cameron_comparison').innerHTML='<p class="small28">평가 가능 5분봉 위치 · 섀넌 P '+coverage('shannon_p_eligible_positions')+
+  ' · 캐머런 Q '+coverage('cameron_q_eligible_positions')+ ' · 누락봉 보간 없음, 평가 불가 종목은 수익률에서 제외</p>'+
+  tbl(['전략','진입','결과 확인','수익','손실','TP','SL','미확인','수익 거래율','평균 순수익률'],totals)+
+  '<h3>검사 날짜별 성과</h3>'+tbl(['날짜','전략','진입','수익','손실','미확인','평균 순수익률'],daily)+
+  '<h3>신규 P/Q 거래 (최대 200건)</h3>'+
+  (details.length?tbl(['날짜','종목','전략','신호 시각','결과','순수익률'],details.slice(0,200).map(e=>tr([
+   e.date,e.market,e.strategy,e.signal_time_kst,e.outcome||'UNKNOWN',fmt(num(e.net_pct))]))):'<p class="small28">신규 신호 없음</p>');
+}
+'''
+    one('function paintTraderOverlap(){', js+'function paintTraderOverlap(){')
+    one(' paintTraderOverlap();\n}', ' paintTraderOverlap();\n paintShannonCameron();\n}')
+    one("'overlap_lag_minutes','overlap_window_minutes','overlap_cooldown_minutes'];",
+        "'overlap_lag_minutes','overlap_window_minutes','overlap_cooldown_minutes',\n"
+        "  'shannon_p_eligible_positions','cameron_q_eligible_positions',\n"
+        "  'shannon_p_short_history_positions','cameron_q_short_history_positions',\n"
+        "  'shannon_p_pre_cooldown_candidates','cameron_q_pre_cooldown_candidates',\n"
+        "  'shannon_p_signals','cameron_q_signals','v111440_no_synthetic_candles',\n"
+        "  'v111440_live_buy_unchanged','pattern_name',\n"
+        "  'shannon_anchor_time_kst','shannon_anchor_age_bars','shannon_anchor_low',\n"
+        "  'shannon_ohlcv_avwap','shannon_prev_ohlcv_avwap',\n"
+        "  'shannon_avwap_change_pct','shannon_reclaim_pct',\n"
+        "  'shannon_volume_ratio','shannon_ohlcv_approximation',\n"
+        "  'cameron_flag_bars','cameron_impulse_time_kst',\n"
+        "  'cameron_impulse_body_pct','cameron_impulse_volume_ratio',\n"
+        "  'cameron_break_volume_ratio','cameron_flag_depth_pct',\n"
+        "  'cameron_flag_high','cameron_breakout_pct'];")
+    one('...(r.v111438_coverage||{}),...(r.v111439_overlap_audit||{})};',
+        '...(r.v111438_coverage||{}),...(r.v111439_overlap_audit||{}),...(r.v111440_coverage||{})};')
+    one("  for(const e of r.v111439_overlap_events||[])add({...base,...e,strategy:'O'});",
+        "  for(const e of r.v111439_overlap_events||[])add({...base,...e,strategy:'O'});\n"
+        "  for(const key of ['P','Q'])for(const e of r.v111440_new_events?.[key]||[])add({...base,...e,strategy:key});")
+    one('bithumb_C5_VOLMAN_CARTER_DEMARK_VELEZ_OVERLAP_v111439.csv',
+        'bithumb_C5_VOLMAN_SHANNON_CAMERON_v111440.csv')
+    if page.count('function paintShannonCameron(){')!=1 or page.count("const API='/api/winrate14c5shannoncameron'")!=1:
+        raise RuntimeError('V11.14.40 new P/Q UI/endpoint not installed')
+    return page
+
+
+C5_V111440_PAGE=c5_v111440_make_page()
+
+
+def register_c5_v111440_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                names=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 종목을 조회할 수 없습니다')
+                cache.update(items=names,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-shannon-cameron')
+    def c5_v111440_page():
+        return render_template_string(C5_V111440_PAGE)
+
+    @app.get('/api/winrate14c5shannoncameron/universe')
+    def c5_v111440_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.40'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5shannoncameron/evaluate')
+    def c5_v111440_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_v111440_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.40',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111439_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111439_register_daytrade_review(app,deps)
+    register_c5_v111440_lab(app,deps)
