@@ -12477,3 +12477,279 @@ _v111437_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111437_register_daytrade_review(app,deps)
     register_c5_v111438_lab(app,deps)
+
+
+# =============================================================================
+# V11.14.39 - RESEARCH ONLY: multi-trader signal coincidence A / L / M / N.
+# Strictly preserve prior A~N strategies. Trigger O only when >=2 DISTINCT
+# strategies produce CLOSED 5-minute signals for SAME market within <=15 min.
+# Signals are considered strictly as-of the latest confirmation time; no
+# profitable/outcome-based retrospective selection is allowed.
+# Use the *next actual 5-minute candle OPEN* for O, with the same frozen exit
+# model and same-symbol cooldown (cfg['bars'] 5m bars), no synthetic bars.
+# Renders O alongside A/L/M/N rather than mixing them as independent trades.
+# Historical backtest only. NEVER modify V2 orders or live BUY logic.
+# =============================================================================
+
+
+def c5_v111439_overlap_study(rows6, baseline, cfg, market, kst):
+    """Confirm two or more different source strategies within a 15m window.
+
+    All source signals already exist in the unchanged baseline.  To prevent
+    lookahead bias, source outcome/net/exit are NEVER referenced in this study.
+    Source signal timestamp is the completed 5m signal-bar timestamp (the bar
+    opens at that time and its data are fully available at time+5min), and O
+    enters at the following 5m candle open exactly as the frozen A/L/M/N arms.
+    Later same-date signals never influence an earlier O event.  Each market
+    can trigger O at most once per cfg['bars']*5m to avoid duplicative trades.
+    """
+    from datetime import datetime as _dt, time as _tm
+    day_start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    keys=(('A',baseline.get('events',{}).get('A',[])),
+          ('L',baseline.get('v111437_new_events',{}).get('L',[])),
+          ('M',baseline.get('v111438_new_events',{}).get('M',[])),
+          ('N',baseline.get('v111438_new_events',{}).get('N',[])))
+    raw=[]
+    for key,entries in keys:
+        for e in entries:
+            if e.get('outcome')=='NO_ENTRY':
+                continue
+            time_str=e.get('signal_time_kst')
+            if not isinstance(time_str,str):
+                continue
+            try:
+                t=_dt.strptime(time_str,'%Y-%m-%d %H:%M').replace(tzinfo=kst)
+            except ValueError:
+                continue
+            if day_start<=t<day_end:
+                # Only strategy and closed signal time are necessary.
+                raw.append((t,key))
+    raw.sort(key=lambda p:(p[0],p[1]))
+    time_index={b['t']:i for i,b in enumerate(rows6)}
+    events=[]
+    last_confirmation=None
+    trigger_opportunities=0
+    cooldown_suppressed=0
+    # Process each unique time once, so simultaneous source signals trigger
+    # exactly one O event and never depend on lexicographic strategy order.
+    for t in sorted({item[0] for item in raw}):
+        available=[(tt,k) for tt,k in raw
+                   if t-timedelta(minutes=15)<=tt<=t]
+        # Pick most recent available signal of each strategy. Same trader's
+        # repeated signals alone are NOT treated as independent confirmation.
+        latest={}
+        for tt,k in available:
+            latest[k]=tt
+        if len(latest)<2:
+            continue
+        trigger_opportunities+=1
+        if (last_confirmation is not None and
+                t-last_confirmation<timedelta(minutes=5*cfg['bars'])):
+            cooldown_suppressed+=1
+            continue
+        last_confirmation=t
+        names=sorted(latest)
+        earliest=min(latest.values())
+        stamp=t.strftime('%Y-%m-%d %H:%M')
+        evidence='|'.join(k+'@'+latest[k].strftime('%H:%M') for k in names)
+        entry={'market':market, 'strategy':'O',
+               'base_id':market+'|O|'+stamp,
+               'base_signal_time_kst':stamp,
+               'signal_time_kst':stamp,
+               'entry_time_kst':(t+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+               'entry_delay_minutes':0,
+               'hypothetical_only':True,
+               'comparison_group':'V111439_MULTITRADER_15M_NEXT_OPEN',
+               'overlap_strategies':'+'.join(names),
+               'overlap_strategy_count':len(names),
+               'overlap_witness_times':evidence,
+               'overlap_first_signal_time_kst':earliest.strftime('%Y-%m-%d %H:%M'),
+               'overlap_confirm_time_kst':stamp,
+               'overlap_lag_minutes':int((t-earliest).total_seconds()/60),
+               'overlap_window_minutes':15,
+               'overlap_cooldown_minutes':cfg['bars']*5,
+               'reason':'연구용 O: 서로 다른 2개 이상 A/L/M/N 완료 신호 15분 이내 확인 후 다음 실제 봉 시가 진입'}
+        idx=time_index.get(t)
+        if idx is None:
+            entry.update({'outcome':'UNKNOWN',
+                          'reason':'확인 신호의 5분봉이 기준 데이터에서 발견되지 않음'})
+        else:
+            entry.update(lab_outcome_v11145(rows6,idx,cfg))
+        events.append(entry)
+    return {'v111439_overlap_events':events,
+            'v111439_overlap_audit':{
+                'overlap_15m_source_signals':len(raw),
+                'overlap_15m_opportunities':trigger_opportunities,
+                'overlap_15m_cooldown_suppressed':cooldown_suppressed,
+                'overlap_15m_signals':len(events),
+                'overlap_15m_completed':sum(e.get('outcome') in ('TP','SL','TIME') for e in events),
+                'overlap_15m_unknown':sum(e.get('outcome')=='UNKNOWN' for e in events),
+                'overlap_source_traders':'A,L,M,N',
+                'overlap_15m_no_future_info':True}}
+
+
+def c5_v111439_evaluate_rows(rows6,cfg,market,kst,truncated=False,meta=None,
+                                rowsN=None,nmeta=None):
+    """Append coincidence study without mutating prior response or arms."""
+    baseline=c5_v111438_evaluate_rows(rows6,cfg,market,kst,
+                                      truncated,meta,rowsN,nmeta)
+    extra=c5_v111439_overlap_study(rows6,baseline,cfg,market,kst)
+    if not set(baseline).isdisjoint(extra):
+        raise RuntimeError('V11.14.39 기존 데이터 필드 충돌')
+    return {**baseline,**extra}
+
+
+def c5_v111439_evaluate_symbol(api_get,market,cfg,kst):
+    rows6,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    try:
+        rowsN,nmeta=c5_v111438_fetch_velez_prehistory(api_get,market,cfg,kst,rows6)
+    except Exception as exc:
+        rowsN=rows6
+        nmeta={'velez_fetch_status':'EXTRA_FETCH_FAILED',
+               'velez_fetch_error':(type(exc).__name__+': '+str(exc))[:120],
+               'velez_extra_pages':0,'velez_extra_raw':0}
+    return c5_v111439_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+
+
+def c5_v111439_make_page():
+    """Clone 4-trader research UI, isolating O endpoint and browser state."""
+    page=C5_V111438_PAGE.replace('V11.14.38','V11.14.39')
+    def one(old,new):
+        nonlocal page
+        count=page.count(old)
+        if count!=1:
+            raise RuntimeError('V11.14.39 화면 기준 불일치: '+str(count)+' '+old[:100])
+        page=page.replace(old,new,1)
+
+    one('<title>V11.14.39 · 볼먼 카터 디마크 벨레즈 4인 비교</title>',
+        '<title>V11.14.39 · 4인 신호 중복 확인 · 15분 검증</title>')
+    one('<h1>🧪 V11.14.39 · 볼먼·카터·디마크·벨레즈</h1>',
+        '<h1>🧪 V11.14.39 · 4인 신호 중복 검증</h1>')
+    one('기존 A~L 보존 · 디마크 Setup9 / 벨레즈 20·200MA 신규 연구',
+        '기존 A~N 보존 · O형 15분 내 2인 이상 중복신호 독립 검증')
+    one("const API='/api/winrate14c5fourtraders', KEY='bithumb_c5_four_traders_v111438_v1';",
+        "const API='/api/winrate14c5overlap', KEY='bithumb_c5_overlap_v111439_v1';")
+    one("const DB_NAME='bithumb_c5_four_traders_v111438_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_overlap_v111439_indexeddb_v1';")
+    one("const DAYS=['2026-11-06','2026-11-07','2026-11-08','2026-11-09','2026-11-10','2026-11-11','2026-11-12'];",
+        "const DAYS=['2026-11-07','2026-11-08','2026-11-09','2026-11-10','2026-11-11','2026-11-12','2026-11-13'];")
+    one('11월 6~12일 전체 7일','11월 7~13일 전체 7일')
+    one('신규 트레이더는 11월 5~6일 · 전체 KRW 종목에서 먼저 비교하고,',
+        '신호 중복은 11월 7~13일 · 전체 KRW 종목에서 먼저 비교하고,')
+
+    introduction="""<section class="panel"><h2>NEW · O형 — 15분 내 서로 다른 2명 이상 동시 확인</h2>
+<div class="alert28"><b>신호 출처:</b> A 볼먼 · L 카터 · M 디마크 · N 벨레즈 (A~N 기존 로직과 결과는 모두 유지).<br>
+<b>O형 판정:</b> 동일 종목·같은 날짜에 서로 다른 두 전략 이상의 <b>완료된 5분봉 신호가 15분 이내</b>에 있으면 가장 늦은 확인 신호봉에서 O 1개 발생. 같은 전략의 반복 신호는 중복으로 세지 않아.<br>
+<b>진입:</b> 두 번째 전략 확인 뒤 <b>그다음 실제 5분봉 시가</b>. TP +1.5%, SL -1.0%, 최대 60분, 동일 비용. 해당 종목의 60분 이내 O 중복 신호는 제외. 누락봉은 UNKNOWN, 임의 채움 없음.<br>
+<b>비교:</b> A/L/M/N 개별 신호 결과와 O 신규 진입 결과를 날짜별 수익·손실·평균 순수익률로 나란히 비교해. O는 기존 결과의 수익 여부를 기준으로 필터링하지 않고, <b>신호 시점의 정보만</b> 사용해.</div>
+<p class="alert28 warn">⚠️ 겹친 <b>수익 신호만</b> 선택하면 미래를 보는 오류가 생겨. 여기선 모든 중복 신호(손실·미확인 포함)를 검사해. 이전 11/7~13일 데이터를 사용해 이 전략을 설계했으므로 그 기간의 성과는 탐색 결과이고, 별도 미래 날짜에서 검증해야 해. 실전 V2 BUY 미변경.</p>
+<div id="overlap_comparison" class="wide28">검사 후 다중 트레이더 신호 성과 표시</div></section>"""
+    one('<section class="panel"><h2>핵심 연구 — VOLMAN A / CARTER L / DEMARK M / VELEZ N</h2>',
+        introduction+'\n<section class="panel"><h2>이전 연구 — VOLMAN A / CARTER L / DEMARK M / VELEZ N</h2>')
+
+    js=r"""function paintTraderOverlap(){
+ const rs=Object.values(state.results||{}),keys=[['A','볼먼 A'],['L','카터 L'],['M','디마크 M'],['N','벨레즈 N'],['O','2인+ 중복 O']];
+ const events=(key,day)=>rs.filter(r=>!day||r.date===day).flatMap(r=>(
+   key==='A'?(r.events?.A||[]):key==='L'?(r.v111437_new_events?.L||[]):
+   key==='O'?(r.v111439_overlap_events||[]):(r.v111438_new_events?.[key]||[])
+ ).filter(e=>e.outcome!=='NO_ENTRY').map(e=>({...e,date:r.date})));
+ const stats=arr=>{const done=arr.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const wins=done.filter(e=>num(e.net_pct)>0).length;
+  return {signals:arr.length,done:done.length,wins,loss:done.length-wins,
+   unknown:arr.filter(e=>e.outcome==='UNKNOWN').length,
+   avg:done.length?done.reduce((s,e)=>s+num(e.net_pct),0)/done.length:NaN};};
+ const fmt=n=>Number.isFinite(n)?n.toFixed(3)+'%':'—';
+ const totals=keys.map(([k,label])=>{const x=stats(events(k));return tr([label,x.signals,x.done,x.wins,x.loss,
+  x.unknown,x.done?(100*x.wins/x.done).toFixed(1)+'%':'—',fmt(x.avg)]);});
+ const dates=[...new Set(rs.map(r=>r.date))].sort(),daily=[];
+ for(const d of dates)for(const [k,label] of keys){const x=stats(events(k,d));
+  daily.push(tr([d,label,x.signals,x.wins,x.loss,x.unknown,fmt(x.avg)]));}
+ const os=events('O').sort((a,b)=>(a.date+a.signal_time_kst).localeCompare(b.date+b.signal_time_kst));
+ const details=os.map(e=>tr([e.date,e.market,e.overlap_strategies,e.overlap_witness_times,
+  e.overlap_lag_minutes+'분',e.entry_time_kst,e.outcome,fmt(num(e.net_pct))]));
+ const audit=rs.reduce((a,r)=>{let x=r.v111439_overlap_audit||{};
+  a.poss+=Number(x.overlap_15m_opportunities||0);a.cool+=Number(x.overlap_15m_cooldown_suppressed||0);
+  return a;},{poss:0,cool:0});
+ $('overlap_comparison').innerHTML='<p class="small28">15분 내 중복 후보 '+audit.poss+'회 · 60분 재신호 제외 '+audit.cool+
+  '회 · O는 기존 전략과 중복되는 동일 기회를 포함하므로 전략별 거래 수를 합산하면 안 돼.</p>'+
+  tbl(['전략','신호','종료','수익','손실','미확인','수익 거래율','평균 순수익률'],totals)+
+  '<h3>날짜별 성적</h3>'+tbl(['날짜','전략','신호','수익','손실','미확인','평균 순수익률'],daily)+
+  '<h3>다중 신호 확인 기록 (최대 150건)</h3>'+
+  (details.length?tbl(['날짜','종목','전략 조합','각 신호 시각','최대 시차','진입 시각','결과','순수익률'],details.slice(0,150)):'<p class="small28">현재 중복 신호 없음</p>');
+}
+"""
+    one('function paintFourTraders(){',js+'function paintFourTraders(){')
+    one(' paintFourTraders();\n}', ' paintFourTraders();\n paintTraderOverlap();\n}')
+    one("'velez_close_to_sma20_pct','velez_volume_ratio'];",
+        "'velez_close_to_sma20_pct','velez_volume_ratio',\n"
+        "  'overlap_15m_source_signals','overlap_15m_opportunities',\n"
+        "  'overlap_15m_cooldown_suppressed','overlap_15m_signals',\n"
+        "  'overlap_15m_completed','overlap_15m_unknown','overlap_source_traders',\n"
+        "  'overlap_15m_no_future_info','overlap_strategies',\n"
+        "  'overlap_strategy_count','overlap_witness_times',\n"
+        "  'overlap_first_signal_time_kst','overlap_confirm_time_kst',\n"
+        "  'overlap_lag_minutes','overlap_window_minutes','overlap_cooldown_minutes'];")
+    one('...(r.v111438_coverage||{})};',
+        '...(r.v111438_coverage||{}),...(r.v111439_overlap_audit||{})};')
+    one("  for(const key of ['M','N'])for(const e of r.v111438_new_events?.[key]||[])add({...base,...e,strategy:key});",
+        "  for(const key of ['M','N'])for(const e of r.v111438_new_events?.[key]||[])add({...base,...e,strategy:key});\n"
+        "  for(const e of r.v111439_overlap_events||[])add({...base,...e,strategy:'O'});")
+    one('bithumb_C5_VOLMAN_CARTER_DEMARK_VELEZ_v111438.csv',
+        'bithumb_C5_VOLMAN_CARTER_DEMARK_VELEZ_OVERLAP_v111439.csv')
+    if '/api/winrate14c5fourtraders' in page or 'bithumb_c5_four_traders_v111438_indexeddb_v1' in page:
+        raise RuntimeError('V11.14.39 새 검증실 API/DB 분리 실패')
+    if page.count('function paintTraderOverlap(){')!=1:
+        raise RuntimeError('V11.14.39 중복 신호 화면 연결 실패')
+    return page
+
+
+C5_V111439_PAGE=c5_v111439_make_page()
+
+
+def register_c5_v111439_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0}; lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                names=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 종목 조회 실패')
+                cache.update(items=names,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-trader-overlap')
+    def c5_v111439_page():
+        return render_template_string(C5_V111439_PAGE)
+
+    @app.get('/api/winrate14c5overlap/universe')
+    def c5_v111439_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.39'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5overlap/evaluate')
+    def c5_v111439_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_v111439_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.39',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111438_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111438_register_daytrade_review(app,deps)
+    register_c5_v111439_lab(app,deps)
