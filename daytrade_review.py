@@ -13106,3 +13106,345 @@ _v111439_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111439_register_daytrade_review(app,deps)
     register_c5_v111440_lab(app,deps)
+
+# =============================================================================
+# V11.14.41 - RESEARCH ONLY: Elder multi-timeframe and Jeff Cooper pullback.
+# P/Q and all earlier A~O strategies are preserved (no deletion/alteration).
+# R/S are OHLCV-derived 5-minute crypto ADAPTATIONS, not original systems.
+# No real orders, no synthetic candles, no look-ahead use of incomplete 15m.
+# =============================================================================
+
+
+def c5_v111441_ema(vals, period):
+    """Seed with an SMA of the first period; do not pretend it is EMA200."""
+    if len(vals)<period or period<2:
+        return None
+    value=sum(vals[:period])/period
+    for x in vals[period:]:
+        value+=(2/(period+1))*(x-value)
+    return value
+
+
+def c5_v111441_closed_15m(rows,i,blocks=18):
+    """Build only fully-observed, COMPLETED 15-minute candles by signal close.
+
+    5m bars are timestamped by candle start, so 15m bucket is complete
+    when all :00/:05/:10 (or :15/:20/:25 etc.) exist at signal close.
+    No future bars may influence any historical screen decision.
+    """
+    signal_close=rows[i]['t']+timedelta(minutes=5)
+    slots={}
+    for bar in rows[max(0,i-3*(blocks+5)):i+1]:
+        t=bar['t']
+        bucket=t.replace(minute=(t.minute//15)*15,second=0,microsecond=0)
+        if bucket+timedelta(minutes=15)>signal_close:
+            continue
+        if bucket not in slots:
+            slots[bucket]={}
+        slots[bucket][t]=bar
+    aggregated=[]
+    for start in sorted(slots):
+        three=[slots[start].get(start+timedelta(minutes=5*k)) for k in range(3)]
+        if not all(three):
+            continue
+        aggregated.append({'t':start,'c':three[-1]['c'],
+                           'h':max(x['h'] for x in three),
+                           'l':min(x['l'] for x in three),
+                           'v':sum(x['v'] for x in three)})
+    chosen=aggregated[-blocks:]
+    if len(chosen)<blocks or any(chosen[k]['t']-chosen[k-1]['t']!=timedelta(minutes=15)
+                                 for k in range(1,len(chosen))):
+        return None
+    return chosen
+
+
+def c5_v111441_elder_signal(rows,i):
+    """15m trend / 5m oscillator reversal; not Elder's original full screens.
+
+    Fixed experimental thresholds: 15m EMA8 above rising EMA13,
+    5m RSI(5) has recently dipped below 45 and recovers above 45,
+    bullish 5m close above prior high with volume >= .8x last 20 bars.
+    """
+    if i<66 or not lab_contiguous(rows,i-65,i):
+        return None
+    higher=c5_v111441_closed_15m(rows,i,18)
+    if higher is None:
+        return None
+    closes=[b['c'] for b in higher]
+    ema8=c5_v111441_ema(closes,8)
+    ema13=c5_v111441_ema(closes,13)
+    prior13=c5_v111441_ema(closes[:-1],13)
+    if not ema8 or not ema13 or not prior13 or not (ema8>ema13 and ema13>prior13 and closes[-1]>ema13):
+        return None
+    def rsi_end(at):
+        diffs=[rows[j]['c']-rows[j-1]['c'] for j in range(at-4,at+1)]
+        ups=sum(max(d,0) for d in diffs)
+        downs=-sum(min(d,0) for d in diffs)
+        return 100. if downs==0 and ups>0 else (50. if ups==downs==0 else 100*ups/(ups+downs))
+    rsi_now=rsi_end(i)
+    rsi_before=rsi_end(i-1)
+    oversold=min(rsi_end(j) for j in range(i-5,i))
+    b=rows[i]; prev=rows[i-1]
+    volume_mean=sum(x['v'] for x in rows[i-20:i])/20
+    if volume_mean<=0:
+        return None
+    if not (oversold<=45 and rsi_now>45 and rsi_now>rsi_before and
+            b['c']>b['o'] and b['c']>prev['h'] and b['v']>=volume_mean*.8):
+        return None
+    return {'pattern_name':'ELDER_15M_TREND_5M_RSI_RECOVERY_ADAPTATION',
+            'elder_15m_last_closed_start_kst':higher[-1]['t'].strftime('%Y-%m-%d %H:%M'),
+            'elder_15m_ema8':round(ema8,10), 'elder_15m_ema13':round(ema13,10),
+            'elder_15m_ema13_slope_pct':round(100*(ema13/prior13-1),6),
+            'elder_rsi5_before':round(rsi_before,5),
+            'elder_rsi5_signal':round(rsi_now,5),
+            'elder_rsi5_pullback_low':round(oversold,5),
+            'elder_volume_ratio':round(b['v']/volume_mean,5)}
+
+
+def c5_v111441_cooper_signal(rows,i):
+    """Three bar lower-high/lower-low pullback in rising SMA20/50 market.
+
+    This is a 5m 24/7 crypto adaptation of Cooper's daily 1-2-3 Pullback.
+    Trend check uses the 5m prior CLOSED data through the signal bar only.
+    """
+    if i<54 or not lab_contiguous(rows,i-53,i):
+        return None
+    b=rows[i]
+    before=rows[i-3:i]
+    pre=rows[i-4]
+    sma20=sum(x['c'] for x in rows[i-19:i+1])/20
+    sma50=sum(x['c'] for x in rows[i-49:i+1])/50
+    sma20_prev=sum(x['c'] for x in rows[i-22:i-2])/20
+    sma50_prev=sum(x['c'] for x in rows[i-52:i-2])/50
+    if min(sma20,sma50,sma20_prev,sma50_prev)<=0:
+        return None
+    if not (sma20>sma50 and sma20>sma20_prev and sma50>sma50_prev and
+            b['c']>sma20 and b['c']>sma50):
+        return None
+    descending= (pre['h']>before[0]['h']>before[1]['h']>before[2]['h'] and
+                 pre['l']>before[0]['l']>before[1]['l']>before[2]['l'])
+    # No abbreviated alternative: fixed 3-candle descending setup, auditable.
+    if not descending:
+        return None
+    volume_mean=sum(x['v'] for x in rows[i-20:i])/20
+    if volume_mean<=0 or b['v'] < volume_mean*.85:
+        return None
+    if not (b['c']>b['o'] and b['c']>before[-1]['h'] and
+            b['h']>before[-1]['h'] and b['c']>before[-1]['c']):
+        return None
+    depth=100*(pre['h']/min(x['l'] for x in before)-1)
+    if depth>3.5:
+        return None
+    return {'pattern_name':'COOPER_123_PULLBACK_5M_REBREAK_ADAPTATION',
+            'cooper_pullback_bars':3,
+            'cooper_sma20':round(sma20,10),'cooper_sma50':round(sma50,10),
+            'cooper_sma20_slope3_pct':round(100*(sma20/sma20_prev-1),5),
+            'cooper_sma50_slope3_pct':round(100*(sma50/sma50_prev-1),5),
+            'cooper_pullback_depth_pct':round(depth,5),
+            'cooper_breakout_pct':round(100*(b['c']/before[-1]['h']-1),5),
+            'cooper_volume_ratio':round(b['v']/volume_mean,5)}
+
+
+def c5_v111441_study(rows,cfg,market,kst):
+    from datetime import datetime as _dt,time as _tm
+    day_start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    day_end=day_start+timedelta(days=1)
+    arms=(('R',c5_v111441_elder_signal,66,'엘더 15m 상승추세 + 5m RSI 회복'),
+          ('S',c5_v111441_cooper_signal,54,'쿠퍼 3봉 눌림 + 상향 돌파'))
+    events={'R':[],'S':[]}
+    audit={}
+    for key,detector,minimum_streak,description in arms:
+        eligible=0;insufficient=0;candidates=0;streak=0;last=-100000
+        for i,bar in enumerate(rows[:-1]):
+            streak=streak+1 if i and bar['t']-rows[i-1]['t']==timedelta(minutes=5) else 1
+            if not day_start<=bar['t']<day_end:
+                continue
+            if streak<minimum_streak:
+                insufficient+=1
+                continue
+            eligible+=1
+            features=detector(rows,i)
+            if features is None:
+                continue
+            candidates+=1
+            if i-last<cfg['bars']:
+                continue
+            last=i
+            stamp=bar['t'].strftime('%Y-%m-%d %H:%M')
+            event={'market':market,'strategy':key,
+                   'base_id':market+'|'+key+'|'+stamp,
+                   'base_signal_time_kst':stamp,'signal_time_kst':stamp,
+                   'entry_time_kst':(bar['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                   'entry_delay_minutes':0,'hypothetical_only':True,
+                   'comparison_group':'V111441_INDEPENDENT_ELDER_COOPER',
+                   'reason':description,**features}
+            event.update(lab_outcome_v11145(rows,i,cfg))
+            events[key].append(event)
+        audit.update({f'v111441_{key}_eligible_positions':eligible,
+                      f'v111441_{key}_insufficient_positions':insufficient,
+                      f'v111441_{key}_pre_cooldown_candidates':candidates,
+                      f'v111441_{key}_signals':len(events[key])})
+    audit.update(v111441_no_synthetic_candles=True,
+                 v111441_live_buy_unchanged=True,
+                 v111441_15m_requires_three_actual_5m=True)
+    return {'v111441_new_events':events,'v111441_coverage':audit}
+
+
+def c5_v111441_evaluate_rows(rows6,cfg,market,kst,truncated=False,meta=None,
+                               rowsN=None,nmeta=None):
+    baseline=c5_v111440_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+    addition=c5_v111441_study(rows6,cfg,market,kst)
+    if not set(addition).isdisjoint(baseline):
+        raise RuntimeError('V11.14.41 previous output collision')
+    return {**baseline,**addition}
+
+
+def c5_v111441_evaluate_symbol(api_get,market,cfg,kst):
+    rows6,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    try:
+        rowsN,nmeta=c5_v111438_fetch_velez_prehistory(api_get,market,cfg,kst,rows6)
+    except Exception as exc:
+        rowsN=rows6
+        nmeta={'velez_fetch_status':'EXTRA_FETCH_FAILED',
+               'velez_fetch_error':(type(exc).__name__+': '+str(exc))[:120],
+               'velez_extra_pages':0,'velez_extra_raw':0}
+    return c5_v111441_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+
+
+def c5_v111441_make_page():
+    """Isolated UI/API/checkpoint, retaining all previous V11.14.40 panels."""
+    page=C5_V111440_PAGE.replace('V11.14.40','V11.14.41')
+    def one(old,new):
+        nonlocal page
+        count=page.count(old)
+        if count!=1:
+            raise RuntimeError('V11.14.41 page marker mismatch '+str(count)+' '+old[:95])
+        page=page.replace(old,new,1)
+    one('<title>V11.14.41 · 섀넌 AVWAP vs 캐머런 모멘텀 스캘핑</title>',
+        '<title>V11.14.41 · 엘더 Triple Screen vs 쿠퍼 1-2-3</title>')
+    one('<h1>🧪 V11.14.41 · 섀넌 · 캐머런 스캘핑 비교</h1>',
+        '<h1>🧪 V11.14.41 · 엘더 · 쿠퍼 스캘핑 비교</h1>')
+    one('기존 A~O 보존 · P 섀넌 AVWAP / Q 캐머런 Bull Flag 독립 연구',
+        '기존 A~Q 보존 · R 엘더 Triple Screen / S 쿠퍼 1-2-3 독립 연구')
+    one("const API='/api/winrate14c5shannoncameron', KEY='bithumb_c5_shannon_cameron_v111440_v1';",
+        "const API='/api/winrate14c5eldercooper', KEY='bithumb_c5_elder_cooper_v111441_v1';")
+    one("const DB_NAME='bithumb_c5_shannon_cameron_v111440_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_elder_cooper_v111441_indexeddb_v1';")
+    # Keep the older P/Q panel as a preserved historical comparison.
+    introduction="""<section class="panel"><h2>NEW · R 엘더 / S 쿠퍼 5분봉 독립 연구</h2>
+<div class="alert28"><b>A · 볼먼:</b> 기존 압축 돌파 신호 그대로.<br>
+<b>L · 카터:</b> 기존 TTM Squeeze 신호 그대로.<br>
+<b>R · 엘더 응용:</b> 누락 없는 완료 15분봉 18개로 EMA8 &gt; EMA13, EMA13 상승 확인. 5분봉 RSI(5)가 최근 45 이하로 눌렸다가 45 위로 회복하고 전봉 고가를 상향 마감하면 후보. 15분봉은 실제 5분봉 3개를 모은 경우만 사용.<br>
+<b>S · 쿠퍼 응용:</b> 상승하는 SMA20/50 위에서 3봉 연속 낮은 고점·저점 형성 후 직전 봉 고가 돌파, 거래량 직전 20봉 평균의 0.85배 이상이면 후보. 원본 일봉 규칙을 5분봉으로 변형.<br>
+<b>공통:</b> 신호 봉 완료 후 다음 실제 5분봉 시가 가상 진입, 익절 +1.5%, 손절 -1%, 최대 60분. 수수료 0.04% / 슬리피지 0.05% 편도 기본. 미관측 봉을 채우지 않고 기존 판정 엔진 적용. 실전 V2 BUY 무변경.</div>
+<p class="alert28 warn">⚠️ 원 트레이더의 매매법 복제가 아닌 OHLCV 5분봉 연구용 변형. 실제 수익성은 신규 날짜에서 따로 확인해야 해.</p>
+<div id="elder_cooper_comparison" class="wide28">검사 후 볼먼·카터·엘더·쿠퍼 비교 결과 표시</div></section>"""
+    one('<section class="panel"><h2>NEW · P형 섀넌 AVWAP / Q형 캐머런 Bull Flag</h2>',
+        introduction+'\n<section class="panel"><h2>이전 연구 · P형 섀넌 AVWAP / Q형 캐머런 Bull Flag</h2>')
+    js=r"""function paintElderCooper(){
+ const rs=Object.values(state.results||{}),keys=[['A','볼먼 A'],['L','카터 L'],['R','엘더 R'],['S','쿠퍼 S']];
+ const items=(key,day)=>rs.filter(r=>!day||r.date===day).flatMap(r=>(
+   key==='A'?(r.events?.A||[]):key==='L'?(r.v111437_new_events?.L||[]):
+   (r.v111441_new_events?.[key]||[])
+ ).filter(e=>e.outcome!=='NO_ENTRY').map(e=>({...e,date:r.date})));
+ const stats=arr=>{const done=arr.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const wins=done.filter(e=>num(e.net_pct)>0).length;
+  return {signals:arr.length,done:done.length,wins,loss:done.length-wins,
+    tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,
+    unknown:arr.filter(e=>e.outcome==='UNKNOWN').length,
+    avg:done.length?done.reduce((s,e)=>s+num(e.net_pct),0)/done.length:NaN};};
+ const fmt=n=>Number.isFinite(n)?n.toFixed(3)+'%':'—';
+ const totals=keys.map(([key,name])=>{const s=stats(items(key));return tr([name,s.signals,s.done,s.wins,s.loss,s.tp,s.sl,s.unknown,
+   s.done?(100*s.wins/s.done).toFixed(1)+'%':'—',fmt(s.avg)]);});
+ const dates=[...new Set(rs.map(r=>r.date))].sort(),daily=[];
+ for(const date of dates)for(const [key,name] of keys){const s=stats(items(key,date));
+   daily.push(tr([date,name,s.signals,s.wins,s.loss,s.unknown,fmt(s.avg)]));}
+ const coverage=key=>rs.reduce((a,r)=>a+Number(r.v111441_coverage?.[key]||0),0);
+ const details=[...items('R'),...items('S')].sort((a,b)=>(a.date+a.signal_time_kst).localeCompare(b.date+b.signal_time_kst));
+ $('elder_cooper_comparison').innerHTML='<p class="small28">평가 가능 5분봉 위치 · 엘더 R '+coverage('v111441_R_eligible_positions')+
+ ' · 쿠퍼 S '+coverage('v111441_S_eligible_positions')+' · 15분봉 미완료 제외 / 누락봉 보간 없음</p>'+
+ tbl(['전략','진입','결과 확인','수익','손실','TP','SL','미확인','수익 거래율','평균 순수익률'],totals)+
+ '<h3>검사 날짜별 수익·손실</h3>'+tbl(['날짜','전략','진입','수익','손실','미확인','평균 순수익률'],daily)+
+ '<h3>신규 R/S 거래 (최대 200건)</h3>'+
+ (details.length?tbl(['날짜','종목','전략','신호 시각','결과','순수익률'],details.slice(0,200).map(e=>tr([
+ e.date,e.market,e.strategy,e.signal_time_kst,e.outcome||'UNKNOWN',fmt(num(e.net_pct))]))):'<p class="small28">신규 신호 없음</p>');
+}
+"""
+    one('function paintShannonCameron(){',js+'function paintShannonCameron(){')
+    one(' paintShannonCameron();\n}', ' paintShannonCameron();\n paintElderCooper();\n}')
+    one("  'cameron_flag_high','cameron_breakout_pct'];",
+        "  'cameron_flag_high','cameron_breakout_pct',\n"
+        "  'v111441_R_eligible_positions','v111441_R_insufficient_positions',\n"
+        "  'v111441_R_pre_cooldown_candidates','v111441_R_signals',\n"
+        "  'v111441_S_eligible_positions','v111441_S_insufficient_positions',\n"
+        "  'v111441_S_pre_cooldown_candidates','v111441_S_signals',\n"
+        "  'v111441_no_synthetic_candles','v111441_live_buy_unchanged',\n"
+        "  'v111441_15m_requires_three_actual_5m',\n"
+        "  'elder_15m_last_closed_start_kst','elder_15m_ema8','elder_15m_ema13',\n"
+        "  'elder_15m_ema13_slope_pct','elder_rsi5_before','elder_rsi5_signal',\n"
+        "  'elder_rsi5_pullback_low','elder_volume_ratio',\n"
+        "  'cooper_pullback_bars','cooper_sma20','cooper_sma50',\n"
+        "  'cooper_sma20_slope3_pct','cooper_sma50_slope3_pct',\n"
+        "  'cooper_pullback_depth_pct','cooper_breakout_pct',\n"
+        "  'cooper_volume_ratio'];")
+    one('...(r.v111439_overlap_audit||{}),...(r.v111440_coverage||{})};',
+        '...(r.v111439_overlap_audit||{}),...(r.v111440_coverage||{}),...(r.v111441_coverage||{})};')
+    one("  for(const key of ['P','Q'])for(const e of r.v111440_new_events?.[key]||[])add({...base,...e,strategy:key});",
+        "  for(const key of ['P','Q'])for(const e of r.v111440_new_events?.[key]||[])add({...base,...e,strategy:key});\n"
+        "  for(const key of ['R','S'])for(const e of r.v111441_new_events?.[key]||[])add({...base,...e,strategy:key});")
+    one('bithumb_C5_VOLMAN_SHANNON_CAMERON_v111440.csv',
+        'bithumb_C5_VOLMAN_ELDER_COOPER_v111441.csv')
+    if page.count('function paintElderCooper(){')!=1 or page.count("const API='/api/winrate14c5eldercooper'")!=1:
+        raise RuntimeError('V11.14.41 new strategy UI missing')
+    return page
+
+
+C5_V111441_PAGE=c5_v111441_make_page()
+
+
+def register_c5_v111441_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                names=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 종목을 조회할 수 없습니다')
+                cache.update(items=names,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-elder-cooper')
+    def c5_v111441_page():
+        return render_template_string(C5_V111441_PAGE)
+
+    @app.get('/api/winrate14c5eldercooper/universe')
+    def c5_v111441_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.41'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5eldercooper/evaluate')
+    def c5_v111441_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_v111441_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.41',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111440_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111440_register_daytrade_review(app,deps)
+    register_c5_v111441_lab(app,deps)
