@@ -11127,3 +11127,371 @@ _v111433_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111433_register_daytrade_review(app,deps)
     register_c5_h2_v111434_lab(app,deps)
+
+
+# =============================================================================
+# V11.14.35 — RESEARCH ONLY: MINIMUM 50-OBSERVED-BAR H2 STUDY
+# The FULL V11.14.34 evaluator is called unchanged first. All A/B/C and D/E/F
+# shadow rows, the original G early signals, coverage statistics, and legacy
+# endpoints remain exactly the same.  This study does not affect live orders.
+#
+# Existing C/G use a real EMA50 at i-3, requiring >=53 consecutive bars even
+# to compute that particular feature. To evaluate a genuine 50-bar window,
+# independent H substitutes EMA35 at i-3 while keeping the H1/H2, EMA20,
+# ATR, candle, volume, cooldown, and settlement rules the same. H is therefore
+# a DIFFERENT strategy, not merely a shorter history gate.  A side-by-side
+# 66-bar EMA50 reference (R) is recalculated on the SAME six-hour input as H.
+# No missing observations are interpolated and no lookahead is introduced.
+# =============================================================================
+
+C5_H2_V111435_MIN_BARS = 50
+C5_H2_V111435_SLOW_EMA = 35
+
+
+def c5_h2_v111435_ema35(rows):
+    """EMA35 seeded with the first 35 consecutive observed closes; gaps reset."""
+    n=len(rows)
+    values=[None]*n
+    start=0
+    alpha=2/(C5_H2_V111435_SLOW_EMA+1)
+    for i,bar in enumerate(rows):
+        if i and bar['t']-rows[i-1]['t']!=timedelta(minutes=5):
+            start=i
+        seen=i-start+1
+        if seen==C5_H2_V111435_SLOW_EMA:
+            values[i]=sum(r['c'] for r in rows[i-34:i+1])/35
+        elif seen>C5_H2_V111435_SLOW_EMA:
+            values[i]=values[i-1]+alpha*(bar['c']-values[i-1])
+    return values
+
+
+def c5_h2_v111435_h2(rows,i,ind,ema35):
+    """50 consecutive *observed* 5m bars; EMA35 proxy, no future bars.
+
+    All thresholds below are copied from the original H2 model except the
+    minimum continuity and the slow EMA period. This is a test hypothesis,
+    not a trading rule attributed to Al Brooks.
+    """
+    if i<49 or not lab_contiguous(rows,i-49,i):
+        return None
+    e20,at=ind['ema20'],ind['atr14']
+    if any(v is None for v in (e20[i-9],e20[i-3],e20[i],ema35[i-3],at[i])):
+        return None
+    atr=at[i]
+    b=rows[i]
+    if atr<=0 or b['c']<=0:
+        return None
+    atr_pct=100*atr/b['c']
+    if not (e20[i-3]>ema35[i-3] and e20[i-3]>e20[i-9]*1.0004):
+        return None
+    if not (0.12<=atr_pct<=4.0 and b['c']>e20[i]*0.992):
+        return None
+    width=b['h']-b['l']
+    if not (width>0 and b['c']>b['o'] and b['h']>rows[i-1]['h']
+            and b['c']>rows[i-1]['h']*1.0001
+            and (b['c']-b['l'])/width>=0.55):
+        return None
+    vavg=sum(r['v'] for r in rows[i-20:i])/20
+    if vavg<=0:
+        return None
+    volume_ratio=b['v']/vavg
+    if volume_ratio<0.80:
+        return None
+    for j in range(i-2,i-9,-1):
+        if j<8:
+            break
+        h1=rows[j]
+        if not (h1['h']>rows[j-1]['h'] and
+                rows[j-1]['c']<rows[j-2]['c'] and
+                rows[j-2]['c']<rows[j-3]['c']):
+            continue
+        before_peak=max(q['h'] for q in rows[j-8:j-2])
+        first_low=min(q['l'] for q in rows[j-3:j])
+        if before_peak-first_low<0.6*atr:
+            continue
+        between=rows[j+1:i]
+        if not between or not (rows[i-1]['h']<rows[i-2]['h']):
+            continue
+        second_low=min(q['l'] for q in between)
+        if not (h1['h']-second_low>=0.40*atr and
+                any(rows[k]['c']<rows[k-1]['c'] for k in range(j+1,i))):
+            continue
+        pullback_low=min(q['l'] for q in rows[j-3:i])
+        if not (pullback_low<=e20[i-3]+1.6*atr and
+                pullback_low>=ema35[i-3]-2.0*atr):
+            continue
+        resistance=max(q['h'] for q in rows[i-24:i])
+        return {
+            'h1_time_kst':rows[j]['t'].strftime('%Y-%m-%d %H:%M'),
+            'second_pullback_time_kst':rows[i-1]['t'].strftime('%Y-%m-%d %H:%M'),
+            'ema20':round(e20[i],10),'ema35':round(ema35[i-3],10),
+            'atr_pct':round(atr_pct,5),
+            'volume_ratio':round(volume_ratio,4),
+            'pullback_depth_atr':round((before_peak-first_low)/atr,4),
+            'resistance_room_pct':round(100*(resistance/b['c']-1),4),
+            'h1_to_h2_bars':i-j,
+            'h2_ema20_vs_ema35_pct':round(100*(e20[i-3]/ema35[i-3]-1),5),
+            'h2_ema20_slope_pct':round(100*(e20[i-3]/e20[i-9]-1),5),
+            'h2_second_pullback_atr':round((h1['h']-second_low)/atr,5),
+            'h2_close_vs_ema20_atr':round((b['c']-e20[i])/atr,5),
+        }
+    return None
+
+
+def c5_h2_v111435_study(rows6,cfg,market,kst):
+    """Paired 50/66 observation-window comparison on the same API candles.
+
+    R uses the old exact 66/EMA50 H2 detector on the full six-hour dataset.
+    H uses the 50/EMA35 variation. Their cooldowns are separate and each
+    entry/exit simulation uses only actual future observed candles.
+    """
+    from datetime import datetime as _dt,time as _tm
+    start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=start+timedelta(days=1)
+    ind=c5_brooks_v111431_indicators(rows6)
+    slow=c5_h2_v111435_ema35(rows6)
+    events_h=[]
+    events_r=[]
+    last_h=-1000000
+    last_r=-1000000
+    eligible_50=eligible_66=0
+    for i in range(49,len(rows6)-1):
+        bar=rows6[i]
+        if not (start<=bar['t']<end):
+            continue
+        if not lab_contiguous(rows6,i-49,i):
+            continue
+        eligible_50+=1
+        eligible_r=(i>=65 and lab_contiguous(rows6,i-65,i))
+        if eligible_r:
+            eligible_66+=1
+        when=bar['t'].strftime('%Y-%m-%d %H:%M')
+        if i-last_h>=cfg['bars']:
+            details=c5_h2_v111435_h2(rows6,i,ind,slow)
+            if details is not None:
+                last_h=i
+                item={'market':market,'strategy':'H',
+                      'base_id':market+'|H2_50_EMA35|'+when,
+                      'base_signal_time_kst':when,'signal_time_kst':when,
+                      'entry_time_kst':(bar['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                      'entry_delay_minutes':0,
+                      'reason':'50개 연속 실제 봉 + EMA35 H2 독립 실험 (매매 아님)',
+                      'hypothetical_only':True,
+                      'comparison_group':('H_50_ONLY_WINDOW' if not eligible_r else 'H_OVERLAP_66_WINDOW'),
+                      'h2_min_observed_bars':50,
+                      'h2_slow_ema_period':35,
+                      'h2_has_strict_66_window':bool(eligible_r),
+                      **details}
+                item.update(lab_outcome_v11145(rows6,i,cfg))
+                events_h.append(item)
+        if eligible_r and i-last_r>=cfg['bars']:
+            details=c5_brooks_v111431_h2(rows6,i,ind)
+            if details is not None:
+                last_r=i
+                item={'market':market,'strategy':'H_REF_66',
+                      'base_id':market+'|H2_REF_66|'+when,
+                      'base_signal_time_kst':when,'signal_time_kst':when,
+                      'entry_time_kst':(bar['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                      'entry_delay_minutes':0,
+                      'reason':'동일 6시간 입력에서 66개 연속봉 + EMA50 기준 연구 (매매 아님)',
+                      'hypothetical_only':True,
+                      'comparison_group':'STRICT_66_SAME_INPUT_REFERENCE',
+                      'h2_min_observed_bars':66,'h2_slow_ema_period':50,
+                      'h2_has_strict_66_window':True,**details}
+                item.update(lab_outcome_v11145(rows6,i,cfg))
+                events_r.append(item)
+    h_times={e['signal_time_kst'] for e in events_h}
+    r_times={e['signal_time_kst'] for e in events_r}
+    for e in events_h:
+        e['h2_66_reference_same_time']=(e['signal_time_kst'] in r_times)
+    if eligible_50<eligible_66:
+        raise RuntimeError('V11.14.35 연속봉 계산 역전')
+    audit={
+        'h2_50_eligible_positions':eligible_50,
+        'h2_66_same_input_eligible_positions':eligible_66,
+        'h2_50_only_positions':eligible_50-eligible_66,
+        'h2_50_market_eligible':eligible_50>0,
+        'h2_66_same_input_market_eligible':eligible_66>0,
+        'h2_50_signals':len(events_h),
+        'h2_50_signals_without_66_window':sum(e['h2_has_strict_66_window'] is False for e in events_h),
+        'h2_50_signals_on_66_window':sum(e['h2_has_strict_66_window'] is True for e in events_h),
+        'h2_66_same_input_signals':len(events_r),
+        'h2_50_same_time_matches':len(h_times & r_times),
+        'h2_50_only_signal_times':len(h_times-r_times),
+        'h2_66_only_signal_times':len(r_times-h_times),
+        'h2_50_changed_slow_indicator':True,
+    }
+    return {'h2_50_events':events_h,
+            'h2_50_reference_events':events_r,
+            'h2_50_audit':audit}
+
+
+def c5_h2_v111435_evaluate_rows(rows6,cfg,market,kst,truncated=False,fetch_info=None):
+    """Preserve V11.14.34 response and add an isolated 50/66 study."""
+    result=c5_h2_v111434_evaluate_rows(rows6,cfg,market,kst,truncated,fetch_info)
+    study=c5_h2_v111435_study(rows6,cfg,market,kst)
+    audit=study['h2_50_audit']
+    old=result['h2_extended_audit']
+    # Comparisons cover the SAME timestamps; both audit functions count
+    # positions only where a following observed bar exists.
+    if audit['h2_50_eligible_positions']!=old['window_50_positions']:
+        raise RuntimeError('V11.14.35 50봉 평가 가능 위치 집계 불일치')
+    if audit['h2_66_same_input_eligible_positions']!=old['window_66_positions_extended']:
+        raise RuntimeError('V11.14.35 66봉 평가 가능 위치 집계 불일치')
+    result.update(study)
+    return result
+
+
+def c5_h2_v111435_evaluate_symbol(api_get,market,cfg,kst):
+    rows,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    return c5_h2_v111435_evaluate_rows(rows,cfg,market,kst,truncated,meta)
+
+
+def c5_h2_v111435_make_page():
+    """Clone .34 browser UI with isolated API, IndexedDB, and full CSV."""
+    page=C5_H2_V111434_PAGE.replace('V11.14.34','V11.14.35')
+    def one(old,new):
+        nonlocal page
+        n=page.count(old)
+        if n!=1:
+            raise RuntimeError('V11.14.35 화면 교체 기준 '+str(n)+': '+old[:95])
+        page=page.replace(old,new,1)
+
+    one('<title>V11.14.35 · H2 6시간 사전 데이터 확보 연구</title>',
+        '<title>V11.14.35 · H2 50봉 / 66봉 독립 비교 실험</title>')
+    one('<h1>🧪 V11.14.35 · H2 5분봉 데이터 확보 연구</h1>',
+        '<h1>🧪 V11.14.35 · H2 50봉 / 66봉 검증실</h1>')
+    one('기존 A~F 그대로 · 6시간 사전봉 조기 H2 실험 · 봉 공백 정밀 진단',
+        '기존 A~G 보존 · H 50봉+EMA35 대 66봉+EMA50 독립 검증')
+    one("const API='/api/winrate14c5history', KEY='bithumb_c5_history_v111434_v1';",
+        "const API='/api/winrate14c5window', KEY='bithumb_c5_window_v111435_v1';")
+    one("const DB_NAME='bithumb_c5_history_v111434_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_window_v111435_indexeddb_v1';")
+
+    intro="""<section class="panel"><h2>V11.14.35 — H2 50봉과 66봉의 공정한 비교</h2>
+<div class="alert28">
+<b>A~G 보존:</b> 이전 VOLMAN / BEGGS / H2 / 그림자 D~F / 조기 G 연구의 신호·성과·진단을 변경하지 않아.<br>
+<b>H 50봉 변형:</b> 50개 <b>실제로 관측한 연속</b> 5분봉 + EMA20/EMA35, ATR14, H1→재눌림→H2 구조로 다음 봉 시가 가상 진입.<br>
+<b>66봉 기준 연구:</b> 같은 6시간 입력 데이터로 원래 EMA20/EMA50 + 66봉 검사를 별도로 실행해 H와 비교.<br>
+<b>중요:</b> 50봉만으로 과거 3봉 전 EMA50을 계산할 수 없으므로 H는 EMA35로 변경한 <b>별도 매매 가설</b>이야. H 신호 증가를 단순히 연속봉 요건 완화의 효과로 해석하면 안 돼.<br>
+<b>공통 청산 가정:</b> TP +1.5%, SL -1%, 최대 60분, 동일 수수료·슬리피지. H와 66봉 기준 모두 독립 쿨다운과 같은 실제 관측 데이터 사용.</div>
+<p class="alert28 warn">⚠️ H와 66봉 기준은 연구용 모의 결과이며 실전 V2 BUY와 분리돼. 봉 공백은 임의로 생성하거나 연결하지 않아. 동일한 시장 움직임에서 겹치는 신호를 독립 수익 기회로 이중 계산하지 않아. 11월 9~12일은 이미 여러 연구에 사용된 날짜이므로 50봉 가설에 대한 성능 검증에는 별도의 날짜가 필요해.</p>
+</section>"""
+    one('</main>',intro+"""<section class="panel"><h2>11. H형 50봉 연구 vs 동일 입력의 66봉 기준</h2>
+<p class="small28">단위: 종목×날짜, 5분봉 평가 위치, 또는 모의 거래. H는 EMA35라서 기존 H2의 단순 축소가 아니야. 원본 C/G와 비교해 결과를 임의로 합산하지 않아.</p>
+<div id="h2_window_comparison" class="wide28">검사 후 표시</div>
+</section>\n</main>""")
+    additions=r"""function paintH2WindowStudy(){
+ const rs=Object.values(state.results||{}),audits=rs.map(r=>r.h2_50_audit||{});
+ const sum=k=>audits.reduce((a,v)=>a+(Number(v[k])||0),0);
+ const count=k=>audits.filter(v=>v[k]===true).length;
+ const h=rs.flatMap(r=>(r.h2_50_events||[]).map(e=>({...e,date:r.date})));
+ const ref=rs.flatMap(r=>(r.h2_50_reference_events||[]).map(e=>({...e,date:r.date})));
+ const metric=items=>{const done=items.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+   const win=done.filter(e=>num(e.net_pct)>0).length;
+   return {signals:items.length,done:done.length,unknown:items.length-done.length,
+    tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,
+    mean:done.length?done.reduce((s,e)=>s+num(e.net_pct),0)/done.length:NaN,win};};
+ const fmt=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+ const mh=metric(h),mr=metric(ref);
+ const measures=[tr(['검사 완료 시장×날짜',rs.length]),
+  tr(['50봉 평가 가능 시장×날짜',count('h2_50_market_eligible')]),
+  tr(['66봉 평가 가능 시장×날짜',count('h2_66_same_input_market_eligible')]),
+  tr(['50봉 평가 가능 5분봉 위치',sum('h2_50_eligible_positions')]),
+  tr(['66봉 평가 가능 5분봉 위치',sum('h2_66_same_input_eligible_positions')]),
+  tr(['50봉에서만 평가 가능한 위치',sum('h2_50_only_positions')]),
+  tr(['H 신호 중 66봉 자체가 없던 위치',sum('h2_50_signals_without_66_window')]),
+  tr(['H·66봉 기준 같은 시각 신호',sum('h2_50_same_time_matches')]),
+  tr(['H에만 존재한 신호 시각',sum('h2_50_only_signal_times')]),
+  tr(['66봉 기준에만 존재한 신호 시각',sum('h2_66_only_signal_times')])];
+ const outcomes=[tr(['H: 50봉+EMA35',mh.signals,mh.done,mh.unknown,mh.tp,mh.sl,mh.win,fmt(mh.mean)]),
+  tr(['동일 입력 66봉+EMA50 기준',mr.signals,mr.done,mr.unknown,mr.tp,mr.sl,mr.win,fmt(mr.mean)])];
+ const cases=h.slice(0,80).map(e=>tr([e.date,e.market,e.signal_time_kst,
+   e.h2_has_strict_66_window?'66봉도 확보':'50봉만 확보',
+   e.h2_66_reference_same_time?'동시 확인':'H만 포착',e.outcome||'UNKNOWN',
+   Number.isFinite(num(e.net_pct))?num(e.net_pct).toFixed(3)+'%':'—']));
+ $('h2_window_comparison').innerHTML=tbl(['연속봉·신호 커버리지','값'],measures)+
+  '<h3>연구용 진입·청산 성과 (같은 6시간 데이터)</h3>'+
+  tbl(['유형','신호','결과 확정','미확정','TP','SL','순수익 거래','평균 순손익'],outcomes)+
+  '<p class="small28">H는 EMA35, 기준형은 EMA50을 사용하므로 66봉이 충분한 구간에서도 신호 차이가 날 수 있어. 표본이 적으면 우열 판단 불가.</p>'+
+  '<h3>H 실험 신호 예시 (최대 80건)</h3>'+
+  (cases.length?tbl(['날짜','종목','시각','관측된 연속 구간','66봉 기준과 겹침','결과','순손익'],cases):'<p class="small28">H 신호 없음</p>');
+}
+"""
+    one('function paintH2History(){',additions+'function paintH2History(){')
+    one(' paintH2History();\n}', ' paintH2History();\n paintH2WindowStudy();\n}')
+    one("'fetch_5m_stop_reason','fetch_5m_page_limit_reached','hypothetical_only'];",
+        "'fetch_5m_stop_reason','fetch_5m_page_limit_reached','hypothetical_only',\n"
+        "  'ema35','h2_ema20_vs_ema35_pct','h2_min_observed_bars',\n"
+        "  'h2_slow_ema_period','h2_has_strict_66_window',\n"
+        "  'h2_66_reference_same_time','h2_50_eligible_positions',\n"
+        "  'h2_66_same_input_eligible_positions','h2_50_only_positions',\n"
+        "  'h2_50_market_eligible','h2_66_same_input_market_eligible',\n"
+        "  'h2_50_signals','h2_50_signals_without_66_window',\n"
+        "  'h2_50_signals_on_66_window','h2_66_same_input_signals',\n"
+        "  'h2_50_same_time_matches','h2_50_only_signal_times',\n"
+        "  'h2_66_only_signal_times','h2_50_changed_slow_indicator'];")
+    one('...c,...(r.h2_extended_audit||{})};',
+        '...c,...(r.h2_extended_audit||{}),...(r.h2_50_audit||{})};')
+    one("  for(const e of r.h2_early_events||[])add({...base,...e,strategy:'G',comparison_group:'EXTENDED_PREFIX_ONLY'});",
+        "  for(const e of r.h2_early_events||[])add({...base,...e,strategy:'G',comparison_group:'EXTENDED_PREFIX_ONLY'});\n"
+        "  for(const e of r.h2_50_events||[])add({...base,...e,strategy:'H'});\n"
+        "  for(const e of r.h2_50_reference_events||[])add({...base,...e,strategy:'H_REF_66'});")
+    one('bithumb_C5_VOLMAN_BEGGS_BROOKS_HISTORY_v111434.csv',
+        'bithumb_C5_VOLMAN_BEGGS_BROOKS_WINDOW_v111435.csv')
+    if '/api/winrate14c5history' in page or 'bithumb_c5_history_v111434_indexeddb_v1' in page:
+        raise RuntimeError('V11.14.35 API/DB 독립 연결 실패')
+    if page.count('function paintH2WindowStudy(){')!=1:
+        raise RuntimeError('V11.14.35 추가 화면 함수 누락')
+    return page
+
+
+C5_H2_V111435_PAGE=c5_h2_v111435_make_page()
+
+
+def register_c5_h2_v111435_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                items=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not items:
+                    raise ValueError('현재 빗썸 KRW 종목을 조회하지 못했어')
+                cache.update(items=items,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-h2-window')
+    def c5_h2_v111435_page():
+        return render_template_string(C5_H2_V111435_PAGE)
+
+    @app.get('/api/winrate14c5window/universe')
+    def c5_h2_v111435_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.35'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5window/evaluate')
+    def c5_h2_v111435_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):raise ValueError('현재 KRW 목록에 없는 코인')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_h2_v111435_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.35',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111434_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111434_register_daytrade_review(app,deps)
+    register_c5_h2_v111435_lab(app,deps)
