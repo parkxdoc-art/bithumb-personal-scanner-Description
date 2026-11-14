@@ -12118,3 +12118,362 @@ _v111436_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111436_register_daytrade_review(app,deps)
     register_c5_v111437_lab(app,deps)
+
+# =============================================================================
+# V11.14.38 - RESEARCH ONLY: four-way comparison A / L / M / N.
+# A VOLMAN and L Carter are unchanged; all earlier A~L preserved.
+# M: Tom DeMark BUY Setup-9 completed on bar i-1 with price-flip precondition;
+#    bar i bullish recovery, enter i+1 open (independent 5-minute hypothesis).
+# N: Oliver Velez 20/200 SIMPLE moving averages + 3-5 bar pullback toward
+#    rising SMA20 + bullish recovery. Fetches 20 HOURS of genuine prehistory
+#    separately for N and never exposes it to frozen earlier strategies.
+# Not DeMark full Countdown, and not the traders' exact discretionary systems.
+# No candles synthesized, no future candles used by either signal detector.
+# All exits use the frozen V11.14.5 result model, not trading orders.
+# =============================================================================
+
+
+def c5_v111438_demark_signal(rows,i):
+    """Setup 9 ends at i-1; i is a completed rebound-confirmation candle.
+
+    Setup at j=i-9 ... i-1: close(j) < close(j-4), exactly 9 in a row,
+    with non-negative pre-setup price flip at j=i-10.
+    DeMark's 9 is a potential exhaustion alert, not a guaranteed buy entry;
+    the next-bar bullish confirmation is OUR independent 5m rule.
+    """
+    if i < 14 or not lab_contiguous(rows,i-14,i):
+        return None
+    if rows[i-10]['c'] < rows[i-14]['c']:
+        return None
+    if not all(rows[j]['c']<rows[j-4]['c'] for j in range(i-9,i)):
+        return None
+    b,p=rows[i],rows[i-1]
+    if not (b['c']>b['o'] and b['c']>p['c'] and b['h']>p['h']):
+        return None
+    setup=rows[i-9:i]
+    lo_67=min(setup[5]['l'],setup[6]['l'])
+    perfected=(setup[7]['l']<=lo_67 or setup[8]['l']<=lo_67)
+    return {'pattern_name':'DEMARK_BUY_SETUP9_REBOUND_5M_ADAPTATION',
+            'demark_setup9_end_kst':p['t'].strftime('%Y-%m-%d %H:%M'),
+            'demark_perfected_setup':perfected,
+            'demark_setup9_decline_pct':round(100*(p['c']/setup[0]['c']-1),5),
+            'demark_rebound_pct':round(100*(b['c']/p['c']-1),5),
+            'demark_setup9_low':round(min(x['l'] for x in setup),10)}
+
+
+def c5_v111438_velez_signal(rows,i):
+    """20/200 5m SMA trend with 3-5 previous bar pullback & bounce.
+
+    STRICT 200-consecutive-observed-5m gate. SMA200 cannot be calculated
+    from an invented or irregular timeline. Long lookback fetched separately.
+    All cutoffs below are fixed research hypotheses, not Velez's exact rules.
+    """
+    if i<202 or not lab_contiguous(rows,i-202,i):
+        return None
+    closes=[r['c'] for r in rows[i-202:i+1]]
+    ma200=sum(closes[-200:])/200
+    ma20=sum(closes[-20:])/20
+    ma20_prev3=sum(closes[-23:-3])/20
+    b=rows[i]
+    if not (ma20>ma20_prev3>0 and ma20>ma200>0
+            and b['c']>ma20 and b['c']>ma200 and b['c']>b['o']
+            and b['c']>rows[i-1]['h']):
+        return None
+    # Three to five red bars OR consistently declining highs/lows prior to rebound.
+    pullback_len=None
+    for n in (5,4,3):
+        pull=rows[i-n:i]
+        red=all(x['c']<x['o'] for x in pull)
+        descending=all(rows[j]['h']<rows[j-1]['h'] and
+                       rows[j]['l']<=rows[j-1]['l'] for j in range(i-n,i))
+        if red or descending:
+            pullback_len=n
+            break
+    if pullback_len is None:
+        return None
+    pull=rows[i-pullback_len:i]
+    # Nearest pullback low should approach the 20MA, but not fall >1.0% under.
+    plow=min(x['l'] for x in pull)
+    if not (ma20*0.990<=plow<=ma20*1.006):
+        return None
+    vavg=sum(x['v'] for x in rows[i-20:i])/20
+    if vavg<=0:return None
+    vr=b['v']/vavg
+    if vr<0.7:return None
+    return {'pattern_name':'VELEZ_SMA20_SMA200_PULLBACK_5M_ADAPTATION',
+            'velez_sma20':round(ma20,10),'velez_sma200':round(ma200,10),
+            'velez_sma20_slope3_pct':round(100*(ma20/ma20_prev3-1),5),
+            'velez_pullback_bars':pullback_len,
+            'velez_pullback_low_to_sma20_pct':round(100*(plow/ma20-1),5),
+            'velez_close_to_sma20_pct':round(100*(b['c']/ma20-1),5),
+            'velez_volume_ratio':round(vr,4)}
+
+
+def c5_v111438_fetch_velez_prehistory(api_get,market,cfg,kst,rows6):
+    """Extend only N's source timeline backwards to 20h prehistory.
+
+    Reuses original 6h rows verbatim; paginates older-than-first only.
+    Additional API calls can affect research time, not old A~L outputs.
+    No same-day or future bars from supplementary pages may overwrite base.
+    """
+    from datetime import datetime as _dt,time as _tm
+    begin=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)-timedelta(hours=20)
+    if not rows6:
+        return [],{'velez_fetch_status':'NO_BASE_CANDLES',
+                   'velez_extra_pages':0,'velez_extra_raw':0}
+    seen={r['t']:r for r in rows6}
+    cursor=rows6[0]['t']
+    if cursor<=begin:
+        return rows6,{'velez_fetch_status':'ALREADY_COVERED',
+                      'velez_extra_pages':0,'velez_extra_raw':0}
+    pages=0;raw_count=0;status='SUPPLEMENT_PAGE_LIMIT'
+    for _ in range(3):
+        raw=api_get('/v1/candles/minutes/5',{
+            'market':market,'count':200,
+            'to':cursor.strftime('%Y-%m-%d %H:%M:%S')})
+        if not isinstance(raw,list):
+            raise ValueError('200SMA 사전봉 API 응답 오류')
+        pages+=1;raw_count+=len(raw)
+        oldest=None
+        for x in raw:
+            if not isinstance(x,dict):continue
+            try:
+                t=local_time(x['candle_date_time_kst'],kst)
+                if oldest is None or t<oldest:oldest=t
+                if not(begin<=t<cursor) or t in seen:continue
+                o,h,l,c=(float(x[k]) for k in ('opening_price','high_price','low_price','trade_price'))
+                v=float(x['candle_acc_trade_volume'])
+                if not(all(isfinite(y) and y>0 for y in (o,h,l,c)) and
+                       isfinite(v) and v>=0 and l<=min(o,c) and h>=max(o,c)):
+                    continue
+                seen[t]={'t':t,'o':o,'h':h,'l':l,'c':c,'v':v}
+            except (ValueError,TypeError,OverflowError,KeyError):
+                continue
+        if oldest is None:
+            status='NO_OLDER_VALID_TIMESTAMPS';break
+        if oldest<=begin:
+            status='BEGIN_REACHED';break
+        if len(raw)<200:
+            status='SHORT_PAGE';break
+        if oldest>=cursor:
+            status='NON_PROGRESSIVE_CURSOR';break
+        cursor=oldest
+    return [seen[t] for t in sorted(seen)],{
+        'velez_fetch_status':status,'velez_extra_pages':pages,
+        'velez_extra_raw':raw_count}
+
+
+def c5_v111438_study(rows6,rowsN,cfg,market,kst,fetchN=None):
+    """Independent M / N detectors; preserve original A/L and other arms."""
+    from datetime import datetime as _dt,time as _tm
+    day=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=day+timedelta(days=1)
+    groups=(('M',rows6,c5_v111438_demark_signal,14),
+            ('N',rowsN,c5_v111438_velez_signal,202))
+    events={'M':[],'N':[]}; eligible={'M':0,'N':0}
+    no_history={'M':0,'N':0}
+    for key,rows,detector,needed in groups:
+        last=-1000000
+        # O(n) contiguous-streak counter; no interpolation.
+        streak=0
+        for i,b in enumerate(rows[:-1]):
+            if i and b['t']-rows[i-1]['t']==timedelta(minutes=5):streak+=1
+            else:streak=1
+            if not day<=b['t']<end:continue
+            if streak<needed+1:
+                no_history[key]+=1
+                continue
+            eligible[key]+=1
+            if i-last<cfg['bars']:continue
+            features=detector(rows,i)
+            if features is None:continue
+            last=i
+            signal=b['t'].strftime('%Y-%m-%d %H:%M')
+            ev={'market':market,'strategy':key,
+                'base_id':market+'|'+key+'|'+signal,
+                'base_signal_time_kst':signal,'signal_time_kst':signal,
+                'entry_time_kst':(b['t']+timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M'),
+                'entry_delay_minutes':0,'hypothetical_only':True,
+                'comparison_group':'V111438_FOUR_TRADERS_INDEPENDENT',
+                'reason':('디마크 Setup9 완성 후 다음 5분봉 반등 확인 (연구용)' if key=='M'
+                          else '벨레즈 SMA20/200 상승추세 3~5봉 눌림 재상승 (연구용)'),
+                **features}
+            ev.update(lab_outcome_v11145(rows,i,cfg))
+            events[key].append(ev)
+    return {'v111438_new_events':events,
+            'v111438_coverage':{
+                'demark_m_eligible_positions':eligible['M'],
+                'velez_n_eligible_positions':eligible['N'],
+                'demark_m_not_enough_continuous':no_history['M'],
+                'velez_n_not_enough_continuous':no_history['N'],
+                'demark_m_signals':len(events['M']),
+                'velez_n_signals':len(events['N']),
+                'velez_200_sma_requires_contiguous_5m':True,
+                'no_synthetic_candles':True,
+                **(fetchN or {})}}
+
+
+def c5_v111438_evaluate_rows(rows6,cfg,market,kst,truncated=False,meta=None,
+                               rowsN=None,nmeta=None):
+    # Freeze old calculations and output fields byte-for-byte.
+    baseline=c5_v111437_evaluate_rows(rows6,cfg,market,kst,truncated,meta)
+    added=c5_v111438_study(rows6,rows6 if rowsN is None else rowsN,
+                            cfg,market,kst,nmeta)
+    if not set(baseline).isdisjoint(added):
+        raise RuntimeError('V11.14.38 이전 연구 결과 키 충돌')
+    return {**baseline,**added}
+
+
+def c5_v111438_evaluate_symbol(api_get,market,cfg,kst):
+    rows6,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    # A~L NEVER read rowsN.
+    try:
+        rowsN,nmeta=c5_v111438_fetch_velez_prehistory(api_get,market,cfg,kst,rows6)
+    except Exception as exc:
+        # Supplementary 200MA request failures should not suppress A or L.
+        rowsN=rows6
+        nmeta={'velez_fetch_status':'EXTRA_FETCH_FAILED',
+               'velez_fetch_error':(type(exc).__name__+': '+str(exc))[:120],
+               'velez_extra_pages':0,'velez_extra_raw':0}
+    return c5_v111438_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+
+
+def c5_v111438_make_page():
+    """Reuse previous presentation/database flow without rewriting old labs."""
+    page=C5_V111437_PAGE.replace('V11.14.37','V11.14.38')
+    def one(old,new):
+        nonlocal page
+        n=page.count(old)
+        if n!=1:
+            raise RuntimeError('V11.14.38 UI 기준 불일치 '+str(n)+' '+old[:80])
+        page=page.replace(old,new,1)
+    one('<title>V11.14.38 · 볼먼 vs 코너스 RSI2 vs 카터 Squeeze</title>',
+        '<title>V11.14.38 · 볼먼 카터 디마크 벨레즈 4인 비교</title>')
+    one('<h1>🧪 V11.14.38 · 볼먼 vs 코너스 vs 카터</h1>',
+        '<h1>🧪 V11.14.38 · 볼먼·카터·디마크·벨레즈</h1>')
+    one('기존 A~J 보존 · RSI(2) / TTM Squeeze 신규 독립 검증',
+        '기존 A~L 보존 · 디마크 Setup9 / 벨레즈 20·200MA 신규 연구')
+    one("const API='/api/winrate14c5connorscarter', KEY='bithumb_c5_connors_carter_v111437_v1';",
+        "const API='/api/winrate14c5fourtraders', KEY='bithumb_c5_four_traders_v111438_v1';")
+    one("const DB_NAME='bithumb_c5_connors_carter_v111437_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_four_traders_v111438_indexeddb_v1';")
+    one('<input type="date" id="day" value="2026-11-01">',
+        '<input type="date" id="day" value="2026-11-07">')
+    intro="""<section class="panel"><h2>핵심 연구 — VOLMAN A / CARTER L / DEMARK M / VELEZ N</h2>
+<div class="alert28"><b>A · 볼먼:</b> 기존 압축 돌파, 변경 없음.<br>
+<b>L · 카터:</b> 기존 BB/KC Squeeze 해제와 상승 모멘텀, 변경 없음.<br>
+<b>M · 디마크 응용:</b> 5분봉에서 과거 4봉 대비 낮은 종가가 9회 연속 발생한 다음, 새로 완료된 5분봉의 양봉 반등을 확인. 전체 Sequential Countdown이 아니라 Setup-9 변형 실험.<br>
+<b>N · 벨레즈 응용:</b> 실제 5분봉 SMA20 상승 + SMA20 > SMA200, 3~5봉 눌림이 SMA20 근처에서 형성된 후 양봉 반등. N형만 사전 봉을 20시간까지 추가 조회하며 <b>200개 연속 실측봉</b>을 확보하지 못하면 평가 불가 처리해. 결측봉 가격 생성 없음.<br>
+<b>공통:</b> 다음 실제 5분봉 시가 진입, 익절 +1.5%, 손절 -1%, 최대 60분, 동일 수수료·슬리피지. A~L 기존 평가 데이터는 변경하지 않아. 실전 V2 BUY·주문과 무관한 연구용.</div>
+<p class="alert28 warn">⚠️ 연구 날짜: <b>2026-11-07 ~ 2026-11-13</b> (7일을 각각 검사·CSV 출력). 11/7~12는 이전 전략 연구에 사용했던 기간이므로 순수 미관측 독립 검증과 혼동하면 안 돼. 200SMA 평가 불가 종목/봉도 함께 기록해.</p>
+<div id="four_traders_comparison" class="wide28">검사 후 4인 비교 표 표시</div></section>"""
+    one('<section class="panel"><h2>핵심 연구 — 볼먼 A vs 코너스 K vs 카터 L</h2>',
+        intro+'\n<section class="panel"><h2>이전 연구 — 볼먼 A vs 코너스 K vs 카터 L</h2>')
+    script=r"""function paintFourTraders(){
+ const rs=Object.values(state.results||{}),keys=[['A','볼먼 A'],['L','카터 L'],['M','디마크 M'],['N','벨레즈 N']];
+ const ev=(key,date)=>rs.filter(r=>!date||r.date===date).flatMap(r=>
+   (key==='A'?(r.events?.A||[]):key==='L'?(r.v111437_new_events?.L||[]):
+    (r.v111438_new_events?.[key]||[])).map(e=>({...e,date:r.date})));
+ const stat=arr=>{const done=arr.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const win=done.filter(e=>num(e.net_pct)>0).length;
+  return {signals:arr.length,done:done.length,win,loss:done.length-win,
+   tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,
+   unknown:arr.filter(e=>e.outcome==='UNKNOWN').length,
+   avg:done.length?done.reduce((t,e)=>t+num(e.net_pct),0)/done.length:NaN};};
+ const fmt=x=>Number.isFinite(x)?x.toFixed(3)+'%':'—';
+ const summary=keys.map(([k,l])=>{const x=stat(ev(k));return tr([l,x.signals,x.done,x.win,x.loss,x.tp,x.sl,x.unknown,
+  x.done?(x.win*100/x.done).toFixed(1)+'%':'—',fmt(x.avg)]);});
+ const dates=[...new Set(rs.map(r=>r.date))].sort(),daily=[];
+ for(const d of dates)for(const [k,l] of keys){const x=stat(ev(k,d));
+   daily.push(tr([d,l,x.signals,x.win,x.loss,x.unknown,fmt(x.avg)]));}
+ const cov=k=>rs.reduce((s,r)=>s+Number(r.v111438_coverage?.[k]||0),0);
+ const fetches=rs.reduce((c,r)=>c+(r.v111438_coverage?.velez_fetch_status==='EXTRA_FETCH_FAILED'?1:0),0);
+ const details=[...ev('M'),...ev('N')].sort((a,b)=>(a.date+a.signal_time_kst).localeCompare(b.date+b.signal_time_kst));
+ $('four_traders_comparison').innerHTML='<p class="small28">M 평가 가능 위치 '+cov('demark_m_eligible_positions')+
+ ' · N (연속 200봉) 평가 가능 위치 '+cov('velez_n_eligible_positions')+
+ ' · N 추가조회 실패 종목 '+fetches+' · 없는 봉은 생성하지 않음</p>'+
+ tbl(['전략','진입','완료','수익','손실','TP','SL','미확인','수익 거래율','평균 순수익률'],summary)+
+ '<h3>검사 날짜별 결과</h3>'+tbl(['날짜','전략','진입','수익','손실','미확인','평균 순수익률'],daily)+
+ '<h3>신규 M/N 신호 상세 (최대 150건)</h3>'+
+ (details.length?tbl(['날짜','종목','전략','신호 시각','결과','순수익률'],details.slice(0,150).map(e=>tr([
+  e.date,e.market,e.strategy,e.signal_time_kst,e.outcome||'UNKNOWN',
+  Number.isFinite(num(e.net_pct))?num(e.net_pct).toFixed(3)+'%':'—']))):'<p class="small28">신규 신호 없음</p>');
+}
+"""
+    one('function paintConnorsCarter(){',script+'function paintConnorsCarter(){')
+    one(' paintConnorsCarter();\n}', ' paintConnorsCarter();\n paintFourTraders();\n}')
+    one("'carter_momentum_previous','carter_momentum_now'];",
+        "'carter_momentum_previous','carter_momentum_now',\n"
+        "  'demark_m_eligible_positions','velez_n_eligible_positions',\n"
+        "  'demark_m_not_enough_continuous','velez_n_not_enough_continuous',\n"
+        "  'demark_m_signals','velez_n_signals',\n"
+        "  'velez_200_sma_requires_contiguous_5m','no_synthetic_candles',\n"
+        "  'velez_fetch_status','velez_fetch_error','velez_extra_pages','velez_extra_raw',\n"
+        "  'demark_setup9_end_kst','demark_perfected_setup',\n"
+        "  'demark_setup9_decline_pct','demark_rebound_pct','demark_setup9_low',\n"
+        "  'velez_sma20','velez_sma200','velez_sma20_slope3_pct',\n"
+        "  'velez_pullback_bars','velez_pullback_low_to_sma20_pct',\n"
+        "  'velez_close_to_sma20_pct','velez_volume_ratio'];")
+    one('...(r.v111437_coverage||{})};',
+        '...(r.v111437_coverage||{}),...(r.v111438_coverage||{})};')
+    one("  for(const key of ['K','L'])for(const e of r.v111437_new_events?.[key]||[])add({...base,...e,strategy:key});",
+        "  for(const key of ['K','L'])for(const e of r.v111437_new_events?.[key]||[])add({...base,...e,strategy:key});\n"
+        "  for(const key of ['M','N'])for(const e of r.v111438_new_events?.[key]||[])add({...base,...e,strategy:key});")
+    one('bithumb_C5_VOLMAN_CONNORS_CARTER_v111437.csv',
+        'bithumb_C5_VOLMAN_CARTER_DEMARK_VELEZ_v111438.csv')
+    if '/api/winrate14c5connorscarter' in page or 'bithumb_c5_connors_carter_v111437_indexeddb_v1' in page:
+        raise RuntimeError('V11.14.38 새 검증실 API/DB 격리 실패')
+    if page.count('function paintFourTraders(){')!=1:
+        raise RuntimeError('V11.14.38 4인 요약표 연결 실패')
+    return page
+
+
+C5_V111438_PAGE=c5_v111438_make_page()
+
+
+def register_c5_v111438_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                names=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 종목을 조회하지 못했어')
+                cache.update(items=names,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-four-traders')
+    def c5_v111438_page():
+        return render_template_string(C5_V111438_PAGE)
+
+    @app.get('/api/winrate14c5fourtraders/universe')
+    def c5_v111438_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.38'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5fourtraders/evaluate')
+    def c5_v111438_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 코인')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_v111438_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.38',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111437_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111437_register_daytrade_review(app,deps)
+    register_c5_v111438_lab(app,deps)
