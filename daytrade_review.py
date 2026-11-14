@@ -13448,3 +13448,337 @@ _v111440_register_daytrade_review=register_daytrade_review
 def register_daytrade_review(app,deps):
     _v111440_register_daytrade_review(app,deps)
     register_c5_v111441_lab(app,deps)
+
+
+# =============================================================================
+# V11.14.42 - LAST NEW TRADER RESEARCH ONLY
+# T: Kathy Lien/Boris Schlossberg 5-minute Momo adaptation (EMA20 / MACD 12,26,9)
+# U: Mark Fisher ACD A-up adaptation (KST 09:00 30m opening range).
+# A~S historical labs, registrations, endpoints and V2 BUY remain unchanged.
+# These OHLCV 5m rules are experimental adaptations, NOT the traders' full methods.
+# =============================================================================
+
+
+def c5_v111442_macd_histogram(closes):
+    """MACD histogram with SMA-initialized EMAs, using only supplied closes."""
+    n=len(closes)
+    values=[None]*n
+    if n<35:
+        return values
+    e12=sum(closes[:12])/12
+    e26=sum(closes[:26])/26
+    a12=2/13
+    a26=2/27
+    for x in closes[12:26]:
+        e12+=(x-e12)*a12
+    macds=[]
+    for i in range(25,n):
+        if i>25:
+            e12+=(closes[i]-e12)*a12
+            e26+=(closes[i]-e26)*a26
+        macds.append((i,e12-e26))
+    if len(macds)<9:
+        return values
+    signal=sum(value for _,value in macds[:9])/9
+    for index,line in macds[8:]:
+        if index>33:
+            signal+=(line-signal)*.2
+        values[index]=line-signal
+    return values
+
+
+def c5_v111442_lien_signal(rows,i):
+    """5m EMA20 bullish recovery + fresh positive MACD histogram transition.
+
+    Uses only completed 5m candles through i. Entry is next candle open.
+    Fixed experimental 80-bar streak warmup; no synthetic candles or FX pip logic.
+    """
+    if i<79 or not lab_contiguous(rows,i-79,i):
+        return None
+    recent=rows[i-79:i+1]
+    closes=[x['c'] for x in recent]
+    ema20=c5_v111441_ema(closes,20)
+    prior20=c5_v111441_ema(closes[:-1],20)
+    if ema20 is None or prior20 is None:
+        return None
+    bar=recent[-1]
+    if not (recent[-2]['c']<=prior20 and bar['c']>ema20 and bar['c']>bar['o']):
+        return None
+    hist=c5_v111442_macd_histogram(closes)
+    last=hist[-1]
+    if last is None or last<=0:
+        return None
+    recent_cross=any(hist[-k-1] is not None and hist[-k] is not None and
+                     hist[-k-1]<=0<hist[-k] for k in range(1,6))
+    if not recent_cross:
+        return None
+    vol_mean=sum(x['v'] for x in recent[-21:-1])/20
+    return {'pattern_name':'LIEN_FIVE_MINUTE_MOMO_EMA20_MACD_ADAPTATION',
+            'lien_ema20':round(ema20,10),
+            'lien_macd_hist':round(last,10),
+            'lien_macd_recent_positive_cross':True,
+            'lien_ema_recovery_pct':round(100*(bar['c']/ema20-1),6),
+            'lien_volume_ratio':round(bar['v']/vol_mean,5) if vol_mean>0 else None,
+            'lien_warmup_bars':80}
+
+
+def c5_v111442_fisher_signal(rows,i,open_high,open_low,session_start):
+    """ACD-inspired A-up: 30m KST 09 opening range, 15m sustained breakout.
+
+    09:00 KST is an exchange-day research convention for 24h crypto,
+    NOT a real market opening auction. A threshold is 0.15 * ATR14.
+    """
+    bar=rows[i]
+    if not (session_start+timedelta(minutes=40)<=bar['t']<
+            session_start+timedelta(hours=15)):
+        return None
+    if i<14 or not lab_contiguous(rows,i-14,i):
+        return None
+    true_ranges=[]
+    for j in range(i-13,i+1):
+        prevclose=rows[j-1]['c']
+        true_ranges.append(max(rows[j]['h']-rows[j]['l'],
+                               abs(rows[j]['h']-prevclose),
+                               abs(rows[j]['l']-prevclose)))
+    atr=sum(true_ranges)/len(true_ranges)
+    if atr<=0 or open_high<=0:
+        return None
+    trigger=open_high+.15*atr
+    last_three=rows[i-2:i+1]
+    if any(b['t']<session_start+timedelta(minutes=30) for b in last_three):
+        return None
+    if not all(b['c']>trigger for b in last_three):
+        return None
+    return {'pattern_name':'FISHER_ACD_KST_OPENING_RANGE_A_UP_ADAPTATION',
+            'fisher_session_start_kst':session_start.strftime('%Y-%m-%d %H:%M'),
+            'fisher_opening_range_minutes':30,
+            'fisher_confirm_minutes':15,
+            'fisher_open_high':round(open_high,10),
+            'fisher_open_low':round(open_low,10),
+            'fisher_atr14':round(atr,10),
+            'fisher_trigger':round(trigger,10),
+            'fisher_breakout_pct':round(100*(bar['c']/open_high-1),6),
+            'fisher_requires_09_kst_six_real_candles':True}
+
+
+def c5_v111442_study(rows,cfg,market,kst):
+    from datetime import datetime as _dt,time as _tm
+    start=_dt.combine(cfg['day'],_tm.min,tzinfo=kst)
+    end=start+timedelta(days=1)
+    session=start+timedelta(hours=9)
+    step=timedelta(minutes=5)
+    # Use exact timestamps; no zero-volume / artificial OHLC candles.
+    lookup={r['t']:r for r in rows}
+    opening=[lookup.get(session+step*j) for j in range(6)]
+    opening_valid=all(opening)
+    open_high=max(b['h'] for b in opening) if opening_valid else None
+    open_low=min(b['l'] for b in opening) if opening_valid else None
+    events={'T':[],'U':[]}
+    counters={'T_eligible':0,'T_candidates':0,'T_insufficient':0,
+              'U_eligible':0,'U_candidates':0,'U_missing_opening':int(not opening_valid),
+              'U_opening_complete':int(opening_valid)}
+    last_t=-100000
+    streak=0
+    for i,r in enumerate(rows[:-1]):
+        streak=streak+1 if i and r['t']-rows[i-1]['t']==step else 1
+        if not start<=r['t']<end:
+            continue
+        if streak<80:
+            counters['T_insufficient']+=1
+        else:
+            counters['T_eligible']+=1
+            features=c5_v111442_lien_signal(rows,i)
+            if features is not None:
+                counters['T_candidates']+=1
+                if i-last_t>=cfg['bars']:
+                    last_t=i
+                    stamp=r['t'].strftime('%Y-%m-%d %H:%M')
+                    event={'market':market,'strategy':'T',
+                           'base_id':market+'|T|'+stamp,
+                           'base_signal_time_kst':stamp,'signal_time_kst':stamp,
+                           'entry_time_kst':(r['t']+step).strftime('%Y-%m-%d %H:%M'),
+                           'entry_delay_minutes':0,'hypothetical_only':True,
+                           'comparison_group':'V111442_LIEN_FISHER_INDEPENDENT',
+                           'reason':'리엔 5분봉 모멘텀 EMA20 회복 + MACD 양전환',**features}
+                    event.update(lab_outcome_v11145(rows,i,cfg))
+                    events['T'].append(event)
+        if opening_valid and session+timedelta(minutes=40)<=r['t']<end:
+            if i>=14 and lab_contiguous(rows,i-14,i):
+                counters['U_eligible']+=1
+                if not events['U']:
+                    features=c5_v111442_fisher_signal(rows,i,open_high,open_low,session)
+                    if features is not None:
+                        counters['U_candidates']+=1
+                        stamp=r['t'].strftime('%Y-%m-%d %H:%M')
+                        event={'market':market,'strategy':'U',
+                               'base_id':market+'|U|'+stamp,
+                               'base_signal_time_kst':stamp,'signal_time_kst':stamp,
+                               'entry_time_kst':(r['t']+step).strftime('%Y-%m-%d %H:%M'),
+                               'entry_delay_minutes':0,'hypothetical_only':True,
+                               'comparison_group':'V111442_LIEN_FISHER_INDEPENDENT',
+                               'reason':'피셔 오전9시 OR30 상방 돌파 15분 안착',**features}
+                        event.update(lab_outcome_v11145(rows,i,cfg))
+                        events['U'].append(event)
+    counters.update({'T_signals':len(events['T']),'U_signals':len(events['U'])})
+    coverage={'v111442_'+k:v for k,v in counters.items()}
+    coverage.update({'v111442_study_only':True,
+                     'v111442_no_synthetic_candles':True,
+                     'v111442_existing_A_to_S_unchanged':True})
+    return {'v111442_new_events':events,'v111442_coverage':coverage}
+
+
+def c5_v111442_evaluate_rows(rows6,cfg,market,kst,truncated=False,meta=None,
+                               rowsN=None,nmeta=None):
+    prior=c5_v111441_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+    added=c5_v111442_study(rows6,cfg,market,kst)
+    if not set(prior).isdisjoint(added):
+        raise RuntimeError('V11.14.42 collision with historical response')
+    return {**prior,**added}
+
+
+def c5_v111442_evaluate_symbol(api_get,market,cfg,kst):
+    rows6,truncated,meta=c5_h2_v111434_fetch_extended(api_get,market,cfg,kst)
+    try:
+        rowsN,nmeta=c5_v111438_fetch_velez_prehistory(api_get,market,cfg,kst,rows6)
+    except Exception as exc:
+        rowsN=rows6
+        nmeta={'velez_fetch_status':'EXTRA_FETCH_FAILED',
+               'velez_fetch_error':(type(exc).__name__+': '+str(exc))[:120],
+               'velez_extra_pages':0,'velez_extra_raw':0}
+    return c5_v111442_evaluate_rows(rows6,cfg,market,kst,truncated,meta,rowsN,nmeta)
+
+
+def c5_v111442_make_page():
+    page=C5_V111441_PAGE.replace('V11.14.41','V11.14.42')
+    def one(old,new):
+        nonlocal page
+        count=page.count(old)
+        if count!=1:
+            raise RuntimeError('V11.14.42 page marker mismatch '+str(count)+' '+old[:90])
+        page=page.replace(old,new,1)
+    one('<title>V11.14.42 · 엘더 Triple Screen vs 쿠퍼 1-2-3</title>',
+        '<title>V11.14.42 · 리엔 Momo vs 피셔 ACD 최종 비교</title>')
+    one('<h1>🧪 V11.14.42 · 엘더 · 쿠퍼 스캘핑 비교</h1>',
+        '<h1>🧪 V11.14.42 · 리엔 · 피셔 최종 신규 트레이더</h1>')
+    one('기존 A~Q 보존 · R 엘더 Triple Screen / S 쿠퍼 1-2-3 독립 연구',
+        '기존 A~S 보존 · T 리엔 5분 Momo / U 피셔 ACD 개장 범위 연구')
+    one("const API='/api/winrate14c5eldercooper', KEY='bithumb_c5_elder_cooper_v111441_v1';",
+        "const API='/api/winrate14c5lienfisher', KEY='bithumb_c5_lien_fisher_v111442_v1';")
+    one("const DB_NAME='bithumb_c5_elder_cooper_v111441_indexeddb_v1';",
+        "const DB_NAME='bithumb_c5_lien_fisher_v111442_indexeddb_v1';")
+    intro="""<section class="panel"><h2>NEW · T 캐시 리엔 / U 마크 피셔 마지막 신규 트레이더 연구</h2>
+<div class="alert28"><b>A 볼먼:</b> 기존 C5 압축 돌파 신호 그대로 유지.<br>
+<b>L 카터:</b> 기존 TTM Squeeze 신호 그대로 유지.<br>
+<b>T 리엔 응용:</b> 연속된 실제 5분봉 80개 기준 EMA20 재돌파 + MACD(12/26/9) 히스토그램 최근 5봉 양전환. 완료봉 기준 다음 실제 봉 시가로 가상 진입.<br>
+<b>U 피셔 ACD 응용:</b> 빗썸 일봉 기준에 맞춘 오전 9:00 KST 이후 최초 30분(6개 실제 5분봉) 고점, 이를 ATR14의 0.15배 이상 넘어서 15분(완료 3봉) 연속 마감하면 첫 신호. 하루 종목당 최대 1회.<br>
+<b>공통:</b> TP +1.5%, SL -1.0%, 최대 60분, 편도 수수료 0.04%·슬리피지 0.05% 기본. 기존 A~S와 V2 BUY 무변경. 없는 봉을 만들지 않음.</div>
+<p class="alert28 warn">⚠️ T는 FX 5분 모멘텀 전략의 OHLCV 응용, U는 세션형 ACD를 24시간 빗썸의 9시 일봉 경계에 적용한 응용이야. 원 트레이더의 매매를 그대로 재현한 것은 아니며, 임의 거래 주문은 실행하지 않아.</p>
+<div id="lien_fisher_comparison" class="wide28">검사 후 볼먼·카터·리엔·피셔의 날짜별 성적 표시</div></section>"""
+    one('<section class="panel"><h2>NEW · R 엘더 / S 쿠퍼 5분봉 독립 연구</h2>',
+        intro+'\n<section class="panel"><h2>이전 연구 · R 엘더 / S 쿠퍼 5분봉 독립 연구</h2>')
+    js=r"""function paintLienFisher(){
+ const rs=Object.values(state.results||{}),keys=[['A','볼먼 A'],['L','카터 L'],['T','리엔 T'],['U','피셔 U']];
+ const items=(key,day)=>rs.filter(r=>!day||r.date===day).flatMap(r=>(
+   key==='A'?(r.events?.A||[]):key==='L'?(r.v111437_new_events?.L||[]):
+   (r.v111442_new_events?.[key]||[])
+ ).filter(e=>e.outcome!=='NO_ENTRY').map(e=>({...e,date:r.date})));
+ const stats=arr=>{const done=arr.filter(e=>['TP','SL','TIME'].includes(e.outcome)&&Number.isFinite(num(e.net_pct)));
+  const wins=done.filter(e=>num(e.net_pct)>0).length;
+  return {signals:arr.length,done:done.length,wins,loss:done.length-wins,
+   tp:done.filter(e=>e.outcome==='TP').length,sl:done.filter(e=>e.outcome==='SL').length,
+   unknown:arr.filter(e=>e.outcome==='UNKNOWN').length,
+   avg:done.length?done.reduce((s,e)=>s+num(e.net_pct),0)/done.length:NaN};};
+ const fmt=n=>Number.isFinite(n)?n.toFixed(3)+'%':'—';
+ const totals=keys.map(([key,name])=>{const s=stats(items(key));return tr([name,s.signals,s.done,s.wins,s.loss,s.tp,s.sl,s.unknown,
+   s.done?(100*s.wins/s.done).toFixed(1)+'%':'—',fmt(s.avg)]);});
+ const dates=[...new Set(rs.map(r=>r.date))].sort(),daily=[];
+ for(const date of dates)for(const [key,name] of keys){const s=stats(items(key,date));
+   daily.push(tr([date,name,s.signals,s.wins,s.loss,s.unknown,fmt(s.avg)]));}
+ const coverage=key=>rs.reduce((a,r)=>a+Number(r.v111442_coverage?.[key]||0),0);
+ const details=[...items('T'),...items('U')].sort((a,b)=>(a.date+a.signal_time_kst).localeCompare(b.date+b.signal_time_kst));
+ $('lien_fisher_comparison').innerHTML='<p class="small28">리엔 T 평가 가능 5분봉 위치 '+coverage('v111442_T_eligible')+
+ ' · 피셔 U '+coverage('v111442_U_eligible')+' · 피셔 9시 개장 6개 실제 봉 확인 종목·날짜 '+coverage('v111442_U_opening_complete')+
+ ' · 9시 봉 부족 종목·날짜 '+coverage('v111442_U_missing_opening')+'</p>'+
+ tbl(['전략','진입','완료','수익','손실','TP','SL','미확인','수익 거래율','평균 순수익률'],totals)+
+ '<h3>날짜별 수익·손실</h3>'+tbl(['날짜','전략','진입','수익','손실','미확인','평균 순수익률'],daily)+
+ '<h3>신규 T/U 거래 내역 (최대 200건)</h3>'+
+ (details.length?tbl(['날짜','종목','전략','신호 시각','결과','순수익률'],details.slice(0,200).map(e=>tr([
+ e.date,e.market,e.strategy,e.signal_time_kst,e.outcome||'UNKNOWN',fmt(num(e.net_pct))]))):'<p class="small28">신규 신호 없음</p>');
+}
+"""
+    one('function paintElderCooper(){',js+'function paintElderCooper(){')
+    one(' paintElderCooper();\n}', ' paintElderCooper();\n paintLienFisher();\n}')
+    one("  'cooper_volume_ratio'];",
+        "  'cooper_volume_ratio',\n"
+        "  'v111442_T_eligible','v111442_T_candidates','v111442_T_insufficient',\n"
+        "  'v111442_U_eligible','v111442_U_candidates','v111442_U_missing_opening',\n"
+        "  'v111442_U_opening_complete','v111442_T_signals','v111442_U_signals',\n"
+        "  'v111442_study_only','v111442_no_synthetic_candles',\n"
+        "  'v111442_existing_A_to_S_unchanged',\n"
+        "  'lien_ema20','lien_macd_hist','lien_macd_recent_positive_cross',\n"
+        "  'lien_ema_recovery_pct','lien_volume_ratio','lien_warmup_bars',\n"
+        "  'fisher_session_start_kst','fisher_opening_range_minutes',\n"
+        "  'fisher_confirm_minutes','fisher_open_high','fisher_open_low',\n"
+        "  'fisher_atr14','fisher_trigger','fisher_breakout_pct',\n"
+        "  'fisher_requires_09_kst_six_real_candles'];")
+    one('...(r.v111441_coverage||{})};',
+        '...(r.v111441_coverage||{}),...(r.v111442_coverage||{})};')
+    one("  for(const key of ['R','S'])for(const e of r.v111441_new_events?.[key]||[])add({...base,...e,strategy:key});",
+        "  for(const key of ['R','S'])for(const e of r.v111441_new_events?.[key]||[])add({...base,...e,strategy:key});\n"
+        "  for(const key of ['T','U'])for(const e of r.v111442_new_events?.[key]||[])add({...base,...e,strategy:key});")
+    one('bithumb_C5_VOLMAN_ELDER_COOPER_v111441.csv',
+        'bithumb_C5_VOLMAN_LIEN_FISHER_v111442.csv')
+    if page.count('function paintLienFisher(){')!=1 or page.count("const API='/api/winrate14c5lienfisher'")!=1:
+        raise RuntimeError('V11.14.42 UI not connected')
+    return page
+
+
+C5_V111442_PAGE=c5_v111442_make_page()
+
+
+def register_c5_v111442_lab(app,deps):
+    api_get,get_markets,kst=deps['api_get'],deps['get_markets'],deps['KST']
+    cache={'items':None,'at':0.0};lock=Lock()
+    def listed():
+        with lock:
+            if cache['items'] is None or time.time()-cache['at']>600:
+                names=sorted({m for m in get_markets()
+                              if isinstance(m,str) and MARKET_RE.fullmatch(m)})
+                if not names:raise ValueError('현재 빗썸 KRW 종목을 조회할 수 없습니다')
+                cache.update(items=names,at=time.time())
+            return cache['items']
+
+    @app.get('/backtest-winrate-c5-lien-fisher')
+    def c5_v111442_page():
+        return render_template_string(C5_V111442_PAGE)
+
+    @app.get('/api/winrate14c5lienfisher/universe')
+    def c5_v111442_universe():
+        try:
+            return jsonify({'ok':True,'items':listed(),'version':'V11.14.42'})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:200]}),400
+
+    @app.post('/api/winrate14c5lienfisher/evaluate')
+    def c5_v111442_evaluate():
+        try:
+            raw=request.get_json(silent=True)
+            if not isinstance(raw,dict):raise ValueError('요청 형식 오류')
+            market=raw.get('market')
+            if not isinstance(market,str) or not MARKET_RE.fullmatch(market):
+                raise ValueError('KRW 종목 형식 오류')
+            if market not in set(listed()):
+                raise ValueError('현재 KRW 목록에 없는 종목')
+            cfg=c5_v111417_config({**raw,'date':raw.get('date') or raw.get('day')},kst)
+            result=c5_v111442_evaluate_symbol(api_get,market,cfg,kst)
+            return jsonify({'ok':True,'version':'V11.14.42',
+                            'date':cfg['day'].isoformat(),**result})
+        except Exception as exc:
+            return jsonify({'ok':False,'error':(type(exc).__name__+': '+str(exc))[:240]}),400
+
+
+_v111441_register_daytrade_review=register_daytrade_review
+
+def register_daytrade_review(app,deps):
+    _v111441_register_daytrade_review(app,deps)
+    register_c5_v111442_lab(app,deps)
