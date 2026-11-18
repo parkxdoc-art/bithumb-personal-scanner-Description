@@ -1,4 +1,4 @@
-"""V2 CORE.53.1 LIGHT — Binance API shared-IP rate-limit resilience; CORE53 strategy unchanged.
+"""V2 CORE.53.2 LIGHT — Bithumb 1m completeness + independent 5m audit; no lookahead.
 
 Standalone replacement for daytrade_review.py; integrates with the existing
 Flask app via register_daytrade_review(app, deps).  Does not change app.py.
@@ -11,7 +11,7 @@ import re
 import time
 from flask import Response, jsonify, request
 
-VERSION = 'V2.CORE.53.1-LIGHT-BINANCE-API-RATE-LIMIT-FIX'
+VERSION = 'V2.CORE.53.2-LIGHT-BITHUMB-1M-5M-INTEGRITY-AUDIT'
 MARKET_PATTERN = re.compile(r'^KRW-[A-Z0-9]+$')
 FIVE = timedelta(minutes=5)
 KST_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -1484,7 +1484,7 @@ def _core53_http(path, args=None):
     if not path.startswith('/api/v3/'):
         raise ValueError('Binance public market-data paths only')
     url = 'https://data-api.binance.vision' + path + ('?' + urlencode(args) if args else '')
-    req = Request(url, headers={'User-Agent': 'PersonalResearchScanner/53.1',
+    req = Request(url, headers={'User-Agent': 'PersonalResearchScanner/53.2',
                                 'Accept': 'application/json'})
     for attempt in range(2):
         retry = False
@@ -1658,33 +1658,172 @@ def _core53_signals(bars,day):
     return out
 
 
-def _core53_fetch_bithumb_day(api_get,market,day,kst,hold=240):
-    """One paginated 1m fetch per coin/day, NOT one fetch per signal.
+def _core53_fetch_bithumb_day(api_get, market, day, kst, hold=240, with_meta=False):
+    """Historical 1m candles, sparse-safe cursor pagination. NEVER backfill.
 
-    Includes 6m prior context and enough of next KST day to settle even
-    23:59 signals for the requested holding period, plus 10m reaction audit.
+    A short (<200) nonempty page is NOT proof that older dates are unavailable.
+    Continue until the required start boundary, empty response or hard cap.
+    with_meta=False retains CORE.53.1 two-value API for regression tests.
     """
-    start=datetime.combine(day,dt_time.min,tzinfo=kst)-timedelta(minutes=7)
-    stop=datetime.combine(day+timedelta(days=1),dt_time.min,tzinfo=kst)+timedelta(minutes=max(hold+2,12))
-    cursor=stop;seen={};pages=0;oldest=None
-    for _ in range(16):
-        raw=api_get('/v1/candles/minutes/1',{'market':market,
-                                             'to':cursor.strftime(KST_FORMAT),'count':200})
+    start = datetime.combine(day,dt_time.min,tzinfo=kst)-timedelta(minutes=7)
+    stop = datetime.combine(day+timedelta(days=1),dt_time.min,tzinfo=kst)+timedelta(minutes=max(hold+2,12))
+    cursor=stop; seen={}; pages=0; bad=0; short_pages=0; raw_count=0
+    reached=False; reason=''; oldest=None; newest=None; last_cursor=None
+    # Sparse 1m candles may require > (window_minutes / 200) calls, but cap
+    # cost and never disguise an incomplete history as full coverage.
+    for _ in range(24):
+        raw=api_get('/v1/candles/minutes/1', {'market':market,'to':cursor.strftime(KST_FORMAT),'count':200})
         if not isinstance(raw,list):raise ValueError('빗썸 1분봉 응답 형식 오류')
-        pages+=1;oldest=None
+        pages+=1;raw_count+=len(raw)
+        if len(raw)<200: short_pages+=1
+        if not raw:
+            reason='EMPTY_BEFORE_START' if not reached else 'START_REACHED';break
+        page_oldest=None;parse_good=0
         for b in raw:
             try:
-                c=_parse_candle(b,kst);t=c['t']
-                oldest=t if oldest is None or t<oldest else oldest
+                c=_parse_candle(b,kst);t=c['t'];parse_good+=1
+                if page_oldest is None or t<page_oldest:page_oldest=t
+                if oldest is None or t<oldest:oldest=t
+                if newest is None or t>newest:newest=t
                 if start<=t<stop:seen[t]=c
+            except (ValueError,KeyError,TypeError,OverflowError):bad+=1
+        if page_oldest is None:
+            reason='ALL_CANDLES_INVALID';break
+        if page_oldest<=start:
+            reached=True;reason='START_REACHED';break
+        if page_oldest>=cursor or page_oldest==last_cursor:
+            reason='CURSOR_STALLED';break
+        last_cursor=cursor;cursor=page_oldest
+    else:reason='PAGE_CAP_REACHED'
+    rows=[seen[t] for t in sorted(seen)]
+    daystart=datetime.combine(day,dt_time.min,tzinfo=kst)
+    in_day=sum(daystart<=r['t']<daystart+timedelta(days=1) for r in rows)
+    meta={'bithumb_1m_pages':pages,'bithumb_1m_bars':len(rows),
+          'bithumb_1m_day_bars':in_day, 'bithumb_1m_day_missing_slots':1440-in_day,
+          'bithumb_1m_raw_count':raw_count,'bithumb_1m_invalid_rows':bad,
+          'bithumb_1m_short_pages':short_pages,
+          'bithumb_1m_oldest':oldest.isoformat() if oldest else '',
+          'bithumb_1m_newest':newest.isoformat() if newest else '',
+          'bithumb_1m_cursor_status':reason,
+          'bithumb_1m_history_complete':reached,
+          'bithumb_1m_coverage_note':'빈 분봉은 자동 생성하거나 보간하지 않음'}
+    return (rows,pages,meta) if with_meta else (rows,pages)
+
+
+def _core532_fetch_5m_audit(api_get,market,day,kst):
+    """INDEPENDENT completed 5m Bithumb OHLCV: retrospective audit only.
+
+    Never use these bars to create 1m entry prices or to pass a BUY gate. A
+    5m bar closing after a signal contains unknowable future-at-signal data.
+    """
+    start=datetime.combine(day,dt_time.min,tzinfo=kst)-timedelta(minutes=15)
+    end=datetime.combine(day+timedelta(days=1),dt_time.min,tzinfo=kst)+timedelta(minutes=20)
+    cursor=end;seen={};pages=0;oldest=None;reached=False;reason=''
+    for _ in range(8):
+        raw=api_get('/v1/candles/minutes/5',{'market':market,'to':cursor.strftime(KST_FORMAT),'count':200})
+        if not isinstance(raw,list):raise ValueError('빗썸 5분봉 응답 형식 오류')
+        pages+=1
+        if not raw:reason='EMPTY_BEFORE_START';break
+        page=[]
+        for b in raw:
+            try:
+                bar=_parse_candle(b,kst);page.append(bar)
+                if start<=bar['t']<end:seen[bar['t']]=bar
             except (ValueError,KeyError,TypeError,OverflowError):continue
-        if oldest is None or oldest<=start or len(raw)<200:break
-        if oldest>=cursor:raise ValueError('빗썸 1분봉 커서 이동 실패')
+        if not page:reason='INVALID_5M_PAGE';break
+        oldest=min(r['t'] for r in page)
+        if oldest<=start:reached=True;reason='START_REACHED';break
+        if oldest>=cursor:reason='CURSOR_STALLED';break
         cursor=oldest
-    else:
-        if oldest is not None and oldest>start:
-            raise ValueError('빗썸 1분봉 페이지 제한(16페이지) 초과: 자료 불완전')
-    return [seen[t] for t in sorted(seen)],pages
+    else:reason='PAGE_CAP_REACHED'
+    return seen,{'bithumb_5m_pages':pages,'bithumb_5m_bars':len(seen),
+                 'bithumb_5m_history_complete':reached,'bithumb_5m_cursor_status':reason}
+
+
+def _core532_bucket_start(t):
+    return t.replace(minute=(t.minute//5)*5,second=0,microsecond=0)
+
+
+def _core532_5m_check(bucket, minute_by_t, five_by_t):
+    """Audit if a sparse bucket's 1m OHLCV reconciles to 5m independently.
+
+    Checks use the COMPLETE 5m bar, so ALL such labels are retrospective only,
+    forbidden for trading decisions at the earlier 1m timestamp.
+    """
+    one=timedelta(minutes=1)
+    bar=five_by_t.get(bucket)
+    ms=[minute_by_t.get(bucket+i*one) for i in range(5)]
+    actual=[x for x in ms if x is not None]
+    missing=sum(x is None for x in ms)
+    if not bar:return 'NO_5M_BAR_AUDIT',missing
+    if not actual:return 'NO_1M_BAR_5M_EXISTS_AUDIT',missing
+    # Aggregated turnover & OHLC: independent data agreement gives strong
+    # retrospective evidence that absent 1m slots contained no trades.
+    cash=sum(x['cash'] for x in actual)
+    volume=sum(x['v'] for x in actual)
+    def near(x,y):return abs(x-y)<=max(1e-8,max(abs(x),abs(y))*0.005)
+    price_ok=(near(actual[0]['o'],bar['o']) and near(actual[-1]['c'],bar['c'])
+              and near(max(x['h'] for x in actual),bar['h'])
+              and near(min(x['l'] for x in actual),bar['l']))
+    if not near(cash,bar['cash']) or not near(volume,bar['v']) or not price_ok:
+        return 'SOURCE_MISMATCH_AUDIT',missing
+    return ('NO_TRADE_SLOTS_SUPPORTED_AUDIT' if missing else 'FULLY_MATCHED_AUDIT'),missing
+
+
+def _core532_audit_event(e, minute_by_t, five_by_t, history_complete):
+    """Label missing 1m before signal using INDEPENDENT 5m hindsight.
+
+    Never turn these labels into a trade. The five-minute bar may close AFTER
+    the signal, therefore it must NEVER be used as a pre-signal BUY filter.
+    """
+    signal=datetime.fromisoformat(e['signal_at']);one=timedelta(minutes=1)
+    missing=[signal-k*one for k in range(6,0,-1) if signal-k*one not in minute_by_t]
+    result={'pre_missing_1m_count':len(missing),
+            'pre_missing_1m_times':','.join(x.strftime('%H:%M') for x in missing),
+            'pre_audit_use':'POST_HOC_ONLY_NEVER_ENTRY'}
+    if not missing:
+        return dict(result,pre_5m_audit='NO_GAP')
+    if not history_complete:
+        return dict(result,pre_5m_audit='FETCH_INCOMPLETE_UNRESOLVED')
+    audits={}
+    for t in missing:
+        b=_core532_bucket_start(t)
+        if b not in audits:audits[b]=_core532_5m_check(b,minute_by_t,five_by_t)[0]
+    labels=set(audits.values())
+    if labels=={'NO_TRADE_SLOTS_SUPPORTED_AUDIT'}:
+        classification='LIKELY_NO_TRADE_AUDIT_ONLY'
+    elif 'SOURCE_MISMATCH_AUDIT' in labels or 'NO_1M_BAR_5M_EXISTS_AUDIT' in labels:
+        classification='SOURCE_MISMATCH_AUDIT_ONLY'
+    elif 'NO_5M_BAR_AUDIT' in labels:
+        classification='5M_DATA_ABSENT_UNRESOLVED'
+    else:classification='MIXED_OR_UNRESOLVED'
+    result['pre_5m_audit']=classification
+    result['pre_5m_bucket_details']='|'.join(b.strftime('%H:%M')+':'+v for b,v in sorted(audits.items()))
+    return result
+
+
+def _core532_sparse_quote_diag(e, minute_by_t):
+    """Past-only stale last-trade snapshot; OBSERVATION ONLY, never BUY.
+
+    If a one-minute candle was not produced, last known traded close is stale;
+    use it only for an audit diagnostic with age, never a fillable live quote.
+    """
+    signal=datetime.fromisoformat(e['signal_at']);one=timedelta(minutes=1)
+    newest=next((minute_by_t[signal-k*one] for k in range(1,16)
+                 if signal-k*one in minute_by_t),None)
+    baseline=next((minute_by_t[signal-k*one] for k in range(6,22)
+                   if signal-k*one in minute_by_t),None)
+    result={'sparse_quote_use':'PAST_ONLY_DIAGNOSTIC_NOT_EXECUTABLE',
+            'sparse_last_trade_at':newest['t'].isoformat() if newest else '',
+            'sparse_reference_at':baseline['t'].isoformat() if baseline else '',
+            'sparse_latest_stale_min':int((signal-one-newest['t']).total_seconds()/60) if newest else None,
+            'sparse_reference_stale_min':int((signal-6*one-baseline['t']).total_seconds()/60) if baseline else None}
+    if newest is not None and baseline is not None and baseline['t']<newest['t']:
+        ret=_price_pct(newest['c'],baseline['c'])
+        result.update(sparse_bithumb_5m_ret_pct=round(ret,5),
+                      sparse_binance_gap_pct=round(e['binance_return_5m_pct']-ret,5))
+    else:result.update(sparse_bithumb_5m_ret_pct=None,sparse_binance_gap_pct=None)
+    return result
 
 
 def _core53_post_reaction(e,bn_by_t,bt_by_t):
@@ -1799,41 +1938,60 @@ def _core53_analyze_market(api_get,market,symbol,day,kst,fee,slip,hold,http_get=
     b,meta=_core53_fetch_binance_1m(symbol,day,kst,http_get)
     events=_core53_signals(b,day)
     for e in events:e['market']=market;e['symbol']=symbol
-    # Even if zero Binance triggers, avoid spending ~10 Bithumb API requests.
-    pages=0;bt_rows=[];fetch_error=''
+    pages=0;bt_rows=[];fetch_error=''; audit_error='';five_by_t={};audit_meta={}
+    bt_meta={'bithumb_1m_history_complete':False,'bithumb_1m_cursor_status':'NOT_FETCHED',
+             'bithumb_1m_pages':0,'bithumb_1m_bars':0}
     if events:
-        try:bt_rows,pages=_core53_fetch_bithumb_day(api_get,market,day,kst,hold)
+        try:
+            bt_rows,pages,bt_meta=_core53_fetch_bithumb_day(api_get,market,day,kst,hold,with_meta=True)
         except Exception as exc:
             fetch_error=f'{type(exc).__name__}: {exc}'[:140]
+        # ALWAYS keep the original exchange candles unchanged, including gaps.
+        if bt_rows:
+            try:five_by_t,audit_meta=_core532_fetch_5m_audit(api_get,market,day,kst)
+            except Exception as exc:audit_error=f'{type(exc).__name__}: {exc}'[:140]
         bn_by_t={x['t']:x for x in b};bt_by_t={x['t']:x for x in bt_rows}
         for e in events:
+            e.update(_core532_audit_event(e,bt_by_t,five_by_t,
+                                          bt_meta.get('bithumb_1m_history_complete') and not bool(audit_error)))
+            e['bithumb_audit_error']=audit_error
+            e.update(_core532_sparse_quote_diag(e,bt_by_t))
             if fetch_error:
-                # Preserve Binance spikes when the Bithumb request fails.
                 e.update(comparison='UNKNOWN',status='UNKNOWN',reason='BITHUMB_FETCH_ERROR: '+fetch_error)
                 e.update(_core53_post_reaction(e,bn_by_t,bt_by_t))
                 continue
             try:
+                # This alignment intentionally uses 1m ORIGINAL data ONLY.
                 diag=_core53_post_reaction(e,bn_by_t,bt_by_t)
                 result=_core53_align_event(e,bt_rows,fee,slip,hold,by_t=bt_by_t)
-                e.update(result)
-                e.update(diag)
+                e.update(result);e.update(diag)
+                if not bt_meta.get('bithumb_1m_history_complete') and e['comparison']=='BINANCE_LEAD':
+                    # Incomplete history should NEVER be allowed to produce a BUY.
+                    e.update(comparison='UNKNOWN',status='UNKNOWN',
+                             reason='BITHUMB_1M_HISTORY_INCOMPLETE',net_pct=None)
             except Exception as exc:
                 e.update(comparison='UNKNOWN',status='UNKNOWN',reason=f'{type(exc).__name__}: {exc}'[:140])
-    return {'date':day.isoformat(),'market':market,'symbol':symbol,'events':events,
-            'coverage':dict(meta,detected=len(events),episodes=sum(bool(e.get('episode_first')) for e in events),
-                            first_signal_at=events[0]['signal_at'] if events else '',
-                            last_signal_at=events[-1]['signal_at'] if events else '',
-                            compared=sum(e.get('comparison') not in (None,'UNKNOWN') for e in events),
-                            sim_ready=sum(e.get('status')=='READY' for e in events),
-                            bithumb_1m_pages=pages,bithumb_1m_bars=len(bt_rows),
-                            bithumb_error=fetch_error,
-                            binance_day_bars=sum(datetime.combine(day,dt_time.min,tzinfo=kst)<=x['t']<datetime.combine(day+timedelta(days=1),dt_time.min,tzinfo=kst) for x in b),
-                            binance_day_expected=1440,
-                            reaction_10m_complete=sum(e.get('reaction_10m_complete') is True for e in events),
-                            full_day_detection=True,raw_spikes_not_capped=True)}
+    start=datetime.combine(day,dt_time.min,tzinfo=kst)
+    coverage=dict(meta,**bt_meta,**audit_meta,
+                  detected=len(events),episodes=sum(bool(e.get('episode_first')) for e in events),
+                  first_signal_at=events[0]['signal_at'] if events else '',
+                  last_signal_at=events[-1]['signal_at'] if events else '',
+                  compared=sum(e.get('comparison') not in (None,'UNKNOWN') for e in events),
+                  sim_ready=sum(e.get('status')=='READY' for e in events),
+                  bithumb_error=fetch_error,bithumb_5m_audit_error=audit_error,
+                  pre_gap_events=sum(e.get('pre_missing_1m_count',0)>0 for e in events),
+                  pre_gap_no_trade_supported=sum(e.get('pre_5m_audit')=='LIKELY_NO_TRADE_AUDIT_ONLY' for e in events),
+                  pre_gap_source_mismatch=sum(e.get('pre_5m_audit')=='SOURCE_MISMATCH_AUDIT_ONLY' for e in events),
+                  binance_day_bars=sum(start<=x['t']<start+timedelta(days=1) for x in b),
+                  binance_day_expected=1440,
+                  reaction_10m_complete=sum(e.get('reaction_10m_complete') is True for e in events),
+                  full_day_detection=True,raw_spikes_not_capped=True,
+                  gap_audit_diagnostic_only=True)
+    return {'date':day.isoformat(),'market':market,'symbol':symbol,
+            'events':events,'coverage':coverage}
 
 
-CORE_PAGE = '<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>V2 CORE.53.1 LIGHT · 바이낸스 급증 전수·빗썸 반응 연구</title>\n<style>\n:root{color-scheme:dark;--bg:#0b1222;--panel:#18233b;--edge:#33435e;--text:#e9f0ff;--sub:#b8c8e5;--ok:#60e4a0;--bad:#ff9cae}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 system-ui,sans-serif}main{max-width:1110px;margin:0 auto;padding:14px 12px 70px}\nh1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}p{margin:7px 0}.panel{border:1px solid var(--edge);background:var(--panel);border-radius:13px;padding:14px;margin:12px 0}.muted{font-size:12px;color:var(--sub)}\n.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(146px,1fr));gap:9px}.field{display:flex;flex-direction:column;gap:3px}label{font-size:12px;color:var(--sub)}input,select,button{background:#0d172a;color:var(--text);border:1px solid #536780;border-radius:8px;padding:10px;font:inherit;width:100%}button{font-weight:700;background:#416dcf;cursor:pointer}button.alt{background:#293e64}button:disabled{opacity:.45;cursor:default}.buttons{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.buttons button{flex:1;min-width:120px}.stat{border:1px solid #334762;border-radius:10px;padding:10px}.stat strong{font-size:22px;display:block}.good{color:var(--ok)}.bad{color:var(--bad)}a{color:#a7c1ff}table{border-collapse:collapse;width:100%;min-width:740px}th,td{border-bottom:1px solid #334762;font-size:12px;padding:9px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.tablewrap{overflow:auto}.note{background:#101d32;border-radius:9px;padding:12px;margin:8px 0;color:#cfdbef;font-size:12px}progress{width:100%;height:12px}\n@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.panel{padding:11px}main{padding:10px 8px 50px}}\n</style></head><body><main>\n<header><h1>🧪 V2 CORE.53.1 LIGHT · 바이낸스 급증 전수·빗썸 반응 연구</h1><p class="muted">바이낸스 현물 거래대금 급증 전수 기록(24시간) → 빗썸 신호 직전·이후 1·3·5·10분 비교 → 별도 가상 진입 / 자동 주문 없음</p><a href="/">← 기존 스캐너</a></header>\n<section class="panel"><h2>① 새 연구 규칙</h2><p>바이낸스 현물과 빗썸에 동시 상장된 코인을 감시합니다. 바이낸스 <b>1분봉 거래대금 ≥직전20봉의 3배</b> 또는 <b>5분봉 거래대금 ≥직전20개 5분봉의 2배</b>, 공격적 매수 비중 ≥55%, 가격 상승을 연구 후보로 봅니다.</p><p>신호가 마감된 시각에 빗썸 최근 5분 수익률과 비교해 바이낸스가 <b>0.5%p 이상 앞서고</b>, 빗썸은 최근 5분 <b>+1% 초과 상승하지 않은</b> 경우에만 가상 진입을 연구합니다. 실제 선행인지 검증 중인 가설입니다.</p>\n<div class="grid"><div class="note"><b>손절</b><p>-3% (진입가 대비 가격 기준)</p></div><div class="note"><b>익절 4단계</b><p>+3% / 30% · +5% / 30%<br>+10% / 20% · +30% / 20%</p></div><div class="note"><b>본절 스톱</b><p>1차 +3% 청산 후 잔여 70%에 수수료·슬리피지 반영 순본절 스톱 (다음 1분봉부터)</p></div><div class="note"><b>시간 청산</b><p>기본 240분. 목표 미달 잔량은 종료 시 종가 청산 가정</p></div></div>\n<p class="muted">수수료와 슬리피지를 빼고 계좌기대값을 비교합니다. 신호 후 1분을 지연하여 빗썸 시가에 가상 진입합니다. 실제 API 지연·호가체결을 완벽히 재현한 결과는 아닙니다.</p></section>\n<section class="panel"><h2>② 테스트 설정</h2><div class="grid">\n<div class="field"><label>마지막 날짜 (KST, 완료일)</label><input type="date" id="day"></div>\n<div class="field"><label>날짜 수</label><select id="days"><option value="1" selected>1일</option><option value="3">3일</option><option value="7">7일</option><option value="14">14일 (많은 API 요청)</option></select></div>\n<div class="field"><label>검사 범위</label><select id="scope"><option value="examples" selected>MMT · PIEVERSE 우선 연구</option><option value="custom">선택 종목</option><option value="all">전체 동시상장 현물 코인 (시간 오래 걸림)</option></select></div>\n<div class="field"><label>선택 종목 (쉼표 구분)</label><input id="custom" value="MMT,PIEVERSE" placeholder="MMT,PIEVERSE"></div>\n<div class="field"><label>편도 수수료 %</label><input id="fee" type="number" value="0.25" step="0.01" min="0" max="0.5"></div>\n<div class="field"><label>편도 슬리피지 %</label><select id="slip"><option value="0.10">0.10%</option><option value="0.15" selected>0.15%</option><option value="0.20">0.20%</option></select></div>\n<div class="field"><label>관찰 후 강제 청산</label><select id="hold"><option value="120">120분</option><option value="240" selected>240분</option><option value="480">480분</option></select></div>\n<div class="field"><label>거래당 계좌 위험 %</label><select id="risk"><option value="0.5" selected>0.5%</option><option value="1">1.0%</option></select></div>\n<div class="field"><label>일 손실 중단 %</label><select id="dailyLoss"><option value="1">1.0%</option><option value="1.5" selected>1.5%</option><option value="2">2.0%</option></select></div>\n</div><div class="buttons"><button id="run">CORE.53.1 연구 스캔 시작</button><button class="alt" disabled id="pause">중지 요청</button><button class="alt" disabled id="csv">CORE.53.1 CSV 저장</button></div><progress id="bar" value="0" max="1"></progress><p id="status" class="muted">검사 전</p>\n<div class="note"><b>CORE.53.1:</b> 전일 110분부터 준비해 KST 00:00~23:59 모든 급증 신호를 기록합니다. 15분 이내 반복 급증은 같은 에피소드로 묶지만 모두 CSV에 남깁니다. 23:59 신호도 다음 날 1분봉으로 평가하며 다음 날 자료가 없으면 UNKNOWN입니다.</div><div class="note">과거 백테스트는 현재 동시 상장된 코인 목록으로 구성되므로 <b>과거 상장 상태가 달랐던 경우 생존 편향</b>이 남습니다. 1분봉 누락은 임의 보간하지 않습니다. Binance 429/418 요청 제한 시 Retry-After를 준수하며 자동으로 대기합니다. 공유 서버 IP 차단이 길면 작업을 미완료로 기록하고 나중에 다시 검사하세요. Binance 접속이 지역/서버 정책 때문에 막히면 오류를 그대로 표시합니다. 과거 실제 호가 스프레드와 매매충격은 재현하지 못합니다.</div></section>\n<section class="panel"><h2>③ 검사 결과</h2><div class="grid"><div class="stat"><span class="muted">검사 완료</span><strong id="kDone">—</strong></div><div class="stat"><span class="muted">바이낸스 급증 신호</span><strong id="kSignal">—</strong></div><div class="stat"><span class="muted">빗썸 선행 격차 통과</span><strong id="kLead">—</strong></div><div class="stat"><span class="muted">데이터 오류</span><strong id="kError">—</strong></div></div>\n<h3>전체 바이낸스 급증 신호 · 빗썸 후행 반응 (가상 선정과 별개)</h3><p class="muted">신호 이후 1·3·5·10분 상승률은 <b>사후 분석용</b>이며 진입 필터나 사전 예측에 사용되지 않습니다. 전체 신호는 CSV에 기록되고 표에는 앞 120건만 표시됩니다.</p>\n<div class="tablewrap"><table><thead><tr><th>신호 시각 KST / 종목</th><th>에피소드</th><th>바이낸스 1분 배수</th><th>바이낸스 5분 배수</th><th>신호 시 선행격차</th><th>판정</th><th>1분 뒤 빗썸</th><th>3분 뒤 빗썸</th><th>5분 뒤 빗썸</th><th>10분 뒤 빗썸</th></tr></thead><tbody id="allEvents"><tr><td colspan="10">검사 전</td></tr></tbody></table></div>\n<h3>연구용 가상 선정 (하루 최대 4회 · 한 번에 1종목 · 연속 3손실 중단)</h3><div class="tablewrap"><table><thead><tr><th>선정</th><th>승 / 패</th><th>수익 확정</th><th>평균 순손익</th><th>기대값</th><th>계좌 누적</th><th>100건 검증</th></tr></thead><tbody id="summary"><tr><td colspan="7">검사 전</td></tr></tbody></table></div>\n<h3>실제 가상 선정 거래</h3><div class="tablewrap"><table><thead><tr><th>날짜/종목</th><th>신호 종류</th><th>바이낸스 5분</th><th>빗썸 5분</th><th>선행 격차</th><th>결과</th><th>익절 단계</th><th>순손익</th><th>계좌 영향</th></tr></thead><tbody id="trades"><tr><td colspan="9">선정 없음</td></tr></tbody></table></div>\n<h3>종목별 관찰</h3><div class="tablewrap"><table><thead><tr><th>날짜/종목</th><th>바이낸스 1분 자료</th><th>급증 신호</th><th>선행 통과</th><th>가상 청산확정</th><th>오류</th></tr></thead><tbody id="markets"><tr><td colspan="6">검사 전</td></tr></tbody></table></div></section>\n<section class="panel"><h2>④ 판단 기준</h2><p>결과가 <b>최소 100건, 서로 다른 날짜 최소 2주</b> 이상 쌓이고 편도 비용 0.1~0.2% 추가에도 기대값이 양수인지 확인할 때까지 실전 자동 신호로 채택하지 않습니다. 같은 분봉 안에서 손절·익절이 모두 가능한 경우 손절을 우선하여 보수적으로 계산하고, 데이터 누락은 미확정으로 기록합니다.</p></section>\n<script>\n\'use strict\';\nconst $=s=>document.getElementById(s),esc=s=>String(s??\'\').replace(/[&<>"\']/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\nconst num=(v,n=3)=>v===null||v===undefined||!Number.isFinite(Number(v))?\'—\':Number(v).toFixed(n);\nconst today=()=>new Date(Date.now()+9*3600000).toISOString().slice(0,10);\nconst yesterday=()=>new Date(Date.now()+9*3600000-86400000).toISOString().slice(0,10);\n$(\'day\').value=yesterday();$(\'day\').max=yesterday();\nlet state=null,busy=false,paused=false;\nfunction setBusy(x){busy=x;$(\'run\').disabled=x;$(\'pause\').disabled=!x;}\nfunction dates(end,count){let out=[];for(let i=count-1;i>=0;i--){let d=new Date(end+\'T00:00:00Z\');d.setUTCDate(d.getUTCDate()-i);out.push(d.toISOString().slice(0,10));}return out;}\nasync function call(path,body){let res=await fetch(path,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(body)});let r=await res.json().catch(()=>({ok:false,error:\'응답 JSON 오류\'}));if(!res.ok||!r.ok)throw Error(r.error||\'API \'+res.status);return r;}\nfunction cfg(){let fee=Number($(\'fee\').value),slip=Number($(\'slip\').value),hold=Number($(\'hold\').value);let day=$(\'day\').value,dc=Number($(\'days\').value);\n if(!day||day>=today()||![1,3,7,14].includes(dc)||![120,240,480].includes(hold)||[fee,slip].some(x=>!Number.isFinite(x)||x<0||x>.5))throw Error(\'날짜·비용을 확인해 줘\');\n return {days:dates(day,dc),fee,slip,hold,scope:$(\'scope\').value,risk:Number($(\'risk\').value),dailyLoss:Number($(\'dailyLoss\').value)};}\nfunction events(){return state?state.results.flatMap(x=>x.events||[]):[];}\nfunction selectTrades(){if(!state)return {selected:[],days:[]};const list=events().filter(x=>x.comparison===\'BINANCE_LEAD\'&&x.entry_at).sort((a,b)=>a.entry_at.localeCompare(b.entry_at)||a.market.localeCompare(b.market));let selected=[],days=[],globalBusy=\'\';\n for(const date of [...new Set([...state.days,...list.map(e=>e.entry_at.slice(0,10))])].sort()){let count=0,streak=0,equity=100,busyUntil=globalBusy,halt=\'\',perDay=[];\n  for(const e of list.filter(x=>x.entry_at.slice(0,10)===date)){if(halt||count>=4)break;if(busyUntil&&e.entry_at<busyUntil)continue;\n   const pos=Math.min(100,state.risk/Math.abs((100*(.97*(1-(state.fee+state.slip)/100)/(1+(state.fee+state.slip)/100)-1)))*100);\n   const net=e.status===\'READY\'?Number(e.net_pct):null;const account=net===null?null:pos*net/100;\n   let item={...e,position_pct:pos,account_pct:account};selected.push(item);perDay.push(item);count++;\n   if(net===null){halt=\'UNKNOWN_OUTCOME\';break;}\n   equity*=1+account/100;streak=account<0?streak+1:0;\n   busyUntil=e.exit_at||\'9999\';\n   if(streak>=3)halt=\'THREE_LOSSES\';\n   if(equity<=100-state.dailyLoss)halt=\'DAILY_LOSS_LIMIT\';\n  }globalBusy=busyUntil;days.push({date,count,halt,equity_pct:equity-100});\n }\n return {selected,days};}\nfunction render(){if(!state)return;let ev=events(),picked=selectTrades(),done=state.done,total=state.tasks.length;\n $(\'kDone\').textContent=state.results.length+\'/\'+total;$(\'kSignal\').textContent=ev.length;$(\'kLead\').textContent=ev.filter(e=>e.comparison===\'BINANCE_LEAD\').length;$(\'kError\').textContent=state.errors.length+ev.filter(e=>e.status===\'UNKNOWN\').length;\n let ready=picked.selected.filter(x=>x.status===\'READY\');let wins=ready.filter(x=>x.net_pct>0),losses=ready.filter(x=>x.net_pct<=0);\n let average=ready.length?ready.reduce((s,x)=>s+x.net_pct,0)/ready.length:null;\n let totalReturn=picked.days.reduce((s,d)=>s*(1+d.equity_pct/100),1)*100-100;\n $(\'summary\').innerHTML=`<tr><td>${picked.selected.length}</td><td>${wins.length}/${losses.length}</td><td>${ready.length}</td><td class="${average>=0?\'good\':\'bad\'}">${num(average)}%</td><td>${num(average)}%</td><td class="${totalReturn>=0?\'good\':\'bad\'}">${num(totalReturn)}%</td><td>${ready.length>=100?\'통과 여부 검토\':\'미달\'}</td></tr>`;\n $(\'allEvents\').innerHTML=ev.sort((a,b)=>a.signal_at.localeCompare(b.signal_at)||a.market.localeCompare(b.market)).slice(0,120).map(x=>`<tr><td>${esc(x.signal_at+\' \'+x.market)}</td><td>${esc(x.burst_group)}</td><td>${num(x.binance_quote_ratio_1m,2)}x</td><td>${num(x.binance_quote_ratio_5m,2)}x</td><td>${num(x.lead_gap_pct,3)}%p</td><td>${esc(x.comparison||\'미분류\')}</td><td>${num(x.post_1m_bithumb_pct)}%</td><td>${num(x.post_3m_bithumb_pct)}%</td><td>${num(x.post_5m_bithumb_pct)}%</td><td>${num(x.post_10m_bithumb_pct)}%</td></tr>`).join(\'\')||\'<tr><td colspan="10">급증 신호 없음</td></tr>\';\n $(\'trades\').innerHTML=picked.selected.map(x=>`<tr><td>${esc(x.date+\' \'+x.market)}</td><td>${esc(x.signal_type)}</td><td>${num(x.binance_return_5m_pct)}%</td><td>${num(x.bithumb_return_5m_pct)}%</td><td>${num(x.lead_gap_pct)}%p</td><td>${esc(x.exit||x.reason||\'미확정\')}</td><td>${Number(x.tp_count||0)}/4</td><td class="${x.net_pct>=0?\'good\':\'bad\'}">${num(x.net_pct)}%</td><td>${num(x.account_pct)}%</td></tr>`).slice(0,180).join(\'\')||\'<tr><td colspan="9">선정 없음</td></tr>\';\n $(\'markets\').innerHTML=state.results.map(x=>`<tr><td>${esc(x.date+\' \'+x.market)}</td><td>${x.coverage.binance_day_bars}/1440</td><td>${x.events.length}</td><td>${x.events.filter(z=>z.comparison===\'BINANCE_LEAD\').length}</td><td>${x.events.filter(z=>z.status===\'READY\').length}</td><td>${esc(x.coverage.bithumb_error||\'—\')}</td></tr>`).concat((state.missing||[]).map(x=>`<tr><td>${esc(x)}</td><td>—</td><td>—</td><td>—</td><td>—</td><td>동시상장 USDT 현물 미확인 · 연구 대상 제외</td></tr>`)).concat(state.errors.map(x=>`<tr><td>${esc(x.date+\' \'+x.market)}</td><td>—</td><td>—</td><td>—</td><td>—</td><td>${esc(x.error)}</td></tr>`)).slice(0,200).join(\'\')||\'<tr><td colspan="6">결과 없음</td></tr>\';\n $(\'bar\').max=Math.max(total,1);$(\'bar\').value=done;$(\'status\').textContent=`${done}/${total} 종목·날짜 검사 · 급증 신호 ${ev.length}건 (19:45 이후 ${ev.filter(x=>Number(x.signal_at.slice(11,13))*60+Number(x.signal_at.slice(14,16))>=19*60+45).length}건) · 교집합 제외 ${(state.missing||[]).join(\', \')||\'없음\'} · 오류 ${state.errors.length}건`+(state.complete?\' · 완료\':state.errors.length?\' · API 오류로 일부 미완료\':\' · 진행 중\');$(\'csv\').disabled=!state.results.length&&!state.errors.length;\n}\n$(\'pause\').onclick=()=>{paused=true;$(\'status\').textContent=\'진행 중 요청 완료 후 정지\';};\n$(\'run\').onclick=async()=>{if(busy)return;try{let c=cfg();paused=false;setBusy(true);$(\'status\').textContent=\'바이낸스 현물·빗썸 교집합 확인 중…\';let universe=await fetch(\'/api/v2core53/universe\').then(x=>x.json());if(!universe.ok)throw Error(universe.error||\'동시상장 목록 오류\');\n let coins=universe.items;let missing=[];if(c.scope!==\'all\'){let names=(c.scope===\'examples\'?[\'MMT\',\'PIEVERSE\']:$(\'custom\').value.toUpperCase().split(/[\\s,;]+/)).filter(Boolean);coins=coins.filter(x=>names.includes(x.market.replace(\'KRW-\',\'\')));missing=names.filter(n=>!coins.some(x=>x.market===\'KRW-\'+n));if(!coins.length)throw Error(\'선택한 종목에 바이낸스 현물 USDT + 빗썸 KRW 동시상장 거래쌍 없음\');}\n state={...c,done:0,results:[],errors:[],missing,tasks:c.days.flatMap(date=>coins.map(x=>({date,...x}))),complete:false};render();let cursor=0;\n async function worker(){while(!paused&&cursor<state.tasks.length){let task=state.tasks[cursor++];try{let r=await call(\'/api/v2core53/probe\',{market:task.market,symbol:task.binance_symbol,date:task.date,fee:c.fee,slip:c.slip,hold:c.hold});state.results.push(r.report);}catch(e){state.errors.push({...task,error:String(e.message||e)});}state.done++;render();if(!paused&&cursor<state.tasks.length)await new Promise(resolve=>setTimeout(resolve,900));}}\n await Promise.all(Array.from({length:Math.min(1,state.tasks.length)},()=>worker()));state.complete=!paused&&state.done===state.tasks.length&&state.errors.length===0;render();\n }catch(e){$(\'status\').textContent=\'⚠️ \'+String(e.message||e);}finally{setBusy(false);if(state)render();}};\nfunction csvCell(x){let s=x===undefined||x===null?\'\':typeof x===\'object\'?JSON.stringify(x):String(x);if(/^[=+@-]/.test(s)&&!Number.isFinite(Number(s)))s="\'"+s;return \'"\'+s.replaceAll(\'"\',\'""\')+\'"\';}\n$(\'csv\').onclick=()=>{if(!state)return;let selected=selectTrades();let rows=[...state.results.flatMap(x=>[{row_type:\'MARKET_COVERAGE\',date:x.date,market:x.market,...x.coverage},...x.events.map(e=>({row_type:\'BINANCE_LEAD_EVENT\',...e}))]),...selected.selected.map(e=>({row_type:\'SELECTED_PAPER_TRADE\',...e})),...selected.days.map(e=>({row_type:\'DAILY_RISK_SUMMARY\',...e})),...(state.missing||[]).map(symbol=>({row_type:\'NOT_IN_SPOT_UNIVERSE\',market:\'KRW-\'+symbol,reason:\'Binance Spot USDT + Bithumb KRW intersection not found\'})),...state.errors.map(e=>({row_type:\'API_ERROR\',...e}))];\n rows.push({row_type:\'SCAN_STATUS\',version:\'CORE.53.1\',full_day_detection:true,uncapped_events:true,post_1_3_5_10_diagnostic_only:true,completed:state.complete,scan_done:state.done,scan_total:state.tasks.length,fee:state.fee,slip:state.slip,hold:state.hold,scope:state.scope});let cols=[\'row_type\',\'date\',\'market\',\'signal_at\',\'comparison\',\'status\',\'net_pct\',...new Set(rows.flatMap(r=>Object.keys(r)))];cols=[...new Set(cols)];let s=\'\\ufeff\'+[cols.join(\',\'),...rows.map(r=>cols.map(k=>csvCell(r[k])).join(\',\'))].join(\'\\r\\n\');let url=URL.createObjectURL(new Blob([s],{type:\'text/csv;charset=utf-8\'}));let a=document.createElement(\'a\');a.href=url;a.download=`CORE53_1_BINANCE_LEAD_3_5_10_30_${state.days[0]}_${state.days.at(-1)}_${state.scope}_KRW.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),4000);};\n</script></main></body></html>\n'
+CORE_PAGE = '<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>V2 CORE.53.2 LIGHT · 바이낸스 급증 전수·빗썸 반응 연구</title>\n<style>\n:root{color-scheme:dark;--bg:#0b1222;--panel:#18233b;--edge:#33435e;--text:#e9f0ff;--sub:#b8c8e5;--ok:#60e4a0;--bad:#ff9cae}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 system-ui,sans-serif}main{max-width:1110px;margin:0 auto;padding:14px 12px 70px}\nh1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}p{margin:7px 0}.panel{border:1px solid var(--edge);background:var(--panel);border-radius:13px;padding:14px;margin:12px 0}.muted{font-size:12px;color:var(--sub)}\n.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(146px,1fr));gap:9px}.field{display:flex;flex-direction:column;gap:3px}label{font-size:12px;color:var(--sub)}input,select,button{background:#0d172a;color:var(--text);border:1px solid #536780;border-radius:8px;padding:10px;font:inherit;width:100%}button{font-weight:700;background:#416dcf;cursor:pointer}button.alt{background:#293e64}button:disabled{opacity:.45;cursor:default}.buttons{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.buttons button{flex:1;min-width:120px}.stat{border:1px solid #334762;border-radius:10px;padding:10px}.stat strong{font-size:22px;display:block}.good{color:var(--ok)}.bad{color:var(--bad)}a{color:#a7c1ff}table{border-collapse:collapse;width:100%;min-width:740px}th,td{border-bottom:1px solid #334762;font-size:12px;padding:9px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.tablewrap{overflow:auto}.note{background:#101d32;border-radius:9px;padding:12px;margin:8px 0;color:#cfdbef;font-size:12px}progress{width:100%;height:12px}\n@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.panel{padding:11px}main{padding:10px 8px 50px}}\n</style></head><body><main>\n<header><h1>🧪 V2 CORE.53.2 LIGHT · 바이낸스 급증 전수·빗썸 반응 연구</h1><p class="muted">바이낸스 현물 거래대금 급증 전수 기록(24시간) → 빗썸 신호 직전·이후 1·3·5·10분 비교 → 별도 가상 진입 / 자동 주문 없음</p><a href="/">← 기존 스캐너</a></header>\n<section class="panel"><h2>① 새 연구 규칙</h2><p>바이낸스 현물과 빗썸에 동시 상장된 코인을 감시합니다. 바이낸스 <b>1분봉 거래대금 ≥직전20봉의 3배</b> 또는 <b>5분봉 거래대금 ≥직전20개 5분봉의 2배</b>, 공격적 매수 비중 ≥55%, 가격 상승을 연구 후보로 봅니다.</p><p>신호가 마감된 시각에 빗썸 최근 5분 수익률과 비교해 바이낸스가 <b>0.5%p 이상 앞서고</b>, 빗썸은 최근 5분 <b>+1% 초과 상승하지 않은</b> 경우에만 가상 진입을 연구합니다. 실제 선행인지 검증 중인 가설입니다.</p>\n<div class="grid"><div class="note"><b>손절</b><p>-3% (진입가 대비 가격 기준)</p></div><div class="note"><b>익절 4단계</b><p>+3% / 30% · +5% / 30%<br>+10% / 20% · +30% / 20%</p></div><div class="note"><b>본절 스톱</b><p>1차 +3% 청산 후 잔여 70%에 수수료·슬리피지 반영 순본절 스톱 (다음 1분봉부터)</p></div><div class="note"><b>시간 청산</b><p>기본 240분. 목표 미달 잔량은 종료 시 종가 청산 가정</p></div></div>\n<p class="muted">수수료와 슬리피지를 빼고 계좌기대값을 비교합니다. 신호 후 1분을 지연하여 빗썸 시가에 가상 진입합니다. 실제 API 지연·호가체결을 완벽히 재현한 결과는 아닙니다.</p></section>\n<section class="panel"><h2>② 테스트 설정</h2><div class="grid">\n<div class="field"><label>마지막 날짜 (KST, 완료일)</label><input type="date" id="day"></div>\n<div class="field"><label>날짜 수</label><select id="days"><option value="1" selected>1일</option><option value="3">3일</option><option value="7">7일</option><option value="14">14일 (많은 API 요청)</option></select></div>\n<div class="field"><label>검사 범위</label><select id="scope"><option value="examples" selected>MMT · PIEVERSE 우선 연구</option><option value="custom">선택 종목</option><option value="all">전체 동시상장 현물 코인 (시간 오래 걸림)</option></select></div>\n<div class="field"><label>선택 종목 (쉼표 구분)</label><input id="custom" value="MMT,PIEVERSE" placeholder="MMT,PIEVERSE"></div>\n<div class="field"><label>편도 수수료 %</label><input id="fee" type="number" value="0.25" step="0.01" min="0" max="0.5"></div>\n<div class="field"><label>편도 슬리피지 %</label><select id="slip"><option value="0.10">0.10%</option><option value="0.15" selected>0.15%</option><option value="0.20">0.20%</option></select></div>\n<div class="field"><label>관찰 후 강제 청산</label><select id="hold"><option value="120">120분</option><option value="240" selected>240분</option><option value="480">480분</option></select></div>\n<div class="field"><label>거래당 계좌 위험 %</label><select id="risk"><option value="0.5" selected>0.5%</option><option value="1">1.0%</option></select></div>\n<div class="field"><label>일 손실 중단 %</label><select id="dailyLoss"><option value="1">1.0%</option><option value="1.5" selected>1.5%</option><option value="2">2.0%</option></select></div>\n</div><div class="buttons"><button id="run">CORE.53.2 연구 스캔 시작</button><button class="alt" disabled id="pause">중지 요청</button><button class="alt" disabled id="csv">CORE.53.2 CSV 저장</button></div><progress id="bar" value="0" max="1"></progress><p id="status" class="muted">검사 전</p>\n<div class="note"><b>CORE.53.2:</b> 빗썸 1분봉 페이지 누락·5분봉 자료 일치 여부를 진단합니다. 전일 110분부터 준비해 KST 00:00~23:59 모든 급증 신호를 기록합니다. 15분 이내 반복 급증은 같은 에피소드로 묶지만 모두 CSV에 남깁니다. 23:59 신호도 다음 날 1분봉으로 평가하며 다음 날 자료가 없으면 UNKNOWN입니다.</div><div class="note">과거 백테스트는 현재 동시 상장된 코인 목록으로 구성되므로 <b>과거 상장 상태가 달랐던 경우 생존 편향</b>이 남습니다. 1분봉은 짧은 페이지도 끝까지 조회합니다. 비어 있는 분봉은 생성·보간하지 않습니다. 별도의 5분봉 OHLCV 대조는 사후 누락 진단 전용이며 BUY에 사용하지 않습니다. Binance 429/418 요청 제한 시 Retry-After를 준수하며 자동으로 대기합니다. 공유 서버 IP 차단이 길면 작업을 미완료로 기록하고 나중에 다시 검사하세요. Binance 접속이 지역/서버 정책 때문에 막히면 오류를 그대로 표시합니다. 과거 실제 호가 스프레드와 매매충격은 재현하지 못합니다.</div></section>\n<section class="panel"><h2>③ 검사 결과</h2><div class="grid"><div class="stat"><span class="muted">검사 완료</span><strong id="kDone">—</strong></div><div class="stat"><span class="muted">바이낸스 급증 신호</span><strong id="kSignal">—</strong></div><div class="stat"><span class="muted">빗썸 선행 격차 통과</span><strong id="kLead">—</strong></div><div class="stat"><span class="muted">데이터 오류</span><strong id="kError">—</strong></div></div>\n<h3>전체 바이낸스 급증 신호 · 빗썸 후행 반응 (가상 선정과 별개)</h3><p class="muted">직전 마지막 체결가의 지연 분석·5분봉 공백 검증과 신호 이후 1·3·5·10분 상승률은 <b>사후 분석용</b>이며 진입 필터나 사전 예측에 사용되지 않습니다. 전체 신호는 CSV에 기록되고 표에는 앞 120건만 표시됩니다.</p>\n<div class="tablewrap"><table><thead><tr><th>신호 시각 KST / 종목</th><th>에피소드</th><th>바이낸스 1분 배수</th><th>바이낸스 5분 배수</th><th>신호 시 선행격차</th><th>판정</th><th>과거 관측 후행(비체결)</th><th>직전 6분 공백</th><th>5분봉 검증(사후)</th><th>1분 뒤 빗썸</th><th>3분 뒤 빗썸</th><th>5분 뒤 빗썸</th><th>10분 뒤 빗썸</th></tr></thead><tbody id="allEvents"><tr><td colspan="13">검사 전</td></tr></tbody></table></div>\n<h3>연구용 가상 선정 (하루 최대 4회 · 한 번에 1종목 · 연속 3손실 중단)</h3><div class="tablewrap"><table><thead><tr><th>선정</th><th>승 / 패</th><th>수익 확정</th><th>평균 순손익</th><th>기대값</th><th>계좌 누적</th><th>100건 검증</th></tr></thead><tbody id="summary"><tr><td colspan="7">검사 전</td></tr></tbody></table></div>\n<h3>실제 가상 선정 거래</h3><div class="tablewrap"><table><thead><tr><th>날짜/종목</th><th>신호 종류</th><th>바이낸스 5분</th><th>빗썸 5분</th><th>선행 격차</th><th>결과</th><th>익절 단계</th><th>순손익</th><th>계좌 영향</th></tr></thead><tbody id="trades"><tr><td colspan="9">선정 없음</td></tr></tbody></table></div>\n<h3>종목별 관찰</h3><div class="tablewrap"><table><thead><tr><th>날짜/종목</th><th>바이낸스 1분 자료</th><th>급증 신호</th><th>선행 통과</th><th>가상 청산확정</th><th>1분 커서</th><th>5분봉 대조</th><th>오류</th></tr></thead><tbody id="markets"><tr><td colspan="8">검사 전</td></tr></tbody></table></div></section>\n<section class="panel"><h2>④ 판단 기준</h2><p>결과가 <b>최소 100건, 서로 다른 날짜 최소 2주</b> 이상 쌓이고 편도 비용 0.1~0.2% 추가에도 기대값이 양수인지 확인할 때까지 실전 자동 신호로 채택하지 않습니다. 같은 분봉 안에서 손절·익절이 모두 가능한 경우 손절을 우선하여 보수적으로 계산하고, 데이터 누락은 미확정으로 기록합니다.</p></section>\n<script>\n\'use strict\';\nconst $=s=>document.getElementById(s),esc=s=>String(s??\'\').replace(/[&<>"\']/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\nconst num=(v,n=3)=>v===null||v===undefined||!Number.isFinite(Number(v))?\'—\':Number(v).toFixed(n);\nconst today=()=>new Date(Date.now()+9*3600000).toISOString().slice(0,10);\nconst yesterday=()=>new Date(Date.now()+9*3600000-86400000).toISOString().slice(0,10);\n$(\'day\').value=yesterday();$(\'day\').max=yesterday();\nlet state=null,busy=false,paused=false;\nfunction setBusy(x){busy=x;$(\'run\').disabled=x;$(\'pause\').disabled=!x;}\nfunction dates(end,count){let out=[];for(let i=count-1;i>=0;i--){let d=new Date(end+\'T00:00:00Z\');d.setUTCDate(d.getUTCDate()-i);out.push(d.toISOString().slice(0,10));}return out;}\nasync function call(path,body){let res=await fetch(path,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(body)});let r=await res.json().catch(()=>({ok:false,error:\'응답 JSON 오류\'}));if(!res.ok||!r.ok)throw Error(r.error||\'API \'+res.status);return r;}\nfunction cfg(){let fee=Number($(\'fee\').value),slip=Number($(\'slip\').value),hold=Number($(\'hold\').value);let day=$(\'day\').value,dc=Number($(\'days\').value);\n if(!day||day>=today()||![1,3,7,14].includes(dc)||![120,240,480].includes(hold)||[fee,slip].some(x=>!Number.isFinite(x)||x<0||x>.5))throw Error(\'날짜·비용을 확인해 줘\');\n return {days:dates(day,dc),fee,slip,hold,scope:$(\'scope\').value,risk:Number($(\'risk\').value),dailyLoss:Number($(\'dailyLoss\').value)};}\nfunction events(){return state?state.results.flatMap(x=>x.events||[]):[];}\nfunction selectTrades(){if(!state)return {selected:[],days:[]};const list=events().filter(x=>x.comparison===\'BINANCE_LEAD\'&&x.entry_at).sort((a,b)=>a.entry_at.localeCompare(b.entry_at)||a.market.localeCompare(b.market));let selected=[],days=[],globalBusy=\'\';\n for(const date of [...new Set([...state.days,...list.map(e=>e.entry_at.slice(0,10))])].sort()){let count=0,streak=0,equity=100,busyUntil=globalBusy,halt=\'\',perDay=[];\n  for(const e of list.filter(x=>x.entry_at.slice(0,10)===date)){if(halt||count>=4)break;if(busyUntil&&e.entry_at<busyUntil)continue;\n   const pos=Math.min(100,state.risk/Math.abs((100*(.97*(1-(state.fee+state.slip)/100)/(1+(state.fee+state.slip)/100)-1)))*100);\n   const net=e.status===\'READY\'?Number(e.net_pct):null;const account=net===null?null:pos*net/100;\n   let item={...e,position_pct:pos,account_pct:account};selected.push(item);perDay.push(item);count++;\n   if(net===null){halt=\'UNKNOWN_OUTCOME\';break;}\n   equity*=1+account/100;streak=account<0?streak+1:0;\n   busyUntil=e.exit_at||\'9999\';\n   if(streak>=3)halt=\'THREE_LOSSES\';\n   if(equity<=100-state.dailyLoss)halt=\'DAILY_LOSS_LIMIT\';\n  }globalBusy=busyUntil;days.push({date,count,halt,equity_pct:equity-100});\n }\n return {selected,days};}\nfunction render(){if(!state)return;let ev=events(),picked=selectTrades(),done=state.done,total=state.tasks.length;\n $(\'kDone\').textContent=state.results.length+\'/\'+total;$(\'kSignal\').textContent=ev.length;$(\'kLead\').textContent=ev.filter(e=>e.comparison===\'BINANCE_LEAD\').length;$(\'kError\').textContent=state.errors.length+ev.filter(e=>e.status===\'UNKNOWN\').length;\n let ready=picked.selected.filter(x=>x.status===\'READY\');let wins=ready.filter(x=>x.net_pct>0),losses=ready.filter(x=>x.net_pct<=0);\n let average=ready.length?ready.reduce((s,x)=>s+x.net_pct,0)/ready.length:null;\n let totalReturn=picked.days.reduce((s,d)=>s*(1+d.equity_pct/100),1)*100-100;\n $(\'summary\').innerHTML=`<tr><td>${picked.selected.length}</td><td>${wins.length}/${losses.length}</td><td>${ready.length}</td><td class="${average>=0?\'good\':\'bad\'}">${num(average)}%</td><td>${num(average)}%</td><td class="${totalReturn>=0?\'good\':\'bad\'}">${num(totalReturn)}%</td><td>${ready.length>=100?\'통과 여부 검토\':\'미달\'}</td></tr>`;\n $(\'allEvents\').innerHTML=ev.sort((a,b)=>a.signal_at.localeCompare(b.signal_at)||a.market.localeCompare(b.market)).slice(0,120).map(x=>`<tr><td>${esc(x.signal_at+\' \'+x.market)}</td><td>${esc(x.burst_group)}</td><td>${num(x.binance_quote_ratio_1m,2)}x</td><td>${num(x.binance_quote_ratio_5m,2)}x</td><td>${num(x.lead_gap_pct,3)}%p</td><td>${esc(x.comparison||\'미분류\')}</td><td>${num(x.sparse_binance_gap_pct)}%p / ${num(x.sparse_latest_stale_min,0)}분 지연</td><td>${Number(x.pre_missing_1m_count||0)}분</td><td>${esc(x.pre_5m_audit||\'—\')}</td><td>${num(x.post_1m_bithumb_pct)}%</td><td>${num(x.post_3m_bithumb_pct)}%</td><td>${num(x.post_5m_bithumb_pct)}%</td><td>${num(x.post_10m_bithumb_pct)}%</td></tr>`).join(\'\')||\'<tr><td colspan="13">급증 신호 없음</td></tr>\';\n $(\'trades\').innerHTML=picked.selected.map(x=>`<tr><td>${esc(x.date+\' \'+x.market)}</td><td>${esc(x.signal_type)}</td><td>${num(x.binance_return_5m_pct)}%</td><td>${num(x.bithumb_return_5m_pct)}%</td><td>${num(x.lead_gap_pct)}%p</td><td>${esc(x.exit||x.reason||\'미확정\')}</td><td>${Number(x.tp_count||0)}/4</td><td class="${x.net_pct>=0?\'good\':\'bad\'}">${num(x.net_pct)}%</td><td>${num(x.account_pct)}%</td></tr>`).slice(0,180).join(\'\')||\'<tr><td colspan="9">선정 없음</td></tr>\';\n $(\'markets\').innerHTML=state.results.map(x=>`<tr><td>${esc(x.date+\' \'+x.market)}</td><td>${x.coverage.binance_day_bars}/1440</td><td>${x.events.length}</td><td>${x.events.filter(z=>z.comparison===\'BINANCE_LEAD\').length}</td><td>${x.events.filter(z=>z.status===\'READY\').length}</td><td>${esc(x.coverage.bithumb_1m_cursor_status||\'—\')}</td><td>${esc(\'5분 \'+(x.coverage.bithumb_5m_bars??0)+\'개 / 진단 \'+(x.coverage.pre_gap_no_trade_supported??0)+\'·불일치 \'+(x.coverage.pre_gap_source_mismatch??0))}</td><td>${esc(x.coverage.bithumb_error||x.coverage.bithumb_5m_audit_error||\'—\')}</td></tr>`).concat((state.missing||[]).map(x=>`<tr><td>${esc(x)}</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>동시상장 USDT 현물 미확인 · 연구 대상 제외</td></tr>`)).concat(state.errors.map(x=>`<tr><td>${esc(x.date+\' \'+x.market)}</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>${esc(x.error)}</td></tr>`)).slice(0,200).join(\'\')||\'<tr><td colspan="8">결과 없음</td></tr>\';\n $(\'bar\').max=Math.max(total,1);$(\'bar\').value=done;$(\'status\').textContent=`${done}/${total} 종목·날짜 검사 · 급증 신호 ${ev.length}건 (19:45 이후 ${ev.filter(x=>Number(x.signal_at.slice(11,13))*60+Number(x.signal_at.slice(14,16))>=19*60+45).length}건) · 교집합 제외 ${(state.missing||[]).join(\', \')||\'없음\'} · 오류 ${state.errors.length}건`+(state.complete?\' · 완료\':state.errors.length?\' · API 오류로 일부 미완료\':\' · 진행 중\');$(\'csv\').disabled=!state.results.length&&!state.errors.length;\n}\n$(\'pause\').onclick=()=>{paused=true;$(\'status\').textContent=\'진행 중 요청 완료 후 정지\';};\n$(\'run\').onclick=async()=>{if(busy)return;try{let c=cfg();paused=false;setBusy(true);$(\'status\').textContent=\'바이낸스 현물·빗썸 교집합 확인 중…\';let universe=await fetch(\'/api/v2core53/universe\').then(x=>x.json());if(!universe.ok)throw Error(universe.error||\'동시상장 목록 오류\');\n let coins=universe.items;let missing=[];if(c.scope!==\'all\'){let names=(c.scope===\'examples\'?[\'MMT\',\'PIEVERSE\']:$(\'custom\').value.toUpperCase().split(/[\\s,;]+/)).filter(Boolean);coins=coins.filter(x=>names.includes(x.market.replace(\'KRW-\',\'\')));missing=names.filter(n=>!coins.some(x=>x.market===\'KRW-\'+n));if(!coins.length)throw Error(\'선택한 종목에 바이낸스 현물 USDT + 빗썸 KRW 동시상장 거래쌍 없음\');}\n state={...c,done:0,results:[],errors:[],missing,tasks:c.days.flatMap(date=>coins.map(x=>({date,...x}))),complete:false};render();let cursor=0;\n async function worker(){while(!paused&&cursor<state.tasks.length){let task=state.tasks[cursor++];try{let r=await call(\'/api/v2core53/probe\',{market:task.market,symbol:task.binance_symbol,date:task.date,fee:c.fee,slip:c.slip,hold:c.hold});state.results.push(r.report);}catch(e){state.errors.push({...task,error:String(e.message||e)});}state.done++;render();if(!paused&&cursor<state.tasks.length)await new Promise(resolve=>setTimeout(resolve,900));}}\n await Promise.all(Array.from({length:Math.min(1,state.tasks.length)},()=>worker()));state.complete=!paused&&state.done===state.tasks.length&&state.errors.length===0;render();\n }catch(e){$(\'status\').textContent=\'⚠️ \'+String(e.message||e);}finally{setBusy(false);if(state)render();}};\nfunction csvCell(x){let s=x===undefined||x===null?\'\':typeof x===\'object\'?JSON.stringify(x):String(x);if(/^[=+@-]/.test(s)&&!Number.isFinite(Number(s)))s="\'"+s;return \'"\'+s.replaceAll(\'"\',\'""\')+\'"\';}\n$(\'csv\').onclick=()=>{if(!state)return;let selected=selectTrades();let rows=[...state.results.flatMap(x=>[{row_type:\'MARKET_COVERAGE\',date:x.date,market:x.market,...x.coverage},...x.events.map(e=>({row_type:\'BINANCE_LEAD_EVENT\',...e}))]),...selected.selected.map(e=>({row_type:\'SELECTED_PAPER_TRADE\',...e})),...selected.days.map(e=>({row_type:\'DAILY_RISK_SUMMARY\',...e})),...(state.missing||[]).map(symbol=>({row_type:\'NOT_IN_SPOT_UNIVERSE\',market:\'KRW-\'+symbol,reason:\'Binance Spot USDT + Bithumb KRW intersection not found\'})),...state.errors.map(e=>({row_type:\'API_ERROR\',...e}))];\n rows.push({row_type:\'SCAN_STATUS\',version:\'CORE.53.2\',bithumb_5m_audit_post_hoc_only:true,bithumb_1m_never_backfilled:true,full_day_detection:true,uncapped_events:true,post_1_3_5_10_diagnostic_only:true,completed:state.complete,scan_done:state.done,scan_total:state.tasks.length,fee:state.fee,slip:state.slip,hold:state.hold,scope:state.scope});let cols=[\'row_type\',\'date\',\'market\',\'signal_at\',\'comparison\',\'status\',\'net_pct\',...new Set(rows.flatMap(r=>Object.keys(r)))];cols=[...new Set(cols)];let s=\'\\ufeff\'+[cols.join(\',\'),...rows.map(r=>cols.map(k=>csvCell(r[k])).join(\',\'))].join(\'\\r\\n\');let url=URL.createObjectURL(new Blob([s],{type:\'text/csv;charset=utf-8\'}));let a=document.createElement(\'a\');a.href=url;a.download=`CORE53_2_BINANCE_LEAD_3_5_10_30_${state.days[0]}_${state.days.at(-1)}_${state.scope}_KRW.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),4000);};\n</script></main></body></html>\n'
 
 # CORE.42 higher-timeframe specification: restored from CORE.46.
 # Used only for completed-candle D1/H4/H1 diagnostics, NOT BUY filtering.
@@ -1977,7 +2135,7 @@ def register_daytrade_review(app,deps):
                 with lock:core53_universe_cache.update(at=time.monotonic(),items=pairs)
             if not any(x['market']==market and x['binance_symbol']==symbol for x in pairs):
                 raise ValueError('현재 동시상장 바이낸스 현물/빗썸 마켓에 없는 심볼')
-            key=('CORE53_FULLDAY',cfg['day'],market,symbol,cfg['fee'],cfg['slip'],hold)
+            key=('CORE53_2_FULLDAY',cfg['day'],market,symbol,cfg['fee'],cfg['slip'],hold)
             with lock:cached=cache['results'].get(key)
             if cached is not None and time.monotonic()-cached[0]<1800:
                 return jsonify(ok=True,version=VERSION,cached=True,report=cached[1])
