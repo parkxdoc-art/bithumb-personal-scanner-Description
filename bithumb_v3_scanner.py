@@ -1,4 +1,4 @@
-"""BITHUMB V3.5 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
+"""BITHUMB V3.6 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
 
 필요: pip install requests
 실행: python bithumb_v3_scanner.py  -> http://127.0.0.1:8080
@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-VERSION = "V3.5"
+VERSION = "V3.6"
 BASE = "https://api.bithumb.com/v1"
 KST = timezone(timedelta(hours=9))
 BUSY = threading.Lock()
@@ -199,7 +199,7 @@ def number(query, key, default, lo, hi, integer=False):
 
 @dataclass(frozen=True)
 class Settings:
-    strategy: str = "trend"
+    strategy: str = "flow"
     tf: int = 60
     count: int = 40
     days: int = 15
@@ -220,12 +220,12 @@ class Settings:
 
     @staticmethod
     def from_q(q):
-        st = q.get("st", ["trend"])[0]
-        if st not in ("pullback", "trend"):
-            st = "pullback"
-        tf = number(q, "tf", (60 if st == "trend" else 15), 5, 240, True)
-        if tf not in VALID_TF or (st == "trend" and tf not in (60, 240)) or (st == "pullback" and tf not in (5, 15, 60)):
-            tf = 60 if st == "trend" else 15
+        st = q.get("st", ["flow"])[0]
+        if st not in ("pullback", "trend", "flow"):
+            st = "flow"
+        tf = number(q, "tf", (60 if st in ("trend", "flow") else 15), 5, 240, True)
+        if tf not in VALID_TF or (st in ("trend", "flow") and tf not in (60, 240)) or (st == "pullback" and tf not in (5, 15, 60)):
+            tf = 60 if st in ("trend", "flow") else 15
         flow = q.get("of", ["weak"])[0]
         if flow not in ("off", "weak", "strong"):
             flow = "weak"
@@ -242,7 +242,7 @@ class Settings:
             be_r=number(q, "be", 0, 0, 5),
             btc=q.get("btc", ["off"])[0] == "on",
             max_positions=number(q, "maxpos", 1, 1, 5, True),
-            max_trades_day=number(q, "maxday", (2 if st == "trend" else 4), 1, 4, True),
+            max_trades_day=number(q, "maxday", (2 if st in ("trend", "flow") else 4), 1, 4, True),
             rs=number(q, "rs", 0, 0, 1), rs_days=number(q, "rsd", 7, 1, 14, True),
         )
 
@@ -289,7 +289,10 @@ def universe(cfg):
                         continue
             rows.sort(key=lambda x: x["turnover"], reverse=True)
             MARKET_CACHE.update(at=time.monotonic(), markets=rows)
-    eligible = [x for x in rows if x["turnover"] >= cfg.turnover_min]
+    # 새 거래대금 반응 연구는 BTC(상대강도 비교 기준)와 스테이블코인을 매매 대상에서 제외한다.
+    excluded = {"BTC", "USDT", "USDC", "DAI", "FDUSD", "TUSD", "PYUSD", "USD1", "USDD", "USDE"} if cfg.strategy == "flow" else set()
+    eligible = [x for x in rows if x["turnover"] >= cfg.turnover_min
+                and x["market"].split("-",1)[-1] not in excluded]
     return (eligible[:cfg.count] if cfg.count else eligible), len(eligible)
 
 
@@ -383,8 +386,8 @@ def enrich(bars, tf):
     """
     alpha50, alpha200 = 2/51, 2/201
     ema50 = ema200 = None
-    atr_q, vol_q, turn_q = deque(), deque(), deque()
-    atr_sum = vol_sum = turn_sum = 0.0
+    atr_q, vol_q, turn_q, turn20_q = deque(), deque(), deque(), deque()
+    atr_sum = vol_sum = turn_sum = turn20_sum = 0.0
     turn_window = 1440 // tf
     previous = None
     run = 0
@@ -393,8 +396,8 @@ def enrich(bars, tf):
         if not contiguous:
             run = 0
             ema50=ema200=b["c"]
-            atr_q.clear();vol_q.clear();turn_q.clear()
-            atr_sum=vol_sum=turn_sum=0.0
+            atr_q.clear();vol_q.clear();turn_q.clear();turn20_q.clear()
+            atr_sum=vol_sum=turn_sum=turn20_sum=0.0
         else:
             run += 1
             ema50=alpha50*b["c"]+(1-alpha50)*ema50
@@ -402,12 +405,15 @@ def enrich(bars, tf):
         old_close=previous["c"] if contiguous else b["c"]
         tr=max(b["h"]-b["l"],abs(b["h"]-old_close),abs(b["l"]-old_close))
         b["volavg"] = vol_sum/20 if len(vol_q)>=20 else None
+        b["turnavg20"] = turn20_sum/20 if len(turn20_q)>=20 else None
         b["turn24"] = turn_sum + b["turn"] if len(turn_q)>=turn_window-1 else None
         atr_q.append(tr);atr_sum+=tr
         if len(atr_q)>14:atr_sum-=atr_q.popleft()
         b["atr"] = atr_sum/14 if len(atr_q)>=14 else None
         vol_q.append(b["v"]);vol_sum+=b["v"]
         if len(vol_q)>20:vol_sum-=vol_q.popleft()
+        turn20_q.append(b["turn"]);turn20_sum+=b["turn"]
+        if len(turn20_q)>20:turn20_sum-=turn20_q.popleft()
         turn_q.append(b["turn"]);turn_sum+=b["turn"]
         if len(turn_q)>turn_window-1:turn_sum-=turn_q.popleft()
         b["ema50"]=ema50 if run>=50 else None
@@ -420,7 +426,7 @@ def enrich(bars, tf):
 
 def min_history(c):
     # 검증용 워밍업: 60분 추세는 EMA200, 눌림은 EMA50, RS 설정이 있으면 별도 창 보장
-    return max((220 if c.strategy == "trend" else 95), c.rs_days * 1440 // c.tf + 22 if c.rs else 0)
+    return max((220 if c.strategy == "trend" else (80 if c.strategy == "flow" else 95)), c.rs_days * 1440 // c.tf + 22 if c.rs and c.strategy=="trend" else 0)
 
 
 def load_series(markets, cfg, days=None, progress=None):
@@ -938,6 +944,8 @@ def simple_buy_ratio(market):
 
 
 def scan(cfg, progress=None):
+    if cfg.strategy=="flow":
+        return flow_scan(cfg,progress)
     if progress: progress("거래대금 상위 마켓 조회", 3, 0, 0, 0)
     chosen,eligible=universe(cfg)
     if progress:progress("검사 마켓 확정", 5, 0, len(chosen), 0)
@@ -1212,7 +1220,337 @@ def compare_portfolios(base_events, retest_events, cfg, cut_time, btc_map=None):
     return comparison,variant_trades
 
 
+
+# ================= V3.6 신규 독립 가설: 거래대금 급증 -> 가격 유지 -> 회복 =================
+# 과거 실패한 'EMA200 상승·고점 돌파'를 조건에 포함하지 않는다.
+FLOW_RULES = {"turnover_burst_min": 2.5, "historical_24h_krw_min": 500_000_000,
+              "close_location_min": 0.75, "max_burst_body_pct": 12.0,
+              "consolidation_bars": [1, 3], "max_drawdown_from_burst_close_pct": 1.5,
+              "relative_to_btc_24h_pp": 2.0, "stop_buffer_atr": 0.25,
+              "risk_min_pct": 0.7, "risk_max_pct": 6.0,
+              "target_r": 2.0, "hold_hours": 24, "max_daily_trades": 2}
+
+
+def flow_btc_reference(rows, tf):
+    """BTC 24시간 수익률은 같은 시각까지 확정된 과거 봉만 사용."""
+    n = 1440 // tf
+    ref = {}
+    for i in range(n, len(rows)):
+        b = rows[i]
+        if b["run"] < n or rows[i-n]["c"] <= 0:
+            continue
+        r = 100*(b["c"]/rows[i-n]["c"]-1)
+        ref[b["t"]] = {"ret24_pct":r, "up24":r>0}
+    return ref
+
+
+def flow_relative(bars, i, btc_ref, tf):
+    n = 1440 // tf
+    if i < n or bars[i]["run"] < n or bars[i-n]["c"] <= 0:
+        return None
+    b = btc_ref.get(bars[i]["t"])
+    if b is None:
+        return None
+    coin = 100*(bars[i]["c"]/bars[i-n]["c"]-1)
+    return {"coin_24h_pct":round(coin,3), "btc_24h_pct":round(b["ret24_pct"],3),
+            "relative_pp":round(coin-b["ret24_pct"],3), "btc_up24":b["up24"]}
+
+
+def flow_surge(bars, k, cfg):
+    """급증봉 k의 완료 당시 자료만 사용; 기준 거래대금은 20개 직전 봉."""
+    b=bars[k]
+    avg=b.get("turnavg20")
+    if b.get("run",0)<60 or not avg or avg<=0 or not b.get("atr"):
+        return None
+    if b.get("turn24") is None or b["turn24"] < max(cfg.turnover_min, FLOW_RULES["historical_24h_krw_min"]):
+        return None
+    ratio=b["turn"]/avg
+    span=b["h"]-b["l"]
+    loc=(b["c"]-b["l"])/span if span>0 else 0
+    if ratio < FLOW_RULES["turnover_burst_min"] or loc < .75 or b["c"]<=b["o"]:
+        return None
+    if b["c"] / b["o"] > 1.12:  # 단일 봉 +12% 초과 추격 금지
+        return None
+    return {"turnover_ratio":round(ratio,3), "close_location":round(loc,3),
+            "surge_turn_krw":round(b["turn"]), "historical_24h_turn_krw":round(b["turn24"]),
+            "burst_close":b["c"], "burst_low":b["l"]}
+
+
+def flow_confirmation(bars, k, tf):
+    """폭증 후 1~3봉의 거래대금 둔화와 회복 양봉. 모든 봉이 마감되어야 함."""
+    b=bars[k]
+    step=timedelta(minutes=tf) if k+1<len(bars) else None
+    if step is None:
+        return None
+    # 확인 봉 j는 2번째 이후 (최소 한 개 눌림/횡보 봉 확보)
+    for j in range(k+2,min(k+5,len(bars))):
+        seq=bars[k+1:j]
+        conf=bars[j]
+        if any(bars[x]["t"]-bars[x-1]["t"]!=step for x in range(k+1,j+1)):
+            break
+        lows=[x["l"] for x in seq]
+        if not lows or min(lows) < b["l"]-0.35*b["atr"]:
+            break
+        if min(x["c"] for x in seq) < b["c"]*.985:
+            break
+        if not any(x["turn"] < b["turn"]*.8 for x in seq):
+            continue
+        if not (conf["c"]>conf["o"] and conf["c"]>bars[j-1]["c"] and conf["c"]>=b["c"]*.99):
+            continue
+        if conf["c"]>b["c"]+1.5*b["atr"]:
+            continue
+        return j,min(lows+[conf["l"]])
+    return None
+
+
+def simulate_flow(bars, idx, stop0, cfg):
+    """완료봉 신호 뒤 다음 시가; 같은 봉의 손절/목표 동시 접촉은 손절 우선.
+    기간 끝까지 24시간 확보 불가 또는 캔들 누락이면 UNKNOWN 처리.
+    """
+    if idx>=len(bars):
+        return {"status":"UNKNOWN", "why":"진입 봉 부족"}
+    entry=bars[idx]["o"]
+    if entry<=0 or stop0<=0 or stop0>=entry:
+        return None
+    risk_pct=100*(entry-stop0)/entry
+    if not (FLOW_RULES["risk_min_pct"] <= risk_pct <= FLOW_RULES["risk_max_pct"]):
+        return None
+    target=entry+2*(entry-stop0)
+    limit=max(1,int(FLOW_RULES["hold_hours"]*60/cfg.tf))
+    high=entry;low=entry
+    end=min(idx+limit,len(bars))
+    def finish(j,px,reason):
+        gross,net=calc_outcome(entry,[(1.0,px)],cfg.fee)
+        return {"status":"CLOSED", "entry_at":bars[idx]["t"].isoformat(),
+                "exit_at":(bars[j]["t"]+timedelta(minutes=cfg.tf)).isoformat(),
+                "exit_price":px,"price":entry,"stop":stop0,"tp":target,
+                "gross_pct":round(100*gross,4),"net_pct":round(100*net,4),
+                "risk_pct":round(risk_pct,3),"why":reason,
+                "mfe_pct":round(100*(high/entry-1),3),"mae_pct":round(100*(low/entry-1),3)}
+    for j in range(idx,end):
+        b=bars[j]
+        if j>idx and b["t"]-bars[j-1]["t"]!=timedelta(minutes=cfg.tf):
+            return {"status":"UNKNOWN", "entry_at":bars[idx]["t"].isoformat(),"why":"보유 중 캔들 누락"}
+        high=max(high,b["h"]);low=min(low,b["l"])
+        if b["l"]<=stop0:
+            return finish(j,min(stop0,b["o"]),"구조 손절")
+        if b["h"]>=target:
+            return finish(j,max(target,b["o"]),"2R 목표")
+    if idx+limit>len(bars):
+        return {"status":"UNKNOWN","entry_at":bars[idx]["t"].isoformat(),"why":"미래 24시간 봉 부족"}
+    return finish(end-1,bars[end-1]["c"],"24시간 종료")
+
+
+def flow_events(market,bars,cfg,btc_ref,cutoff=None,live=False):
+    """주어진 시장의 3군 후보. 시장내 거래 선택은 이후 동시 보유/일 2회 규칙 적용.
+    live=True일 때도 마지막 완료봉의 신호만 노출, 미완성 봉 결과는 이용하지 않음.
+    """
+    events={"SURGE_2":[],"HOLD_2":[],"HOLD_RS_2":[],"HOLD_BTC_2":[]}
+    watch=[]
+    n=len(bars)
+    step=timedelta(minutes=cfg.tf)
+    for k in range(65,n):
+        if k%1500==0:ensure_active()
+        burst=flow_surge(bars,k,cfg)
+        if not burst:continue
+        now=bars[k]
+        sr=flow_relative(bars,k,btc_ref,cfg.tf)
+        if not live and k+1<n and bars[k+1]["t"]-now["t"]==step:
+            if cutoff is None or bars[k+1]["t"]>=cutoff:
+                stop=now["l"]-0.25*now["atr"]
+                outcome=simulate_flow(bars,k+1,stop,cfg)
+                if outcome:
+                    ev={"market":market,"strategy":"flow","rule":"SURGE_2",
+                        "signal_at":now["t"].isoformat(),"rank":0, "score":0,
+                        "turnover_ratio":burst["turnover_ratio"],"relative_pp":sr["relative_pp"] if sr else None,
+                        "historical_24h_turn_krw":burst["historical_24h_turn_krw"],
+                        "signal_close":now["c"],"signal_index":k, **outcome}
+                    events["SURGE_2"].append(ev)
+        confirm=flow_confirmation(bars,k,cfg.tf)
+        if not confirm:
+            if live and k>=n-3:
+                watch.append({"market":market,"status":"거래대금 급증 후 회복 확인 대기",
+                              "box":now["c"],"price":bars[-1]["c"]})
+            continue
+        j,retest_low=confirm
+        confirmed=bars[j]
+        rs=flow_relative(bars,j,btc_ref,cfg.tf)
+        # 확인 신호 k+1...j에 존재하는 캔들만 사용; 다음 봉 시가는 진입가 계산에만 사용
+        if live:
+            if j != n-1:continue
+            price=confirmed["c"]
+            stop=min(retest_low,now["l"])-.25*now["atr"]
+            if not (stop>0 and FLOW_RULES["risk_min_pct"] <= 100*(price-stop)/price <= FLOW_RULES["risk_max_pct"]):
+                continue
+            if rs is None or rs["relative_pp"]<2:
+                watch.append({"market":market,"status":"상대강도 기준 미충족",
+                              "box":confirmed["c"],"price":price})
+                continue
+            events["HOLD_RS_2"].append({"market":market,"strategy":"flow", "signal_at":confirmed["t"].isoformat(),
+                "price":price,"stop":stop,"tp":price+2*(price-stop),"risk_pct":round(100*(price-stop)/price,2),
+                "turnover_24h":burst["historical_24h_turn_krw"],
+                "context":{"box":now["c"],"volume_ratio":burst["turnover_ratio"]},
+                "score":{"total":None,"volume":min(100,int(100*burst["turnover_ratio"]/4)),
+                         "structure":None,"timing":None,"trend":None,"setup":None,"entry":None,"safety":None,
+                         "pressure":None},
+                "why":f"거래대금 {burst['turnover_ratio']:.2f}배 급증 뒤 1~3봉 가격 유지·재상승을 확인했어요. BTC 대비 24시간 상대강도 {rs['relative_pp']:+.2f}%p. 진입은 다음 봉 시가를 기다려야 하며 실제 체결가는 미확정입니다."})
+            continue
+        if j+1>=n or bars[j+1]["t"]-confirmed["t"]!=step:
+            continue
+        if cutoff is not None and bars[j+1]["t"]<cutoff:
+            continue
+        stop=min(retest_low,now["l"])-.25*now["atr"]
+        outcome=simulate_flow(bars,j+1,stop,cfg)
+        if not outcome:
+            continue
+        common={"market":market,"strategy":"flow","signal_at":confirmed["t"].isoformat(),
+                "turnover_ratio":burst["turnover_ratio"],"close_location":burst["close_location"],
+                "historical_24h_turn_krw":burst["historical_24h_turn_krw"],
+                "signal_close":confirmed["c"],"relative_pp":(rs["relative_pp"] if rs else None),
+                "coin24_pct":(rs["coin_24h_pct"] if rs else None),
+                "btc24_pct":(rs["btc_24h_pct"] if rs else None),
+                "btc_positive":(rs["btc_up24"] if rs else None),
+                "surge_at":now["t"].isoformat(),**outcome}
+        for key,eligible in (("HOLD_2",True),("HOLD_RS_2",rs is not None and rs["relative_pp"]>=2),
+                             ("HOLD_BTC_2",rs is not None and rs["relative_pp"]>=2 and rs["btc_up24"])):
+            if eligible:events[key].append({**common,"rule":key})
+    return events,watch
+
+
+def _flow_verdict(comp,coverage_n,requested_n):
+    coverage = coverage_n/max(1,requested_n)
+    if coverage < .80:
+        return {"status":"DATA_INCOMPLETE","message":"요청 기간 전체를 확보한 종목 비율이 80% 미만입니다. 판단 불가"}
+    main=next(x for x in comp if x["key"]=="HOLD_RS_2")
+    if main["train"]["n"]<20 or main["test"]["n"]<10:
+        return {"status":"INSUFFICIENT","message":"확정 표본이 부족합니다. 이 전략을 채택하지 마세요"}
+    if (main["train"]["avg_net"]>0 and main["test"]["avg_net"]>0
+        and main["test_no_top2"]["avg_net"] is not None and main["test_no_top2"]["avg_net"]>0):
+        return {"status":"RESEARCH_ONLY","message":"사전 기준 통과. 외부 기간/당시 종목 구성에서 재검증 전에는 실전 금지"}
+    return {"status":"REJECT","message":"사전에 고정한 학습·검증 기준 미통과. 이 가설을 실전 진입으로 채택하지 않습니다"}
+
+
+def flow_backtest(cfg,progress=None):
+    """신규 독립 연구판. 동일 역사 구간에서 급증 즉시 vs 유지 vs 상대강도 보수적 비교."""
+    pre=validate_workload(cfg,cfg.count or 500)
+    if pre and "error" in pre and "초과" in pre["error"]:return pre
+    if progress: progress("신규 가설·데이터 범위 확인",2,0,0,0)
+    chosen,eligible=universe(cfg)
+    pre=validate_workload(cfg,len(chosen))
+    if pre:return pre
+    if not chosen:return {"error":"유효 거래대금 조건을 통과한 코인이 없습니다"}
+    need=math.ceil(cfg.days*1440/cfg.tf)+min_history(cfg)+4
+    if progress:progress("BTC 상대강도 기준 수집",4,0,len(chosen),0)
+    try:
+        bitcoin=complete(enrich(candles("KRW-BTC",cfg.tf,need),cfg.tf),cfg.tf)
+        btc_ref=flow_btc_reference(bitcoin,cfg.tf)
+        if len(btc_ref)<24:return {"error":"BTC 과거 데이터 부족: 상대강도를 계산할 수 없습니다"}
+    except Exception as exc:
+        return {"error":f"BTC 비교 기준 수집 실패(검사 중단): {exc}"}
+    start=kst_now()-timedelta(days=cfg.days)
+    end=kst_now()
+    cut=end-timedelta(days=cfg.days*.3)
+    errors=[];coverage={};all_events={x:[] for x in ("SURGE_2","HOLD_2","HOLD_RS_2","HOLD_BTC_2")}
+    order={x["market"]:i for i,x in enumerate(chosen)}
+    size=4 if need>=10000 else 8 if need>=5000 else 12
+    processed=0
+    for begin in range(0,len(chosen),size):
+        ensure_active()
+        batch=chosen[begin:begin+size]
+        def track(m,d,total,e):
+            if progress:progress(f"과거 봉 수집 {m}",5+int(80*(processed+d)/len(chosen)),processed+d,len(chosen),len(errors)+e)
+        data,errs=load_series(batch,cfg,progress=track)
+        errors.extend(errs)
+        for market,bars in data.items():
+            ensure_active()
+            rows=complete(bars,cfg.tf)
+            if not rows:continue
+            complete_start=rows[0]["t"]
+            is_full=complete_start<=start-timedelta(minutes=cfg.tf*min_history(cfg))
+            coverage[market]={"first_at":complete_start.isoformat(), "last_at":rows[-1]["t"].isoformat(),
+                              "full_period":is_full,"observed":len(rows),
+                              "gaps":sum(rows[i]["t"]-rows[i-1]["t"]!=timedelta(minutes=cfg.tf) for i in range(1,len(rows)))}
+            variants,_=flow_events(market,rows,cfg,btc_ref,cutoff=start)
+            for key,xs in variants.items():
+                for x in xs:x["rank"]=order.get(market,999)
+                all_events[key].extend(xs)
+        processed+=len(batch)
+        if progress:progress(f"거래대금·회복 신호 정리 {processed}/{len(chosen)}",5+int(88*processed/len(chosen)),processed,len(chosen),len(errors))
+    if not coverage:
+        return {"error":"검사 가능한 시장 데이터를 확보하지 못했습니다: "+"; ".join(errors[:2])}
+    ensure_active()
+    if progress:progress("포트폴리오 및 학습/검증 비교",96,len(chosen),len(chosen),len(errors))
+    cmp=[];variant_trades={}
+    for key,label in (("SURGE_2","급증봉 다음 시가 (비교 기준)"),
+                      ("HOLD_2","횡보 유지 뒤 재상승 확인"),
+                      ("HOLD_RS_2","재상승 + BTC 대비 상대강도 +2%p"),
+                      ("HOLD_BTC_2","상대강도 + BTC 자체 상승")):
+        selected=select_trades(all_events[key],replace(cfg,max_trades_day=2))
+        st,_,split=daily_and_split(selected,cfg,cut)
+        tests=[x for x in selected if x.get("status")=="CLOSED" and datetime.fromisoformat(x["entry_at"])>=cut]
+        cmp.append({"key":key,"label":label,"stat":st,"train":split["train"],"test":split["test"],
+                    "test_no_top2":upper_trim_stat(tests,cfg),"signals":len(all_events[key]),
+                    "selected":len(selected),"unknown":sum(x.get("status")!="CLOSED" for x in selected)})
+        variant_trades[key]=selected
+    main=variant_trades["HOLD_RS_2"]
+    st,daily,split=daily_and_split(main,cfg,cut)
+    diagnostics=summarize_diagnostics(main,cfg.capital)
+    full_markets={m for m,info in coverage.items() if info.get("full_period")}
+    fully_selected=select_trades([e for e in all_events["HOLD_RS_2"] if e["market"] in full_markets],replace(cfg,max_trades_day=2))
+    full_stat,_,full_split=daily_and_split(fully_selected,cfg,cut)
+    full_sensitivity={"full_markets":len(full_markets),"requested_markets":len(chosen),
+                      "stat":full_stat,"train":full_split["train"],"test":full_split["test"]}
+    verdict=_flow_verdict(cmp,len(full_markets),len(chosen))
+    warnings=["V3.6은 새 연구 가설이며, 이전 EMA200 고점 돌파 전략과 별도입니다.",
+              "매수세란 실제 주문 흐름이 아닌 캔들 거래대금·종가 위치에 대한 근사 설명입니다.",
+              "스캔 대상은 현재 거래대금 순위로 뽑으므로 과거 당시 구성과 다를 수 있습니다.",
+              "봉 마감 후 다음 봉 시가 진입 가정, 수수료 편도 0.25% 기본, 슬리피지 0% 가정.",
+              "24시간 종료·캔들 결측은 구분하며 미확정 손익을 성공으로 계산하지 않습니다."]
+    return {"version":VERSION,"kind":"flow","markets":len(coverage),"eligible":eligible,
+       "requested_markets":len(chosen),"partial_markets":sum(not v["full_period"] for v in coverage.values()),
+       "signals":len(all_events["HOLD_RS_2"]),"selected":len(main),
+       "unknown":sum(x.get("status")!="CLOSED" for x in main),"stat":st,"split":split,"daily":daily,
+       "trades":main,"comparisons":cmp,"variant_trades":variant_trades,"verdict":verdict,
+       "rule_params":FLOW_RULES,"market_stats":diagnostics["markets"],"reasons":diagnostics["reasons"],
+       "mdd_krw":diagnostics["mdd_krw"],"quick_stop_45m":diagnostics["quick_stop_45m"],
+       "max_lose_streak":diagnostics["max_lose_streak"],
+       "coverage":coverage,"full_sensitivity":full_sensitivity,"errors":errors,"error_count":len(errors),
+       "settings":{"fee_pct":cfg.fee*100,"slip_pct":0,"per_trade_krw":cfg.capital,
+                   "period_days":cfg.days,"tf":cfg.tf,"count":cfg.count,"maxday":2,
+                   "turnover_min_krw":cfg.turnover_min,"scanned_at_kst":kst_now().isoformat(),
+                   "start_kst":start.isoformat(),"cut_kst":cut.isoformat()},
+       "warnings":warnings}
+
+
+def flow_scan(cfg,progress=None):
+    if progress:progress("거래대금 급증 후보 스캔 준비",3,0,0,0)
+    chosen,eligible=universe(cfg)
+    if not chosen:return {"error":"조건을 만족하는 종목이 없습니다"}
+    need=120
+    try:
+        btc=complete(enrich(candles("KRW-BTC",cfg.tf,need),cfg.tf),cfg.tf)
+        btc_ref=flow_btc_reference(btc,cfg.tf)
+    except Exception as exc:
+        return {"error":f"BTC 상대강도 참고 자료를 확보하지 못했습니다: {exc}"}
+    def track(m,d,total,e):
+        if progress:progress(f"최근 거래대금·봉 수집: {m}",5+int(85*d/max(1,total)),d,total,e)
+    data,errors=load_series(chosen,cfg,days=max(4,math.ceil(120*cfg.tf/1440)+1),progress=track)
+    signals=[];watch=[]
+    for j,item in enumerate(chosen):
+        if j%10==0:ensure_active()
+        if progress:progress(f"반등 확인: {item['market']}",91+int(8*(j+1)/len(chosen)),j+1,len(chosen),len(errors))
+        rows=complete(data.get(item['market'],[]),cfg.tf)
+        if not rows:continue
+        variants,wait=flow_events(item['market'],rows,cfg,btc_ref,live=True)
+        signals+=variants["HOLD_RS_2"]
+        watch+=wait
+    return {"version":VERSION,"checked":len(data),"eligible":eligible,"signals":signals,
+            "watch":watch[:15],"errors":errors,"updated":kst_now().strftime("%Y-%m-%d %H:%M:%S KST"),
+            "notes":["신규 연구용 후보이며 진입가·체결 성공은 보장되지 않습니다."]}
+
 def backtest(cfg, progress=None):
+    if cfg.strategy=="flow":
+        return flow_backtest(cfg,progress)
     if progress:progress("기간·봉 수 검사", 1, 0, 0, 0)
     needed = math.ceil(cfg.days * 1440 / cfg.tf) + min_history(cfg) + 4
     # 검증 전에도 빠르게 거절하여 Render 과부하 방지.
@@ -1398,7 +1736,7 @@ def holding(q,cfg):
 # -------------------------------- 화면 --------------------------------
 HTML = r'''<!doctype html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>BITHUMB V3.5 | 빗썸 전략 스캐너</title>
+<title>BITHUMB V3.6 | 빗썸 거래대금 반응 연구</title>
 <style>
 :root{color-scheme:dark;--bg:#080e1c;--panel:#111c33;--inner:#0b1429;--line:#283752;--text:#e9effb;--muted:#a0aec8;--good:#49deb4;--bad:#fb7777;--blue:#688dff;--gold:#f2bd70}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Noto Sans KR",Roboto,Arial,sans-serif;padding:18px 13px 56px;line-height:1.5}
@@ -1422,10 +1760,10 @@ body{background:var(--bg)}.entry,.card,.stat{background:var(--panel);box-shadow:
 .scoregrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}.scorecell{background:#1c2746;padding:10px;text-align:center;border-radius:14px}.scorecell strong{font-size:25px;display:block}.scorecell small{display:block;color:#b0bdd7;font-size:12px}.explainer{background:#153127;color:#65eab4;padding:12px;border-radius:12px;font-size:13px;line-height:1.65;margin-top:12px;font-weight:600}
 @media(min-width:720px){.scoregrid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
-<header><div><span class="version">NEW V3.5</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>눌림목 & 추세추종 스캐너</h1><div class="sub">봉 마감 확인 → 다음 봉 진입 가정. 실시간 후보와 과거 백테스트를 같은 규칙으로 계산합니다. 기존 V2/CORE와 독립 프로그램입니다. 슬리피지는 0%로 고정(이상적인 체결 가정)하며 편도 수수료는 반영해요.</div></header>
+<header><div><span class="version">NEW V3.6</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>거래대금 급증 · 가격 유지 스캐너</h1><div class="sub">봉 마감 확인 → 다음 봉 진입 가정. 실시간 후보와 과거 백테스트를 같은 규칙으로 계산합니다. 기존 V2/CORE와 독립 프로그램입니다. 슬리피지는 0%로 고정(이상적인 체결 가정)하며 편도 수수료는 반영해요.</div></header>
 <div class="stats"><div class="stat"><small>검사 마켓</small><div class="value" id="k_count">–</div></div><div class="stat"><small>진입 후보</small><div class="value g" id="k_sig">–</div></div><div class="stat"><small>관심 후보</small><div class="value" id="k_watch">–</div></div><div class="stat"><small>최근 갱신 (KST)</small><div class="value" id="k_time" style="font-size:15px">–</div></div></div>
 <div class="two"><div class="card"><h2>① 스캔 설정</h2>
-<label>전략</label><select id="st"><option value="pullback">눌림목 · 박스 돌파 → 재테스트</option><option value="trend" selected>추세추종 · 상위 봉 고점 돌파</option></select>
+<label>전략</label><select id="st"><option value="pullback">눌림목 · 박스 돌파 → 재테스트</option><option value="trend">기존 추세추종 · 실패 전략 기록용</option><option value="flow" selected>NEW 거래대금 급증 → 횡보 → 재상승</option></select>
 <div class="row"><div><label>캔들</label><select id="tf"><option value="15">15분봉</option><option value="5">5분봉</option><option value="60" selected>1시간봉</option><option value="240">4시간봉</option></select></div><div><label>검색 종목 수</label><select id="n"><option value="40">40개</option><option value="80">80개</option><option value="0">전체 (거래대금 하한 적용)</option></select></div></div>
 <div class="row"><div><label>24시간 거래대금 하한</label><select id="liquidity"><option value="500000000">5억원</option><option value="1000000000">10억원</option><option value="2000000000">20억원</option><option value="0">제한 없음</option></select></div><div><label>편도 수수료</label><select id="fee"><option value="0.25">0.25%</option><option value="0.04">0.04%</option><option value="0">0%</option></select></div></div>
 <div class="row"><div><label>건당 투자금</label><select id="amt"><option value="1000000">100만원</option><option value="500000">50만원</option><option value="2000000">200만원</option><option value="5000000">500만원</option></select></div></div>
@@ -1440,7 +1778,7 @@ body{background:var(--bg)}.entry,.card,.stat{background:var(--panel);box-shadow:
 <div class="msg" id="scanMsg">서버 연결 확인 중…</div></div>
 <div class="card"><h2>② 진입 확인</h2><div id="signals" class="sub">아직 스캔하지 않았어요.</div><div class="section"><h2>③ 눌림 대기 / 관심 후보</h2><div id="watch" class="sub">아직 스캔하지 않았어요.</div></div></div></div>
 <div class="two"><div class="card"><h2>④ 보유 코인 손절선 (추세추종)</h2><div class="sub">진입가·진입 시각을 입력하면 확정 분봉 기반 ATR 트레일링을 재현합니다. 실제 주문 기록을 조회하지 않습니다.</div><label>종목 (예: XRP)</label><input id="h_sym" autocapitalize="characters" placeholder="XRP"><div class="row"><div><label>내 진입가 (원)</label><input id="h_price" type="number" min="0" step="any" placeholder="예: 3250"></div><div><label>진입 시각 (KST)</label><input id="h_time" type="datetime-local"></div></div><div class="actions"><button id="holdBtn" class="primary" onclick="doHold()">트레일링 확인</button></div><div class="msg" id="holdMsg"></div><div id="holdResult"></div></div>
-<div class="card"><h2>⑤ 백테스트 · V3.5 정밀 진단</h2><div class="sub">기존 V3.4 비교를 유지하며 진입 전 특징·수익 상위 2건 제외·고정 필터 3종·전략 중단 판단을 추가했어요. <b>같은 데이터</b>에서 비교합니다. 학습 70% / 검증 30%, 결측·미래봉 부족은 UNKNOWN입니다. 거래 0회도 허용합니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="15">15일</option><option value="30">30일</option><option value="80">80일</option><option value="180">180일</option><option value="365">365일</option></select></div><div><label>계산 조건</label><input value="봉 마감·손절 우선" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">백테스트 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>CSV 저장</button><button id="btStop" onclick="cancelCurrent('backtest')" disabled>중지</button></div><div class="progress" id="btProgress" hidden><div class="phead"><b id="btStage">대기</b><b id="btPct">0%</b></div><div class="ptrack"><div id="btFill" class="pfill"></div></div><div class="msg" id="btCount">0/0</div></div><div id="btMsg" class="msg">기간 15·30·80·180·365일 / 코인 40·80·전체 선택. 분봉별 과거 2만 봉 한도를 넘으면 시작 전에 이유를 안내합니다.</div><div id="btResult"></div></div></div>
+<div class="card"><h2>⑤ 백테스트 · V3.6 신규 가설 검증</h2><div class="sub">새 전략 4가지 비교와 거래별 로그를 한 CSV로 다운로드해 사진 대신 전송할 수 있습니다. 기존 전략 연구 기록은 보존해요. <b>같은 데이터</b>에서 비교합니다. 학습 70% / 검증 30%, 결측·미래봉 부족은 UNKNOWN입니다. 거래 0회도 허용합니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="15">15일</option><option value="30">30일</option><option value="80">80일</option><option value="180">180일</option><option value="365">365일</option></select></div><div><label>계산 조건</label><input value="봉 마감·손절 우선" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">백테스트 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>전체 결과 CSV 저장</button><button id="btStop" onclick="cancelCurrent('backtest')" disabled>중지</button></div><div class="progress" id="btProgress" hidden><div class="phead"><b id="btStage">대기</b><b id="btPct">0%</b></div><div class="ptrack"><div id="btFill" class="pfill"></div></div><div class="msg" id="btCount">0/0</div></div><div id="btMsg" class="msg">기간 15·30·80·180·365일 / 코인 40·80·전체. 검사 후 CSV 버튼만 눌러 보내주세요. 분봉별 과거 2만 봉 한도를 넘으면 시작 전에 이유를 안내합니다.</div><div id="btResult"></div></div></div>
 <div class="card"><h2>검증할 때 꼭 볼 점</h2><div class="warn">• 백테스트는 과거 신호가 형성된 뒤 다음 분봉 시가로만 진입합니다.<br>• 손절과 익절이 같은 분봉에 닿으면 손절 우선. 공백 봉은 임의 생성하지 않아요.<br>• 백테스트 대상 종목은 현재 24시간 거래대금 순위이므로 과거 당시의 상장·거래대금과 다를 수 있어요.<br>• 실거래 호가·주문 체결을 재현하지 못하며 신호를 매수 보장으로 해석하면 안 돼요.<br>• 주문/API 키 기능이 없어요. 데이터 오류·검증 불충분시 거래 0회도 정상입니다.</div></div>
 </main><script>
 const $=id=>document.getElementById(id);let autoTimer=null, scanning=false, lastBT=null, activeJobs={scan:null,backtest:null};
@@ -1450,9 +1788,9 @@ const krw=v=>(v>0?'+':'')+Number(v||0).toLocaleString('ko-KR')+'원';
 const esc=s=>String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const ids=['st','tf','n','liquidity','fee','amt','tp','of','trail','tp1','be','btc','rs','rsd','maxday','maxpos','days'];
 function qs(){const p=new URLSearchParams();ids.forEach(id=>p.set(id,$(id).value));return p.toString()}
-function changeStrategy(){let trend=$('st').value==='trend';$('pbopts').style.display=trend?'none':'block';$('tropts').style.display=trend?'block':'none';const wanted=trend?['60','240']:['5','15','60'];
- [...$('tf').options].forEach(o=>o.hidden=!wanted.includes(o.value));if(!wanted.includes($('tf').value))$('tf').value=trend?'60':'15';}
-$('st').onchange=()=>{changeStrategy();$('maxday').value=$('st').value==='trend'?'2':'4'};changeStrategy();
+function changeStrategy(){let trend=$('st').value==='trend',flow=$('st').value==='flow';$('pbopts').style.display=(trend||flow)?'none':'block';$('tropts').style.display=trend?'block':'none';const wanted=(trend||flow)?['60','240']:['5','15','60'];
+ [...$('tf').options].forEach(o=>o.hidden=!wanted.includes(o.value));if(!wanted.includes($('tf').value))$('tf').value=(trend||flow)?'60':'15';}
+$('st').onchange=()=>{changeStrategy();$('maxday').value=$('st').value==='pullback'?'4':'2'};changeStrategy();
 async function request(path){const r=await fetch(path);let d;try{d=await r.json()}catch(e){throw Error('서버 JSON 응답이 아닙니다')};if(!r.ok||d.error)throw Error(d.error||'HTTP '+r.status);return d}
 async function ping(){try{const d=await request('/api/ping');$('scanMsg').textContent='서버 연결 완료 · '+esc(d.version)+' · 마지막 스캔을 실행할 수 있습니다.'}catch(e){$('scanMsg').textContent='연결 실패: '+e.message}}
 function tiles(items){return `<div class="detail">${items.map(([k,v])=>`<div class="cell"><small>${esc(k)}</small><b>${esc(v)}</b></div>`).join('')}</div>`}
@@ -1462,7 +1800,7 @@ const pts=[['Structure',score.structure],['Timing',score.timing],['Trend',score.
 const scoreHtml=`<div class="scoregrid">${pts.map(([name,num])=>`<div class="scorecell"><strong>${esc(num)}</strong><small>${esc(name)}</small></div>`).join('')}</div>`;
 const rr=s.tp&&s.price>s.stop?((s.tp-s.price)/(s.price-s.stop)).toFixed(2)+'R':'트레일링';
 const levels=tiles([['예상 진입가',fmt(s.price)+'원'],['손절가',fmt(s.stop)+'원'],['목표가',s.tp?fmt(s.tp)+'원':'ATR 추종'],['기대 R:R',rr]]);
-return `<div class="entry"><div class="top"><div><div class="coin">${esc(s.market.replace('KRW-',''))} <small>${fmt(s.price)}원</small></div><small>신호 확정 ${esc(s.signal_at.replace('T',' '))}</small></div><span class="tag">${esc(s.strategy==='trend'?'추세추종 조건 충족':'눌림목 조건 충족')}</span></div>
+return `<div class="entry"><div class="top"><div><div class="coin">${esc(s.market.replace('KRW-',''))} <small>${fmt(s.price)}원</small></div><small>신호 확정 ${esc(s.signal_at.replace('T',' '))}</small></div><span class="tag">${esc(s.strategy==='flow'?'거래대금 반응 연구 후보':s.strategy==='trend'?'추세추종 조건 충족':'눌림목 조건 충족')}</span></div>
 <div class="note">24H ${s.turnover_24h?fmt(s.turnover_24h/100000000)+'억원':'–'} · 거래량 ${esc(s.context.volume_ratio)}배 · 위험폭 ${Number(s.risk_pct).toFixed(2)}% · 규칙 점수 <b>${esc(score.total??'–')}점</b></div>
 <details class="expanded"><summary>분석 상세 보기</summary>${scoreHtml}<div class="explainer">${esc(s.why||'모든 전략 조건을 충족한 과거 마감봉을 확인했습니다. 실시간 호가와 체결 조건은 별도 확인이 필요합니다.')}</div>${levels}
 <div class="note">※ 점수는 조건 충족 상태를 보여주는 실험용 규칙 점수이며, 승률·수익 확률이나 매수 추천이 아닙니다.</div></details></div>`}
@@ -1487,6 +1825,14 @@ $('holdResult').innerHTML=`<div class="entry"><h3>${esc(d.market)} · 최근 완
 }catch(e){$('holdMsg').textContent='오류: '+e.message}finally{b.disabled=false;b.textContent='트레일링 확인'}}
 function trStat(label,s){return `<tr><td>${label}</td><td>${s?.n??0}</td><td>${s?.win_rate??'–'}%</td><td>${s?.avg_net==null?'–':pct(s.avg_net)}</td><td>${s?.pnl_krw==null?'–':krw(s.pnl_krw)}</td></tr>`}
 function renderBT(d){let s=d.stat;let h=`<div class="section"><small>검사 마켓 ${d.markets}/${d.requested_markets??d.markets}개 · 기간 일부만 확보 ${d.partial_markets??0}개 · 신호 ${d.signals}건 · 선택 ${d.selected}건 · 미확정 ${d.unknown}건</small><div class="bigresult ${s.avg_net>0?'g':s.avg_net<0?'r':''}">${s.avg_net==null?'거래 없음':'평균 '+pct(s.avg_net)}</div><div class="sub">승률 ${s.win_rate??'–'}% · ${s.win}승 ${s.loss}패 · 동일 금액 건별 합산 ${krw(s.pnl_krw)}</div></div>`;
+if(d.kind==='flow'){
+ const v=d.verdict||{};
+ h+=`<h3>V3.6 거래대금 급증 후 가격 유지 연구</h3><div class="note">급증봉 직후 / 횡보 유지 / 상대강도 / BTC 상승 4개 연구군을 동일 코인·기간으로 비교. 일일 최대 2회, 동시 보유 제한 적용.</div><div class="scroll"><table><tr><th>전략</th><th>거래</th><th>승률</th><th>학습 평균</th><th>검증 평균</th><th>검증 상위2 제외</th></tr>${d.comparisons.map(x=>`<tr><td>${esc(x.label)}</td><td>${x.stat.n}</td><td>${x.stat.win_rate??'–'}%</td><td>${pct(x.train?.avg_net)}</td><td class="${x.test?.avg_net>0?'g':'r'}">${pct(x.test?.avg_net)}</td><td>${pct(x.test_no_top2?.avg_net)}</td></tr>`).join('')}</table></div>`;
+ h+=`<div class="entry"><div class="coin ${v.status==='RESEARCH_ONLY'?'gold':'r'}">${esc(v.status||'미판정')}</div><div class="note">${esc(v.message||'')} · 실제 매매 신호가 아니라 가설 검증입니다.</div></div>`;
+ h+=`<div class="detail">${tiles([['백테스트 대상',`${d.markets}/${d.requested_markets}개`],['부분 데이터 종목',d.partial_markets],['CSV 포함 선택 거래',Object.values(d.variant_trades||{}).reduce((n,a)=>n+a.length,0)],['데이터 오류',d.error_count]])}</div>`;
+ h+=`<div class="note">⭐ 아래 <b>전체 결과 CSV 저장</b> 버튼을 눌러 나온 파일 하나만 보내줘. 사진은 필요 없어! CSV에 기간·설정·모든 전략 거래·일자별·종목별·결측·오류와 결론이 담겨 있어. 현재 거래대금 상위 과거 검사는 선택 편향이 남아 있어.</div>`;
+ return h;
+}
 if(d.kind==='trend' && Array.isArray(d.comparisons)&&d.comparisons.length){
  h+=`<h3>V3.5 기존 비교 유지 (동일 기간·종목)</h3><div class="note">횟수 제한만 바꾼 돌파 4회/2회 비교와 눌림 재상승·BTC 필터 비교입니다. 수익 우위는 아직 검증 전입니다.</div><div class="scroll"><table><tr><th>비교 전략</th><th>거래</th><th>승률</th><th>평균순익</th><th>검증 평균</th><th>총 손익</th></tr>${d.comparisons.map(x=>`<tr><td>${esc(x.label)}</td><td>${x.stat.n}</td><td>${x.stat.win_rate??'–'}%</td><td class="${x.stat.avg_net>0?'g':'r'}">${pct(x.stat.avg_net)}</td><td>${pct(x.test?.avg_net)}</td><td>${krw(x.stat.pnl_krw)}</td></tr>`).join('')}</table></div>`;
 }
@@ -1522,8 +1868,51 @@ const b=$('btBtn');b.disabled=true;b.textContent='백테스트 중…';$('csvBtn
 $('btProgress').hidden=false;$('btPct').textContent='0%';$('btFill').style.width='0%';
 try{const d=await runJob('backtest',qs(),'bt');lastBT=d;$('btResult').innerHTML=renderBT(d);$('btMsg').textContent='계산 완료 · '+d.settings.period_days+'일 · '+d.settings.tf+'분봉 · 수수료 편도 '+d.settings.fee_pct+'% · 슬리피지 0% 가정';$('csvBtn').disabled=false}
 catch(e){$('btMsg').textContent='백테스트 오류: '+e.message}finally{activeJobs.backtest=null;$('btStop').disabled=true;b.disabled=false;b.textContent='백테스트 실행'}}
-function exportCSV(){if(!lastBT)return;const d=lastBT;const objs=[...d.daily.map(x=>({row_type:'DAILY',...x})),...d.trades.map(x=>({row_type:'TRADE',version:d.version,...x})),...(d.comparisons||[]).map(x=>({row_type:'COMPARE',version:d.version,variant:x.key,label:x.label,...x.stat,validation_avg:x.test?.avg_net})),...(d.exit_analysis||[]).map(x=>({row_type:'EXIT_DIAGNOSTIC',version:d.version,...x})),...(d.v35_features||[]).map(x=>({row_type:'PREENTRY_FEATURE',version:d.version,...x})),...(d.v35_gates||[]).map(x=>({row_type:'FIXED_GATE',version:d.version,...x})),...Object.entries(d.v35_gate_trades||{}).flatMap(([gate,trades])=>trades.map(x=>({row_type:'FIXED_GATE_TRADE',version:d.version,gate,...x}))),{row_type:'V35_DECISION',version:d.version,...(d.v35_verdict||{})}, {row_type:'V35_DIAG',version:d.version,...(d.v35_diagnostic||{})},{row_type:'V35_FULL_ONLY',version:d.version,...(d.v35_full_only||{})},...Object.entries(d.variant_trades||{}).flatMap(([variant,trades])=>trades.map(x=>({row_type:'VARIANT_TRADE',version:d.version,variant,...x})))];const columns=[...new Set(['row_type','version','date','market','signal_at','entry_at','exit_at','status','net_pct',...objs.flatMap(x=>Object.keys(x))])];const cell=v=>{const s=typeof v==='object'&&v!==null?JSON.stringify(v):String(v??'');return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
-const csv='\ufeff'+[columns.join(','),...objs.map(x=>columns.map(k=>cell(x[k])).join(','))].join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`BITHUMB_V3_5_${d.kind}_${d.settings.tf}m_${d.settings.period_days}d.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
+function exportCSV(){
+ if(!lastBT)return;
+ const d=lastBT, version=d.version||'V3.6', cfg=d.settings||{};
+ let objs=[{row_type:'RUN_CONFIG',version,run_at_kst:cfg.scanned_at_kst,kind:d.kind,
+   period_days:cfg.period_days,tf_minutes:cfg.tf,market_scope:cfg.count,
+   fee_side_pct:cfg.fee_pct,slippage_pct:cfg.slip_pct,investment_krw:cfg.per_trade_krw,
+   daily_limit:cfg.maxday,requested_markets:d.requested_markets,checked_markets:d.markets,
+   partial_markets:d.partial_markets,full_markets:d.full_sensitivity?.full_markets,signal_count:d.signals,selected_count:d.selected,
+   unknown_count:d.unknown,error_count:d.error_count},
+ ...Object.entries(d.rule_params||{}).map(([rule,value])=>({row_type:'RULE',version,rule,value})),
+ {row_type:'OVERALL',version,...(d.stat||{})},
+ ...Object.entries(d.split||{}).map(([segment,s])=>({row_type:'SPLIT',version,segment,...(s||{})})),
+ ...(d.comparisons||[]).map(x=>({row_type:'COMPARE',version,variant:x.key,label:x.label,
+    train_n:x.train?.n,train_avg:x.train?.avg_net,test_n:x.test?.n,test_avg:x.test?.avg_net,
+    test_no_top2_avg:x.test_no_top2?.avg_net,test_trimmed_n:x.test_no_top2?.left_n,
+    selected:x.selected,unknown:x.unknown,...x.stat})),
+ ...(d.daily||[]).map(x=>({row_type:'DAILY',version,...x})),
+ ...(d.market_stats||[]).map(x=>({row_type:'MARKET',version,...x})),
+ ...(d.reasons||[]).map(x=>({row_type:'EXIT_REASON',version,...x})),
+ ...(d.trades||[]).map(x=>({row_type:'MAIN_TRADE',version,...x})),
+ ...Object.entries(d.variant_trades||{}).flatMap(([variant,trades])=>trades.map(x=>({row_type:'VARIANT_TRADE',version,variant,...x}))),
+ ...Object.entries(d.coverage||{}).map(([market,q])=>({row_type:'COVERAGE',version,market,...q})),
+ ...(d.full_sensitivity?[{row_type:'FULL_ONLY',version,full_markets:d.full_sensitivity.full_markets,requested_markets:d.full_sensitivity.requested_markets,...d.full_sensitivity.stat,test_n:d.full_sensitivity.test?.n,test_avg_net:d.full_sensitivity.test?.avg_net}]:[]),
+ ...(d.errors||[]).map((error,index)=>({row_type:'DATA_ERROR',version,error,index:index+1})),
+ ...(d.warnings||[]).map(warning=>({row_type:'WARNING',version,warning})),
+ ...(d.verdict?[{row_type:'VERDICT',version,...d.verdict}]:[])];
+ if(d.kind!=='flow'){
+   objs=[...objs,...(d.exit_analysis||[]).map(x=>({row_type:'EXIT_DIAGNOSTIC',version,...x})),
+     ...(d.v35_features||[]).map(x=>({row_type:'PREENTRY_FEATURE',version,...x})),
+     ...(d.v35_gates||[]).map(x=>({row_type:'FIXED_GATE',version,...x})),
+     ...Object.entries(d.v35_gate_trades||{}).flatMap(([gate,trades])=>trades.map(x=>({row_type:'FIXED_GATE_TRADE',version,gate,...x}))),
+     {row_type:'V35_DECISION',version,...(d.v35_verdict||{})},
+     {row_type:'V35_DIAG',version,...(d.v35_diagnostic||{})},
+     {row_type:'V35_FULL_ONLY',version,...(d.v35_full_only||{})}];
+ }
+ const columns=[...new Set(['row_type','version','market','variant','signal_at','entry_at','exit_at','net_pct',
+                              ...objs.flatMap(x=>Object.keys(x))])];
+ const cell=v=>{const s=typeof v==='object'&&v!==null?JSON.stringify(v):String(v??'');
+    return /^[=+@]|^-(?!\d)/.test(s)?'"\''+s.replace(/"/g,'""')+'"':/[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
+ const csv='\ufeff'+[columns.join(','),...objs.map(x=>columns.map(k=>cell(x[k])).join(','))].join('\r\n');
+ const blob=new Blob([csv],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download=`BITHUMB_${version.replace('.','_')}_ALL_RESULTS_${d.kind}_${cfg.tf}m_${cfg.period_days}d.csv`;
+ document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+}
+
 ping();
 </script></body></html>'''
 
