@@ -1,4 +1,4 @@
-"""BITHUMB V3.1 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
+"""BITHUMB V3.2 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
 
 필요: pip install requests
 실행: python bithumb_v3_scanner.py  -> http://127.0.0.1:8080
@@ -11,6 +11,12 @@ Render: PORT 환경변수가 있으면 0.0.0.0:$PORT에 바인딩.
 import json
 import math
 import os
+import tempfile
+import uuid
+import zlib
+import hashlib
+from collections import deque
+from pathlib import Path
 import re
 import threading
 import time
@@ -23,13 +29,133 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-VERSION = "V3.1"
+VERSION = "V3.2"
 BASE = "https://api.bithumb.com/v1"
 KST = timezone(timedelta(hours=9))
 BUSY = threading.Lock()
 MARKET_CACHE = {"at": 0, "markets": []}
 MARKET_LOCK = threading.Lock()
 VALID_TF = {5, 15, 60, 240}
+# V2의 4 worker 수집 구조 유지. 병렬 수를 늘리면 429가 증가할 수 있어 제한함.
+MAX_WORKERS = 4
+# Render / Pydroid 로컬 임시 캐시: 이전 조회 캔들을 재사용하고 변경된 최근 봉만 추가 수집
+CANDLE_CACHE_DIR = Path(tempfile.gettempdir()) / "bithumb_v32_candle_cache"
+CANDLE_CACHE_LOCK = threading.Lock()
+SESSION_LOCAL = threading.local()
+JOB_LOCK = threading.Lock()
+JOB = None
+
+
+def request_session():
+    session = getattr(SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"Accept": "application/json", "User-Agent": "bithumb-v3-research/1.1"})
+        SESSION_LOCAL.session = session
+    return session
+
+
+def _cache_path(market, tf):
+    name = hashlib.sha256(f"{market}|{tf}".encode()).hexdigest()[:24]
+    return CANDLE_CACHE_DIR / f"{name}.bin"
+
+
+def cache_read(market, tf):
+    path = _cache_path(market, tf)
+    try:
+        if time.time() - path.stat().st_mtime > 3600:
+            return [], float("inf")
+        payload = json.loads(zlib.decompress(path.read_bytes()).decode("utf-8"))
+        rows = [{**x, "t": datetime.fromisoformat(x["t"])} for x in payload]
+        return rows, max(0.0, time.time() - path.stat().st_mtime)
+    except (OSError, ValueError, TypeError, zlib.error):
+        return [], float("inf")
+
+
+def cache_write(market, tf, rows):
+    try:
+        CANDLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _cache_path(market, tf)
+        payload = json.dumps([{**b, "t": b["t"].isoformat()} for b in rows[-6500:]], separators=(",", ":"))
+        raw = zlib.compress(payload.encode("utf-8"), level=3)
+        tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
+        tmp.write_bytes(raw)
+        with CANDLE_CACHE_LOCK:
+            os.replace(tmp, path)
+            files = list(CANDLE_CACHE_DIR.glob("*.bin"))
+            # 디스크 캐시는 약 70MB만 유지. 오래된 항목부터 제거.
+            total = sum(f.stat().st_size for f in files)
+            if total > 70_000_000:
+                for f in sorted(files, key=lambda x:x.stat().st_mtime):
+                    if total <= 55_000_000:
+                        break
+                    size = f.stat().st_size
+                    f.unlink(missing_ok=True)
+                    total -= size
+    except (OSError, TypeError, ValueError):
+        # 캐시 문제로 본 작업을 중단하지는 않는다.
+        pass
+
+
+def job_update(stage, pct=None, done=None, total=None, errors=None):
+    with JOB_LOCK:
+        if not JOB or not JOB.get("running"):
+            return
+        JOB["stage"] = stage
+        if pct is not None:
+            JOB["percent"] = max(JOB.get("percent", 0), min(99, int(pct)))
+        if done is not None:
+            JOB["done_count"] = done
+        if total is not None:
+            JOB["total_count"] = total
+        if errors is not None:
+            JOB["error_count"] = errors
+
+
+def start_job(kind, cfg):
+    global JOB
+    if kind not in ("scan", "backtest"):
+        return {"error": "지원하지 않는 작업"}
+    with JOB_LOCK:
+        if JOB and JOB["running"]:
+            if JOB["kind"] == kind and JOB["settings"] == cfg:
+                return {"job": JOB["id"], "reused": True}
+            return {"error": "다른 작업 진행 중입니다. 완료 후 실행해주세요."}
+        if not BUSY.acquire(blocking=False):
+            return {"error": "다른 스캔/백테스트가 진행 중입니다."}
+        job_id = uuid.uuid4().hex[:20]
+        JOB = dict(id=job_id, kind=kind, settings=cfg, running=True, percent=0,
+                   stage="작업 준비 중", done_count=0, total_count=0, error_count=0,
+                   started=time.monotonic(), error=None, result=None)
+    def worker():
+        try:
+            result = scan(cfg, progress=job_update) if kind == "scan" else backtest(cfg, progress=job_update)
+            with JOB_LOCK:
+                JOB["result"] = result if "error" not in result else None
+                JOB["error"] = result.get("error")
+        except Exception as exc:
+            with JOB_LOCK:
+                JOB["error"] = str(exc)[:400]
+            print("[V3] background job error", repr(exc))
+        finally:
+            with JOB_LOCK:
+                JOB["running"] = False
+                JOB["percent"] = 100
+                JOB["stage"] = "완료" if not JOB["error"] else "오류"
+            BUSY.release()
+    threading.Thread(target=worker, daemon=True, name=f"v3-{kind}").start()
+    return {"job": job_id, "reused": False}
+
+
+def job_status(job_id):
+    with JOB_LOCK:
+        if JOB is None or JOB["id"] != job_id:
+            return {"error": "진행 중인 작업이 없어요. 서버가 재시작됐을 수도 있습니다."}
+        return dict(job=JOB["id"], kind=JOB["kind"], running=JOB["running"],
+                    percent=JOB["percent"], stage=JOB["stage"],
+                    done=JOB["done_count"], total=JOB["total_count"],
+                    errors=JOB["error_count"], elapsed=int(time.monotonic()-JOB["started"]),
+                    error=JOB["error"], result=None if JOB["running"] else JOB["result"])
 
 
 def kst_now():
@@ -102,7 +228,7 @@ def api(endpoint, params=None, retry=3):
     last = "알 수 없는 오류"
     for attempt in range(retry):
         try:
-            resp = requests.get(url, params=params, timeout=(5, 14), headers={"Accept": "application/json", "User-Agent": "bithumb-v3-research/1.0"})
+            resp = request_session().get(url, params=params, timeout=(5, 14))
             if resp.status_code in (429, 500, 502, 503, 504):
                 last = f"API {resp.status_code}"
                 time.sleep(min(.6 * (2 ** attempt), 3))
@@ -143,78 +269,124 @@ def universe(cfg):
     return eligible[:cfg.count], len(eligible)
 
 
-def candles(market, tf, need):
-    """페이지 사이 KST 시각 연결. Bithumb `to`가 KST라는 공식 문서 규격 준수.
-    거래가 없어서 발생하는 누락 분봉은 합성하지 않음.
+def candles(market, tf, need, cache_ttl=90):
+    """KST 연결 기반 페이징 + 압축 캐시. 최신 200봉과 과거 페이지를 병합.
+    1차 요청 결과에 공백이 있으면 이전 캐시를 버려 누락을 정상 봉처럼 취급하지 않는다.
     """
     if tf not in VALID_TF:
         raise ValueError("지원하지 않는 캔들 단위")
     need = min(max(need, 10), 6500)
-    seen, cursor = {}, None
-    previous_oldest = None
-    for _ in range(math.ceil(need / 200) + 3):
-        if len(seen) >= need:
-            break
-        params = {"market": market, "count": min(200, need - len(seen))}
-        if cursor:
-            params["to"] = cursor
-        data = api(f"candles/minutes/{tf}", params)
+    saved, age = cache_read(market, tf)
+    if saved and len(saved) >= need and age < cache_ttl:
+        return saved[-need:]
+    seen = {b["t"]: b for b in saved}
+    fetched = False
+    page_no = 0
+    cursor = None
+    # 새 조회는 항상 최신 구간부터 시작하여 마감된 신규 봉을 반영한다.
+    if not saved or age >= cache_ttl:
+        data = api(f"candles/minutes/{tf}", {"market":market,"count":min(200,need)})
+        fetched = True
         if not data:
-            break
+            return []
+        recent = []
         for x in data:
             try:
                 at = datetime.strptime(x["candle_date_time_kst"], "%Y-%m-%dT%H:%M:%S")
-                row = {"t": at, "o": float(x["opening_price"]), "h": float(x["high_price"]),
-                       "l": float(x["low_price"]), "c": float(x["trade_price"]),
-                       "v": float(x["candle_acc_trade_volume"]),
-                       "turn": float(x.get("candle_acc_trade_price", 0))}
-                if all(math.isfinite(row[k]) for k in ("o", "h", "l", "c", "v", "turn")) and row["l"] > 0 and row["h"] >= row["l"]:
-                    seen[at] = row
-            except (KeyError, TypeError, ValueError):
+                row = {"t":at,"o":float(x["opening_price"]),"h":float(x["high_price"]),
+                       "l":float(x["low_price"]),"c":float(x["trade_price"]),
+                       "v":float(x["candle_acc_trade_volume"]),
+                       "turn":float(x.get("candle_acc_trade_price",0))}
+                if all(math.isfinite(row[k]) for k in ("o","h","l","c","v","turn")) and row["l"]>0 and row["h"]>=row["l"]:
+                    recent.append(row)
+            except (ValueError, KeyError, TypeError):
                 continue
-        oldest = data[-1]["candle_date_time_kst"].replace("T", " ")
-        if oldest == previous_oldest:
+        if not recent:
+            return []
+        if saved and min(x["t"] for x in recent) > saved[-1]["t"] + timedelta(minutes=tf):
+            seen = {}  # 캐시와 신규 API 사이에 자료 공백이 있어 재조회
+        for b in recent:
+            seen[b["t"]] = b
+        page_no += 1
+    previous_oldest = None
+    # 최신 200봉과 캐시 병합으로 충분하면 나머지 과거 API 페이지는 생략.
+    for _ in range(math.ceil(need/200)+3):
+        if len(seen) >= need:
             break
-        previous_oldest, cursor = oldest, oldest
-        if len(data) < params["count"]:
+        if not seen:
+            params = {"market":market, "count":min(200,need)}
+        else:
+            oldest = min(seen)
+            cursor = oldest.strftime("%Y-%m-%d %H:%M:%S")
+            if cursor == previous_oldest:
+                break
+            previous_oldest = cursor
+            params = {"market":market,"count":min(200,need-len(seen)),"to":cursor}
+        data = api(f"candles/minutes/{tf}",params)
+        fetched = True
+        page_no += 1
+        if not data:
             break
-        time.sleep(.11)
-    out = [seen[t] for t in sorted(seen)]
+        added = 0
+        for x in data:
+            try:
+                at=datetime.strptime(x["candle_date_time_kst"],"%Y-%m-%dT%H:%M:%S")
+                row={"t":at,"o":float(x["opening_price"]),"h":float(x["high_price"]),
+                     "l":float(x["low_price"]),"c":float(x["trade_price"]),
+                     "v":float(x["candle_acc_trade_volume"]),
+                     "turn":float(x.get("candle_acc_trade_price",0))}
+                if all(math.isfinite(row[k]) for k in ("o","h","l","c","v","turn")) and row["l"]>0 and row["h"]>=row["l"]:
+                    added += int(at not in seen)
+                    seen[at]=row
+            except (KeyError,TypeError,ValueError):
+                continue
+        if not added or len(data) < params["count"]:
+            break
+        time.sleep(.08)
+    out = [seen[t] for t in sorted(seen)][-6500:]
+    if fetched and out:
+        cache_write(market,tf,out)
     return out[-need:]
 
 
 def enrich(bars, tf):
-    """각 봉 마감 시점까지만 이용해 EMA/ATR/거래량 평균 계산.
-    누락 봉이 생기면 계산 워밍업을 다시 시작해 빈 봉을 메우지 않음.
+    """O(N) rolling ATR/거래량/거래대금. V3.1의 반복 sum(slice)을 제거.
+    결측 봉은 기존과 같이 해당 시점부터 워밍업 재시작.
     """
-    a50, a200 = 2 / 51, 2 / 201
+    alpha50, alpha200 = 2/51, 2/201
     ema50 = ema200 = None
-    trs, vols, turns = [], [], []
-    run = 0
+    atr_q, vol_q, turn_q = deque(), deque(), deque()
+    atr_sum = vol_sum = turn_sum = 0.0
+    turn_window = 1440 // tf
     previous = None
+    run = 0
     for b in bars:
-        contiguous = previous is not None and b["t"] - previous["t"] == timedelta(minutes=tf)
+        contiguous = previous is not None and b["t"]-previous["t"]==timedelta(minutes=tf)
         if not contiguous:
             run = 0
-            ema50 = ema200 = b["c"]
-            trs, vols, turns = [], [], []
+            ema50=ema200=b["c"]
+            atr_q.clear();vol_q.clear();turn_q.clear()
+            atr_sum=vol_sum=turn_sum=0.0
         else:
             run += 1
-            ema50 = a50 * b["c"] + (1 - a50) * ema50
-            ema200 = a200 * b["c"] + (1 - a200) * ema200
-        tr = max(b["h"] - b["l"], abs(b["h"] - (previous["c"] if contiguous else b["c"])),
-                 abs(b["l"] - (previous["c"] if contiguous else b["c"])))
-        b["volavg"] = sum(vols[-20:]) / 20 if len(vols) >= 20 else None
-        b["turn24"] = sum(turns[-(1440 // tf - 1):]) + b["turn"] if len(turns) >= (1440 // tf - 1) else None
-        trs.append(tr)
-        vols.append(b["v"])
-        turns.append(b["turn"])
-        b["atr"] = sum(trs[-14:]) / 14 if len(trs) >= 14 else None
-        b["ema50"] = ema50 if run >= 50 else None
-        b["ema200"] = ema200 if run >= 200 else None
-        b["run"] = run
-        b["dr"] = (2 * b["c"] - b["h"] - b["l"]) / max(1e-12, b["h"] - b["l"])
-        previous = b
+            ema50=alpha50*b["c"]+(1-alpha50)*ema50
+            ema200=alpha200*b["c"]+(1-alpha200)*ema200
+        old_close=previous["c"] if contiguous else b["c"]
+        tr=max(b["h"]-b["l"],abs(b["h"]-old_close),abs(b["l"]-old_close))
+        b["volavg"] = vol_sum/20 if len(vol_q)>=20 else None
+        b["turn24"] = turn_sum + b["turn"] if len(turn_q)>=turn_window-1 else None
+        atr_q.append(tr);atr_sum+=tr
+        if len(atr_q)>14:atr_sum-=atr_q.popleft()
+        b["atr"] = atr_sum/14 if len(atr_q)>=14 else None
+        vol_q.append(b["v"]);vol_sum+=b["v"]
+        if len(vol_q)>20:vol_sum-=vol_q.popleft()
+        turn_q.append(b["turn"]);turn_sum+=b["turn"]
+        if len(turn_q)>turn_window-1:turn_sum-=turn_q.popleft()
+        b["ema50"]=ema50 if run>=50 else None
+        b["ema200"]=ema200 if run>=200 else None
+        b["run"]=run
+        b["dr"]=(2*b["c"]-b["h"]-b["l"])/max(1e-12,b["h"]-b["l"])
+        previous=b
     return bars
 
 
@@ -223,7 +395,7 @@ def min_history(c):
     return max((220 if c.strategy == "trend" else 95), c.rs_days * 1440 // c.tf + 22 if c.rs else 0)
 
 
-def load_series(markets, cfg, days=None):
+def load_series(markets, cfg, days=None, progress=None):
     days = cfg.days if days is None else days
     need = min(6500, math.ceil(days * 1440 / cfg.tf) + min_history(cfg) + 4)
     datasets, errors = {}, []
@@ -231,21 +403,25 @@ def load_series(markets, cfg, days=None):
     def one(item):
         m = item["market"]
         try:
-            bars = enrich(candles(m, cfg.tf, need), cfg.tf)
+            bars = enrich(candles(m, cfg.tf, need, cache_ttl=(180 if days is None else 55)), cfg.tf)
             if len(bars) < min_history(cfg) + 5:
                 return m, None, "충분한 연속 이력 없음"
             return m, bars, None
         except Exception as exc:
             return m, None, str(exc)[:170]
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = [pool.submit(one, item) for item in markets]
+        done = 0
         for fut in as_completed(futures):
+            done += 1
             market, data, err = fut.result()
             if err:
                 errors.append(f"{market}: {err}")
             else:
                 datasets[market] = data
+            if progress:
+                progress(market,done,len(markets),len(errors))
     return datasets, errors
 
 
@@ -596,11 +772,16 @@ def simple_buy_ratio(market):
         return None
 
 
-def scan(cfg):
+def scan(cfg, progress=None):
+    if progress: progress("거래대금 상위 마켓 조회", 3, 0, 0, 0)
     chosen,eligible=universe(cfg)
+    if progress:progress("검사 마켓 확정", 5, 0, len(chosen), 0)
     if not chosen:
         return {"error":"거래대금 조건을 만족하는 종목을 찾지 못했습니다. API 연결도 확인해주세요."}
-    bars, errors=load_series(chosen,cfg,days=max(4,math.ceil(min_history(cfg)*cfg.tf/1440)+1))
+    if progress: progress("캔들 수집 준비", 6, 0, len(chosen), 0)
+    def scan_load(m,d,total,err):
+        if progress:progress(f"캔들 수집: {m}", 6+int(78*d/max(total,1)), d,total,err)
+    bars, errors=load_series(chosen,cfg,days=max(4,math.ceil(min_history(cfg)*cfg.tf/1440)+1), progress=scan_load)
     btc_map=None
     if cfg.strategy=="trend" and cfg.btc:
         try:
@@ -612,8 +793,9 @@ def scan(cfg):
             return {"error":f"BTC 필터 사용 중 데이터 오류. 안전을 위해 신호 계산을 중단합니다: {ex}"}
     rs_map=rs_by_time({m:complete(b,cfg.tf) for m,b in bars.items()},cfg) if cfg.strategy=="trend" and cfg.rs else None
     signals, watch, quality=[],[],{}
-    for item in chosen:
+    for idx,item in enumerate(chosen):
         m=item["market"]
+        if progress:progress(f"신호 계산: {m}", 85+int(13*(idx+1)/max(1,len(chosen))),idx+1,len(chosen),len(errors))
         if m not in bars:
             continue
         sig,wt,q=detect_all(m,bars[m],cfg,btc_map,rs_map,True)
@@ -622,8 +804,34 @@ def scan(cfg):
             s["turnover_24h"]=item["turnover"]
             signals.append(s)
         watch+=wt
-    for s in signals[:12]:
+    for s in signals[:6]:
         s["buy_ratio"]=simple_buy_ratio(s["market"])
+    for s in signals:
+        # 아래 점수는 차트 체크리스트 시각화용 규칙 점수. 예측 승률이 아님.
+        vr = max(0.0, float(s["context"].get("volume_ratio") or 0))
+        risk = max(0.0, float(s["risk_pct"]))
+        market_bars = bars[s["market"]]
+        last_bar = complete(market_bars, cfg.tf)[-1]
+        ema = last_bar.get("ema50") if cfg.strategy=="pullback" else last_bar.get("ema200")
+        trend_pass = ema is not None and last_bar["c"] > ema
+        s["score"] = {
+            "structure": 90 if cfg.strategy=="pullback" else 85,
+            "timing": 85,
+            "trend": 85 if trend_pass else 50,
+            "setup": round(min(100,40+vr*20)),
+            "entry": round(max(0,100-risk*12)),
+            "safety": round(max(0,100-risk*15)),
+            "pressure": s.get("buy_ratio"),
+        }
+        if cfg.strategy == "pullback":
+            s["why"] = (f"박스 상단 {s['context']['box']:,.4g}원 돌파 후 눌림 지지·양봉 마감을 확인했어요. "
+                        f"거래량은 평균의 {vr:.2f}배이며, 다음 봉 진입 예상가 {s['price']:,.4g}원, "
+                        f"구조 손절 {s['stop']:,.4g}원, 목표 {s['tp']:,.4g}원이에요. "
+                        "진입가·손절가가 가까우면 슬리피지와 호가를 추가 확인하세요.")
+        else:
+            s["why"] = (f"상위봉 고점 {s['context']['box']:,.4g}원 돌파 및 EMA200 상승 조건을 확인했어요. "
+                        f"거래량은 평균의 {vr:.2f}배이며, 초기 손절 {s['stop']:,.4g}원입니다. "
+                        "추세추종은 고정 목표가보다 ATR 트레일링을 사용해요.")
     signals.sort(key=lambda x:x["turnover_24h"],reverse=True)
     watch=watch[:10]
     return {"version":VERSION,"checked":len(bars),"eligible":eligible,"signals":signals,"watch":watch,
@@ -631,14 +839,18 @@ def scan(cfg):
             "quality":quality,"notes":["미완성 현재 봉은 신호에 사용하지 않습니다.","진입가는 확정 신호 다음 봉의 예상 시가이며 실시간 확정 체결가가 아닙니다."]}
 
 
-def backtest(cfg):
+def backtest(cfg, progress=None):
+    if progress:progress("기간·봉 수 검사", 1, 0, 0, 0)
     needed = math.ceil(cfg.days * 1440 / cfg.tf) + min_history(cfg) + 4
     if needed > 6500:
         return {"error":"선택한 기간과 분봉 조합은 6,500개 봉 한도를 넘습니다. 5분봉은 14일 이하로 검사하세요."}
     chosen,eligible=universe(cfg)
+    if progress:progress("검사 마켓 확정", 5, 0, len(chosen), 0)
     if not chosen:
         return {"error":"조건을 만족하는 마켓이 없습니다."}
-    data,errors=load_series(chosen,cfg)
+    def backtest_load(m,d,total,err):
+        if progress:progress(f"캔들 수집: {m}", 5+int(72*d/max(1,total)),d,total,err)
+    data,errors=load_series(chosen,cfg,progress=backtest_load)
     if not data:
         return {"error":"백테스트 데이터를 받지 못했습니다: "+("; ".join(errors[:2]))}
     btc_map=None
@@ -651,13 +863,15 @@ def backtest(cfg):
     rs_map=rs_by_time({m:complete(b,cfg.tf) for m,b in data.items()},cfg) if cfg.strategy=="trend" and cfg.rs else None
     events,coverage=[],{}
     order={x["market"]:i for i,x in enumerate(chosen)}
-    for m,bars in data.items():
+    for idx,(m,bars) in enumerate(data.items()):
+        if progress:progress(f"백테스트 계산: {m}", 78+int(19*(idx+1)/max(1,len(data))),idx+1,len(data),len(errors))
         e,_,q=detect_all(m,bars,cfg,btc_map,rs_map)
         coverage[m]=q
         for t in e:
             t["rank"]=order.get(m,999)
         events+=e
     # 다음 봉 시가로 진입하지 못하는 UNKNOWN은 통계에 수익/손실로 가산하지 않음.
+    if progress:progress("시간순 진입 제한·수익률 집계", 98, len(data), len(data), len(errors))
     selected=select_trades(events,cfg)
     end_time = max(b[-1]["t"] for b in data.values() if b)
     cut_time = end_time - timedelta(days=cfg.days * 0.3)
@@ -731,7 +945,7 @@ def holding(q,cfg):
 # -------------------------------- 화면 --------------------------------
 HTML = r'''<!doctype html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>BITHUMB V3.1 | 빗썸 전략 스캐너</title>
+<title>BITHUMB V3.2 | 빗썸 전략 스캐너</title>
 <style>
 :root{color-scheme:dark;--bg:#080e1c;--panel:#111c33;--inner:#0b1429;--line:#283752;--text:#e9effb;--muted:#a0aec8;--good:#49deb4;--bad:#fb7777;--blue:#688dff;--gold:#f2bd70}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Noto Sans KR",Roboto,Arial,sans-serif;padding:18px 13px 56px;line-height:1.5}
@@ -744,8 +958,16 @@ select:focus,input:focus{border-color:var(--blue)}.row{display:grid;grid-templat
 .entry{background:var(--inner);border:1px solid var(--line);border-radius:14px;padding:13px;margin:10px 0}.entry .top{display:flex;justify-content:space-between;gap:8px;align-items:start}.coin{font-size:22px;font-weight:800}.tag{display:inline-block;border-radius:99px;padding:4px 10px;background:#123b32;color:var(--good);font-size:12px;font-weight:700;white-space:nowrap}.tag.watch{background:#3e3324;color:var(--gold)}.detail{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:11px}.cell{border-radius:9px;padding:9px;background:#16233e}.cell b{display:block;font-size:15px;overflow-wrap:anywhere}.cell small{font-size:11px}.note{font-size:12px;color:var(--muted);line-height:1.65;margin-top:10px}.warn{color:var(--gold);font-size:12px;line-height:1.6}
 .scroll{overflow-x:auto}.scroll table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}th,td{text-align:right;padding:9px 7px;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-weight:500}.bigresult{font-size:26px;font-weight:800;letter-spacing:-.7px}.section{border-top:1px solid var(--line);margin:12px 0;padding-top:11px}
 @media(min-width:720px){body{padding:23px 20px}.stats{grid-template-columns:repeat(4,minmax(0,1fr))}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.two>.card{align-self:start}.stats .value{font-size:28px}}
+
+/* V3.2: 참고 이미지의 밝은 카드형 검사표 */
+:root{color-scheme:light;--bg:#f5f6f9;--panel:#fff;--inner:#f7f8fa;--line:#e5e8ee;--text:#20242f;--muted:#7d8594;--good:#128464;--bad:#c43148;--blue:#3166e5;--gold:#a46a03}
+body{background:var(--bg)}.entry,.card,.stat{background:white;box-shadow:0 3px 15px rgba(10,20,44,.035)}.entry{border-color:#e5e8ec}.cell{background:#f4f5f8;border-radius:13px;padding:13px 9px;text-align:center}.cell b{font-size:20px;margin-top:4px}.cell small{font-size:12px;color:#838996}
+.tag{background:#e9f8f3;color:#13815d}.tag.watch{background:#f9f3e6;color:#9b6b09}.version{background:#eaf0ff;color:#3055a5}select,input{color:#20242f;background:white;border-color:#d8dee7}button{color:#394764;background:#f0f3fa;border-color:#d8deea}button.primary{color:#fff}
+.progress{margin:12px 0;background:#f4f6fb;border-radius:13px;padding:12px;border:1px solid #e2e7f2}.progress[hidden]{display:none}.phead{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#405273;font-size:13px}.ptrack{height:12px;background:#dce3ef;border-radius:99px;margin-top:10px;overflow:hidden}.pfill{height:100%;width:0%;background:#3166e5;border-radius:99px;transition:width .35s ease}.progress .msg{margin-top:7px}
+.scoregrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}.scorecell{background:#f4f5f8;padding:10px;text-align:center;border-radius:14px}.scorecell strong{font-size:25px;display:block}.scorecell small{display:block;color:#828a96;font-size:12px}.explainer{background:#f1f7f4;color:#16714e;padding:12px;border-radius:12px;font-size:13px;line-height:1.65;margin-top:12px;font-weight:600}
+@media(min-width:720px){.scoregrid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
-<header><div><span class="version">NEW V3.1</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>눌림목 & 추세추종 스캐너</h1><div class="sub">봉 마감 확인 → 다음 봉 진입 가정. 실시간 후보와 과거 백테스트를 같은 규칙으로 계산합니다. 기존 CORE.56과 독립 프로그램입니다.</div></header>
+<header><div><span class="version">NEW V3.2</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>눌림목 & 추세추종 스캐너</h1><div class="sub">봉 마감 확인 → 다음 봉 진입 가정. 실시간 후보와 과거 백테스트를 같은 규칙으로 계산합니다. 기존 CORE.56과 독립 프로그램입니다.</div></header>
 <div class="stats"><div class="stat"><small>검사 마켓</small><div class="value" id="k_count">–</div></div><div class="stat"><small>진입 후보</small><div class="value g" id="k_sig">–</div></div><div class="stat"><small>관심 후보</small><div class="value" id="k_watch">–</div></div><div class="stat"><small>최근 갱신 (KST)</small><div class="value" id="k_time" style="font-size:15px">–</div></div></div>
 <div class="two"><div class="card"><h2>① 스캔 설정</h2>
 <label>전략</label><select id="st"><option value="pullback">눌림목 · 박스 돌파 → 재테스트</option><option value="trend">추세추종 · 상위 봉 고점 돌파</option></select>
@@ -757,10 +979,12 @@ select:focus,input:focus{border-color:var(--blue)}.row{display:grid;grid-templat
 <div class="row"><div><label>본전선 이동</label><select id="be"><option value="0">끄기</option><option value="0.5">+0.5R 도달 시</option><option value="0.75">+0.75R 도달 시</option><option value="1">+1R 도달 시</option></select></div><div><label>BTC 추세 필터</label><select id="btc"><option value="off">끄기</option><option value="on">켜기</option></select></div></div>
 <div class="row"><div><label>상대강도 상위</label><select id="rs"><option value="0">끄기</option><option value="0.3">상위 30%</option><option value="0.5">상위 50%</option><option value="0.2">상위 20%</option></select></div><div><label>상대강도 측정 기간</label><select id="rsd"><option value="7">7일</option><option value="14">14일</option></select></div></div></div>
 <div class="row"><div><label>하루 최대 진입</label><select id="maxday"><option value="4">4건</option><option value="3">3건</option><option value="2">2건</option><option value="1">1건</option></select></div><div><label>동시 보유</label><select id="maxpos"><option value="1">1개</option><option value="2">2개</option><option value="3">3개</option><option value="5">5개</option></select></div></div>
-<div class="actions"><button class="primary" id="scanBtn" onclick="doScan()">지금 스캔</button><button id="autoBtn" onclick="autoSwitch()">자동 갱신 켜기</button></div><div class="msg" id="scanMsg">서버 연결 확인 중…</div></div>
+<div class="actions"><button class="primary" id="scanBtn" onclick="doScan()">지금 스캔</button><button id="autoBtn" onclick="autoSwitch()">자동 갱신 켜기</button></div>
+<div class="progress" id="scanProgress" hidden><div class="phead"><b id="scanStage">대기</b><b id="scanPct">0%</b></div><div class="ptrack"><div id="scanFill" class="pfill"></div></div><div class="msg" id="scanCount">0/0</div></div>
+<div class="msg" id="scanMsg">서버 연결 확인 중…</div></div>
 <div class="card"><h2>② 진입 확인</h2><div id="signals" class="sub">아직 스캔하지 않았어요.</div><div class="section"><h2>③ 눌림 대기 / 관심 후보</h2><div id="watch" class="sub">아직 스캔하지 않았어요.</div></div></div></div>
 <div class="two"><div class="card"><h2>④ 보유 코인 손절선 (추세추종)</h2><div class="sub">진입가·진입 시각을 입력하면 확정 분봉 기반 ATR 트레일링을 재현합니다. 실제 주문 기록을 조회하지 않습니다.</div><label>종목 (예: XRP)</label><input id="h_sym" autocapitalize="characters" placeholder="XRP"><div class="row"><div><label>내 진입가 (원)</label><input id="h_price" type="number" min="0" step="any" placeholder="예: 3250"></div><div><label>진입 시각 (KST)</label><input id="h_time" type="datetime-local"></div></div><div class="actions"><button id="holdBtn" class="primary" onclick="doHold()">트레일링 확인</button></div><div class="msg" id="holdMsg"></div><div id="holdResult"></div></div>
-<div class="card"><h2>⑤ 백테스트</h2><div class="sub">학습 기간 70% / 검증 30%. 분봉 결측 또는 미래 봉 부족은 UNKNOWN으로 따로 집계합니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="14">14일</option><option value="7">7일</option><option value="30">30일</option><option value="3">3일</option></select></div><div><label>계산 조건</label><input value="봉 마감·손절 우선" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">백테스트 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>CSV 저장</button></div><div id="btMsg" class="msg">기간·분봉·종목 수가 늘어나면 API 조회 시간이 길어질 수 있어요.</div><div id="btResult"></div></div></div>
+<div class="card"><h2>⑤ 백테스트</h2><div class="sub">학습 기간 70% / 검증 30%. 분봉 결측 또는 미래 봉 부족은 UNKNOWN으로 따로 집계합니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="14">14일</option><option value="7">7일</option><option value="30">30일</option><option value="3">3일</option></select></div><div><label>계산 조건</label><input value="봉 마감·손절 우선" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">백테스트 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>CSV 저장</button></div><div class="progress" id="btProgress" hidden><div class="phead"><b id="btStage">대기</b><b id="btPct">0%</b></div><div class="ptrack"><div id="btFill" class="pfill"></div></div><div class="msg" id="btCount">0/0</div></div><div id="btMsg" class="msg">기간·분봉·종목 수가 늘어나면 API 조회 시간이 길어질 수 있어요.</div><div id="btResult"></div></div></div>
 <div class="card"><h2>검증할 때 꼭 볼 점</h2><div class="warn">• 백테스트는 과거 신호가 형성된 뒤 다음 분봉 시가로만 진입합니다.<br>• 손절과 익절이 같은 분봉에 닿으면 손절 우선. 공백 봉은 임의 생성하지 않아요.<br>• 백테스트 대상 종목은 현재 24시간 거래대금 순위이므로 과거 당시의 상장·거래대금과 다를 수 있어요.<br>• 실거래 호가·주문 체결을 재현하지 못하며 신호를 매수 보장으로 해석하면 안 돼요.<br>• 주문/API 키 기능이 없어요. 데이터 오류·검증 불충분시 거래 0회도 정상입니다.</div></div>
 </main><script>
 const $=id=>document.getElementById(id);let autoTimer=null, scanning=false, lastBT=null;
@@ -776,11 +1000,27 @@ $('st').onchange=changeStrategy;changeStrategy();
 async function request(path){const r=await fetch(path);let d;try{d=await r.json()}catch(e){throw Error('서버 JSON 응답이 아닙니다')};if(!r.ok||d.error)throw Error(d.error||'HTTP '+r.status);return d}
 async function ping(){try{const d=await request('/api/ping');$('scanMsg').textContent='서버 연결 완료 · '+esc(d.version)+' · 마지막 스캔을 실행할 수 있습니다.'}catch(e){$('scanMsg').textContent='연결 실패: '+e.message}}
 function tiles(items){return `<div class="detail">${items.map(([k,v])=>`<div class="cell"><small>${esc(k)}</small><b>${esc(v)}</b></div>`).join('')}</div>`}
-function card(s){return `<div class="entry"><div class="top"><div><div class="coin">${esc(s.market.replace('KRW-',''))} <small>${esc(s.strategy==='trend'?'추세추종':'눌림목')}</small></div><small>신호 확정: ${esc(s.signal_at.replace('T',' '))}</small></div><span class="tag">마감봉 확인</span></div>${tiles([['예상 진입가',fmt(s.price)+'원'],['구조 손절선',fmt(s.stop)+'원'],['초기 위험',Number(s.risk_pct).toFixed(2)+'%'],[s.tp?'1차 목표가':'돌파 고점',fmt(s.tp||s.context.box)+'원']])}<div class="note">거래량 ${esc(s.context.volume_ratio)}배 · 24시간 거래대금 ${s.turnover_24h?fmt(s.turnover_24h/100000000)+'억원':'–'}${s.buy_ratio==null?'':' · 최근 200체결 매수 비율 '+s.buy_ratio+'%'}</div></div>`}
-async function doScan(){if(scanning)return;scanning=true;const b=$('scanBtn');b.disabled=true;b.textContent='조회 중…';$('scanMsg').textContent='빗썸 공개 시세로 완료봉을 검사 중입니다.';
-try{const d=await request('/api/scan?'+qs());$('k_count').textContent=d.checked;$('k_sig').textContent=d.signals.length;$('k_watch').textContent=d.watch.length;$('k_time').textContent=d.updated.slice(11,19);
+function card(s){
+const score=s.score||{};
+const pts=[['Structure',score.structure],['Timing',score.timing],['Trend',score.trend],['Setup',score.setup],['Entry',score.entry],['Risk 안전도',score.safety],['매수체결 비율',score.pressure==null?'미집계':score.pressure+'%']];
+const scoreHtml=`<div class="scoregrid">${pts.map(([name,num])=>`<div class="scorecell"><strong>${esc(num)}</strong><small>${esc(name)}</small></div>`).join('')}</div>`;
+const rr=s.tp&&s.price>s.stop?((s.tp-s.price)/(s.price-s.stop)).toFixed(2)+'R':'트레일링';
+const levels=tiles([['예상 진입가',fmt(s.price)+'원'],['손절가',fmt(s.stop)+'원'],['목표가',s.tp?fmt(s.tp)+'원':'ATR 추종'],['기대 R:R',rr]]);
+return `<div class="entry"><div class="top"><div><div class="coin">${esc(s.market.replace('KRW-',''))} <small>${fmt(s.price)}원</small></div><small>신호 확정 ${esc(s.signal_at.replace('T',' '))}</small></div><span class="tag">${esc(s.strategy==='trend'?'추세추종 조건 충족':'눌림목 조건 충족')}</span></div>
+<div class="note">24H ${s.turnover_24h?fmt(s.turnover_24h/100000000)+'억원':'–'} · 거래량 ${esc(s.context.volume_ratio)}배 · 위험폭 ${Number(s.risk_pct).toFixed(2)}%</div>
+${scoreHtml}<div class="explainer">${esc(s.why||'모든 전략 조건을 충족한 과거 마감봉을 확인했습니다. 실시간 호가와 체결 조건은 별도 확인이 필요합니다.')}</div>${levels}
+<div class="note">※ 점수는 조건 충족 상태를 보여주는 실험용 규칙 점수이며, 승률·수익 확률이나 매수 추천이 아닙니다.</div></div>`}
+function updateProgress(prefix,d){const container=$(prefix+'Progress');container.hidden=false;$(prefix+'Stage').textContent=d.stage;$(prefix+'Pct').textContent=d.percent+'%';$(prefix+'Fill').style.width=d.percent+'%';$(prefix+'Count').textContent=`검사 ${d.done}/${d.total||'?'}개 · 오류 ${d.errors||0}개 · 경과 ${d.elapsed}초`;}
+async function runJob(kind,query,progressPrefix){const start=await request('/api/job/start?kind='+kind+'&'+query);let failedPoll=0;
+while(true){await new Promise(ok=>setTimeout(ok,1300));let s;
+try{s=await request('/api/job/status?id='+encodeURIComponent(start.job));failedPoll=0}catch(e){if(++failedPoll>=4)throw e;continue;}
+updateProgress(progressPrefix,s);if(!s.running){if(s.error)throw Error(s.error);return s.result;}}
+}
+async function doScan(){if(scanning)return;scanning=true;const b=$('scanBtn');b.disabled=true;b.textContent='스캔 중…';$('scanMsg').textContent='실시간 진행률을 표시합니다.';
+$('scanProgress').hidden=false;$('scanPct').textContent='0%';$('scanFill').style.width='0%';
+try{const d=await runJob('scan',qs(),'scan');$('k_count').textContent=d.checked;$('k_sig').textContent=d.signals.length;$('k_watch').textContent=d.watch.length;$('k_time').textContent=d.updated.slice(11,19);
 $('signals').innerHTML=d.signals.length?d.signals.map(card).join(''):'조건을 모두 통과한 진입 후보가 없습니다.';
-$('watch').innerHTML=d.watch.length?d.watch.map(s=>`<div class="entry"><b>${esc(s.market)}</b><span class="tag watch">${esc(s.status||'관심')}</span><div class="sub">기준 고점 ${fmt(s.box)}원 · 마지막 완료봉 ${fmt(s.price)}원</div></div>`).join(''):'관심 후보가 없습니다.';
+$('watch').innerHTML=d.watch.length?d.watch.map(s=>`<div class="entry"><div class="top"><b>${esc(s.market)}</b><span class="tag watch">${esc(s.status||'관심')}</span></div><div class="sub">기준 고점 ${fmt(s.box)}원 · 마지막 완료봉 ${fmt(s.price)}원</div></div>`).join(''):'관심 후보가 없습니다.';
 $('scanMsg').textContent=`검사 완료 ${d.checked}개 / 거래대금 조건 충족 ${d.eligible}개 · ${d.updated}`+(d.errors.length?`\n자료 부족/오류 ${d.errors.length}건: `+d.errors.slice(0,2).join(' / '):'');
 }catch(e){$('scanMsg').textContent='스캔 오류: '+e.message}finally{scanning=false;b.disabled=false;b.textContent='지금 스캔'}}
 function autoSwitch(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;$('autoBtn').textContent='자동 갱신 켜기'}else{doScan();autoTimer=setInterval(()=>{if(!scanning)doScan()},90000);$('autoBtn').textContent='자동 갱신 끄기 (90초)'}}
@@ -794,10 +1034,12 @@ h+=`<h3>학습 / 검증 (시간순 70/30)</h3><div class="scroll"><table><tr><th
 h+=`<h3>날짜별</h3><div class="scroll"><table><tr><th>일자</th><th>건수</th><th>승/패</th><th>평균순익</th><th>손익(원)</th></tr>${d.daily.map(x=>`<tr><td>${x.date}</td><td>${x.n}</td><td>${x.win}/${x.loss}</td><td>${pct(x.avg_net)}</td><td class="${x.pnl_krw>0?'g':'r'}">${krw(x.pnl_krw)}</td></tr>`).join('')||'<tr><td colspan="5">데이터 없음</td></tr>'}</table></div>`;
 h+=`<h3>최근 선택 거래</h3><div class="scroll"><table><tr><th>진입</th><th>마켓</th><th>종료사유</th><th>순수익</th></tr>${d.trades.slice(-30).reverse().map(t=>`<tr><td>${esc(t.entry_at.slice(5,16).replace('T',' '))}</td><td>${esc(t.market.replace('KRW-',''))}</td><td>${esc(t.why||'–')}</td><td class="${t.net_pct>0?'g':'r'}">${t.net_pct==null?'미확정':pct(t.net_pct)}</td></tr>`).join('')||'<tr><td colspan="4">거래 없음</td></tr>'}</table></div>`;
 h+=`<div class="note">${d.warnings.map(x=>'• '+esc(x)).join('<br>')}${d.errors.length?'<br>• 데이터 부족: '+d.errors.map(esc).slice(0,3).join(' / '):''}</div>`;return h}
-async function doBT(){const b=$('btBtn');b.disabled=true;b.textContent='백테스트 중…';$('csvBtn').disabled=true;$('btMsg').textContent='API 데이터를 모으고 가격 흐름을 검증하는 중입니다.';try{const d=await request('/api/backtest?'+qs());lastBT=d;$('btResult').innerHTML=renderBT(d);$('btMsg').textContent='계산 완료 · '+d.settings.period_days+'일 · '+d.settings.tf+'분봉 · 수수료 편도 '+d.settings.fee_pct+'% · 슬리피지 편도 '+d.settings.slip_pct+'%';$('csvBtn').disabled=false}
+async function doBT(){const b=$('btBtn');b.disabled=true;b.textContent='백테스트 중…';$('csvBtn').disabled=true;$('btMsg').textContent='종목별 진행률을 표시합니다.';
+$('btProgress').hidden=false;$('btPct').textContent='0%';$('btFill').style.width='0%';
+try{const d=await runJob('backtest',qs(),'bt');lastBT=d;$('btResult').innerHTML=renderBT(d);$('btMsg').textContent='계산 완료 · '+d.settings.period_days+'일 · '+d.settings.tf+'분봉 · 수수료 편도 '+d.settings.fee_pct+'% · 슬리피지 편도 '+d.settings.slip_pct+'%';$('csvBtn').disabled=false}
 catch(e){$('btMsg').textContent='백테스트 오류: '+e.message}finally{b.disabled=false;b.textContent='백테스트 실행'}}
 function exportCSV(){if(!lastBT)return;const d=lastBT;const objs=[...d.daily.map(x=>({row_type:'DAILY',...x})),...d.trades.map(x=>({row_type:'TRADE',version:d.version,...x}))];const columns=[...new Set(['row_type','version','date','market','signal_at','entry_at','exit_at','status','net_pct',...objs.flatMap(x=>Object.keys(x))])];const cell=v=>{const s=typeof v==='object'&&v!==null?JSON.stringify(v):String(v??'');return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
-const csv='\ufeff'+[columns.join(','),...objs.map(x=>columns.map(k=>cell(x[k])).join(','))].join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`BITHUMB_V3_1_${d.kind}_${d.settings.tf}m_${d.settings.period_days}d.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
+const csv='\ufeff'+[columns.join(','),...objs.map(x=>columns.map(k=>cell(x[k])).join(','))].join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`BITHUMB_V3_2_${d.kind}_${d.settings.tf}m_${d.settings.period_days}d.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
 ping();
 </script></body></html>'''
 
@@ -826,6 +1068,12 @@ class WebHandler(BaseHTTPRequestHandler):
             return self.send_body(200, HTML, "text/html")
         if route.path in ("/health", "/api/ping"):
             return self.send_body(200, {"ok": True, "version": VERSION, "local_kst":kst_now().isoformat(), "trading":False})
+        if route.path == "/api/job/status":
+            return self.send_body(200, job_status(parse_qs(route.query).get("id",[""])[0]))
+        if route.path == "/api/job/start":
+            q = parse_qs(route.query)
+            result = start_job(q.get("kind",[""])[0], Settings.from_q(q))
+            return self.send_body(200 if "error" not in result else 429, result)
         if route.path not in ("/api/scan", "/api/backtest", "/api/hold"):
             return self.send_body(404, {"error":"지원하지 않는 경로입니다."})
         if not BUSY.acquire(blocking=False):
