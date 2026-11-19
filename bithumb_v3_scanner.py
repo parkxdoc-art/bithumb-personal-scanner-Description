@@ -1,4 +1,4 @@
-"""BITHUMB V3.8 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
+"""BITHUMB V3.9 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
 
 필요: pip install requests
 실행: python bithumb_v3_scanner.py  -> http://127.0.0.1:8080
@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-VERSION = "V3.8"
+VERSION = "V3.9"
 BASE = "https://api.bithumb.com/v1"
 KST = timezone(timedelta(hours=9))
 BUSY = threading.Lock()
@@ -152,7 +152,7 @@ def start_job(kind, cfg):
                    started=time.monotonic(), error=None, result=None, cancel=False)
     def worker():
         try:
-            result = (precursor_scan(cfg,progress=job_update) if kind=="scan" else precursor_backtest(cfg,progress=job_update)) if cfg.strategy=="precursor" else (scan(cfg, progress=job_update) if kind=="scan" else backtest(cfg, progress=job_update))
+            result = (momentum_scan(cfg, progress=job_update) if kind=="scan" else momentum_backtest(cfg, progress=job_update)) if cfg.strategy=="momentum" else ((precursor_scan(cfg,progress=job_update) if kind=="scan" else precursor_backtest(cfg,progress=job_update)) if cfg.strategy=="precursor" else (scan(cfg, progress=job_update) if kind=="scan" else backtest(cfg, progress=job_update)))
             with JOB_LOCK:
                 JOB["result"] = result if "error" not in result else None
                 JOB["error"] = result.get("error")
@@ -208,7 +208,7 @@ def number(query, key, default, lo, hi, integer=False):
 
 @dataclass(frozen=True)
 class Settings:
-    strategy: str = "precursor"
+    strategy: str = "momentum"
     tf: int = 60
     count: int = 40
     days: int = 15
@@ -229,12 +229,12 @@ class Settings:
 
     @staticmethod
     def from_q(q):
-        st = q.get("st", ["precursor"])[0]
-        if st not in ("pullback", "trend", "flow", "trap", "precursor"):
-            st = "precursor"
-        tf = number(q, "tf", (60 if st == "precursor" else 15 if st == "trap" else 60 if st in ("trend", "flow") else 15), 5, 240, True)
-        if tf not in VALID_TF or (st in ("trend", "flow") and tf not in (60, 240)) or (st == "pullback" and tf not in (5, 15, 60)) or (st == "trap" and tf not in (15, 60)) or (st == "precursor" and tf not in (60, 240)):
-            tf = 60 if st == "precursor" else 15 if st == "trap" else 60 if st in ("trend", "flow") else 15
+        st = q.get("st", ["momentum"])[0]
+        if st not in ("pullback", "trend", "flow", "trap", "precursor", "momentum"):
+            st = "momentum"
+        tf = number(q, "tf", (60 if st in ("precursor", "momentum") else 15 if st == "trap" else 60 if st in ("trend", "flow") else 15), 5, 240, True)
+        if tf not in VALID_TF or (st in ("trend", "flow") and tf not in (60, 240)) or (st == "pullback" and tf not in (5, 15, 60)) or (st == "trap" and tf not in (15, 60)) or (st in ("precursor", "momentum") and tf not in (60, 240)):
+            tf = 60 if st in ("precursor", "momentum") else 15 if st == "trap" else 60 if st in ("trend", "flow") else 15
         flow = q.get("of", ["weak"])[0]
         if flow not in ("off", "weak", "strong"):
             flow = "weak"
@@ -251,7 +251,7 @@ class Settings:
             be_r=number(q, "be", 0, 0, 5),
             btc=q.get("btc", ["off"])[0] == "on",
             max_positions=number(q, "maxpos", 1, 1, 5, True),
-            max_trades_day=(min(2, number(q, "maxday", 2, 1, 4, True)) if st in ("trap", "precursor") else number(q, "maxday", (2 if st in ("trend", "flow") else 4), 1, 4, True)),
+            max_trades_day=(min(2, number(q, "maxday", 2, 1, 4, True)) if st in ("trap", "precursor", "momentum") else number(q, "maxday", (2 if st in ("trend", "flow") else 4), 1, 4, True)),
             rs=number(q, "rs", 0, 0, 1), rs_days=number(q, "rsd", 7, 1, 14, True),
         )
 
@@ -299,7 +299,7 @@ def universe(cfg):
             rows.sort(key=lambda x: x["turnover"], reverse=True)
             MARKET_CACHE.update(at=time.monotonic(), markets=rows)
     # 새 거래대금 반응 연구는 BTC(상대강도 비교 기준)와 스테이블코인을 매매 대상에서 제외한다.
-    excluded = {"BTC", "USDT", "USDC", "DAI", "FDUSD", "TUSD", "PYUSD", "USD1", "USDD", "USDE"} if cfg.strategy in ("flow", "trap", "precursor") else set()
+    excluded = {"BTC", "USDT", "USDC", "DAI", "FDUSD", "TUSD", "PYUSD", "USD1", "USDD", "USDE"} if cfg.strategy in ("flow", "trap", "precursor", "momentum") else set()
     eligible = [x for x in rows if x["turnover"] >= cfg.turnover_min
                 and x["market"].split("-",1)[-1] not in excluded]
     return (eligible[:cfg.count] if cfg.count else eligible), len(eligible)
@@ -435,7 +435,7 @@ def enrich(bars, tf):
 
 def min_history(c):
     # 검증용 워밍업: 60분 추세는 EMA200, 눌림은 EMA50, RS 설정이 있으면 별도 창 보장
-    return max((220 if c.strategy == "trend" else (80 if c.strategy in ("flow", "precursor") else 95)), c.rs_days * 1440 // c.tf + 22 if c.rs and c.strategy=="trend" else 0)
+    return max((220 if c.strategy == "trend" else (80 if c.strategy in ("flow", "precursor", "momentum") else 95)), c.rs_days * 1440 // c.tf + 22 if c.rs and c.strategy=="trend" else 0)
 
 
 def load_series(markets, cfg, days=None, progress=None):
@@ -2361,10 +2361,290 @@ def precursor_scan(cfg,progress=None):
       'updated':kst_now().strftime('%Y-%m-%d %H:%M:%S KST'),
       'notes':['현재 시점의 사전 정의된 특징만 참고로 표시합니다. BUY·진입가 계산 없음.']}
 
+
+# ---------- V3.9: 고정 +2% 전조의 체결 가능한 거래가설 검증 ----------
+# 모든 전략은 같은 시각(매일 KST 00:00)의 완료된 1시간봉만 사용해 선정.
+# 필터 결과에 맞춰 손절/익절 문턱을 재조정하지 않으며 주문 기능 없음.
+M39_RULES = {
+    'BASE_24H': ('당시 거래대금 상위 2종목 (비교 기준)', False, 24),
+    'MOM_24H': ('직전 24시간 +2% 이상 · 24시간 보유', True, 24),
+    'MOM_12H': ('직전 24시간 +2% 이상 · 12시간 보유', True, 12),
+}
+M39_STOP_PCT = 3.0
+M39_TAKE_PCT = 5.0
+M39_COLUMNS = [
+  'row_type','version','rule','rule_label','segment','market','date_kst','anchor_at_kst',
+  'anchor_close','entry_at_kst','entry_price','exit_at_kst','exit_price','stop_price','target_price',
+  'why','status','gross_pct','net_pct','pnl_krw','fee_side_pct','slippage_pct','capital_krw',
+  'past_24h_pct','turnover_24h_krw','market_rank_today','rank_at_signal','hold_hours',
+  'mfe_pct','mae_pct','max_favorable_high','min_adverse_low','data_gap','bar_count',
+  'candidate_count','momentum_count','n','win','loss','unknown','win_rate','avg_net_pct','sum_pnl_krw',
+  'train_n','train_avg_net_pct','test_n','test_avg_net_pct','test_trim2_avg_net_pct',
+  'selected_n','complete_market_count','partial_market_count','requested_markets',
+  'checked_markets','error_count','period_start_kst','period_end_kst','train_cut_kst',
+  'tf_minutes','requested_days','market_scope','turnover_min_krw','time_entry_policy',
+  'full_period','first_at','last_at','gap_count','observation_count','reason','message','warning','error',
+]
+
+
+def _m39_fee_net(entry, exit_price, fee):
+    # 투입금에 매수 수수료 포함(왕복 매수/매도 각각 실제 명목가 기준).
+    return ((exit_price / entry) * (1-fee) / (1+fee) - 1) * 100
+
+
+def _m39_simulate(bars, i, tf, cfg, hold_h):
+    """확정 시점 i의 다음 시가 진입, 보수적 동일봉 손절 우선.
+    미래 봉 누락은 UNKNOWN 처리. 이미 청산된 뒤의 봉 누락은 영향 없음.
+    """
+    at=bars[i]['t']+timedelta(minutes=tf)
+    n=hold_h*60//tf
+    if i+1>=len(bars) or bars[i+1]['t']!=at:
+        return dict(status='UNKNOWN',why='MISSING_ENTRY_BAR',data_gap=1)
+    entry=bars[i+1]['o']
+    if not (math.isfinite(entry) and entry>0):
+        return dict(status='UNKNOWN',why='INVALID_ENTRY',data_gap=1)
+    stop=entry*(1-M39_STOP_PCT/100)
+    target=entry*(1+M39_TAKE_PCT/100)
+    hi=entry;lo=entry;prev=None; last=None
+    for j in range(i+1,i+1+n):
+        if j>=len(bars) or bars[j]['t']!=at+timedelta(minutes=(j-i-1)*tf):
+            return dict(status='UNKNOWN',why='GAP_OR_MISSING_FUTURE',entry_at_kst=at.isoformat(),entry_price=entry,
+                        stop_price=stop,target_price=target,data_gap=1)
+        b=bars[j];prev=b;last=j
+        # 시가 갭은 시가가 먼저 발생: 시가가 스톱/목표 밖이면 시가로 체결.
+        if b['o']<=stop: price=b['o'];why='STOP_GAP'
+        elif b['o']>=target: price=b['o'];why='TARGET_GAP'
+        elif b['l']<=stop: price=stop;why='STOP_FIRST'
+        elif b['h']>=target: price=target;why='TARGET'
+        else: price=None;why=None
+        # MFE/MAE는 *사후* 봉 고저가 진단, 봉 내 선후관계 미확인.
+        hi=max(hi,b['h']);lo=min(lo,b['l'])
+        if price is not None:
+            net=_m39_fee_net(entry,price,cfg.fee)
+            return dict(status='READY',why=why,entry_at_kst=at.isoformat(),entry_price=entry,
+              stop_price=stop,target_price=target,exit_at_kst=b['t'].isoformat(),exit_price=price,
+              gross_pct=round((price/entry-1)*100,5),net_pct=round(net,5),
+              pnl_krw=round(cfg.capital*net/100),hold_hours=hold_h,data_gap=0,
+              mfe_pct=round((hi/entry-1)*100,4),mae_pct=round((lo/entry-1)*100,4),
+              max_favorable_high=hi,min_adverse_low=lo)
+    if last is None or prev is None:
+        return dict(status='UNKNOWN',why='NO_FUTURE',data_gap=1)
+    price=prev['c'];net=_m39_fee_net(entry,price,cfg.fee)
+    return dict(status='READY',why='TIME_EXIT',entry_at_kst=at.isoformat(),entry_price=entry,
+      stop_price=stop,target_price=target,exit_at_kst=(prev['t']+timedelta(minutes=tf)).isoformat(),
+      exit_price=price,gross_pct=round((price/entry-1)*100,5),net_pct=round(net,5),
+      pnl_krw=round(cfg.capital*net/100),hold_hours=hold_h,data_gap=0,
+      mfe_pct=round((hi/entry-1)*100,4),mae_pct=round((lo/entry-1)*100,4),
+      max_favorable_high=hi,min_adverse_low=lo)
+
+
+def _m39_select(dst, key, event, score):
+    """매일 당일 데이터만으로 상위 2건 유지. 결과 가격은 절대 정렬에 미사용."""
+    events=dst.setdefault(key,[])
+    events.append((score,event))
+    events.sort(key=lambda x:x[0])
+    del events[2:]
+
+
+def _m39_stats(events,cfg):
+    ready=[e for e in events if e.get('status')=='READY']
+    n=len(ready);win=sum(e['net_pct']>0 for e in ready)
+    return dict(n=n,win=win,loss=n-win,unknown=len(events)-n,selected_n=len(events),
+      win_rate=round(win/n*100,2) if n else None,
+      avg_net_pct=round(sum(e['net_pct'] for e in ready)/n,4) if n else None,
+      sum_pnl_krw=sum(e['pnl_krw'] for e in ready))
+
+
+def _m39_trim2(events,cfg):
+    ready=sorted((e for e in events if e.get('status')=='READY'),key=lambda e:e['net_pct'],reverse=True)
+    return _m39_stats(ready[2:],cfg)['avg_net_pct'] if len(ready)>2 else None
+
+
+def _m39_verdict(comparisons,full_count,requested,errors):
+    m=next((x for x in comparisons if x['rule']=='MOM_24H'),None)
+    if full_count < math.ceil(.8*max(1,requested)) or errors:
+        return {'status':'DATA_INCOMPLETE','message':'기간 완전 확보 마켓 80% 미만 또는 API 오류: 결과는 잠정값. 추가 전략 조건을 조정하지 않음.'}
+    if not m or m['train']['n']<30 or m['test']['n']<15:
+        return {'status':'INSUFFICIENT','message':'학습 30건/검증 15건이 없어 채택·폐기 판정 보류.'}
+    if m['train']['avg_net_pct'] is not None and m['test']['avg_net_pct'] is not None and m['test_trim2_avg_net_pct'] is not None and all(x>0 for x in [m['train']['avg_net_pct'],m['test']['avg_net_pct'],m['test_trim2_avg_net_pct']]):
+        return {'status':'CANDIDATE_ONLY','message':'사전 고정 양 구간 및 검증 상위 2건 제외 평균 플러스. 독립기간/선정 편향 검증 전 실전 금지.'}
+    return {'status':'DISCARD','message':'사전 고정 +2% 거래 전략은 검증 수익성 기준 미달. 추가 최적화 없이 종료 권고.'}
+
+
+def momentum_backtest(cfg,progress=None):
+    if cfg.tf!=60:return {'error':'V3.9 진입·경로 검증은 60분봉만 지원합니다. (동일봉 4시간봉에선 손절 선후 순서를 더 알기 어렵습니다.)'}
+    markets,eligible=universe(replace(cfg,turnover_min=0))
+    if not markets:return {'error':'검사할 KRW 마켓이 없습니다.'}
+    if (fail:=validate_workload(cfg,len(markets))):return fail
+    start=kst_now()-timedelta(days=cfg.days)
+    end=kst_now()
+    split=start+timedelta(days=cfg.days*.7)
+    step=timedelta(minutes=60)
+    day_top={};coverage={};errors=[];seen_markets=set();counts={'eligible_anchor':0,'momentum_anchor':0,'past_gap':0,'no_liquidity':0,'pending':0,'embargo':0}
+    ranks={r['market']:ix+1 for ix,r in enumerate(markets)}
+    batch_size=4 if cfg.days>=180 else 8
+    done=0
+    for base in range(0,len(markets),batch_size):
+        ensure_active();batch=markets[base:base+batch_size]
+        def on_progress(m,d,t,e):
+            if progress:progress('V3.9 과거 1시간봉 수집 '+m,5+int(84*(done+d)/len(markets)),done+d,len(markets),len(errors)+e)
+        data,errs=load_series(batch,cfg,progress=on_progress)
+        errors.extend(errs)
+        for market,original in data.items():
+            ensure_active()
+            bars=complete(original,60)
+            if len(bars)<80:continue
+            first=bars[0]['t'];last=bars[-1]['t']+step
+            gaps=sum(bars[j]['t']-bars[j-1]['t']!=step for j in range(1,len(bars)))
+            full=(first<=start-timedelta(hours=min_history(cfg)-3) and last>=end-timedelta(hours=2) and gaps==0)
+            coverage[market]={'market':market,'first_at':first.isoformat(),'last_at':last.isoformat(),
+              'bar_count':len(bars),'gap_count':gaps,'full_period':int(full),'market_rank_today':ranks[market]}
+            seen_markets.add(market)
+            for i in range(25,len(bars)):
+                if i%400==0:ensure_active()
+                r=bars[i];at=r['t']+step
+                if not(start<=at<end and at.hour==0 and at.minute==0):continue
+                # 사전에 미래가 부족함을 아는 마지막 24h는 아예 관측에서 제외.
+                if at+timedelta(hours=24)>end:
+                    counts['pending']+=1;continue
+                if at<split and at+timedelta(hours=24)>split:
+                    counts['embargo']+=1;continue
+                if r.get('run',0)<24 or not (r['c']>0 and bars[i-24]['c']>0):
+                    counts['past_gap']+=1;continue
+                turn=r.get('turn24')
+                if turn is None or not math.isfinite(turn) or turn<cfg.turnover_min:
+                    counts['no_liquidity']+=1;continue
+                past_pct=100*(r['c']/bars[i-24]['c']-1)
+                if not math.isfinite(past_pct):continue
+                counts['eligible_anchor']+=1
+                d=at.date().isoformat();seg='train' if at<split else 'test'
+                e={'market':market,'date_kst':d,'anchor_at_kst':at.isoformat(),
+                  'anchor_close':r['c'],'segment':seg,'past_24h_pct':round(past_pct,5),
+                  'turnover_24h_krw':round(turn),'market_rank_today':ranks[market],
+                  'full_period':int(full),'signal_ix':i}
+                # 계산 결과는 순위에 절대 섞지 않음. 디스크/메모리 낭비 방지 위해 상위2만 보관.
+                score_baseline=(-turn,market)
+                _m39_select(day_top,('BASE',d),{**e,'outcome_24':_m39_simulate(bars,i,60,cfg,24)},score_baseline)
+                if past_pct>=2:
+                    counts['momentum_anchor']+=1
+                    score_mom=(-past_pct,-turn,market)
+                    _m39_select(day_top,('MOM',d),{**e,'outcome_24':_m39_simulate(bars,i,60,cfg,24),
+                        'outcome_12':_m39_simulate(bars,i,60,cfg,12)},score_mom)
+        done+=len(batch)
+    selected={k:[] for k in M39_RULES}; daily={}
+    for (group,day),records in sorted(day_top.items()):
+        for ix,(_,e) in enumerate(records,1):
+            keys=['BASE_24H'] if group=='BASE' else ['MOM_24H','MOM_12H']
+            for rule in keys:
+                hold=12 if rule=='MOM_12H' else 24
+                o=e['outcome_12'] if hold==12 else e['outcome_24']
+                t={k:v for k,v in e.items() if k not in ('signal_ix','outcome_12','outcome_24')}
+                t.update(o);t.update(rule=rule,rule_label=M39_RULES[rule][0],rank_at_signal=ix,
+                    hold_hours=hold,fee_side_pct=round(cfg.fee*100,4),slippage_pct=0,capital_krw=cfg.capital)
+                selected[rule].append(t)
+                ds=daily.setdefault((rule,day),{'rule':rule,'date_kst':day,'n':0,'win':0,'loss':0,'unknown':0,'sum_pnl_krw':0,'net_sum':0.0})
+                if t['status']=='READY':
+                    ds['n']+=1;ds['win']+=int(t['net_pct']>0);ds['loss']+=int(t['net_pct']<=0)
+                    ds['net_sum']+=t['net_pct'];ds['sum_pnl_krw']+=t['pnl_krw']
+                else:ds['unknown']+=1
+    for d in daily.values():
+        d['avg_net_pct']=round(d.pop('net_sum')/d['n'],4) if d['n'] else None
+    comparisons=[]
+    for rule,(label,mom,hours) in M39_RULES.items():
+        t=selected[rule];train=[x for x in t if x['segment']=='train'];test=[x for x in t if x['segment']=='test']
+        st=_m39_stats(t,cfg);tr=_m39_stats(train,cfg);te=_m39_stats(test,cfg)
+        comparisons.append({'rule':rule,'rule_label':label,'stat':st,'train':tr,'test':te,
+            'test_trim2_avg_net_pct':_m39_trim2(test,cfg)})
+    full_count=sum(x['full_period'] for x in coverage.values())
+    verdict=_m39_verdict(comparisons,full_count,len(markets),errors)
+    config={'version':VERSION,'requested_days':cfg.days,'tf_minutes':cfg.tf,'market_scope':cfg.count,
+      'requested_markets':len(markets),'checked_markets':len(coverage),'complete_market_count':full_count,
+      'partial_market_count':len(coverage)-full_count,'error_count':len(errors),
+      'fee_side_pct':round(cfg.fee*100,4),'slippage_pct':0,'capital_krw':cfg.capital,
+      'period_start_kst':start.isoformat(),'period_end_kst':end.isoformat(),'train_cut_kst':split.isoformat(),
+      'turnover_min_krw':cfg.turnover_min,'time_entry_policy':'KST midnight completed candle -> next 1h candle OPEN',
+      'stop_pct':-M39_STOP_PCT,'target_pct':M39_TAKE_PCT,'max_entries_per_day':2}
+    notes=[
+      '사전 고정: 모멘텀은 지난 24시간 종가수익률 +2% 이상, 각 일자 강도 상위 2개 선정(미달이면 0건).',
+      '비교 기준: 당시 24시간 거래대금 상위 2개; 미래 성과를 선택/순위에 절대 사용하지 않음.',
+      '1시간봉 00:00 마감 후 다음 1시간봉 00:00 시가에 이상적 체결을 가정 (실제 체결지연 없음 가정).',
+      '손절 -3% / 익절 +5% / 보유 24h 또는 12h 사전 고정, 매수/매도 편도 수수료 반영, 슬리피지 0%.',
+      '동일봉 손절/익절 동시 접촉은 손절 우선. 시가 갭은 시가 체결, 봉 내 선후관계 불명.',
+      '미래 봉 누락 또는 시작 분봉 누락이면 UNKNOWN, 그 뒤 차순위 코인으로 보충하지 않음.',
+      '학습 70% / 검증 30% 시간순. 학습 미래 24h가 검증으로 넘어가는 관측은 제외.',
+      '현재 24시간 거래대금 상위의 과거 코인 선택 편향 및 과거 상장/폐지 종목 누락이 남음.',
+      '검증 후 임의 문턱 조정 금지. 수익성 통과도 실전 거래의 우위를 보장하지 않음.',
+    ]
+    csvpath=Path(tempfile.gettempdir())/('BITHUMB_V3_9_'+uuid.uuid4().hex[:12]+'.csv')
+    try:
+        with csvpath.open('w',newline='',encoding='utf-8-sig') as f:
+            w=csv.DictWriter(f,fieldnames=M39_COLUMNS,extrasaction='ignore');w.writeheader()
+            def put(kind,**kw):w.writerow({'row_type':kind,'version':VERSION,**kw})
+            put('RUN_CONFIG',**config)
+            for rule,(label,_,hold) in M39_RULES.items():put('RULE',rule=rule,rule_label=label,hold_hours=hold,message='STOP -3% / TARGET +5% / DAILY <=2')
+            for c in comparisons:
+                for seg,stat in (('all',c['stat']),('train',c['train']),('test',c['test'])):
+                    put('COMPARE',rule=c['rule'],rule_label=c['rule_label'],segment=seg,**stat,
+                        test_trim2_avg_net_pct=c['test_trim2_avg_net_pct'] if seg=='test' else None)
+            for d in sorted(daily.values(),key=lambda x:(x['date_kst'],x['rule'])):put('DAILY',**d)
+            for rule,trades in selected.items():
+                permarket={}
+                for t in trades:
+                    z=permarket.setdefault(t['market'],[]);z.append(t)
+                for m,items in sorted(permarket.items()):put('MARKET',market=m,rule=rule,**_m39_stats(items,cfg))
+                for t in sorted(trades,key=lambda x:(x['anchor_at_kst'],x['rank_at_signal'])):
+                    put('TRADE',**t)
+            for c in coverage.values():put('COVERAGE',**c)
+            for error in errors:put('DATA_ERROR',error=error)
+            for note in notes:put('WARNING',warning=note)
+            put('VERDICT',status=verdict['status'],message=verdict['message'],
+                complete_market_count=full_count,requested_markets=len(markets))
+            put('COUNTS',candidate_count=counts['eligible_anchor'],momentum_count=counts['momentum_anchor'],
+                reason=json.dumps(counts,ensure_ascii=False))
+    except Exception:
+        csvpath.unlink(missing_ok=True)
+        raise
+    if progress:progress('V3.9 비교군 집계·CSV 완료',99,len(markets),len(markets),len(errors))
+    return {'version':VERSION,'kind':'momentum','settings':config,'checked':len(coverage),
+      'requested_markets':len(markets),'counts':counts,'comparisons':comparisons,'verdict':verdict,
+      'errors':errors[:25],'notes':notes,'csv_ready':True,
+      'csv_name':f'BITHUMB_V3_9_ALL_RESULTS_momentum_{cfg.tf}m_{cfg.days}d.csv','_csv_file':str(csvpath)}
+
+
+def momentum_scan(cfg,progress=None):
+    """현재 +2% 전조 조건만 참고로 표시. 거래 진입 신호/B U Y 표시 없음."""
+    if cfg.tf!=60:return {'error':'V3.9 연구 스캔은 60분봉으로 해 주세요.'}
+    markets,eligible=universe(replace(cfg,turnover_min=0))
+    def on_progress(m,d,t,e):
+        if progress:progress(f'현재 +2% 전조 검사 {m}',5+int(90*d/max(1,len(markets))),d,len(markets),e)
+    data,errors=load_series(markets,cfg,days=6,progress=on_progress)
+    watch=[]
+    for m,bars in data.items():
+        rows=complete(bars,cfg.tf)
+        if len(rows)<25 or rows[-1].get('run',0)<24:continue
+        b=rows[-1];turn=b.get('turn24')
+        if turn is None or turn<cfg.turnover_min:continue
+        pct24=(b['c']/rows[-25]['c']-1)*100
+        if pct24<2:continue
+        ratio=b['turn']/b['turnavg20'] if b.get('turnavg20') else None
+        high=max(x['h'] for x in rows[-25:-1])
+        watch.append({'market':m,'price':round(b['c'],8),
+          'at_kst':(b['t']+timedelta(hours=1)).isoformat(),
+          'past_24h_pct':round(pct24,3),
+          'turnover_ratio':round(ratio,2) if ratio is not None else None,
+          'distance_prior_high_pct':round(100*(high/b['c']-1),3),
+          'historical_turnover_24h_krw':round(turn)})
+    watch.sort(key=lambda x:(-x['past_24h_pct'],-x['historical_turnover_24h_krw'],x['market']))
+    return {'version':VERSION,'kind':'momentum','checked':len(data),'eligible':eligible,
+      'signals':[],'watch':watch[:20], 'errors':errors[:20],
+      'updated':kst_now().strftime('%Y-%m-%d %H:%M:%S KST'),
+      'notes':['완료된 봉 기준 현재 +2% 상태만 표시. 실제 BUY 신호가 아닙니다.']}
+
+
 # -------------------------------- 화면 --------------------------------
 HTML = r'''<!doctype html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>BITHUMB V3.8 | 상승 전조 탐색</title>
+<title>BITHUMB V3.9 | +2% 전조의 매매 가능성 검증</title>
 <style>
 :root{color-scheme:dark;--bg:#080e1c;--panel:#111c33;--inner:#0b1429;--line:#283752;--text:#e9effb;--muted:#a0aec8;--good:#49deb4;--bad:#fb7777;--blue:#688dff;--gold:#f2bd70}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Noto Sans KR",Roboto,Arial,sans-serif;padding:18px 13px 56px;line-height:1.5}
@@ -2388,10 +2668,10 @@ body{background:var(--bg)}.entry,.card,.stat{background:var(--panel);box-shadow:
 .scoregrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}.scorecell{background:#1c2746;padding:10px;text-align:center;border-radius:14px}.scorecell strong{font-size:25px;display:block}.scorecell small{display:block;color:#b0bdd7;font-size:12px}.explainer{background:#153127;color:#65eab4;padding:12px;border-radius:12px;font-size:13px;line-height:1.65;margin-top:12px;font-weight:600}
 @media(min-width:720px){.scoregrid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
-<header><div><span class="version">NEW V3.8</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>상승 전조 탐색 · 코인 상승 전 특징 연구</h1><div class="sub">매일 자정 시점의 거래대금·가격 구조를 관측하고 이후 6·12·24시간 +5%/+10% 도달 여부를 비교합니다. 이 버전은 <b>BUY 신호·매매 수익률을 계산하지 않는 관찰 연구</b>입니다. V2/CORE는 그대로 보존합니다.</div></header>
-<div class="stats"><div class="stat"><small>검사 마켓</small><div class="value" id="k_count">–</div></div><div class="stat"><small>진입 후보 (V3.8 비활성)</small><div class="value g" id="k_sig">–</div></div><div class="stat"><small>관심 후보</small><div class="value" id="k_watch">–</div></div><div class="stat"><small>최근 갱신 (KST)</small><div class="value" id="k_time" style="font-size:15px">–</div></div></div>
+<header><div><span class="version">NEW V3.9</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>+2% 전조 · 실제 진입/청산 연구</h1><div class="sub">매일 자정 직전 24시간 +2% 전조를 포착하고 다음 1시간봉 시가 진입을 가정해 손절·익절·수수료 차감 성과를 비교합니다. <b>연구용 가상 거래이며 실전 BUY 신호는 없습니다.</b> V2/CORE는 그대로 보존합니다.</div></header>
+<div class="stats"><div class="stat"><small>검사 마켓</small><div class="value" id="k_count">–</div></div><div class="stat"><small>진입 후보 (연구용 신호 없음)</small><div class="value g" id="k_sig">–</div></div><div class="stat"><small>관심 후보</small><div class="value" id="k_watch">–</div></div><div class="stat"><small>최근 갱신 (KST)</small><div class="value" id="k_time" style="font-size:15px">–</div></div></div>
 <div class="two"><div class="card"><h2>① 스캔 설정</h2>
-<label>전략</label><select id="st"><option value="pullback">눌림목 · 박스 돌파 → 재테스트</option><option value="trend">기존 추세추종 · 실패 전략 기록용</option><option value="flow">이전 V3.6 거래대금 급증 연구 (보관)</option><option value="trap">지난 V3.7 가짜 이탈 연구 (보관)</option><option value="precursor" selected>NEW V3.8 상승 전조 탐색 (매매 신호 없음)</option></select>
+<label>전략</label><select id="st"><option value="pullback">눌림목 · 박스 돌파 → 재테스트</option><option value="trend">기존 추세추종 · 실패 전략 기록용</option><option value="flow">이전 V3.6 거래대금 급증 연구 (보관)</option><option value="trap">지난 V3.7 가짜 이탈 연구 (보관)</option><option value="precursor">V3.8 상승 전 특징 탐색 (보관)</option><option value="momentum" selected>NEW V3.9 +2% 전조 · 거래 가능성 검증</option></select>
 <div class="row"><div><label>캔들</label><select id="tf"><option value="15">15분봉</option><option value="5">5분봉</option><option value="60" selected>1시간봉</option><option value="240">4시간봉</option></select></div><div><label>검색 종목 수</label><select id="n"><option value="40">40개</option><option value="80">80개</option><option value="0">전체 (거래대금 하한 적용)</option></select></div></div>
 <div class="row"><div><label>24시간 거래대금 하한</label><select id="liquidity"><option value="500000000">5억원</option><option value="1000000000">10억원</option><option value="2000000000">20억원</option><option value="0">제한 없음</option></select></div><div><label>편도 수수료</label><select id="fee"><option value="0.25">0.25%</option><option value="0.04">0.04%</option><option value="0">0%</option></select></div></div>
 <div class="row"><div><label>건당 투자금</label><select id="amt"><option value="1000000">100만원</option><option value="500000">50만원</option><option value="2000000">200만원</option><option value="5000000">500만원</option></select></div></div>
@@ -2400,14 +2680,14 @@ body{background:var(--bg)}.entry,.card,.stat{background:var(--panel);box-shadow:
 <div class="row"><div><label>본전선 이동</label><select id="be"><option value="0">끄기</option><option value="0.5">+0.5R 도달 시</option><option value="0.75">+0.75R 도달 시</option><option value="1">+1R 도달 시</option></select></div><div><label>BTC 추세 필터</label><select id="btc"><option value="off">끄기</option><option value="on">켜기</option></select></div></div>
 <div class="row"><div><label>상대강도 상위</label><select id="rs"><option value="0">끄기</option><option value="0.3">상위 30%</option><option value="0.5">상위 50%</option><option value="0.2">상위 20%</option></select></div><div><label>상대강도 측정 기간</label><select id="rsd"><option value="7">7일</option><option value="14">14일</option></select></div></div></div>
 <div id="tradeOptions"><div class="row"><div><label>하루 최대 진입</label><select id="maxday"><option value="2" selected>2건 (연구 기본)</option><option value="1">1건</option><option value="3">3건</option><option value="4">4건 (비교용)</option></select></div><div><label>동시 보유</label><select id="maxpos"><option value="1">1개</option><option value="2">2개</option><option value="3">3개</option><option value="5">5개</option></select></div></div>
-<div class="note">이 설정은 이전 매매형 전략에만 적용됩니다. V3.8 상승 전조 연구는 거래를 생성하지 않습니다.</div></div>
+<div class="note">기존 매매형 전략 전용 설정입니다. V3.9 연구에서는 하루 2회 고정으로 비교하고 실전 BUY 신호는 제공하지 않습니다.</div></div>
 <div class="actions"><button class="primary" id="scanBtn" onclick="doScan()">지금 스캔</button><button id="autoBtn" onclick="autoSwitch()">자동 갱신 켜기</button><button id="scanStop" onclick="cancelCurrent('scan')" disabled>중지</button></div>
 <div class="progress" id="scanProgress" hidden><div class="phead"><b id="scanStage">대기</b><b id="scanPct">0%</b></div><div class="ptrack"><div id="scanFill" class="pfill"></div></div><div class="msg" id="scanCount">0/0</div></div>
 <div class="msg" id="scanMsg">서버 연결 확인 중…</div></div>
-<div class="card"><h2>② 매수 신호 없음 · 연구 전용</h2><div id="signals" class="sub">V3.8은 BUY 신호를 만들지 않아요.</div><div class="section"><h2>③ 관찰 대상 · 현재 사전 특징</h2><div id="watch" class="sub">아직 스캔하지 않았어요.</div></div></div></div>
+<div class="card"><h2>② 매수 신호 없음 · 연구 전용</h2><div id="signals" class="sub">V3.9는 실전 BUY 신호를 만들지 않아요.</div><div class="section"><h2>③ 관찰 대상 · 현재 사전 특징</h2><div id="watch" class="sub">아직 스캔하지 않았어요.</div></div></div></div>
 <div class="two"><div class="card" id="holdPanel"><h2>④ 보유 코인 손절선 (이전 추세추종 기록용)</h2><div class="sub">진입가·진입 시각을 입력하면 확정 분봉 기반 ATR 트레일링을 재현합니다. 실제 주문 기록을 조회하지 않습니다.</div><label>종목 (예: XRP)</label><input id="h_sym" autocapitalize="characters" placeholder="XRP"><div class="row"><div><label>내 진입가 (원)</label><input id="h_price" type="number" min="0" step="any" placeholder="예: 3250"></div><div><label>진입 시각 (KST)</label><input id="h_time" type="datetime-local"></div></div><div class="actions"><button id="holdBtn" class="primary" onclick="doHold()">트레일링 확인</button></div><div class="msg" id="holdMsg"></div><div id="holdResult"></div></div>
-<div class="card"><h2>⑤ 상승 전조 연구 · V3.8 학습/검증 비교</h2><div class="sub">KST 자정에 코인당 매일 1번 관측해 이후 6/12/24시간에 +5%/+10% 도달 여부를 판별합니다. 전체 사례와 사전 정의된 4개 특징을 <b>학습 70% / 검증 30%</b>에서 비교해요. 거래를 가정하지 않으며 결과는 CSV 한 파일로 보낼 수 있습니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="15">15일</option><option value="30">30일</option><option value="80">80일</option><option value="180">180일</option><option value="365">365일</option></select></div><div><label>분석 조건</label><input value="자정 1회 관측 · 미래24h 라벨" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">상승 전조 분석 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>전체 결과 CSV 저장</button><button id="btStop" onclick="cancelCurrent('backtest')" disabled>중지</button></div><div class="progress" id="btProgress" hidden><div class="phead"><b id="btStage">대기</b><b id="btPct">0%</b></div><div class="ptrack"><div id="btFill" class="pfill"></div></div><div class="msg" id="btCount">0/0</div></div><div id="btMsg" class="msg">기간 15·30·80·180·365일 / 40·80·전체. 1시간·4시간봉 전용. 결과는 CSV 파일 한 개로 받아서 보내줘. 직접적인 수익·승률 예측은 하지 않습니다.</div><div id="btResult"></div></div></div>
-<div class="card"><h2>V3.8 결과를 읽을 때 주의</h2><div class="warn">• 이번 버전은 거래 없이 향후 고가 도달률만 관찰합니다. 수익률·진입 확률·BUY를 예측하지 않습니다.<br>• 한 코인 하루 한 번, KST 00:00 기준. 미래 24시간 자료가 없는 마지막 하루는 제외됩니다.<br>• 한 봉이라도 누락된 관측 구간은 제외하고 임의 보간하지 않습니다.<br>• 현재 상장된 KRW 종목·현재 거래대금 상위 순위에 기반한 과거 표본선정 편향이 남아 있습니다.<br>• 거래대금 하한은 관측 당시 과거 24시간 거래대금으로 재평가합니다.<br>• +5%/+10%는 미래 고가 도달이며 실제 체결·이익 실현을 보장하지 않습니다.<br>• 주문·API 키 기능은 없으며, 데이터 부족이면 합격/폐기 판단을 보류합니다.</div></div>
+<div class="card"><h2>⑤ V3.9 · +2% 전조의 실제 매매 가능성 검증</h2><div class="sub">KST 자정 확정봉 기준, 다음 1시간봉 시가에 진입한 것으로 가정합니다. +2% 조건과 거래대금 기준군을 같은 기간에 비교하고 <b>학습 70% / 검증 30%</b>, 손절 우선, 12·24시간 결과를 확인합니다. 결과는 CSV 한 파일로 저장합니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="15">15일</option><option value="30">30일</option><option value="80">80일</option><option value="180">180일</option><option value="365">365일</option></select></div><div><label>분석 조건</label><input value="자정 +2% · 다음 시가 · 손절 -3%" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">+2% 매매 검증 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>전체 결과 CSV 저장</button><button id="btStop" onclick="cancelCurrent('backtest')" disabled>중지</button></div><div class="progress" id="btProgress" hidden><div class="phead"><b id="btStage">대기</b><b id="btPct">0%</b></div><div class="ptrack"><div id="btFill" class="pfill"></div></div><div class="msg" id="btCount">0/0</div></div><div id="btMsg" class="msg">기간 15·30·80·180·365일 / 40·80·전체. V3.9는 1시간봉 전용이며 실전 주문 기능이 없습니다. 결과 CSV 하나만 보내주면 됩니다.</div><div id="btResult"></div></div></div>
+<div class="card"><h2>V3.9 연구 결과를 읽을 때 주의</h2><div class="warn">• V3.9는 가상 체결로 수익률을 계산하되 실제 BUY 권유가 아닙니다. V3.8 관찰 연구는 보관합니다.<br>• V3.9는 KST 00:00 확정봉 기준 하루 한 번 후보를 정렬하며, 미래 24시간이 남지 않은 마지막 날은 제외합니다.<br>• 진입 전 분봉 누락은 제외, 진입 후 분봉 누락은 UNKNOWN으로 남기고 후순위 코인으로 대체하지 않습니다.<br>• 현재 상장된 KRW 종목·현재 거래대금 상위 순위에 기반한 과거 표본선정 편향이 남아 있습니다.<br>• 거래대금 하한은 관측 당시 과거 24시간 거래대금으로 재평가합니다.<br>• V3.9의 +5% 목표는 실제 체결이 아니라 분봉 OHLC로 추정한 가상 체결입니다. 수수료는 반영하나 가격 미끄러짐은 0%로 가정합니다.<br>• 주문·API 키 기능은 없으며, 데이터 부족이면 합격/폐기 판단을 보류합니다.</div></div>
 </main><script>
 const $=id=>document.getElementById(id);let autoTimer=null, scanning=false, lastBT=null, activeJobs={scan:null,backtest:null};
 const fmt=v=>v===null||v===undefined?'–':Number(v).toLocaleString('ko-KR',{maximumFractionDigits:Number(v)<100?5:0});
@@ -2417,7 +2697,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'
 let latestResearchJobId=null;
 const ids=['st','tf','n','liquidity','fee','amt','tp','of','trail','tp1','be','btc','rs','rsd','maxday','maxpos','days'];
 function qs(){const p=new URLSearchParams();ids.forEach(id=>p.set(id,$(id).value));return p.toString()}
-function changeStrategy(){let trend=$('st').value==='trend',flow=$('st').value==='flow',trap=$('st').value==='trap',precursor=$('st').value==='precursor';$('pbopts').style.display=(trend||flow||precursor||trap)?'none':'block';$('tropts').style.display=trend?'block':'none';$('tradeOptions').style.display=precursor?'none':'block';$('holdPanel').style.display=precursor?'none':'block';const wanted=precursor?['60','240']:trap?['15','60']:(trend||flow)?['60','240']:['5','15','60'];
+function changeStrategy(){let trend=$('st').value==='trend',flow=$('st').value==='flow',trap=$('st').value==='trap',precursor=['precursor','momentum'].includes($('st').value);$('pbopts').style.display=(trend||flow||precursor||trap)?'none':'block';$('tropts').style.display=trend?'block':'none';$('tradeOptions').style.display=precursor?'none':'block';$('holdPanel').style.display=precursor?'none':'block';const wanted=$('st').value==='momentum'?['60']:precursor?['60','240']:trap?['15','60']:(trend||flow)?['60','240']:['5','15','60'];
  [...$('tf').options].forEach(o=>o.hidden=!wanted.includes(o.value));if(!wanted.includes($('tf').value))$('tf').value=precursor?'60':trap?'15':(trend||flow)?'60':'15'; if(trap||precursor){$('maxday').value=String(Math.min(2,Number($('maxday').value)));}}
 $('st').onchange=()=>{changeStrategy();$('maxday').value=$('st').value==='pullback'?'4':'2'};changeStrategy();
 async function request(path){const r=await fetch(path);let d;try{d=await r.json()}catch(e){throw Error('서버 JSON 응답이 아닙니다')};if(!r.ok||d.error)throw Error(d.error||'HTTP '+r.status);return d}
@@ -2437,13 +2717,13 @@ function updateProgress(prefix,d){const container=$(prefix+'Progress');container
 async function runJob(kind,query,progressPrefix){const start=await request('/api/job/start?kind='+kind+'&'+query);activeJobs[kind]=start.job;$(kind==='scan'?'scanStop':'btStop').disabled=false;let failedPoll=0;
 while(true){await new Promise(ok=>setTimeout(ok,1300));let s;
 try{s=await request('/api/job/status?id='+encodeURIComponent(start.job));failedPoll=0}catch(e){if(++failedPoll>=4)throw e;continue;}
-updateProgress(progressPrefix,s);if(!s.running){activeJobs[kind]=null;$(kind==='scan'?'scanStop':'btStop').disabled=true;if(s.error)throw Error(s.error);if(kind==='backtest'&&s.result?.kind==='precursor')latestResearchJobId=start.job;return s.result;}}
+updateProgress(progressPrefix,s);if(!s.running){activeJobs[kind]=null;$(kind==='scan'?'scanStop':'btStop').disabled=true;if(s.error)throw Error(s.error);if(kind==='backtest'&&['precursor','momentum'].includes(s.result?.kind))latestResearchJobId=start.job;return s.result;}}
 }
 async function cancelCurrent(kind){const id=activeJobs[kind];if(!id)return;try{const r=await request('/api/job/cancel?id='+encodeURIComponent(id));$(kind==='scan'?'scanMsg':'btMsg').textContent=r.message}catch(e){$(kind==='scan'?'scanMsg':'btMsg').textContent='중지 오류: '+e.message}}
 async function doScan(){if(scanning)return;scanning=true;const b=$('scanBtn');b.disabled=true;b.textContent='스캔 중…';$('scanMsg').textContent='실시간 진행률을 표시합니다.';
 $('scanProgress').hidden=false;$('scanPct').textContent='0%';$('scanFill').style.width='0%';
 try{const d=await runJob('scan',qs(),'scan');$('k_count').textContent=d.checked;$('k_sig').textContent=d.signals.length;$('k_watch').textContent=d.watch.length;$('k_time').textContent=d.updated.slice(11,19);
-if(d.kind==='precursor'){
+if(['precursor','momentum'].includes(d.kind)){
 $('signals').innerHTML='이번 버전은 BUY 판단을 하지 않아요. 과거 상승 전 특징이 구별되는지 연구 중입니다.';
 $('watch').innerHTML=(d.watch||[]).map(s=>`<div class="entry"><b>${esc(s.market.replace('KRW-',''))}</b> · ${fmt(s.price)}원<div class="note">직전 24h ${pct(s.past_24h_pct)} · 거래대금 ${esc(s.turnover_ratio??'–')}배 · 이전 고점 거리 ${pct(s.distance_prior_high_pct)}</div><small>연구용 관측 상태 · 매수 추천 아님</small></div>`).join('')||'조건을 만족하는 관측 종목 없음';
 $('scanMsg').textContent='시장 특징 참고용 스캔 완료 · BUY 신호 없음 · '+d.updated;
@@ -2469,7 +2749,17 @@ out+=`<h3>상승/비상승 사례의 진입 전 특징</h3><div class="scroll"><
 out+=`<div class="note">CSV에는 전체 관측치의 직전 거래대금·ATR·가격 구조·6/12/24시간 미래 고가 라벨·시장별 데이터 확보율까지 담습니다. 사진 없이 파일 하나만 보내 주세요.</div>`;
 return out;
 }
-function renderBT(d){if(d.kind==='precursor')return renderPrecursor(d);let s=d.stat;let h=`<div class="section"><small>검사 마켓 ${d.markets}/${d.requested_markets??d.markets}개 · 기간 일부만 확보 ${d.partial_markets??0}개 · 신호 ${d.signals}건 · 선택 ${d.selected}건 · 미확정 ${d.unknown}건</small><div class="bigresult ${s.avg_net>0?'g':s.avg_net<0?'r':''}">${s.avg_net==null?'거래 없음':'평균 '+pct(s.avg_net)}</div><div class="sub">승률 ${s.win_rate??'–'}% · ${s.win}승 ${s.loss}패 · 동일 금액 건별 합산 ${krw(s.pnl_krw)}</div></div>`;
+function renderMomentum(d){
+const C=d.comparisons||[],v=d.verdict||{},s=d.settings||{};
+let out=`<div class="section"><div class="bigresult">V3.9 실제 거래 재현 결과</div><div class="note">${s.requested_days}일 · ${s.tf_minutes}분봉 · ${d.checked}/${d.requested_markets} 마켓 · 완전 기간 ${s.complete_market_count}개 · 오류 ${s.error_count}개 · 슬리피지 0%</div></div>`;
+out+=`<div class="entry"><div class="coin ${v.status==='DISCARD'?'r':'gold'}">${esc(v.status)}</div><div class="note">${esc(v.message)}</div></div>`;
+out+=`<h3>진입 규칙 · 실제 체결 가정</h3><div class="note">KST 매일 00:00 확정봉 기준, 다음 1시간봉 시가 진입 · 하루 최대 2종목(조건이 없으면 0) · 손절 -3% · 목표 +5% · 편도 수수료 ${s.fee_side_pct}% · 손절/목표 같은 봉이면 손절 우선</div>`;
+out+=`<h3>기준군 vs +2% 전조 · 학습/검증 비교</h3><div class="scroll"><table><tr><th>비교군</th><th>전체 거래</th><th>미확정</th><th>전체 평균</th><th>학습 평균</th><th>검증 평균</th><th>검증 상위2 제외</th></tr>${C.map(x=>`<tr><td>${esc(x.rule_label)}</td><td>${x.stat.n}</td><td>${x.stat.unknown}</td><td class="${x.stat.avg_net_pct>0?'g':'r'}">${pct(x.stat.avg_net_pct)}</td><td>${pct(x.train.avg_net_pct)}</td><td class="${x.test.avg_net_pct>0?'g':'r'}">${pct(x.test.avg_net_pct)}</td><td>${pct(x.test_trim2_avg_net_pct)}</td></tr>`).join('')}</table></div>`;
+out+=`<div class="detail">${tiles([['관측 조건 통과',d.counts.momentum_anchor],['전체 기준 관측',d.counts.eligible_anchor],['봉 불연속',d.counts.past_gap],['최근 24h 미확정',d.counts.pending]])}</div>`;
+out+=`<div class="note">CSV 한 파일에는 비교군별 개별 거래의 진입·청산·손익, 날짜별·종목별 통계, 데이터 누락, 최종 판정까지 모두 저장됩니다. 이 수치는 실제 체결이 아닌 가상 거래 결과입니다.</div>`;
+return out;
+}
+function renderBT(d){if(d.kind==='precursor')return renderPrecursor(d);if(d.kind==='momentum')return renderMomentum(d);let s=d.stat;let h=`<div class="section"><small>검사 마켓 ${d.markets}/${d.requested_markets??d.markets}개 · 기간 일부만 확보 ${d.partial_markets??0}개 · 신호 ${d.signals}건 · 선택 ${d.selected}건 · 미확정 ${d.unknown}건</small><div class="bigresult ${s.avg_net>0?'g':s.avg_net<0?'r':''}">${s.avg_net==null?'거래 없음':'평균 '+pct(s.avg_net)}</div><div class="sub">승률 ${s.win_rate??'–'}% · ${s.win}승 ${s.loss}패 · 동일 금액 건별 합산 ${krw(s.pnl_krw)}</div></div>`;
 if(d.kind==='trap'){
  const v=d.verdict||{};
  h+=`<h3>V3.7 지지선 이탈 실패 연구 · A/B/C × 4/8/12시간</h3><div class="note">A 첫 회복 / B 지지 재확인 / C 단기 고점 돌파. 모두 확인봉 마감 뒤 다음 시가 가정. <b>하루 2회, 없으면 0회</b>.</div><div class="scroll"><table><tr><th>비교</th><th>거래</th><th>승률</th><th>학습 평균</th><th>검증 평균</th><th>검증 상위2 제외</th></tr>${(d.comparisons||[]).map(x=>`<tr><td>${esc(x.label)}</td><td>${x.stat.n}</td><td>${x.stat.win_rate??'–'}%</td><td>${pct(x.train?.avg_net)}</td><td class="${x.test?.avg_net>0?'g':'r'}">${pct(x.test?.avg_net)}</td><td>${pct(x.test_no_top2?.avg_net)}</td></tr>`).join('')}</table></div>`;
@@ -2520,12 +2810,12 @@ if(n==='0'||days>=180){if(!confirm(`${days}일 / ${n==='0'?'전체':n+'개'} / $
 const b=$('btBtn');b.disabled=true;b.textContent='백테스트 중…';$('csvBtn').disabled=true;latestResearchJobId=null;$('btMsg').textContent='종목별 진행률을 표시합니다.';
 $('btProgress').hidden=false;$('btPct').textContent='0%';$('btFill').style.width='0%';
 try{const d=await runJob('backtest',qs(),'bt');lastBT=d;$('btResult').innerHTML=renderBT(d);$('btMsg').textContent=d.kind==='precursor'?('관측 완료 · '+d.settings.requested_days+'일 · '+d.settings.tf_minutes+'분봉 · BUY 신호 없음 · CSV 저장 가능'):('계산 완료 · '+d.settings.period_days+'일 · '+d.settings.tf+'분봉 · 수수료 편도 '+d.settings.fee_pct+'% · 슬리피지 0% 가정');$('csvBtn').disabled=false}
-catch(e){$('btMsg').textContent='백테스트 오류: '+e.message}finally{activeJobs.backtest=null;$('btStop').disabled=true;b.disabled=false;b.textContent='상승 전조 분석 실행'}}
+catch(e){$('btMsg').textContent='백테스트 오류: '+e.message}finally{activeJobs.backtest=null;$('btStop').disabled=true;b.disabled=false;b.textContent='+2% 매매 검증 실행'}}
 function exportCSV(){
  if(!lastBT)return;
- if(lastBT.kind==='precursor'){
+ if(['precursor','momentum'].includes(lastBT.kind)){
   if(!latestResearchJobId){alert('CSV 작업 식별자가 없어요. 분석을 다시 실행해 주세요.');return;}
-  const a=document.createElement('a');a.href='/api/job/csv?id='+encodeURIComponent(latestResearchJobId);a.download=lastBT.csv_name||'BITHUMB_V3_8_ALL_RESULTS.csv';document.body.appendChild(a);a.click();a.remove();return;
+  const a=document.createElement('a');a.href='/api/job/csv?id='+encodeURIComponent(latestResearchJobId);a.download=lastBT.csv_name||'BITHUMB_V3_9_ALL_RESULTS.csv';document.body.appendChild(a);a.click();a.remove();return;
  }
  const d=lastBT, version=d.version||'V3.7', cfg=d.settings||{};
  let objs=[{row_type:'RUN_CONFIG',version,run_at_kst:cfg.scanned_at_kst,kind:d.kind,
@@ -2639,9 +2929,9 @@ class WebHandler(BaseHTTPRequestHandler):
             q=parse_qs(route.query)
             cfg=Settings.from_q(q)
             if route.path == "/api/scan":
-                result=precursor_scan(cfg) if cfg.strategy=="precursor" else scan(cfg)
+                result=momentum_scan(cfg) if cfg.strategy=="momentum" else precursor_scan(cfg) if cfg.strategy=="precursor" else scan(cfg)
             elif route.path == "/api/backtest":
-                result=precursor_backtest(cfg) if cfg.strategy=="precursor" else backtest(cfg)
+                result=momentum_backtest(cfg) if cfg.strategy=="momentum" else precursor_backtest(cfg) if cfg.strategy=="precursor" else backtest(cfg)
             else:
                 if cfg.strategy != "trend":
                     from dataclasses import replace
