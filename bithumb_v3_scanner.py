@@ -1,4 +1,4 @@
-"""BITHUMB V3.4 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
+"""BITHUMB V3.5 | 휴대폰(Pydroid 3) + Render 겸용 연구 스캐너.
 
 필요: pip install requests
 실행: python bithumb_v3_scanner.py  -> http://127.0.0.1:8080
@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-VERSION = "V3.4"
+VERSION = "V3.5"
 BASE = "https://api.bithumb.com/v1"
 KST = timezone(timedelta(hours=9))
 BUSY = threading.Lock()
@@ -550,6 +550,34 @@ def risk_levels_trend(bars, k, entry, cfg):
     return stop, None, risk
 
 
+
+
+def entry_snapshot(bars, signal_ix, entry_open, level, cfg):
+    """신호 마감 시점까지와 다음 봉 진입 시가만 사용한 재현 가능한 진입 특징.
+    거래 결과/MFE/미래 종가는 절대 들어가지 않음.
+    """
+    b = bars[signal_ix]
+    def pct(v, digits=3):
+        return round(v, digits) if v is not None and math.isfinite(v) else None
+    ema = b.get("ema200")
+    past_ema = bars[signal_ix-5].get("ema200") if signal_ix >= 5 else None
+    volume = (b["v"] / b["volavg"]) if b.get("volavg") and b["volavg"]>0 else None
+    past6 = (100*(b["c"] / bars[signal_ix-6]["c"]-1)
+             if signal_ix>=6 and b.get("run",0)>=6 and bars[signal_ix-6]["c"]>0 else None)
+    length24 = int(1440/cfg.tf)
+    past24 = (100*(b["c"] / bars[signal_ix-length24]["c"]-1)
+              if signal_ix>=length24 and b.get("run",0)>=length24 and bars[signal_ix-length24]["c"]>0 else None)
+    return {
+        "volume_ratio": pct(volume,2),
+        "ema_slope_5_pct": pct(100*(ema/past_ema-1) if ema and past_ema and past_ema>0 else None),
+        "ema_distance_pct": pct(100*(b["c"]/ema-1) if ema and ema>0 else None),
+        "breakout_atr": pct((b["c"]-level)/b["atr"] if b.get("atr") and b["atr"]>0 else None),
+        "atr_pct": pct(100*b["atr"]/b["c"] if b.get("atr") and b["c"]>0 else None),
+        "prior6_pct": pct(past6), "prior24_pct": pct(past24),
+        "entry_gap_pct": pct(100*(entry_open/b["c"]-1) if b["c"]>0 else None),
+        "turn24_billion": pct(b["turn24"]/1e9 if b.get("turn24") is not None else None,2),
+    }
+
 def btc_ok_by_time(btc_bars):
     vals = {}
     for i, b in enumerate(btc_bars):
@@ -698,6 +726,7 @@ def trend_retest_entry(market, bars, cfg, k, level, btc_map=None, rs_map=None):
                 "price": entry, "stop": stop, "tp": tp, "risk_pct": risk*100,
                 "context": {"box":level, "retest": b["l"],
                             "volume_ratio":round(b["v"]/max(b["volavg"],1e-12),2)},
+                "features": entry_snapshot(bars,j,entry,level,cfg),
                 "entry_ix":ni}
     return None
 
@@ -739,7 +768,11 @@ def exit_path_diagnostics(bars, entry_ix, result, cfg):
         result_diag["post6_peak_pct"] = round(100*(max(b["h"] for b in valid[:hours6])/exit_px - 1),3)
     if len(valid) >= hours24:
         result_diag["post24_peak_pct"] = round(100*(max(b["h"] for b in valid[:hours24])/exit_px - 1),3)
+        result_diag["post24_trough_pct"] = round(100*(min(b["l"] for b in valid[:hours24])/exit_px - 1),3)
         result_diag["post24_close_pct"] = round(100*(valid[hours24-1]["c"]/exit_px - 1),3)
+    result_diag["hold_hours"] = round((exit_at-bars[entry_ix]["t"]).total_seconds()/3600,2)
+    # MFE/MAE는 봉 고저가를 관측한 값. 손절 당일 봉의 체결 후 가격도 포함될 수 있음.
+    # 정확한 거래 경로가 아님을 프런트엔드에서 명시한다.
     return result_diag
 
 
@@ -825,7 +858,8 @@ def detect_all(market, bars, cfg, btc_map=None, rs_map=None, for_scan=False, ret
         event={"market":market,"strategy":cfg.strategy,"signal_at":sig_time.isoformat(),
                "entry_at":(bars[i]["t"] if i < len(bars) else sig_time + timedelta(minutes=cfg.tf)).isoformat(),
                "price":entry,"stop":stop,"tp":tp,"risk_pct":100*risk,"context":context,
-               "entry_rule":"BREAKOUT" if cfg.strategy=="trend" else "PULLBACK"}
+               "entry_rule":"BREAKOUT" if cfg.strategy=="trend" else "PULLBACK",
+               "features":entry_snapshot(bars,(k if cfg.strategy=="trend" else j),entry,hh,cfg)}
         if for_scan:
             events.append(event)
         elif i<len(bars):
@@ -1054,6 +1088,111 @@ def time_exit_analysis(trades):
     return rows
 
 
+
+
+def upper_trim_stat(trades, cfg):
+    """대형 수익 2건을 빼고도 결과가 유지되는지 확인. 실제 필터/매매 규칙 아님."""
+    closed = [x for x in trades if x.get("status")=="CLOSED" and isinstance(x.get("net_pct"),(int,float))]
+    rest = sorted(closed, key=lambda x:x["net_pct"], reverse=True)[2:]
+    return {"original_n":len(closed),"removed":min(2,len(closed)),"left_n":len(rest),
+            "avg_net":round(sum(x["net_pct"] for x in rest)/len(rest),3) if rest else None,
+            "sum_net":round(sum(x["net_pct"] for x in rest),3) if rest else None}
+
+
+def predeclared_gate(event, key):
+    """사전에 고정한 단순 가설 3개. 결과 데이터에 맞춰 임계값 변경 금지."""
+    f=event.get("features") or {}
+    vol=f.get("volume_ratio")
+    slope=f.get("ema_slope_5_pct")
+    if key=="VOL2":
+        return vol is not None and vol>=2.0
+    if key=="SLOPE015":
+        return slope is not None and slope>=0.15
+    if key=="BOTH":
+        return vol is not None and slope is not None and vol>=2.0 and slope>=0.15
+    return key=="BASE"
+
+
+def compare_fixed_gates(base_events, cfg, cut_time, baseline=None):
+    """단일 사전 명시 필터 3개와 무필터 기준. 테스트를 보고 후보/문턱을 고르지 않음.
+    필터는 *포트폴리오 선택 전에* 적용하여 슬롯 선별 왜곡 방지.
+    """
+    rules=[("BASE","기준 돌파 · 2회"),("VOL2","거래량 ≥ 2.0배"),
+           ("SLOPE015","EMA200 5봉 기울기 ≥ +0.15%"),
+           ("BOTH","두 조건 동시 충족")]
+    c2=replace(cfg,max_trades_day=2)
+    result=[];variant={}
+    for key,label in rules:
+        chosen=(baseline if key=="BASE" and baseline is not None
+                else select_trades([x for x in base_events if predeclared_gate(x,key)],c2))
+        st,_,split=daily_and_split(chosen,c2,cut_time)
+        empty={"n":0,"win":0,"loss":0,"win_rate":None,"avg_net":None,"sum_net":None,"pnl_krw":0,"ev":None}
+        split={"train":split["train"] or empty,"test":split["test"] or empty}
+        test=[x for x in chosen if x.get("status")=="CLOSED" and datetime.fromisoformat(x["entry_at"])>=cut_time]
+        result.append({"key":key,"label":label,"stat":st,"train":split["train"],"test":split["test"],
+                       "test_no_top2":upper_trim_stat(test,cfg),"selected":len(chosen),
+                       "unknown":sum(x.get("status")!="CLOSED" for x in chosen)})
+        variant[key]=chosen
+    return result,variant
+
+
+def win_loss_features(trades):
+    """진입 전에 알 수 있었던 특징의 승패별 통계. 사후 진입 필터 자동 결정에는 미사용."""
+    keys=[("volume_ratio","진입 전 거래량 배수"), ("ema_slope_5_pct","EMA200 5봉 기울기 %"),
+          ("ema_distance_pct","EMA200 위 이격 %"),("breakout_atr","돌파 폭 / ATR"),
+          ("atr_pct","ATR / 가격 %"),("prior6_pct","직전 6봉 수익률 %"),
+          ("prior24_pct","직전 24시간 수익률 %"),("entry_gap_pct","신호 대비 다음 시가 %")]
+    win=[x for x in trades if x.get("status")=="CLOSED" and x.get("net_pct",0)>0]
+    lose=[x for x in trades if x.get("status")=="CLOSED" and x.get("net_pct",0)<=0]
+    def metric(rows,key):
+        vals=[(x.get("features") or {}).get(key) for x in rows]
+        nums=[v for v in vals if isinstance(v,(float,int)) and math.isfinite(v)]
+        return {"n":len(nums),"avg":round(sum(nums)/len(nums),3) if nums else None}
+    return [{"key":key,"label":label,"win":metric(win,key),"loss":metric(lose,key)} for key,label in keys]
+
+
+def build_trade_diagnostics(trades):
+    """90거래/손실 n건을 혼동하지 않도록 손실/회복 유형을 전체·검증으로 집계."""
+    closed=[x for x in trades if x.get("status")=="CLOSED"]
+    losses=[x for x in closed if x.get("net_pct",0)<=0]
+    winners=[x for x in closed if x.get("net_pct",0)>0]
+    stop=[x for x in losses if "손절" in x.get("why","")]
+    complete24=[x for x in stop if isinstance(x.get("post24_close_pct"),(int,float))]
+    no_rise=[x for x in losses if isinstance(x.get("mfe_pct"),(int,float)) and x["mfe_pct"]<1]
+    gave_back=[x for x in losses if isinstance(x.get("mfe_pct"),(int,float)) and x["mfe_pct"]>=2]
+    fast6=[x for x in stop if isinstance(x.get("hold_hours"),(int,float)) and x["hold_hours"]<=6]
+    comeback=[x for x in complete24 if x["post24_close_pct"]>=2]
+    return {"total":len(closed),"wins":len(winners),"losses":len(losses),
+            "loss_never_up1":len(no_rise),"loss_gave_back2":len(gave_back),
+            "stop_losses":len(stop),"stop_under6h":len(fast6),
+            "stop_post24_observed":len(complete24),"stop_post24_close_up2":len(comeback),
+            "avg_win":round(sum(x["net_pct"] for x in winners)/len(winners),3) if winners else None,
+            "avg_loss":round(sum(x["net_pct"] for x in losses)/len(losses),3) if losses else None,
+            "top_wins":[{"market":x["market"],"entry_at":x["entry_at"],"net_pct":round(x["net_pct"],3),
+                         "features":x.get("features")} for x in sorted(winners,key=lambda x:-x["net_pct"])[:5]],
+            "worst_losses":[{"market":x["market"],"entry_at":x["entry_at"],"net_pct":round(x["net_pct"],3),
+                            "features":x.get("features")} for x in sorted(losses,key=lambda x:x["net_pct"])[:5]]}
+
+
+def research_verdict(gates, coverage, requested, cfg):
+    """판정표: 고정 가설 중 학습·검증 각각 순익이 있고 표본이 충분한지.
+    검증 10건/학습 20건 미만인 전략은 '좋다'고 채택하지 않음.
+    유니버스 생존 편향/슬리피지 0 때문에 PASS도 실전 적용 금지.
+    """
+    ratio=coverage/max(requested,1)
+    if ratio<.8:
+        return {"status":"DATA_INCOMPLETE","text":"검사 가능 종목이 80% 미만입니다. 전략 평가를 중단하고 데이터부터 점검하세요.","coverage":round(ratio*100,1)}
+    base=next((x for x in gates if x["key"]=="BASE"),None)
+    if not base or base["train"]["n"]<20 or base["test"]["n"]<10:
+        return {"status":"INSUFFICIENT","text":"기준 전략의 학습 20건·검증 10건 미만입니다. 수익을 주장하지 말고 추가 기간을 확인하세요.","coverage":round(ratio*100,1)}
+    passed=[x for x in gates if x["train"]["n"]>=20 and x["test"]["n"]>=10
+            and x["train"]["avg_net"]>0 and x["test"]["avg_net"]>0
+            and x["test_no_top2"]["avg_net"] is not None and x["test_no_top2"]["avg_net"]>0]
+    if passed:
+        return {"status":"RESEARCH_ONLY","text":"사전 정의 가설 일부가 학습·검증에서 모두 플러스였습니다. 아직 생존편향·체결오차가 남아 실전 채택은 금지하고 독립 재검증만 하세요.",
+                "keys":[x["key"] for x in passed],"coverage":round(ratio*100,1)}
+    return {"status":"DISCARD","text":"현재 검증 기준을 충족하는 전략이 없습니다. 이 방식의 실전 적용을 중단하고, 추가 조건 덧붙이기보다 전략 폐기를 권합니다.","coverage":round(ratio*100,1)}
+
 def compare_portfolios(base_events, retest_events, cfg, cut_time, btc_map=None):
     """공통 유니버스·봉·손절/청산 규칙. 선별 횟수/진입 구조만 분리 비교."""
     configs=[("BREAKOUT_4", "기존 돌파 · 하루 최대 4회", base_events, replace(cfg,max_trades_day=4)),
@@ -1162,19 +1301,40 @@ def backtest(cfg, progress=None):
     comparisons,variant_trades=(compare_portfolios(all_events,retest_events,cfg,cut_time,btc_map)
                                 if cfg.strategy=="trend" else ([],{}))
     after_exit=time_exit_analysis(selected)
+    # V3.5 진단은 기본 돌파형 최대 2회 결과만 분석. 앞선 V3.4 비교군은 원본 보존.
+    baseline2=variant_trades.get("BREAKOUT_2",selected) if cfg.strategy=="trend" else selected
+    gates,gate_trades=(compare_fixed_gates(all_events,cfg,cut_time,baseline2) if cfg.strategy=="trend" else ([],{}))
+    diagnostic=build_trade_diagnostics(baseline2)
+    preentry=win_loss_features(baseline2) if cfg.strategy=="trend" else []
+    test_sample=[x for x in baseline2 if x.get("status")=="CLOSED" and datetime.fromisoformat(x["entry_at"])>=cut_time]
+    robust={"overall":upper_trim_stat(baseline2,cfg),"validation":upper_trim_stat(test_sample,cfg)}
+    # 일부 기간만 확보한 신규상장/누락 종목을 빼도 결론이 뒤집히는지 민감도 검사.
+    if cfg.strategy=="trend":
+        full_markets={m for m,q in coverage.items() if q.get("full_period")}
+        only_full=select_trades([x for x in all_events if x["market"] in full_markets], replace(cfg,max_trades_day=2))
+        full_stat,_,full_split=daily_and_split(only_full,cfg,cut_time)
+        full_sensitivity={"full_markets":len(full_markets),"requested_markets":len(chosen),
+                          "stat":full_stat,"test":full_split["test"],"train":full_split["train"]}
+    else:
+        full_sensitivity={}
+    verdict=(research_verdict(gates,len(coverage),len(chosen),cfg) if cfg.strategy=="trend"
+             else {"status":"NOT_APPLICABLE","text":"추세추종 비교에만 적용되는 판정입니다."})
     # 데이터 결손 시 표본을 허위로 확대하지 않고 누락/상장일별 기록을 표시.
     return {"version":VERSION,"kind":cfg.strategy,"markets":len(coverage),"eligible":eligible,
             "requested_markets":len(chosen),"partial_markets":sum(not c.get("full_period") for c in coverage.values()),"signals":len(all_events),"selected":len(selected),"unknown":len(unknown),
             "stat":stat,"daily":daily,"split":split,"trades":selected,
             "comparisons":comparisons,"variant_trades":variant_trades,
             "retest_signals":len(retest_events),"exit_analysis":after_exit,
+            "v35_diagnostic":diagnostic,"v35_features":preentry,
+            "v35_gates":gates,"v35_gate_trades":gate_trades,
+            "v35_robust":robust,"v35_verdict":verdict,"v35_full_only":full_sensitivity,
             "market_stats":diagnostics["markets"],"reasons":diagnostics["reasons"],"quick_stop_45m":diagnostics["quick_stop_45m"],"mdd_krw":diagnostics["mdd_krw"],"max_lose_streak":diagnostics["max_lose_streak"],
             "coverage":coverage,"errors":errors[:20],"error_count":len(errors),
             "settings":{"fee_pct":cfg.fee*100,"slip_pct":0.0,
                "per_trade_krw":cfg.capital,"period_days":cfg.days,"maxday":cfg.max_trades_day,
                "btc":cfg.btc,"rs":cfg.rs,"tf":cfg.tf,"count":cfg.count},
-            "warnings":["V3.4 연구 비교는 동일 종목/기간에서 하루 최대 진입 횟수, 눌림 확인 조건, BTC 필터만 바꿉니다. 실전 우위는 검증 전입니다.",
-                        "청산 후 24시간 고점은 사후 관찰용입니다. 실제로 그 고점에 매도했다고 가정하지 않습니다.",
+            "warnings":["V3.5는 V3.4 거래 선정/청산 규칙을 유지하고 2회 기준 손익·진입 특징 및 사전 정의한 필터 3개를 따로 비교합니다. 실전 우위는 검증 전입니다.",
+                        "청산 후 24시간 고점/저점/종가는 사후 관찰용입니다. 실제 체결 수익을 뜻하지 않으며 진입 선택에 사용하지 않습니다.",
                         "슬리피지 0% 가정(실제 체결 지연·호가 차이로 실전 수익은 달라질 수 있음).",
                         "현재 시점의 거래대금 상위 종목으로 과거를 검사합니다(생존·선택 편향).",
                         "전체 기간을 확보하지 못한 종목은 partial_markets에 집계됩니다. 데이터 누락은 기간 전체처럼 보이지 않도록 표시합니다.",
@@ -1238,7 +1398,7 @@ def holding(q,cfg):
 # -------------------------------- 화면 --------------------------------
 HTML = r'''<!doctype html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>BITHUMB V3.4 | 빗썸 전략 스캐너</title>
+<title>BITHUMB V3.5 | 빗썸 전략 스캐너</title>
 <style>
 :root{color-scheme:dark;--bg:#080e1c;--panel:#111c33;--inner:#0b1429;--line:#283752;--text:#e9effb;--muted:#a0aec8;--good:#49deb4;--bad:#fb7777;--blue:#688dff;--gold:#f2bd70}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Noto Sans KR",Roboto,Arial,sans-serif;padding:18px 13px 56px;line-height:1.5}
@@ -1252,7 +1412,7 @@ select:focus,input:focus{border-color:var(--blue)}.row{display:grid;grid-templat
 .scroll{overflow-x:auto}.scroll table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}th,td{text-align:right;padding:9px 7px;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-weight:500}.bigresult{font-size:26px;font-weight:800;letter-spacing:-.7px}.section{border-top:1px solid var(--line);margin:12px 0;padding-top:11px}
 @media(min-width:720px){body{padding:23px 20px}.stats{grid-template-columns:repeat(4,minmax(0,1fr))}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.two>.card{align-self:start}.stats .value{font-size:28px}}
 
-/* V3.4: 모바일 중심 다크 대시보드 */
+/* V3.5: 모바일 중심 다크 대시보드 */
 :root{color-scheme:dark;--bg:#090f20;--panel:#121a31;--inner:#0b1326;--line:#2c3654;--text:#edf2ff;--muted:#9ca9c3;--good:#50e0aa;--bad:#ff808b;--blue:#3f65ff;--gold:#ffc47b}
 body{background:var(--bg)}.entry,.card,.stat{background:var(--panel);box-shadow:0 6px 24px rgba(0,0,0,.07)}.entry{border-color:var(--line)}
 .cell{background:#19233e;border-radius:13px;padding:13px 9px;text-align:center}.cell b{font-size:19px;margin-top:4px;color:#f0f3ff}.cell small{font-size:12px;color:#a7b2c9}
@@ -1262,7 +1422,7 @@ body{background:var(--bg)}.entry,.card,.stat{background:var(--panel);box-shadow:
 .scoregrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}.scorecell{background:#1c2746;padding:10px;text-align:center;border-radius:14px}.scorecell strong{font-size:25px;display:block}.scorecell small{display:block;color:#b0bdd7;font-size:12px}.explainer{background:#153127;color:#65eab4;padding:12px;border-radius:12px;font-size:13px;line-height:1.65;margin-top:12px;font-weight:600}
 @media(min-width:720px){.scoregrid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 </style></head><body><main>
-<header><div><span class="version">NEW V3.4</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>눌림목 & 추세추종 스캐너</h1><div class="sub">봉 마감 확인 → 다음 봉 진입 가정. 실시간 후보와 과거 백테스트를 같은 규칙으로 계산합니다. 기존 V2/CORE와 독립 프로그램입니다. 슬리피지는 0%로 고정(이상적인 체결 가정)하며 편도 수수료는 반영해요.</div></header>
+<header><div><span class="version">NEW V3.5</span> <span class="muted" style="font-size:12px">빗썸 KRW · 주문 없는 연구용</span></div><h1>눌림목 & 추세추종 스캐너</h1><div class="sub">봉 마감 확인 → 다음 봉 진입 가정. 실시간 후보와 과거 백테스트를 같은 규칙으로 계산합니다. 기존 V2/CORE와 독립 프로그램입니다. 슬리피지는 0%로 고정(이상적인 체결 가정)하며 편도 수수료는 반영해요.</div></header>
 <div class="stats"><div class="stat"><small>검사 마켓</small><div class="value" id="k_count">–</div></div><div class="stat"><small>진입 후보</small><div class="value g" id="k_sig">–</div></div><div class="stat"><small>관심 후보</small><div class="value" id="k_watch">–</div></div><div class="stat"><small>최근 갱신 (KST)</small><div class="value" id="k_time" style="font-size:15px">–</div></div></div>
 <div class="two"><div class="card"><h2>① 스캔 설정</h2>
 <label>전략</label><select id="st"><option value="pullback">눌림목 · 박스 돌파 → 재테스트</option><option value="trend" selected>추세추종 · 상위 봉 고점 돌파</option></select>
@@ -1280,7 +1440,7 @@ body{background:var(--bg)}.entry,.card,.stat{background:var(--panel);box-shadow:
 <div class="msg" id="scanMsg">서버 연결 확인 중…</div></div>
 <div class="card"><h2>② 진입 확인</h2><div id="signals" class="sub">아직 스캔하지 않았어요.</div><div class="section"><h2>③ 눌림 대기 / 관심 후보</h2><div id="watch" class="sub">아직 스캔하지 않았어요.</div></div></div></div>
 <div class="two"><div class="card"><h2>④ 보유 코인 손절선 (추세추종)</h2><div class="sub">진입가·진입 시각을 입력하면 확정 분봉 기반 ATR 트레일링을 재현합니다. 실제 주문 기록을 조회하지 않습니다.</div><label>종목 (예: XRP)</label><input id="h_sym" autocapitalize="characters" placeholder="XRP"><div class="row"><div><label>내 진입가 (원)</label><input id="h_price" type="number" min="0" step="any" placeholder="예: 3250"></div><div><label>진입 시각 (KST)</label><input id="h_time" type="datetime-local"></div></div><div class="actions"><button id="holdBtn" class="primary" onclick="doHold()">트레일링 확인</button></div><div class="msg" id="holdMsg"></div><div id="holdResult"></div></div>
-<div class="card"><h2>⑤ 백테스트 · V3.4 비교 연구</h2><div class="sub">추세추종: 기존 돌파 4회 / 2회, 재테스트 2회, BTC 상승 필터 2회를 <b>같은 데이터</b>에서 나란히 비교합니다. 학습 70% / 검증 30%, 결측·미래봉 부족은 UNKNOWN입니다. 거래 0회도 허용합니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="15">15일</option><option value="30">30일</option><option value="80">80일</option><option value="180">180일</option><option value="365">365일</option></select></div><div><label>계산 조건</label><input value="봉 마감·손절 우선" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">백테스트 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>CSV 저장</button><button id="btStop" onclick="cancelCurrent('backtest')" disabled>중지</button></div><div class="progress" id="btProgress" hidden><div class="phead"><b id="btStage">대기</b><b id="btPct">0%</b></div><div class="ptrack"><div id="btFill" class="pfill"></div></div><div class="msg" id="btCount">0/0</div></div><div id="btMsg" class="msg">기간 15·30·80·180·365일 / 코인 40·80·전체 선택. 분봉별 과거 2만 봉 한도를 넘으면 시작 전에 이유를 안내합니다.</div><div id="btResult"></div></div></div>
+<div class="card"><h2>⑤ 백테스트 · V3.5 정밀 진단</h2><div class="sub">기존 V3.4 비교를 유지하며 진입 전 특징·수익 상위 2건 제외·고정 필터 3종·전략 중단 판단을 추가했어요. <b>같은 데이터</b>에서 비교합니다. 학습 70% / 검증 30%, 결측·미래봉 부족은 UNKNOWN입니다. 거래 0회도 허용합니다.</div><div class="row"><div><label>기간</label><select id="days"><option value="15">15일</option><option value="30">30일</option><option value="80">80일</option><option value="180">180일</option><option value="365">365일</option></select></div><div><label>계산 조건</label><input value="봉 마감·손절 우선" disabled></div></div><div class="actions"><button class="primary" id="btBtn" onclick="doBT()">백테스트 실행</button><button id="csvBtn" onclick="exportCSV()" disabled>CSV 저장</button><button id="btStop" onclick="cancelCurrent('backtest')" disabled>중지</button></div><div class="progress" id="btProgress" hidden><div class="phead"><b id="btStage">대기</b><b id="btPct">0%</b></div><div class="ptrack"><div id="btFill" class="pfill"></div></div><div class="msg" id="btCount">0/0</div></div><div id="btMsg" class="msg">기간 15·30·80·180·365일 / 코인 40·80·전체 선택. 분봉별 과거 2만 봉 한도를 넘으면 시작 전에 이유를 안내합니다.</div><div id="btResult"></div></div></div>
 <div class="card"><h2>검증할 때 꼭 볼 점</h2><div class="warn">• 백테스트는 과거 신호가 형성된 뒤 다음 분봉 시가로만 진입합니다.<br>• 손절과 익절이 같은 분봉에 닿으면 손절 우선. 공백 봉은 임의 생성하지 않아요.<br>• 백테스트 대상 종목은 현재 24시간 거래대금 순위이므로 과거 당시의 상장·거래대금과 다를 수 있어요.<br>• 실거래 호가·주문 체결을 재현하지 못하며 신호를 매수 보장으로 해석하면 안 돼요.<br>• 주문/API 키 기능이 없어요. 데이터 오류·검증 불충분시 거래 0회도 정상입니다.</div></div>
 </main><script>
 const $=id=>document.getElementById(id);let autoTimer=null, scanning=false, lastBT=null, activeJobs={scan:null,backtest:null};
@@ -1328,10 +1488,25 @@ $('holdResult').innerHTML=`<div class="entry"><h3>${esc(d.market)} · 최근 완
 function trStat(label,s){return `<tr><td>${label}</td><td>${s?.n??0}</td><td>${s?.win_rate??'–'}%</td><td>${s?.avg_net==null?'–':pct(s.avg_net)}</td><td>${s?.pnl_krw==null?'–':krw(s.pnl_krw)}</td></tr>`}
 function renderBT(d){let s=d.stat;let h=`<div class="section"><small>검사 마켓 ${d.markets}/${d.requested_markets??d.markets}개 · 기간 일부만 확보 ${d.partial_markets??0}개 · 신호 ${d.signals}건 · 선택 ${d.selected}건 · 미확정 ${d.unknown}건</small><div class="bigresult ${s.avg_net>0?'g':s.avg_net<0?'r':''}">${s.avg_net==null?'거래 없음':'평균 '+pct(s.avg_net)}</div><div class="sub">승률 ${s.win_rate??'–'}% · ${s.win}승 ${s.loss}패 · 동일 금액 건별 합산 ${krw(s.pnl_krw)}</div></div>`;
 if(d.kind==='trend' && Array.isArray(d.comparisons)&&d.comparisons.length){
- h+=`<h3>V3.4 추세추종 비교 (동일 기간·종목)</h3><div class="note">횟수 제한만 바꾼 돌파 4회/2회 비교와 눌림 재상승·BTC 필터 비교입니다. 수익 우위는 아직 검증 전입니다.</div><div class="scroll"><table><tr><th>비교 전략</th><th>거래</th><th>승률</th><th>평균순익</th><th>검증 평균</th><th>총 손익</th></tr>${d.comparisons.map(x=>`<tr><td>${esc(x.label)}</td><td>${x.stat.n}</td><td>${x.stat.win_rate??'–'}%</td><td class="${x.stat.avg_net>0?'g':'r'}">${pct(x.stat.avg_net)}</td><td>${pct(x.test?.avg_net)}</td><td>${krw(x.stat.pnl_krw)}</td></tr>`).join('')}</table></div>`;
+ h+=`<h3>V3.5 기존 비교 유지 (동일 기간·종목)</h3><div class="note">횟수 제한만 바꾼 돌파 4회/2회 비교와 눌림 재상승·BTC 필터 비교입니다. 수익 우위는 아직 검증 전입니다.</div><div class="scroll"><table><tr><th>비교 전략</th><th>거래</th><th>승률</th><th>평균순익</th><th>검증 평균</th><th>총 손익</th></tr>${d.comparisons.map(x=>`<tr><td>${esc(x.label)}</td><td>${x.stat.n}</td><td>${x.stat.win_rate??'–'}%</td><td class="${x.stat.avg_net>0?'g':'r'}">${pct(x.stat.avg_net)}</td><td>${pct(x.test?.avg_net)}</td><td>${krw(x.stat.pnl_krw)}</td></tr>`).join('')}</table></div>`;
 }
 if(Array.isArray(d.exit_analysis)&&d.exit_analysis.length){
  h+=`<h3>청산 사유별 · 청산 후 24시간 추적</h3><div class="note">24시간 고점은 사후 관찰용이며 실제 매도가 아닙니다. 기간·분봉이 부족하면 표본에서 제외합니다. MFE/MAE는 해당 봉 고저가 기준 관측치로 체결 가능 수익을 뜻하지 않습니다.</div><div class="scroll"><table><tr><th>청산 사유</th><th>건수</th><th>평균 순익</th><th>최대 유리(MFE)</th><th>최대 불리(MAE)</th><th>24시간 확인</th><th>+2% 고점</th></tr>${d.exit_analysis.map(x=>`<tr><td>${esc(x.why)}</td><td>${x.n}</td><td>${pct(x.avg_net)}</td><td>${pct(x.avg_mfe)}</td><td>${pct(x.avg_mae)}</td><td>${x.post24_count}/${x.n}</td><td>${x.post24_up2}/${x.post24_count||0}</td></tr>`).join('')}</table></div>`;
+}
+
+if(d.kind==='trend' && d.v35_verdict){
+ const dd=d.v35_diagnostic||{}, vv=d.v35_verdict||{}, rb=d.v35_robust||{};
+ const statline=(x)=>x?`표본 ${x.n}건 · 승 ${x.win} / 패 ${x.loss} · 평균 ${pct(x.avg_net)}`:'자료 없음';
+ h+=`<div class="section"><h3>V3.5 · 손실 정밀 진단 / 채택·폐기 기준</h3><div class="entry"><div class="coin ${vv.status==='DISCARD'?'r':'gold'}">${esc(vv.status==='DISCARD'?'중단 권고':vv.status==='RESEARCH_ONLY'?'독립 검증 필요':vv.status==='DATA_INCOMPLETE'?'데이터 보완 필요':'표본 부족')}</div><div class="note">${esc(vv.text||'')} · 확보 마켓 비율 ${esc(vv.coverage??0)}%</div></div>
+ <div class="detail">${tiles([['2회 기준 선택 거래',dd.total??0],['수익 / 손실',`${dd.wins??0}승 / ${dd.losses??0}패`],['+1% 유리 움직임도 없던 손실',dd.loss_never_up1??0],['+2% 유리했다가 손실',dd.loss_gave_back2??0],['6시간 이내 손절',dd.stop_under6h??0],['손절 뒤 24h 종가 +2%',`${dd.stop_post24_close_up2??0}/${dd.stop_post24_observed??0}`]])}</div>
+ <div class="note">손절 후 24h는 완전한 봉 자료가 확보된 경우만 집계해. MFE는 고가 기준 관측이고 동일 봉 내 손절 시 고가 선후 관계는 알 수 없어.</div>
+ <h3>전체 기간 확보 종목만 남긴 민감도 검사</h3><div class="note">전체 기간을 확보한 ${d.v35_full_only?.full_markets??0}/${d.v35_full_only?.requested_markets??0}개 마켓만 재선별한 결과야. 부분 수집 때문에 성과가 왜곡되었는지 살펴보는 용도야.</div><div class="scroll"><table><tr><th>구간</th><th>거래</th><th>평균순손익</th></tr><tr><td>전체</td><td>${d.v35_full_only?.stat?.n??0}</td><td>${pct(d.v35_full_only?.stat?.avg_net)}</td></tr><tr><td>검증</td><td>${d.v35_full_only?.test?.n??0}</td><td>${pct(d.v35_full_only?.test?.avg_net)}</td></tr></table></div>
+ <h3>큰 수익 2건 제외 영향</h3><div class="scroll"><table><tr><th>구간</th><th>제외</th><th>남은 거래</th><th>평균 순손익</th></tr>${[['전체',rb.overall],['검증',rb.validation]].map(([label,r])=>`<tr><td>${label}</td><td>${r?.removed??0}</td><td>${r?.left_n??0}</td><td>${r?.avg_net==null?'–':pct(r.avg_net)}</td></tr>`).join('')}</table></div>
+ <h3>미리 고정한 3가지 필터 · 데이터 내 검증</h3><div class="note">검증 결과를 보고 문턱값을 조정하지 않는 실험이야. 학습 20건·검증 10건 미만은 긍정 판단에서 제외. 기존 기준 전략도 같이 표시해.</div>
+ <div class="scroll"><table><tr><th>규칙</th><th>학습 건수</th><th>학습 평균</th><th>검증 건수</th><th>검증 평균</th><th>검증 상위2 제외</th></tr>${(d.v35_gates||[]).map(g=>`<tr><td>${esc(g.label)}</td><td>${g.train.n}</td><td>${pct(g.train.avg_net)}</td><td>${g.test.n}</td><td class="${g.test.avg_net>0?'g':'r'}">${pct(g.test.avg_net)}</td><td>${pct(g.test_no_top2.avg_net)}</td></tr>`).join('')}</table></div>
+ <h3>진입 전에 확인 가능한 특징 · 승/패 비교</h3><div class="scroll"><table><tr><th>항목</th><th>승 (표본)</th><th>패 (표본)</th></tr>${(d.v35_features||[]).map(f=>`<tr><td>${esc(f.label)}</td><td>${f.win.avg==null?'–':f.win.avg} (${f.win.n})</td><td>${f.loss.avg==null?'–':f.loss.avg} (${f.loss.n})</td></tr>`).join('')}</table></div>
+ <h3>가장 큰 수익/손실 5건 · 사례 진단</h3><div class="scroll"><table><tr><th>분류</th><th>종목</th><th>진입</th><th>순손익</th><th>거래량 배수</th><th>EMA 기울기</th></tr>${[...(dd.top_wins||[]).map(x=>({...x,group:'수익'})),...(dd.worst_losses||[]).map(x=>({...x,group:'손실'}))].map(t=>`<tr><td>${t.group}</td><td>${esc(t.market.replace('KRW-',''))}</td><td>${esc(t.entry_at.slice(0,16).replace('T',' '))}</td><td class="${t.net_pct>0?'g':'r'}">${pct(t.net_pct)}</td><td>${esc(t.features?.volume_ratio??'–')}</td><td>${esc(t.features?.ema_slope_5_pct??'–')}%</td></tr>`).join('')}</table></div>
+ <div class="warn">이 진단은 당시 거래대금 순위가 아니라 현재 거래대금 상위 종목의 역사적 수익을 계산하므로 생존·선택 편향이 남아. 판정 통과도 실제 매수 신호가 아니야.</div></div>`;
 }
 h+=`<h3>학습 / 검증 (시간순 70/30)</h3><div class="scroll"><table><tr><th>기간</th><th>거래</th><th>승률</th><th>평균순익</th><th>총손익</th></tr>${trStat('전체',d.stat)}${trStat('학습',d.split.train)}${trStat('검증',d.split.test)}</table></div>`;
 h+=`<h3>날짜별</h3><div class="scroll"><table><tr><th>일자</th><th>건수</th><th>승/패</th><th>평균순익</th><th>손익(원)</th></tr>${d.daily.map(x=>`<tr><td>${x.date}</td><td>${x.n}</td><td>${x.win}/${x.loss}</td><td>${pct(x.avg_net)}</td><td class="${x.pnl_krw>0?'g':'r'}">${krw(x.pnl_krw)}</td></tr>`).join('')||'<tr><td colspan="5">데이터 없음</td></tr>'}</table></div>`;
@@ -1347,8 +1522,8 @@ const b=$('btBtn');b.disabled=true;b.textContent='백테스트 중…';$('csvBtn
 $('btProgress').hidden=false;$('btPct').textContent='0%';$('btFill').style.width='0%';
 try{const d=await runJob('backtest',qs(),'bt');lastBT=d;$('btResult').innerHTML=renderBT(d);$('btMsg').textContent='계산 완료 · '+d.settings.period_days+'일 · '+d.settings.tf+'분봉 · 수수료 편도 '+d.settings.fee_pct+'% · 슬리피지 0% 가정';$('csvBtn').disabled=false}
 catch(e){$('btMsg').textContent='백테스트 오류: '+e.message}finally{activeJobs.backtest=null;$('btStop').disabled=true;b.disabled=false;b.textContent='백테스트 실행'}}
-function exportCSV(){if(!lastBT)return;const d=lastBT;const objs=[...d.daily.map(x=>({row_type:'DAILY',...x})),...d.trades.map(x=>({row_type:'TRADE',version:d.version,...x})),...(d.comparisons||[]).map(x=>({row_type:'COMPARE',version:d.version,variant:x.key,label:x.label,...x.stat,validation_avg:x.test?.avg_net})),...(d.exit_analysis||[]).map(x=>({row_type:'EXIT_DIAGNOSTIC',version:d.version,...x})),...Object.entries(d.variant_trades||{}).flatMap(([variant,trades])=>trades.map(x=>({row_type:'VARIANT_TRADE',version:d.version,variant,...x})))];const columns=[...new Set(['row_type','version','date','market','signal_at','entry_at','exit_at','status','net_pct',...objs.flatMap(x=>Object.keys(x))])];const cell=v=>{const s=typeof v==='object'&&v!==null?JSON.stringify(v):String(v??'');return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
-const csv='\ufeff'+[columns.join(','),...objs.map(x=>columns.map(k=>cell(x[k])).join(','))].join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`BITHUMB_V3_4_${d.kind}_${d.settings.tf}m_${d.settings.period_days}d.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
+function exportCSV(){if(!lastBT)return;const d=lastBT;const objs=[...d.daily.map(x=>({row_type:'DAILY',...x})),...d.trades.map(x=>({row_type:'TRADE',version:d.version,...x})),...(d.comparisons||[]).map(x=>({row_type:'COMPARE',version:d.version,variant:x.key,label:x.label,...x.stat,validation_avg:x.test?.avg_net})),...(d.exit_analysis||[]).map(x=>({row_type:'EXIT_DIAGNOSTIC',version:d.version,...x})),...(d.v35_features||[]).map(x=>({row_type:'PREENTRY_FEATURE',version:d.version,...x})),...(d.v35_gates||[]).map(x=>({row_type:'FIXED_GATE',version:d.version,...x})),...Object.entries(d.v35_gate_trades||{}).flatMap(([gate,trades])=>trades.map(x=>({row_type:'FIXED_GATE_TRADE',version:d.version,gate,...x}))),{row_type:'V35_DECISION',version:d.version,...(d.v35_verdict||{})}, {row_type:'V35_DIAG',version:d.version,...(d.v35_diagnostic||{})},{row_type:'V35_FULL_ONLY',version:d.version,...(d.v35_full_only||{})},...Object.entries(d.variant_trades||{}).flatMap(([variant,trades])=>trades.map(x=>({row_type:'VARIANT_TRADE',version:d.version,variant,...x})))];const columns=[...new Set(['row_type','version','date','market','signal_at','entry_at','exit_at','status','net_pct',...objs.flatMap(x=>Object.keys(x))])];const cell=v=>{const s=typeof v==='object'&&v!==null?JSON.stringify(v):String(v??'');return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
+const csv='\ufeff'+[columns.join(','),...objs.map(x=>columns.map(k=>cell(x[k])).join(','))].join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`BITHUMB_V3_5_${d.kind}_${d.settings.tf}m_${d.settings.period_days}d.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
 ping();
 </script></body></html>'''
 
