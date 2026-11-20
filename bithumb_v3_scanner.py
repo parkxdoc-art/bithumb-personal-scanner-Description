@@ -1,7 +1,8 @@
-"""BITHUMB V3.11 | 시장 게이트 (가벼운 실시간 연구판).
+"""BITHUMB V3.12 | BTC 8개 시간봉: 시장 게이트와 분봉 흐름 분리.
 
-BTC 월/주/일/4시간/1시간의 마감된 캔들만 분석하고, KRW 알트코인들의
-전일 대비 상승 참여율을 확인한다. BUY 신호, 자동 주문, 수익률 백테스트 없음.
+BTC 월/주/일/4시간/1시간과 30/15/5분의 마감된 캔들만 분석한다.
+큰 흐름/시장 상태 판정은 V3.11과 동일, 초단기 흐름은 관찰만 한다.
+KRW 알트코인들의 전일 대비 상승 참여율을 확인한다. BUY 신호, 자동 주문, 수익률 백테스트 없음.
 
 pip install requests
 python bithumb_v3_scanner.py
@@ -22,7 +23,7 @@ from urllib.parse import urlparse
 
 import requests
 
-VERSION = 'V3.11'
+VERSION = 'V3.12'
 API = 'https://api.bithumb.com/v1'
 KST = timezone(timedelta(hours=9))
 CACHE_SECONDS = 60
@@ -34,6 +35,9 @@ TIMEFRAMES = (
     ('day', '일봉', '/candles/days'),
     ('4h', '4시간봉', '/candles/minutes/240'),
     ('1h', '1시간봉', '/candles/minutes/60'),
+    ('30m', '30분봉', '/candles/minutes/30'),
+    ('15m', '15분봉', '/candles/minutes/15'),
+    ('5m', '5분봉', '/candles/minutes/5'),
 )
 
 
@@ -55,7 +59,7 @@ def get_api(path, params=None):
     for attempt in range(3):
         try:
             response = requests.get(API + path, params=params, timeout=(4, 12),
-                                    headers={'Accept': 'application/json', 'User-Agent': 'v311-market-gate/1.0'})
+                                    headers={'Accept': 'application/json', 'User-Agent': 'v312-market-gate/1.0'})
             if response.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f'HTTP {response.status_code} 요청 제한/일시 오류')
             response.raise_for_status()
@@ -91,6 +95,8 @@ def end_of_candle(start, tf):
         return start + timedelta(hours=4)
     if tf == '1h':
         return start + timedelta(hours=1)
+    if tf in ('30m', '15m', '5m'):
+        return start + timedelta(minutes=int(tf[:-1]))
     raise ValueError(f'지원하지 않는 시간봉 {tf}')
 
 
@@ -224,6 +230,37 @@ def decide(tf, breadth):
             'long': long, 'short': short, 'can_search': False}
 
 
+def assess_micro(tf):
+    """30/15/5m status only. Must NEVER change the V3.11 market gate.
+
+    1h is used only to label a lower-timeframe rebound accurately.
+    Unknown/missing candles are not interpreted as a new trend.
+    """
+    keys = ('30m', '15m', '5m')
+    vals = [tf[k]['state'] for k in keys]
+    h1 = tf['1h']['state']
+    if 'unknown' in vals:
+        return {'key': 'unknown', 'label': '분봉 자료 확인 필요',
+                'detail': '30·15·5분 마감봉이 부족하거나 조회에 실패했어. 타이밍 판단 보류.'}
+    if vals == ['up', 'up', 'up']:
+        if h1 == 'down':
+            return {'key': 'rebound', 'label': '1시간 하락 속 반등 관찰',
+                    'detail': '30·15·5분은 상승이지만 1시간 추세는 하락. 추세 전환 확정이 아니야.'}
+        return {'key': 'up', 'label': '단기 상승 정렬',
+                'detail': '30·15·5분 마감봉이 모두 상승. 시장 진입 허용과는 별개야.'}
+    if vals[1:] == ['up', 'up']:
+        return {'key': 'rebound', 'label': '초기 반등 관찰',
+                'detail': '15·5분은 상승하지만 30분 추세는 아직 정렬되지 않았어.'}
+    if vals == ['down', 'down', 'down']:
+        return {'key': 'down', 'label': '단기 하락 지속',
+                'detail': '30·15·5분이 모두 하락. 반등 신호로 해석하지 않아.'}
+    if vals[0] == 'up' and vals[1:] == ['down', 'down']:
+        return {'key': 'pullback', 'label': '단기 조정 관찰',
+                'detail': '30분 상승 흐름 안에서 15·5분 하락이 나타나고 있어.'}
+    return {'key': 'mixed', 'label': '분봉 방향 혼조',
+            'detail': '30·15·5분 방향이 서로 달라. 진입 신호로 쓰지 않아.'}
+
+
 def compute_status():
     warnings = []
     tf = {}
@@ -248,12 +285,14 @@ def compute_status():
         breadth = breadth_from_tickers([], [])
         warnings.append(f'원화마켓 조회 실패: {str(exc)[:140]}')
     decision = decide(tf, breadth)
+    timing = assess_micro(tf)
     return {
         'version': VERSION, 'checked_kst': now_kst().isoformat(timespec='seconds'),
-        'btc': tf, 'breadth': breadth, 'decision': decision, 'warnings': warnings,
+        'btc': tf, 'breadth': breadth, 'decision': decision, 'timing': timing, 'warnings': warnings,
         'rules': {
             'trend': '마감봉 종가 > SMA5 > SMA10 = 상승; 종가 < SMA5 < SMA10 = 하락; 나머지 혼조',
             'long': '월봉·주봉 합의', 'short': '4시간봉·1시간봉 합의', 'day': '일봉은 참고 표시',
+            'micro': '30분·15분·5분은 단기 움직임 관찰 전용. 매수 허용 여부와 기존 시장 판단을 변경하지 않음',
             'breadth': '원화 알트코인 전일 대비 상승 참여율 >=55%이면 상승 참여 우세(임시 연구 기준)',
             'coverage': '전체 현존 KRW 알트의 80% 이상·20종목 이상 확인해야 판정',
             'caveat': '수익성 미검증·현재 상장 코인 기준·자동 주문/매수 신호 아님',
@@ -286,11 +325,11 @@ def csv_safe(value):
 
 
 def export_csv(result):
-    """One UTF-8 BOM CSV: config + status + 5 TF + market breadth + per-market snapshots."""
+    """One UTF-8 BOM CSV: gate + timing + eight TF + breadth + ticker snapshots."""
     output = io.StringIO(newline='')
     fields = ['row_type', 'version', 'checked_kst', 'market', 'timeframe', 'state', 'value',
-              'close', 'ma5', 'ma10', 'last_closed_start', 'rising_pct', 'change_rate_pct',
-              'turnover_24h_krw', 'valid_markets', 'total_markets', 'decision', 'reason']
+              'close', 'ma5', 'ma10', 'last_closed_start', 'last_closed_end', 'rising_pct', 'change_rate_pct',
+              'turnover_24h_krw', 'valid_markets', 'total_markets', 'decision', 'timing', 'reason']
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
     stamp = result['checked_kst']
@@ -301,14 +340,18 @@ def export_csv(result):
 
     dec = result['decision']
     br = result['breadth']
-    write('SUMMARY', market='KRW-BTC', state=dec['key'], decision=dec['label'], reason=dec['detail'],
+    timing = result['timing']
+    write('SUMMARY', market='KRW-BTC', state=dec['key'], decision=dec['label'],
+          timing=timing['label'], reason=dec['detail'],
           rising_pct=br['rising_pct'], valid_markets=br['valid_markets'], total_markets=br['total_markets'])
+    write('MICRO_TIMING', market='KRW-BTC', state=timing['key'], timing=timing['label'], reason=timing['detail'])
     for name, val in result['rules'].items():
         write('RULE', state=name, reason=val)
     for tf_key, obj in result['btc'].items():
         write('BTC_TIMEFRAME', market='KRW-BTC', timeframe=tf_key, state=obj['state'],
               close=obj.get('close'), ma5=obj.get('ma5'), ma10=obj.get('ma10'),
-              last_closed_start=obj.get('last_closed_start'), reason=obj.get('reason', ''))
+              last_closed_start=obj.get('last_closed_start'),
+              last_closed_end=obj.get('last_closed_end'), reason=obj.get('reason', ''))
     write('MARKET_BREADTH', market='KRW-ALTS', state=br['state'], rising_pct=br['rising_pct'],
           value=f"상승 {br['rising']} / 하락 {br['falling']} / 보합 {br['flat']}",
           turnover_24h_krw=br['turnover_24h_krw'], valid_markets=br['valid_markets'],
@@ -323,16 +366,16 @@ def export_csv(result):
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BITHUMB V3.11 · 시장 게이트</title>
+<title>BITHUMB V3.12 · 시장 + 단기 흐름</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1324;--panel:#142038;--border:#2a3a55;--muted:#91a3c2;--white:#edf2fe;--green:#52d5a0;--red:#f28e91;--amber:#ffcf77}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(170deg,#12223d 0,#0b1324 45%);color:var(--white);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}
 main{max-width:760px;margin:0 auto;padding:22px 15px 56px}.eyebrow{font-size:12px;letter-spacing:.14em;color:var(--green);font-weight:700}
 h1{font-size:25px;margin:6px 0 7px;letter-spacing:-.04em}p{color:var(--muted);line-height:1.5;font-size:13px}header{margin-bottom:20px}
 .panel{background:#142038;border:1px solid var(--border);border-radius:18px;padding:18px;margin:13px 0;box-shadow:0 10px 24px #050b1822}
-.hero{border-top:3px solid #637d9c}.hero.scalp,.hero.trend{border-top-color:var(--green)}.hero.swing{border-top-color:var(--amber)}.hero.wait,.hero.unknown{border-top-color:var(--red)}
+.hero{border-top:3px solid #637d9c}.microline{font-size:13px;color:#d7e4f7;padding-top:11px;margin-top:10px;border-top:1px solid #2a3a55}.microline b{font-weight:800}.microline small{color:var(--muted);display:block;margin-top:5px;font-size:11px;line-height:1.4}.hero.scalp,.hero.trend{border-top-color:var(--green)}.hero.swing{border-top-color:var(--amber)}.hero.wait,.hero.unknown{border-top-color:var(--red)}
 .kicker{font-size:12px;color:var(--muted);font-weight:600;margin-bottom:6px}.headline{font-size:29px;font-weight:800;letter-spacing:-.04em;margin:1px 0 7px}.subline{font-size:14px;color:#cddaf0;line-height:1.5}.notice{font-size:13px;color:var(--muted);line-height:1.55;margin-top:9px}
-.sectiontitle{font-weight:700;font-size:16px;margin:0 0 13px}.chips{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px}
+.sectiontitle{font-weight:700;font-size:16px;margin:0 0 13px}.chips{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px}.microchips{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.microcaption{font-size:11px;color:var(--muted);margin:12px 0 7px}
 .chip{background:#0e192e;border:1px solid #253754;border-radius:11px;text-align:center;padding:12px 3px;min-width:0}
 .chip .name{font-size:11px;color:var(--muted);white-space:nowrap}.chip .state{font-size:15px;font-weight:750;margin-top:6px;white-space:nowrap}
 .up{color:var(--green)}.down{color:var(--red)}.side{color:var(--amber)}.unknown{color:#93a2bd}
@@ -347,12 +390,12 @@ h1{font-size:25px;margin:6px 0 7px;letter-spacing:-.04em}p{color:var(--muted);li
 footer{font-size:12px;color:#7d90af;line-height:1.6;margin-top:20px}
 @media(max-width:390px){main{padding:17px 11px}.panel{padding:14px}.chip .name{font-size:10px}.chip .state{font-size:13px}.stats{gap:5px}.stat b{font-size:17px}.actions{flex-direction:column}h1{font-size:22px}}
 </style></head><body><main>
-<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.11 시장 판단</h1><p>① 지금 살 만한 시장인가? → ② 단타인가 스윙인가? <br>우선 시장부터 확인하고, 코인 추천은 다음 단계에서 만들자.</p></header>
-<section id="hero" class="panel hero unknown"><div class="kicker">BTC + 빗썸 원화시장</div><div id="decision" class="headline">검사 전</div><div id="action" class="subline">버튼을 눌러 시장 상태를 확인해.</div><div id="detail" class="notice">매수 신호가 아닌 시장 상태 연구용 표시야.</div></section>
-<section class="panel"><h2 class="sectiontitle">BTC 큰 흐름 · 확정봉 기준</h2><div class="chips" id="chips">
-<div class="chip"><div class="name">월봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">주봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">일봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">4시간</div><div class="state unknown">—</div></div><div class="chip"><div class="name">1시간</div><div class="state unknown">—</div></div></div><p class="small">판정: 종가 &gt; 5이평 &gt; 10이평이면 상승, 역순이면 하락. 나머지는 혼조. 월·주 = 장기, 4시간·1시간 = 단기, 일봉 = 참고.</p></section>
+<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.12 시장 판단</h1><p>① 시장 진입 가능? → ② 단타·스윙? → ③ 분봉 움직임 확인<br>시장 상태와 단기 움직임을 구분해서 보여줘.</p></header>
+<section id="hero" class="panel hero unknown"><div class="kicker">BTC + 빗썸 원화시장</div><div id="decision" class="headline">검사 전</div><div id="action" class="subline">버튼을 눌러 시장 상태를 확인해.</div><div id="detail" class="notice">매수 신호가 아닌 시장 상태 연구용 표시야.</div><div class="microline">단기 움직임: <b id="timing">검사 전</b><small id="timingdetail">30·15·5분 마감봉으로만 관찰</small></div></section>
+<section class="panel"><h2 class="sectiontitle">BTC 8개 시간봉 · 마감봉만</h2><div class="chips" id="chips">
+<div class="chip"><div class="name">월봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">주봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">일봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">4시간</div><div class="state unknown">—</div></div><div class="chip"><div class="name">1시간</div><div class="state unknown">—</div></div></div><div class="microcaption">작은 움직임 · 관찰 전용</div><div id="microchips" class="microchips"><div class="chip"><div class="name">30분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">15분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">5분</div><div class="state unknown">—</div></div></div><p class="small">마감봉 종가 &gt; 5이평 &gt; 10이평 = 상승, 역순 = 하락. 월·주 = 장기, 4시간·1시간 = 시장 방향, 30·15·5분 = 타이밍 관찰. 분봉 상승만으로 매수 허용하지 않아.</p></section>
 <section class="panel"><h2 class="sectiontitle">알트코인 상승 참여</h2><div class="stats"><div class="stat"><small>상승 참여율</small><b id="breadth">—</b></div><div class="stat"><small>상승 / 확인</small><b id="rising">—</b></div><div class="stat"><small>24시간 거래대금</small><b id="money">—</b></div></div><div class="meter"><div id="meterfill"></div></div><p id="mnote" class="small">현재 상장된 빗썸 원화 알트코인의 전일 대비 상승 비율. 55% 이상은 임시 연구 기준.</p></section>
-<section class="panel"><h2 class="sectiontitle">판정 요약</h2><div class="info"><span>BTC 장기 / 단기</span><b id="direction">— / —</b></div><div class="info"><span>시장 판단</span><b id="state">—</b></div><div class="info"><span>자료 확인 비율</span><b id="coverage">—</b></div><div class="info"><span>검사 시각 (KST)</span><b id="checked">—</b></div><div class="statusline" id="warning"></div></section>
+<section class="panel"><h2 class="sectiontitle">판정 요약</h2><div class="info"><span>BTC 장기 / 단기</span><b id="direction">— / —</b></div><div class="info"><span>시장 판단</span><b id="state">—</b></div><div class="info"><span>단기 움직임</span><b id="microstate">—</b></div><div class="info"><span>자료 확인 비율</span><b id="coverage">—</b></div><div class="info"><span>검사 시각 (KST)</span><b id="checked">—</b></div><div class="statusline" id="warning"></div></section>
 <div class="actions"><button id="go">시장 분석하기</button><button id="csv" disabled>결과 CSV 저장</button></div><div id="msg" class="statusline">첫 번째 연구판 · 자동 주문 기능 없음</div>
 <footer>단타는 짧은 가격 움직임, 스윙은 더 큰 가격 움직임을 관찰한다는 의미야. 투자금을 크게 늘리라는 뜻은 아니야. 이 규칙은 아직 수익성 검증 전이며 진입 결정은 별도 확인해야 해.</footer>
 </main><script>
@@ -362,9 +405,10 @@ const labels={up:'상승',down:'하락',side:'혼조',unknown:'자료부족',mix
 const fmt = v => v===null||v===undefined?'—':Number(v).toLocaleString('ko-KR');
 const f = v => Number.isFinite(v)?Number(v).toFixed(1)+'%':'—';
 function show(d){
- const dec=d.decision, br=d.breadth;
+ const dec=d.decision, br=d.breadth, micro=d.timing||{label:'자료 확인 필요',detail:'분봉 자료 없음'};
  $('hero').className='panel hero '+dec.key;
  $('decision').textContent=dec.label; $('action').textContent=dec.action; $('detail').textContent=dec.detail;
+ $('timing').textContent=micro.label;$('timingdetail').textContent=micro.detail;$('microstate').textContent=micro.label;
  $('chips').innerHTML='';
  for(const [key,label] of [['month','월봉'],['week','주봉'],['day','일봉'],['4h','4시간'],['1h','1시간']]){
   const value=d.btc[key]||{state:'unknown'};
@@ -372,6 +416,14 @@ function show(d){
   const name=document.createElement('div');name.className='name';name.textContent=label;
   const state=document.createElement('div');state.className='state '+value.state;state.textContent=labels[value.state]||'자료부족';
   cell.append(name,state);$('chips').append(cell);
+ }
+ $('microchips').replaceChildren();
+ for(const [key,label] of [['30m','30분'],['15m','15분'],['5m','5분']]){
+  const value=d.btc[key]||{state:'unknown'};
+  const cell=document.createElement('div');cell.className='chip';
+  const name=document.createElement('div');name.className='name';name.textContent=label;
+  const state=document.createElement('div');state.className='state '+value.state;state.textContent=labels[value.state]||'자료부족';
+  cell.append(name,state);$('microchips').append(cell);
  }
  $('breadth').textContent=f(br.rising_pct);$('rising').textContent=fmt(br.rising)+' / '+fmt(br.valid_markets);
  $('money').textContent=br.turnover_24h_krw>0?(br.turnover_24h_krw/1e8).toLocaleString('ko-KR',{maximumFractionDigits:0})+'억':'—';
@@ -385,7 +437,7 @@ function show(d){
  $('csv').disabled=false;
 }
 async function go(){
- $('go').disabled=true;$('go').textContent='시장 확인 중…';$('msg').textContent='BTC 5개 시간봉과 원화시장 자료를 확인하고 있어.';
+ $('go').disabled=true;$('go').textContent='시장 확인 중…';$('msg').textContent='BTC 8개 시간봉과 원화시장 자료를 확인하고 있어.';
  try{
   const r=await fetch('/api/status?refresh=1',{cache:'no-store'});const d=await r.json();
   if(!r.ok)throw Error(d.error||'조회 실패');show(d);$('msg').textContent='분석 완료 · 데이터 상태를 확인해줘.';
@@ -399,7 +451,7 @@ async function download(){
   if(!r.ok)throw Error('CSV를 가져오지 못했어');
   const blob=await r.blob(),a=document.createElement('a'),url=URL.createObjectURL(blob);
   const cd=r.headers.get('Content-Disposition')||'';const name=cd.match(/filename="([^"]+)"/);
-  a.href=url;a.download=name?name[1]:'BITHUMB_V3_11_MARKET_GATE.csv';
+  a.href=url;a.download=name?name[1]:'BITHUMB_V3_12_MARKET_GATE.csv';
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
  }catch(e){$('msg').textContent=String(e.message||e)}finally{$('csv').disabled=false}
 }
@@ -449,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
             if result is None:
                 return self.respond(409, {'error': '먼저 시장 분석을 실행해줘.'})
             stamp = result['checked_kst'].replace('-', '').replace(':', '').replace('T', '_')[:15]
-            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_11_MARKET_GATE_{stamp}.csv')
+            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_12_MARKET_GATE_{stamp}.csv')
         return self.respond(404, {'error': '없는 주소야.'})
 
 
