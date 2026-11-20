@@ -1,7 +1,7 @@
-"""BITHUMB V3.12 | BTC 8개 시간봉: 시장 게이트와 분봉 흐름 분리.
+"""BITHUMB V3.13 | BTC 8개 시간봉 + 원화마켓 거래대금 집중도.
 
 BTC 월/주/일/4시간/1시간과 30/15/5분의 마감된 캔들만 분석한다.
-큰 흐름/시장 상태 판정은 V3.11과 동일, 초단기 흐름은 관찰만 한다.
+큰 흐름/시장 상태 판정은 V3.11과 동일, 초단기 흐름 및 거래대금 집중도는 관찰만 한다.
 KRW 알트코인들의 전일 대비 상승 참여율을 확인한다. BUY 신호, 자동 주문, 수익률 백테스트 없음.
 
 pip install requests
@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 import requests
 
-VERSION = 'V3.12'
+VERSION = 'V3.13'
 API = 'https://api.bithumb.com/v1'
 KST = timezone(timedelta(hours=9))
 CACHE_SECONDS = 60
@@ -59,7 +59,7 @@ def get_api(path, params=None):
     for attempt in range(3):
         try:
             response = requests.get(API + path, params=params, timeout=(4, 12),
-                                    headers={'Accept': 'application/json', 'User-Agent': 'v312-market-gate/1.0'})
+                                    headers={'Accept': 'application/json', 'User-Agent': 'v313-market-gate/1.0'})
             if response.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f'HTTP {response.status_code} 요청 제한/일시 오류')
             response.raise_for_status()
@@ -188,10 +188,31 @@ def breadth_from_tickers(markets, tickers):
         state = 'mixed'
     else:
         state = 'weak'
+    total_turnover = sum(x['turnover_24h_krw'] for x in rows)
+    top = sorted(rows, key=lambda x: (-x['turnover_24h_krw'], x['market']))
+    top1 = top[0] if top else None
+    top1_value = top1['turnover_24h_krw'] if top1 else 0
+    top10_value = sum(x['turnover_24h_krw'] for x in top[:10])
+    # Snapshot concentration is context only; it MUST NOT affect the entry gate.
+    enough = valid >= 20 and coverage >= 80 and total_turnover > 0
+    top1_pct = round(top1_value * 100 / total_turnover, 2) if enough else None
+    top10_pct = round(top10_value * 100 / total_turnover, 2) if enough else None
+    concentration = 'unknown' if not enough else (
+        'high' if top1_pct >= 30 or top10_pct >= 75 else 'normal'
+    )
+    turnover_detail = {
+        'state': concentration, 'top_market': top1['market'] if top1 else None,
+        'top1_krw': top1_value if enough else None,
+        'top10_krw': top10_value if enough else None,
+        'top1_pct': top1_pct, 'top10_pct': top10_pct,
+        'excluding_top1_krw': (total_turnover - top1_value) if enough else None,
+        'thresholds': {'top1_pct': 30, 'top10_pct': 75},
+    }
     return {
         'total_markets': total, 'valid_markets': valid, 'coverage_pct': round(coverage, 2),
         'rising': up, 'falling': down, 'flat': flat, 'rising_pct': round(ratio, 2) if ratio is not None else None,
-        'turnover_24h_krw': sum(x['turnover_24h_krw'] for x in rows),
+        'turnover_24h_krw': total_turnover,
+        'concentration': turnover_detail,
         'state': state, 'rows': rows,
     }
 
@@ -295,6 +316,7 @@ def compute_status():
             'micro': '30분·15분·5분은 단기 움직임 관찰 전용. 매수 허용 여부와 기존 시장 판단을 변경하지 않음',
             'breadth': '원화 알트코인 전일 대비 상승 참여율 >=55%이면 상승 참여 우세(임시 연구 기준)',
             'coverage': '전체 현존 KRW 알트의 80% 이상·20종목 이상 확인해야 판정',
+            'concentration': '24시간 거래대금 상위 1개 >=30% 또는 상위 10개 >=75%이면 집중 높음(임시 기준). BTC 제외, USDT 포함. 매수 허용 판정에는 영향 없음',
             'caveat': '수익성 미검증·현재 상장 코인 기준·자동 주문/매수 신호 아님',
         },
     }
@@ -329,7 +351,9 @@ def export_csv(result):
     output = io.StringIO(newline='')
     fields = ['row_type', 'version', 'checked_kst', 'market', 'timeframe', 'state', 'value',
               'close', 'ma5', 'ma10', 'last_closed_start', 'last_closed_end', 'rising_pct', 'change_rate_pct',
-              'turnover_24h_krw', 'valid_markets', 'total_markets', 'decision', 'timing', 'reason']
+              'turnover_24h_krw', 'valid_markets', 'total_markets', 'decision', 'timing', 'reason',
+              'top_market', 'top1_turnover_24h_krw', 'top1_share_pct', 'top10_share_pct',
+              'turnover_ex_top1_24h_krw', 'turnover_rank', 'turnover_share_pct']
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
     stamp = result['checked_kst']
@@ -356,9 +380,22 @@ def export_csv(result):
           value=f"상승 {br['rising']} / 하락 {br['falling']} / 보합 {br['flat']}",
           turnover_24h_krw=br['turnover_24h_krw'], valid_markets=br['valid_markets'],
           total_markets=br['total_markets'])
+    conc = br['concentration']
+    write('TURNOVER_CONCENTRATION', market='KRW-ALTS', state=conc['state'],
+          reason='전체 거래대금 내 쏠림도 · 관찰 전용 · 진입 판정에 영향 없음',
+          turnover_24h_krw=br['turnover_24h_krw'],
+          top_market=conc['top_market'], top1_turnover_24h_krw=conc['top1_krw'],
+          top1_share_pct=conc['top1_pct'], top10_share_pct=conc['top10_pct'],
+          turnover_ex_top1_24h_krw=conc['excluding_top1_krw'],
+          valid_markets=br['valid_markets'], total_markets=br['total_markets'])
+    ranked = sorted(br['rows'], key=lambda x: (-x['turnover_24h_krw'], x['market']))
+    order = {row['market']: i for i, row in enumerate(ranked, 1)}
+    total_value = br['turnover_24h_krw']
     for row in br['rows']:
         write('MARKET_TICKER', market=row['market'], state='up' if row['rising'] else 'not_up',
-              change_rate_pct=row['change_rate_pct'], turnover_24h_krw=row['turnover_24h_krw'])
+              change_rate_pct=row['change_rate_pct'], turnover_24h_krw=row['turnover_24h_krw'],
+              turnover_rank=order[row['market']],
+              turnover_share_pct=round(row['turnover_24h_krw'] * 100 / total_value, 4) if total_value else None)
     for w in result['warnings']:
         write('DATA_WARNING', reason=w)
     return ('\ufeff' + output.getvalue()).encode('utf-8')
@@ -366,7 +403,7 @@ def export_csv(result):
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BITHUMB V3.12 · 시장 + 단기 흐름</title>
+<title>BITHUMB V3.13 · 시장 + 단기 흐름 + 거래대금 집중</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1324;--panel:#142038;--border:#2a3a55;--muted:#91a3c2;--white:#edf2fe;--green:#52d5a0;--red:#f28e91;--amber:#ffcf77}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(170deg,#12223d 0,#0b1324 45%);color:var(--white);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}
@@ -382,6 +419,7 @@ h1{font-size:25px;margin:6px 0 7px;letter-spacing:-.04em}p{color:var(--muted);li
 .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stat{background:#0e192e;border-radius:11px;padding:13px 7px;text-align:center}
 .stat small{font-size:11px;color:var(--muted);display:block;margin-bottom:6px}.stat b{font-size:20px;font-variant-numeric:tabular-nums}
 .meter{height:9px;border-radius:9px;background:#273750;overflow:hidden;margin:15px 0 6px}.meter>div{height:100%;width:0;background:var(--green);transition:width .4s}
+.concentration{border-top:1px solid #2a3a55;margin-top:12px;padding-top:11px}.conctitle{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:13px;font-weight:750;margin-bottom:3px}.conctitle b{color:var(--muted)}.conctitle b.high{color:var(--amber)}.conctitle b.normal{color:var(--green)}
 .actions{display:flex;gap:9px;margin:19px 0 6px}button{font:inherit;border:0;border-radius:11px;padding:13px 16px;font-weight:750;cursor:pointer}
 #go{background:#54dfac;color:#052219;flex:1}#csv{background:#263a57;color:var(--white);border:1px solid #405676;flex:1}button:disabled{opacity:.45;cursor:wait}
 .statusline{font-size:12px;color:var(--muted);min-height:17px;margin-top:8px}.small{font-size:12px;color:var(--muted);line-height:1.6}
@@ -390,11 +428,11 @@ h1{font-size:25px;margin:6px 0 7px;letter-spacing:-.04em}p{color:var(--muted);li
 footer{font-size:12px;color:#7d90af;line-height:1.6;margin-top:20px}
 @media(max-width:390px){main{padding:17px 11px}.panel{padding:14px}.chip .name{font-size:10px}.chip .state{font-size:13px}.stats{gap:5px}.stat b{font-size:17px}.actions{flex-direction:column}h1{font-size:22px}}
 </style></head><body><main>
-<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.12 시장 판단</h1><p>① 시장 진입 가능? → ② 단타·스윙? → ③ 분봉 움직임 확인<br>시장 상태와 단기 움직임을 구분해서 보여줘.</p></header>
+<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.13 시장 판단</h1><p>① 시장 진입 가능? → ② 단타·스윙? → ③ 분봉 움직임 확인<br>시장 상태와 단기 움직임을 구분해서 보여줘.</p></header>
 <section id="hero" class="panel hero unknown"><div class="kicker">BTC + 빗썸 원화시장</div><div id="decision" class="headline">검사 전</div><div id="action" class="subline">버튼을 눌러 시장 상태를 확인해.</div><div id="detail" class="notice">매수 신호가 아닌 시장 상태 연구용 표시야.</div><div class="microline">단기 움직임: <b id="timing">검사 전</b><small id="timingdetail">30·15·5분 마감봉으로만 관찰</small></div></section>
 <section class="panel"><h2 class="sectiontitle">BTC 8개 시간봉 · 마감봉만</h2><div class="chips" id="chips">
 <div class="chip"><div class="name">월봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">주봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">일봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">4시간</div><div class="state unknown">—</div></div><div class="chip"><div class="name">1시간</div><div class="state unknown">—</div></div></div><div class="microcaption">작은 움직임 · 관찰 전용</div><div id="microchips" class="microchips"><div class="chip"><div class="name">30분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">15분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">5분</div><div class="state unknown">—</div></div></div><p class="small">마감봉 종가 &gt; 5이평 &gt; 10이평 = 상승, 역순 = 하락. 월·주 = 장기, 4시간·1시간 = 시장 방향, 30·15·5분 = 타이밍 관찰. 분봉 상승만으로 매수 허용하지 않아.</p></section>
-<section class="panel"><h2 class="sectiontitle">알트코인 상승 참여</h2><div class="stats"><div class="stat"><small>상승 참여율</small><b id="breadth">—</b></div><div class="stat"><small>상승 / 확인</small><b id="rising">—</b></div><div class="stat"><small>24시간 거래대금</small><b id="money">—</b></div></div><div class="meter"><div id="meterfill"></div></div><p id="mnote" class="small">현재 상장된 빗썸 원화 알트코인의 전일 대비 상승 비율. 55% 이상은 임시 연구 기준.</p></section>
+<section class="panel"><h2 class="sectiontitle">알트코인 상승 참여</h2><div class="stats"><div class="stat"><small>상승 참여율</small><b id="breadth">—</b></div><div class="stat"><small>상승 / 확인</small><b id="rising">—</b></div><div class="stat"><small>24시간 거래대금</small><b id="money">—</b></div></div><div class="meter"><div id="meterfill"></div></div><p id="mnote" class="small">현재 상장된 빗썸 원화 알트코인의 전일 대비 상승 비율. 55% 이상은 임시 연구 기준.</p><div class="concentration"><div class="conctitle"><span>거래대금 집중</span><b id="concstate">분석 전</b></div><div id="concinfo" class="small">상위 1개·10개 종목의 거래대금 쏠림 확인</div><div id="concrest" class="small"></div></div></section>
 <section class="panel"><h2 class="sectiontitle">판정 요약</h2><div class="info"><span>BTC 장기 / 단기</span><b id="direction">— / —</b></div><div class="info"><span>시장 판단</span><b id="state">—</b></div><div class="info"><span>단기 움직임</span><b id="microstate">—</b></div><div class="info"><span>자료 확인 비율</span><b id="coverage">—</b></div><div class="info"><span>검사 시각 (KST)</span><b id="checked">—</b></div><div class="statusline" id="warning"></div></section>
 <div class="actions"><button id="go">시장 분석하기</button><button id="csv" disabled>결과 CSV 저장</button></div><div id="msg" class="statusline">첫 번째 연구판 · 자동 주문 기능 없음</div>
 <footer>단타는 짧은 가격 움직임, 스윙은 더 큰 가격 움직임을 관찰한다는 의미야. 투자금을 크게 늘리라는 뜻은 아니야. 이 규칙은 아직 수익성 검증 전이며 진입 결정은 별도 확인해야 해.</footer>
@@ -429,6 +467,15 @@ function show(d){
  $('money').textContent=br.turnover_24h_krw>0?(br.turnover_24h_krw/1e8).toLocaleString('ko-KR',{maximumFractionDigits:0})+'억':'—';
  $('meterfill').style.width=Number.isFinite(br.rising_pct)?Math.max(0,Math.min(100,br.rising_pct))+'%':'0%';
  $('mnote').textContent='전일 대비 상승 비율 · 현재 상장 KRW 알트 기준 · 55% 이상은 임시 연구 기준';
+ const c=br.concentration||{};
+ $('concstate').textContent=c.state==='high'?'높음 · 주의':c.state==='normal'?'기준 미만':'자료 확인 필요';
+ $('concstate').className=c.state||'unknown';
+ if(Number.isFinite(c.top1_pct)&&Number.isFinite(c.top10_pct)){
+  $('concinfo').textContent='1위 '+String(c.top_market||'—')+' '+f(c.top1_pct)+' · 상위 10개 '+f(c.top10_pct);
+  $('concrest').textContent='1위 제외 '+(c.excluding_top1_krw/1e8).toLocaleString('ko-KR',{maximumFractionDigits:0})+'억 · 집중 기준은 임시값';
+ }else{
+  $('concinfo').textContent='유효 종목 또는 거래대금 자료 부족'; $('concrest').textContent='시장 판정과 분리된 참고 정보야.';
+ }
  $('direction').textContent=(labels[dec.long]||'혼조')+' / '+(labels[dec.short]||'혼조');
  $('state').textContent=br.state==='strong'?'상승 참여 우세':br.state==='mixed'?'혼조':br.state==='weak'?'상승 참여 약세':'자료 부족';
  $('coverage').textContent=f(br.coverage_pct)+' ('+fmt(br.valid_markets)+' / '+fmt(br.total_markets)+')';
@@ -451,7 +498,7 @@ async function download(){
   if(!r.ok)throw Error('CSV를 가져오지 못했어');
   const blob=await r.blob(),a=document.createElement('a'),url=URL.createObjectURL(blob);
   const cd=r.headers.get('Content-Disposition')||'';const name=cd.match(/filename="([^"]+)"/);
-  a.href=url;a.download=name?name[1]:'BITHUMB_V3_12_MARKET_GATE.csv';
+  a.href=url;a.download=name?name[1]:'BITHUMB_V3_13_MARKET_GATE.csv';
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
  }catch(e){$('msg').textContent=String(e.message||e)}finally{$('csv').disabled=false}
 }
@@ -501,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
             if result is None:
                 return self.respond(409, {'error': '먼저 시장 분석을 실행해줘.'})
             stamp = result['checked_kst'].replace('-', '').replace(':', '').replace('T', '_')[:15]
-            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_12_MARKET_GATE_{stamp}.csv')
+            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_13_MARKET_GATE_{stamp}.csv')
         return self.respond(404, {'error': '없는 주소야.'})
 
 
