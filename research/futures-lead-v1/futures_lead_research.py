@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+import hyperliquid_wallet_study_v15 as walletstudy
 
 VERSION = "1.4.1"
 BINANCE = "https://fapi.binance.com"
@@ -629,6 +630,7 @@ HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#0b1321;color:#eaf1fb;margin:0}main{max-width:980px;margin:auto;padding:14px 12px 55px}h1{font-size:24px;margin:6px 0}h2{font-size:17px;margin:12px 0}section{background:#162237;border:1px solid #2d435b;border-radius:14px;padding:15px;margin:14px 0}p,.note{color:#aebfd0;line-height:1.6;font-size:13px}.status{border:1px solid #537089;border-radius:8px;padding:10px}.top{font-size:12px;color:#79bec6}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{border:1px solid #364e65;border-radius:8px;padding:9px}.stat small{display:block;color:#aab8c8}.stat strong{display:block;font-size:19px;margin-top:5px}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;min-width:690px;font-size:12px}td,th{border-bottom:1px solid #36475c;padding:10px 7px;text-align:right}td:first-child,th:first-child{text-align:left}th{color:#b5c6dc;font-weight:600}input{width:100%;background:#0d182a;border:1px solid #475c76;color:white;border-radius:8px;padding:12px;margin:4px 0 12px;font-size:16px}button,.link{background:#287fd5;color:#fff;border:0;border-radius:9px;padding:12px 15px;display:inline-block;text-decoration:none;font-size:14px;font-weight:600;cursor:pointer}button:disabled{opacity:.5}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.5;color:#b7c4d6}.good{color:#82d8bd}.bad{color:#ffb0a3}.sub{font-size:12px;color:#91a7bf}#result[hidden]{display:none}@media(max-width:620px){.stats{grid-template-columns:repeat(2,1fr)}table{font-size:12px}}</style></head><body><main>
 <div class="top">BITHUMB × BINANCE · 독립 연구 · 자동매매 없음</div>
 <h1>선물 데이터 선행성 연구 V1.4.1</h1>
+<p><a href="/traders" style="color:#83d1ff">새 연구: 실제 공개 트레이더 체결 패턴 V1.5 보기 →</a></p>
 <p>저성과 A/B/C/M/E/P 규칙을 주력 신호에서 제외하고, <b>G형만 연구 후보</b>로 남겼습니다. N(같은 BTC 상승 구간)과 X(BTC 하락 구간)는 <b>통계 비교용</b>이며 BUY 알림이 아닙니다.</p>
 <section><p><b>안전장치:</b> 바이낸스 IP 차단이 감지되면 차단 해제 시각까지 요청하지 않습니다. 최초 확인된 Render 차단 종료 시각은 2026-11-24 05:54:58 KST입니다. 기본 5종목·6일부터 재검증하세요.</p></section>
 <section><div class="sub">빗썸 KRW + 바이낸스 USDT 선물 공통 코인 (최대 20개)</div><input id="coins" value="BTC,ETH,XRP,SOL,SUI"><div class="sub">최근 연구 일수 (1~13)</div><input id="days" type="number" value="6" min="1" max="13"><button id="go" onclick="start()">연구 실행</button><p>기본 설정: 5개 코인, 최근 6일 (최대 20개·13일). IP 요청 제한 방지용 보수적 기본값. 거래소 자료는 실제 API에서 불러오며 수집 중 다소 시간이 걸릴 수 있습니다.</p></section>
@@ -682,6 +684,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urlsplit(self.path).path
+        if p == '/traders':
+            return self.respond(walletstudy.HTML,ctype='text/html; charset=utf-8')
+        if p == '/api/wallet-study/status':
+            return self.respond(json.dumps(walletstudy.status(),ensure_ascii=False))
+        if p == '/api/wallet-study/csv':
+            result=walletstudy.status().get('result')
+            if not result: return self.respond(json.dumps({'error':'아직 완료된 결과 없음'},ensure_ascii=False),404)
+            return self.respond(walletstudy.to_csv(result),ctype='text/csv; charset=utf-8',
+                                extra={'Content-Disposition':'attachment; filename="HYPERLIQUID_WALLET_STUDY_V1_5.csv"'})
         if p in ('/','/health'):
             self.respond(HTML if p=='/' else 'ok',ctype='text/html; charset=utf-8' if p=='/' else 'text/plain')
         elif p=='/api/status':
@@ -698,6 +709,17 @@ class Handler(BaseHTTPRequestHandler):
         else: self.respond(json.dumps({'error':'not found'}),404)
 
     def do_POST(self):
+        if urlsplit(self.path).path == '/api/wallet-study/run':
+            try:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 0<length<=512: raise ValueError('요청 크기 오류')
+                obj=json.loads(self.rfile.read(length))
+                days=int(obj.get('days',6))
+                ok,reason=walletstudy.start(days)
+            except (ValueError,TypeError,KeyError,json.JSONDecodeError) as e:
+                return self.respond(json.dumps({'error':str(e)},ensure_ascii=False),400)
+            return self.respond(json.dumps({'ok':ok,'error':reason},ensure_ascii=False),
+                                200 if ok else 400 if '기간은' in reason else 429)
         if urlsplit(self.path).path != '/api/run':
             return self.respond(json.dumps({'error':'not found'}),404)
         if ban_until_ms():
