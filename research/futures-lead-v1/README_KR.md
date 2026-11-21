@@ -1,11 +1,20 @@
-# 빗썸 × 바이낸스 선물 데이터 선행성 연구 V1.0
+# 빗썸 × 바이낸스 선물 데이터 선행성 연구 V1.1
 
 **기존 V2·V3와 완전히 분리된 읽기 전용 독립 연구판**입니다. 자동주문·계좌 조회·매수 알림이 없습니다.
+
+## V1.1 Binance API 오류 수정 (2026-11-21)
+
+- V1.0에서 최근 6일치를 한 번의 `startTime`~`endTime` 요청으로 보내 `HTTP 400 / -1130 / parameter 'endTime' is invalid` 오류가 발생했습니다.
+- 15분 선물 데이터는 최대 **400구간씩** 시간을 나누어 불러옵니다. 서버가 동일 오류를 반환하면 해당 데이터 조회를 **96구간(1일)** 단위로 자동 축소해 재시도합니다.
+- 데이터가 비는 페이지가 있어도 남은 기간을 탐색하며, 실제 존재하는 데이터만 분석합니다. 최신 30일 제한·완료봉 조건은 유지합니다.
+- 화면·버전·CSV 이름을 V1.1로 통일했습니다. 8개 오프라인 회귀 테스트 통과. 실제 시장 결과를 보장하지 않습니다.
+- 새 연구판 Live 주소: https://bithumb-futures-lead-v1.onrender.com
+- GitHub 경로: `research/futures-lead-v1/` (독립 브랜치 `futures-lead-research`). **기존 V2·V3 서비스 수정 없음.**
 
 ## 생성 파일
 
 - `futures_lead_research.py`: 웹 화면 + 연구 로직 + CLI (Python 표준 라이브러리만 사용)
-- `futures_lead_research_V1_0_FULL.txt`: 전체 코드 열람용
+- `futures_lead_research_V1_1_FULL.txt`: 전체 코드 열람용
 - `test_futures_lead_research.py`: 오프라인 단위 테스트 6개
 - `Procfile`: 지원 플랫폼의 실행 설정
 - `requirements.txt`: 추가 Python 패키지 불필요
@@ -63,7 +72,7 @@ python futures_lead_research.py --coins ETH,XRP,SOL --days 6
 
 - **바이낸스 공식 2026년 API 문서**는 상위 트레이더 포지션 비율 엔드포인트에 `X-MBX-APIKEY` 필수로 표시합니다. 이 호출에 401/403이 반환되면 자동으로 A/B를 배제하고 C/M만 분석하며 '비율 없음' 경고를 표시합니다. 절대로 비율 값을 임의 생성하지 않습니다.
 - 거래소 통신 실패, 지표 누락, 페어 미상장, 일부 빈 캔들은 강제로 보간하거나 가짜 값으로 대체하지 않습니다. 결과가 없으면 오류 또는 0건을 보여줍니다.
-- **신규 상장 14일 미만** 자동 판별은 이번 V1.0에 없습니다. 기존 V3 시장 전체 거래대금 집중도 연구와는 분리된 과제입니다.
+- **신규 상장 14일 미만** 자동 판별은 이번 V1.1에 없습니다. 기존 V3 시장 전체 거래대금 집중도 연구와는 분리된 과제입니다.
 - 소량 샘플·종목 선택·수수료/슬리피지 가정·신호 직후 종가 체결의 이상화 때문에 결과 해석은 매우 신중해야 합니다.
 - 실거래 데이터 분석은 네트워크 연결과 서비스 배포가 가능한 환경에서 별도로 실행해야 합니다. **오프라인 테스트 통과는 실제 전략의 수익성 검증이 아닙니다.**
 
@@ -76,5 +85,5 @@ python futures_lead_research.py --coins ETH,XRP,SOL --days 6
 ## 커밋 메시지
 
 ```
-feat: add independent Bithumb-Binance futures lead research V1.0
+feat: add independent Bithumb-Binance futures lead research V1.1
 ```
