@@ -64,12 +64,41 @@ class TestResearch(unittest.TestCase):
         seq=[{"timestamp":self.t+i*r.PERIOD_MS,"sumOpenInterest":"1000"} for i in range(600)]
         calls=[]
         def fake_fetch(base,path,params,headers=None):
-            calls.append(params['startTime'])
+            calls.append((params['startTime'], params['endTime']))
+            # Reject a range which exceeds 400 periods, reproducing the
+            # Binance 'endTime is invalid' regression on 6-day requests.
+            assert params['endTime'] - params['startTime'] < 400*r.PERIOD_MS
             data=[x for x in seq if params['startTime']<=x['timestamp']<=params['endTime']]
             return data[:params['limit']]
         with patch.object(r,'fetch_json',side_effect=fake_fetch):
             got=r.history('/futures/data/openInterestHist','ETHUSDT',self.t,self.t+600*r.PERIOD_MS)
         self.assertEqual(len(got),600)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(calls[0][1] + 1, calls[1][0])
+
+    def test_endtime_invalid_one_day_fallback(self):
+        seq=[{"timestamp":self.t+i*r.PERIOD_MS,"sumOpenInterest":"1000"} for i in range(580)]
+        calls=[]
+        def fake_fetch(base,path,params,headers=None):
+            calls.append((params['startTime'],params['endTime']))
+            if params['endTime']-params['startTime'] >= 96*r.PERIOD_MS:
+                raise r.APIError("parameter 'endTime' is invalid",400)
+            return [x for x in seq if params['startTime'] <= x['timestamp'] <= params['endTime']]
+        with patch.object(r,'fetch_json',side_effect=fake_fetch):
+            got=r.history('/futures/data/openInterestHist','ETHUSDT',self.t,self.t+580*r.PERIOD_MS)
+        self.assertEqual(len(got),580)
+        self.assertGreater(len(calls),6)
+        self.assertTrue(any(b-a < 96*r.PERIOD_MS for a,b in calls))
+
+    def test_empty_page_does_not_stop_later_pages(self):
+        seq=[{"timestamp":self.t+i*r.PERIOD_MS,"sumOpenInterest":"1000"} for i in range(500,520)]
+        calls=[]
+        def fake_fetch(base,path,params,headers=None):
+            calls.append(params['startTime'])
+            return [x for x in seq if params['startTime'] <= x['timestamp'] <= params['endTime']]
+        with patch.object(r,'fetch_json',side_effect=fake_fetch):
+            got=r.history('/futures/data/openInterestHist','ETHUSDT',self.t,self.t+550*r.PERIOD_MS)
+        self.assertEqual(len(got),20)
         self.assertEqual(len(calls),2)
 
     def test_input_validation(self):
