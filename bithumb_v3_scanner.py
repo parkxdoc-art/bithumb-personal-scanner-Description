@@ -1,4 +1,4 @@
-"""BITHUMB V3.17 | 지난 단타·스윙 후보 유지/탈락 추적.
+"""BITHUMB V3.18 | 단타 초기/추격 판단 + 스윙 눌림 대기/반등 관찰.
 
 BTC 월/주/일/4시간/1시간과 30/15/5분의 마감된 캔들만 분석한다.
 큰 흐름/시장 상태 판정은 V3.11과 동일, 초단기 흐름 및 정제 거래대금은 관찰만 한다.
@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 
 import requests
 
-VERSION = 'V3.17'
+VERSION = 'V3.18'
 API = 'https://api.bithumb.com/v1'
 AGE_DAYS = 14
 AGE_WORKERS = 12
@@ -75,7 +75,7 @@ def get_api(path, params=None, max_attempts=3, timeout=(4, 12)):
     for attempt in range(max_attempts):
         try:
             response = requests.get(API + path, params=params, timeout=timeout,
-                                    headers={'Accept': 'application/json', 'User-Agent': 'v317-market-gate/1.0'})
+                                    headers={'Accept': 'application/json', 'User-Agent': 'v318-market-gate/1.0'})
             if response.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f'HTTP {response.status_code} 요청 제한/일시 오류')
             response.raise_for_status()
@@ -409,54 +409,100 @@ def assess_micro(tf):
 
 
 
+def scalp_phase(tf, base_ok):
+    """Classification only, not a validated entry signal. Strict closed 30/15/5m."""
+    if not base_ok:
+        return 'BASE_FAIL', '1시간·4시간·BTC 상대강도 기준 미충족'
+    if any(tf[k].get('state') == 'unknown' for k in ('30m','15m','5m')):
+        return 'DATA_CHECK', '30·15·5분 마감봉 확인 필요'
+    m30, m15, m5 = (tf[k]['state'] for k in ('30m','15m','5m'))
+    d30 = (tf['30m']['close'] / tf['30m']['ma5'] - 1) * 100
+    d5 = (tf['5m']['close'] / tf['5m']['ma5'] - 1) * 100
+    if d30 > 2.0 or d5 > 1.5:
+        return 'CHASE', f'추격 주의 · 30분 MA5 이격 {d30:+.2f}%, 5분 {d5:+.2f}%'
+    if m30 == 'up' and m15 == 'up' and m5 in ('up','side'):
+        return 'EARLY', '초기 관찰 · 30·15분 상승, 5분 비하락 · 이격 과다 아님'
+    if m30 == 'up' and m15 == 'up' and m5 == 'down':
+        return 'PULLBACK', '단기 눌림 관찰 · 5분 하락 중, 반등 확인 전'
+    return 'MIXED', '30·15·5분 방향 불일치 · 초기 상승 미확인'
+
+
+def swing_phase(states, deviation):
+    """A daily-up correction may WAIT; only a recovered 1h with stable 4h may WATCH."""
+    if states['day'] != 'up' or deviation is None:
+        return 'NONE', '일봉 상승 추세 아님'
+    if states['4h'] in ('up','side') and states['1h'] == 'up' and -2 <= deviation <= 2:
+        return 'WATCH', '스윙 반등 관찰 · 일봉 상승, 4시간 비하락, 1시간 상승 회복'
+    if -5 <= deviation <= 2 and (states['4h'] == 'down' or states['1h'] in ('down','side')):
+        return 'WAIT', '스윙 눌림 대기 · 일봉 상승 속 단기 조정, 반등 확인 전'
+    return 'NONE', '스윙 눌림·반등 기준 미충족 (이격 또는 추세 불일치)'
+
+
 def analyze_candidate_market(market, ticker, btc_4h_change, reader=None, now=None):
-    """Read-only candidate review. Uses completed candles only; never places orders."""
+    """Candidate review, with optional micro-candle read only for base scalp candidates."""
     reader = reader or get_api
     now = now or now_kst()
     tf = {}
     issues = []
-    for key, path in (('day', '/candles/days'), ('4h', '/candles/minutes/240'), ('1h', '/candles/minutes/60')):
+    base_defs = (('day','/candles/days'),('4h','/candles/minutes/240'),('1h','/candles/minutes/60'))
+    freshness = {'day':timedelta(hours=48),'4h':timedelta(hours=8),'1h':timedelta(hours=2),
+                 '30m':timedelta(minutes=70),'15m':timedelta(minutes=40),'5m':timedelta(minutes=16)}
+    for key, path in base_defs:
         try:
-            raw = reader(path, {'market': market, 'count': 20})
+            raw = reader(path, {'market':market,'count':20})
             tf[key] = classify_trend(completed_candles(raw, key, now), key)
-            # A continuous but old candle series is not a current-entry candidate.
-            latest_end = tf[key].get('last_closed_end')
-            if latest_end and now - datetime.fromisoformat(latest_end) > {'day': timedelta(hours=48), '4h': timedelta(hours=8), '1h': timedelta(hours=2)}[key]:
+            latest = tf[key].get('last_closed_end')
+            if latest and now - datetime.fromisoformat(latest) > freshness[key]:
                 issues.append(f'{key}: 최신 마감봉이 오래됨')
         except Exception as exc:
-            tf[key] = {'state': 'unknown', 'reason': '캔들 API 조회 실패'}
-            issues.append(f'{key}: {str(exc)[:80]}')
-    states = {k: tf[k]['state'] for k in ('day', '4h', '1h')}
+            tf[key] = {'state':'unknown','reason':'캔들 API 조회 실패'}
+            issues.append(f'{key}: {str(exc)[:75]}')
+    states = {k:tf[k]['state'] for k in ('day','4h','1h')}
     strength = tf['1h'].get('return_4h_pct')
-    relative = round(strength - btc_4h_change, 4) if strength is not None and btc_4h_change is not None else None
+    relative = round(strength - btc_4h_change,4) if strength is not None and btc_4h_change is not None else None
     h4 = tf['4h']
-    deviation = (round((h4['close'] / h4['ma5'] - 1) * 100, 4)
-                 if h4.get('ma5') and h4.get('close') else None)
+    deviation = round((h4['close']/h4['ma5']-1)*100,4) if h4.get('ma5') and h4.get('close') else None
     common = {
-        'market': market, 'turnover_24h_krw': ticker['turnover_24h_krw'],
-        'change_rate_pct': ticker['change_rate_pct'],
-        'daily_state': states['day'], 'h4_state': states['4h'], 'h1_state': states['1h'],
-        'return_4h_pct': strength, 'btc_return_4h_pct': btc_4h_change,
-        'relative_4h_pct': relative, 'h4_distance_ma5_pct': deviation,
-        'last_price': tf['1h'].get('close'),
-        'last_closed_end': tf['1h'].get('last_closed_end'),
-        'issues': issues,
+      'market':market,'turnover_24h_krw':ticker['turnover_24h_krw'],
+      'change_rate_pct':ticker['change_rate_pct'],
+      'daily_state':states['day'],'h4_state':states['4h'],'h1_state':states['1h'],
+      'return_4h_pct':strength,'btc_return_4h_pct':btc_4h_change,
+      'relative_4h_pct':relative,'h4_distance_ma5_pct':deviation,
+      'last_price':tf['1h'].get('close'),'last_closed_end':tf['1h'].get('last_closed_end'),
+      'issues':issues,'selected_mode':''
     }
-    if issues or any(state == 'unknown' for state in states.values()) or relative is None or deviation is None:
-        return {**common, 'scalp_ok': False, 'swing_ok': False,
-                'state': 'DATA_INCOMPLETE', 'reason': '마감봉 연속 이력 또는 API 자료 부족', 'selected_mode': ''}
-    if not (0 <= ticker['change_rate_pct'] <= MAX_RISE_24H_PCT):
-        return {**common, 'scalp_ok': False, 'swing_ok': False,
-                'state': 'REJECT', 'reason': '24시간 상승률 0~10% 범위 밖(급등 추격 방지)', 'selected_mode': ''}
-    scalp_ok = states['1h'] == 'up' and states['4h'] in ('up', 'side') and relative > 0
-    swing_ok = (states['day'] == 'up' and states['4h'] in ('up', 'side')
-                and states['1h'] in ('up', 'side') and -2 <= deviation <= 2)
-    reason = ('단타·스윙 모두 관찰 가능' if scalp_ok and swing_ok else
-              '단타 관찰 기준 충족' if scalp_ok else
-              '스윙 관찰 기준 충족' if swing_ok else '기준 미충족 · 매수 신호 없음')
-    return {**common, 'scalp_ok': scalp_ok, 'swing_ok': swing_ok,
-            'state': 'ELIGIBLE' if scalp_ok or swing_ok else 'REJECT',
-            'reason': reason, 'selected_mode': ''}
+    if issues or any(x=='unknown' for x in states.values()) or relative is None or deviation is None:
+        return {**common,'scalp_ok':False,'swing_ok':False,'swing_wait':False,
+                'scalp_stage':'DATA_CHECK','scalp_note':'자료 확인 필요',
+                'swing_stage':'DATA_CHECK','swing_note':'자료 확인 필요',
+                'state':'DATA_INCOMPLETE','reason':'마감봉 연속 이력 또는 API 자료 부족'}
+    change = ticker['change_rate_pct']
+    base_scalp = 0 <= change <= MAX_RISE_24H_PCT and states['1h']=='up' and states['4h'] in ('up','side') and relative>0
+    sw_stage,sw_note = swing_phase(states,deviation)
+    if not (-5 <= change <= MAX_RISE_24H_PCT):
+        sw_stage,sw_note = 'NONE','일간 등락 -5~+10% 범위 밖'
+    if base_scalp:
+        for key,path in (('30m','/candles/minutes/30'),('15m','/candles/minutes/15'),('5m','/candles/minutes/5')):
+            try:
+                raw=reader(path,{'market':market,'count':20})
+                tf[key]=classify_trend(completed_candles(raw,key,now),key)
+                latest=tf[key].get('last_closed_end')
+                if latest and now-datetime.fromisoformat(latest)>freshness[key]:
+                    tf[key]={'state':'unknown','reason':f'{key} 마감봉이 오래됨'}
+            except Exception:
+                tf[key]={'state':'unknown','reason':f'{key} 캔들 조회 실패'}
+        stage,note=scalp_phase(tf,True)
+    else:
+        stage,note='BASE_FAIL','단타 1시간·4시간·상대강도 또는 24시간 상승률 기준 미충족'
+    scalp_ok = bool(base_scalp and stage in ('EARLY','PULLBACK'))
+    swing_ok = sw_stage=='WATCH'
+    reason='단타 '+note+' / 스윙 '+sw_note
+    return {**common,'scalp_ok':scalp_ok,'scalp_base_ok':base_scalp,
+            'scalp_stage':stage,'scalp_note':note,
+            'swing_ok':swing_ok,'swing_wait':sw_stage=='WAIT',
+            'swing_stage':sw_stage,'swing_note':sw_note,
+            'state':'ELIGIBLE' if scalp_ok or swing_ok else ('WATCH_WAIT' if sw_stage=='WAIT' else 'REJECT'),
+            'reason':reason}
 
 
 def select_candidates(decision, breadth, btc, reader=None, now=None):
@@ -469,10 +515,10 @@ def select_candidates(decision, breadth, btc, reader=None, now=None):
               'gate': decision.get('key'), 'pool_size': 0, 'checked': 0,
               'candidates': [], 'reviews': [], 'warnings': [],
               'rules': {
-                  'universe': f'14일 이전 거래 확인된 일반 알트 중 거래대금 >=5억원, 24시간 상승률 0~10% 상위 {CANDIDATE_POOL}개',
+                  'universe': f'14일 이전 거래 확인된 일반 알트 중 거래대금 >=5억원, 24시간 상승률 -5~+10%(단타는 0~+10%) 상위 {CANDIDATE_POOL}개',
                   'exclude': '신규·이력 미확인·스테이블·BTC 제외. 24시간 +10% 초과 추격 제외',
-                  'scalp': '1시간 상승·4시간 비하락·BTC 대비 최근 4시간 상대강도 양수',
-                  'swing': '일봉 상승·4시간 비하락·1시간 비하락·4시간 종가가 SMA5 ±2% 이내',
+                  'scalp': '1시간 상승·4시간 비하락·BTC 상대강도 양수 후 30/15/5분으로 초기·추격·눌림 분류',
+                  'swing': '일봉 상승+4시간 MA5 이격 -5~+2% 단기조정은 WAIT, 1시간 상승 회복+4시간 비하락+이격 ±2%는 WATCH',
                   'limit': '단타 시장은 단타 최대 2개, 추세 시장은 단타 1개+스윙 1개 우선, 총 2개',
                   'limitations': '관찰 후보만 표시. 미래 수익·체결 검증 없음. 실전 BUY/자동주문 없음',
               }}
@@ -484,7 +530,7 @@ def select_candidates(decision, breadth, btc, reader=None, now=None):
         return output
     pool = sorted((r for r in breadth.get('rows', []) if r.get('turnover_included')
                    and r['turnover_24h_krw'] >= MIN_TURNOVER_KRW
-                   and 0 <= r['change_rate_pct'] <= MAX_RISE_24H_PCT),
+                   and (-5 if decision.get('key') == 'trend' else 0) <= r['change_rate_pct'] <= MAX_RISE_24H_PCT),
                   key=lambda r: (-r['turnover_24h_krw'], r['market']))[:CANDIDATE_POOL]
     output['pool_size'] = len(pool)
     if not pool:
@@ -508,7 +554,7 @@ def select_candidates(decision, breadth, btc, reader=None, now=None):
     output['reviews'].sort(key=lambda r: (-r['turnover_24h_krw'], r['market']))
     output['checked'] = len(output['reviews'])
     scalps = sorted((r for r in output['reviews'] if r.get('scalp_ok')),
-                    key=lambda r: (-r['relative_4h_pct'], -r['turnover_24h_krw'], r['market']))
+                    key=lambda r: (0 if r.get('scalp_stage')=='EARLY' else 1, -r['relative_4h_pct'], -r['turnover_24h_krw'], r['market']))
     swings = sorted((r for r in output['reviews'] if r.get('swing_ok')),
                     key=lambda r: (abs(r['h4_distance_ma5_pct']), -r['turnover_24h_krw'], r['market']))
     chosen = []
@@ -559,7 +605,7 @@ def diagnostic_preview(snapshot, reader=None, now=None):
         'market_gate_label': snapshot['decision']['label'],
         'official_gate_unchanged': True, 'pool_size': 0, 'checked': 0,
         'candidates': [], 'reviews': [], 'warnings': [],
-        'rule': '시장 상태와 무관하게 정제 거래대금 상위 20종목(일간 -5~+10%)만 점검. 단타·스윙 비교용 각 최대 1종목. BUY 신호/추천 아님.'
+        'rule': '정제 거래대금 상위 20종목(-5~+10%) 별도 진단. 단타 30/15/5분 초기·추격 주의, 스윙 눌림 WAIT→1시간 반등 WATCH. 각 1개 참고. BUY 아님.'
     }
     btc_4h = tf.get('1h', {}).get('return_4h_pct')
     if btc_4h is None:
@@ -600,11 +646,13 @@ def diagnostic_preview(snapshot, reader=None, now=None):
     # plus proximity to MA5 for swing. Display strict condition compliance.
     scalp_rank = sorted(usable, key=lambda r:(
         -int(bool(r.get('scalp_ok'))),
+        0 if r.get('scalp_stage')=='EARLY' else 1,
         -int(r.get('h1_state')=='up'),
         -int(r.get('h4_state') in ('up','side')),
         -r['relative_4h_pct'], -r['turnover_24h_krw'], r['market']))
     swing_rank = sorted(usable, key=lambda r:(
         -int(bool(r.get('swing_ok'))),
+        -int(bool(r.get('swing_wait'))),
         -int(r.get('daily_state')=='up'),
         -int(r.get('h4_state') in ('up','side')),
         abs(r['h4_distance_ma5_pct']), -r['turnover_24h_krw'], r['market']))
@@ -617,8 +665,8 @@ def diagnostic_preview(snapshot, reader=None, now=None):
             copy = dict(item)
             copy['diagnostic_mode'] = mode
             copy['diagnostic_qualified'] = bool(item.get(flag))
-            copy['diagnostic_note'] = (mode + ' 관찰 조건 충족 · 그래도 현재 시장 매수 허용과 무관' if copy['diagnostic_qualified']
-                                       else mode + ' 관찰 조건 미충족 · 비교 참고만 가능')
+            copy['diagnostic_note'] = (('단타 '+str(item.get('scalp_note','')) if flag=='scalp_ok' else '스윙 '+str(item.get('swing_note','')))
+          + ' · 시장 진입 판단과 별개, BUY 아님')
             diag['candidates'].append(copy)
             break
     if diag['candidates']:
@@ -647,134 +695,132 @@ TRACK_MARKET_RE = re.compile(r'^KRW-[A-Z0-9]{1,15}$')
 
 
 def verify_tracked(snapshot, items, reader=None, now=None):
-    """Independently review prior user-observed symbols, even while gate is WAIT.
+    """Previous-candidate follow-up. No new closed 1h candle => BAR_WAIT, not KEEP.
 
-    No forced 'DROP' for API failures/incomplete candles. This is a trend
-    observation, not an actionable BUY/SELL signal or a price backtest.
+    Never promotes a diagnostic reference without meeting the full present-day
+    rules. A swing daily-up correction can WAIT without pretending to be ready.
     """
     now = now or now_kst()
     reader = reader or get_api
-    if not isinstance(items, list) or len(items) > MAX_TRACKED:
+    if not isinstance(items,list) or len(items)>MAX_TRACKED:
         raise ValueError(f'이전 추적 종목은 최대 {MAX_TRACKED}개야.')
-    br = snapshot['breadth']
-    lookup = {r['market']: r for r in br.get('rows', [])}
-    btc_4h = snapshot.get('btc', {}).get('1h', {}).get('return_4h_pct')
-    entries = []
-    used = set()
+    lookup={r['market']:r for r in snapshot['breadth'].get('rows',[])}
+    btc_4h=snapshot.get('btc',{}).get('1h',{}).get('return_4h_pct')
+    entries=[]; used=set()
     for raw in items:
-        if not isinstance(raw, dict):
-            raise ValueError('추적 종목 형식 오류')
-        market = str(raw.get('market', '')).strip().upper()
-        mode = str(raw.get('mode', '')).strip().lower()
-        if not TRACK_MARKET_RE.fullmatch(market) or mode not in ('scalp', 'swing'):
+        if not isinstance(raw,dict): raise ValueError('추적 종목 형식 오류')
+        market=str(raw.get('market','')).strip().upper()
+        mode=str(raw.get('mode','')).strip().lower()
+        if not TRACK_MARKET_RE.fullmatch(market) or mode not in ('scalp','swing'):
             raise ValueError('종목 코드 또는 추적 유형 형식 오류')
-        if (market, mode) in used:
-            continue
-        used.add((market, mode))
-        entries.append({'market': market, 'mode': mode,
-                        'first_seen_kst': str(raw.get('first_seen_kst') or '')[:45],
-                        'origin': str(raw.get('origin') or '진단')[:16],
-                        'origin_qualified': bool(raw.get('origin_qualified', False)),
-                        'first_price': finite_number(raw.get('first_price'))})
-    results = {}
-
+        if (market,mode) in used: continue
+        used.add((market,mode))
+        entries.append({'market':market,'mode':mode,
+                        'first_seen_kst':str(raw.get('first_seen_kst') or '')[:45],
+                        'origin':str(raw.get('origin') or '진단')[:16],
+                        'origin_qualified':bool(raw.get('origin_qualified',False)),
+                        'first_price':finite_number(raw.get('first_price')),
+                        'previous_closed_end':str(raw.get('last_closed_end') or '')[:45],
+                        'previous_status':str(raw.get('track_status') or '')[:20],
+                        'previous_swing_stage':str(raw.get('swing_stage') or '')[:20]})
     def fetch_market(market):
-        row = lookup.get(market)
+        row=lookup.get(market)
         if row is None:
-            # A missing ticker can also indicate partial ticker API coverage.
-            return {'market': market, 'tracking_data_state': 'CHECK',
-                    'reason': '현재 종목 데이터 확인 불가 · 거래소 목록 또는 조회 누락 확인 필요'}
+            return {'market':market,'tracking_data_state':'CHECK','reason':'현재 종목 확인 불가'}
         if not row.get('turnover_included'):
-            state = row.get('age_status')
-            if state == 'unverified':
-                return {'market': market, 'tracking_data_state': 'CHECK',
-                        'reason': '14일 이전 거래 이력 확인 실패'}
-            return {'market': market, 'tracking_data_state': 'DROP',
-                    'reason': '현재 일반 알트 추적 대상 제외: ' + str(row.get('exclusion_reason') or state or '자료 제외')[:90]}
+            if row.get('age_status')=='unverified':
+                return {'market':market,'tracking_data_state':'CHECK','reason':'14일 이전 거래 이력 확인 실패'}
+            return {'market':market,'tracking_data_state':'DROP',
+                    'reason':'현재 일반 알트 추적 대상 제외: '+str(row.get('exclusion_reason') or '자료 제외')[:90]}
         if btc_4h is None:
-            return {'market': market, 'tracking_data_state': 'CHECK',
-                    'reason': 'BTC 상대강도 계산용 1시간봉 부족'}
+            return {'market':market,'tracking_data_state':'CHECK','reason':'BTC 상대강도 계산용 마감봉 부족'}
         try:
-            item = analyze_candidate_market(market, row, btc_4h, reader, now)
+            item=analyze_candidate_market(market,row,btc_4h,reader,now)
         except Exception as exc:
-            return {'market': market, 'tracking_data_state': 'CHECK',
-                    'reason': '코인 캔들 조회 오류: ' + str(exc)[:90]}
-        if item.get('issues') or any(item.get(k) == 'unknown' for k in ('daily_state','h4_state','h1_state')):
-            return {**item, 'tracking_data_state': 'CHECK',
-                    'reason': '연속 마감봉·최신 시각 확인 필요: ' + ('; '.join(item.get('issues') or []) or item.get('reason',''))[:110]}
-        return {**item, 'tracking_data_state': 'VALID'}
-
-    markets = list(dict.fromkeys(e['market'] for e in entries))
+            return {'market':market,'tracking_data_state':'CHECK','reason':'코인 캔들 조회 오류: '+str(exc)[:90]}
+        if item.get('issues') or item.get('state')=='DATA_INCOMPLETE':
+            return {**item,'tracking_data_state':'CHECK',
+                    'reason':'마감봉·자료 확인 필요: '+('; '.join(item.get('issues') or []) or item.get('reason',''))[:105]}
+        return {**item,'tracking_data_state':'VALID'}
+    results={}
+    markets=list(dict.fromkeys(e['market'] for e in entries))
     if markets:
-        with ThreadPoolExecutor(max_workers=min(CANDIDATE_WORKERS, len(markets))) as pool:
-            fut = {pool.submit(fetch_market, m): m for m in markets}
-            for future in as_completed(fut):
-                m = fut[future]
-                try:
-                    results[m] = future.result()
+        with ThreadPoolExecutor(max_workers=min(CANDIDATE_WORKERS,len(markets))) as pool:
+            futures={pool.submit(fetch_market,m):m for m in markets}
+            for future in as_completed(futures):
+                m=futures[future]
+                try: results[m]=future.result()
                 except Exception as exc:
-                    results[m] = {'market': m, 'tracking_data_state': 'CHECK',
-                                  'reason': '추세 검사 실패: ' + str(exc)[:90]}
-    reviews = []
+                    results[m]={'market':m,'tracking_data_state':'CHECK','reason':'재검사 실패: '+str(exc)[:90]}
+    def parse_dt(value):
+        if not value: return None
+        try:
+            dt=datetime.fromisoformat(str(value).replace('Z','+00:00'))
+            return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
+        except (ValueError,TypeError): return None
+    reviews=[]
     for e in entries:
-        item = results[e['market']]
-        mode = e['mode']
-        state = item.get('tracking_data_state')
-        if state in ('CHECK', 'DROP'):
-            verdict = state
-            reason = item.get('reason', '자료 부족')
-        else:
-            d, h4, h1 = (item.get(k) for k in ('daily_state','h4_state','h1_state'))
-            rel = item.get('relative_4h_pct')
-            if mode == 'scalp':
-                alive = h1 == 'up' and h4 in ('up', 'side') and rel is not None and rel > 0
-                verdict = 'KEEP' if alive else 'DROP'
-                if alive:
-                    reason = f'1시간 상승·4시간 비하락·BTC 대비 4시간 상대강도 {rel:+.2f}%p 유지'
-                else:
-                    reasons = []
-                    if h1 != 'up': reasons.append('1시간 상승 추세 소멸')
-                    if h4 not in ('up','side'): reasons.append('4시간 하락 전환')
-                    if rel is None or rel <= 0: reasons.append('BTC 대비 단기 상대강도 약화')
-                    reason = ' / '.join(reasons) or '단타 추세 기준 이탈'
+        item=results[e['market']];mode=e['mode']
+        state=item.get('tracking_data_state')
+        last_closed=item.get('last_closed_end')
+        prev_dt=parse_dt(e['previous_closed_end']) or parse_dt(e['first_seen_kst'])
+        current_dt=parse_dt(last_closed)
+        new_bar=current_dt is not None and (prev_dt is None or current_dt>prev_dt)
+        if state in ('CHECK','DROP'):
+            verdict=state;reason=item.get('reason','자료 확인 필요')
+        elif not new_bar:
+            verdict='BAR_WAIT'
+            base='스윙 눌림 상태' if mode=='swing' and item.get('swing_wait') else '이전 관찰 상태'
+            reason=base+' · 새 1시간 마감봉이 없어 유지/탈락 미갱신'
+        elif mode=='scalp':
+            base_ok=bool(item.get('scalp_base_ok'))
+            stage=item.get('scalp_stage') or 'DATA_CHECK'
+            if stage=='DATA_CHECK':
+                verdict='CHECK';reason='단타 30·15·5분 마감봉 확인 필요 · 유지/탈락 미갱신'
+            elif base_ok and (e['origin_qualified'] or bool(item.get('scalp_ok'))):
+                verdict='KEEP';reason='단타 추세 유지 · '+item.get('scalp_note','')
+            elif base_ok:
+                verdict='REFERENCE';reason='최초 기준 미충족 · 현재 추세는 있으나 초기/눌림 기준 미충족 · '+item.get('scalp_note','')
+            elif e['origin_qualified']:
+                verdict='DROP';reason='1시간·4시간 또는 BTC 상대강도 기준 이탈'
             else:
-                # A 1h pullback or MA distance alone must not kill a live swing trend.
-                alive = d == 'up' and h4 in ('up', 'side')
-                verdict = 'KEEP' if alive else 'DROP'
-                if alive:
-                    notices = []
-                    if h1 == 'down': notices.append('1시간 조정 주의')
-                    deviation = item.get('h4_distance_ma5_pct')
-                    if deviation is not None and abs(deviation) > 2:
-                        notices.append(f'4시간 MA5 이격 {deviation:+.2f}% · 진입 위치 재확인')
-                    reason = '일봉 상승·4시간 비하락 유지' + (' · ' + ' / '.join(notices) if notices else '')
-                else:
-                    reasons = []
-                    if d != 'up': reasons.append('일봉 상승 추세 소멸')
-                    if h4 not in ('up','side'): reasons.append('4시간 하락 전환')
-                    reason = ' / '.join(reasons) or '스윙 추세 기준 이탈'
-        price = finite_number(item.get('last_price'))
-        first_price = e.get('first_price')
-        drift = (round((price/first_price-1)*100,3)
-                 if price is not None and first_price is not None and first_price > 0 else None)
-        if not e['origin_qualified']:
-            reason = '최초 진단 기준 미충족 · 추세 참고용 | ' + reason
-        reviews.append({**e, 'track_status': verdict, 'track_reason': reason,
-                        'checked_kst': now.isoformat(timespec='seconds'),
-                        'snapshot_kst': snapshot['checked_kst'],
-                        'daily_state': item.get('daily_state'),
-                        'h4_state': item.get('h4_state'), 'h1_state': item.get('h1_state'),
-                        'change_rate_pct': item.get('change_rate_pct'),
-                        'relative_4h_pct': item.get('relative_4h_pct'),
-                        'h4_distance_ma5_pct': item.get('h4_distance_ma5_pct'),
-                        'last_price': price, 'last_closed_end': item.get('last_closed_end'),
-                        'price_change_since_seen_pct': drift})
-    return {'version': VERSION, 'snapshot_kst': snapshot['checked_kst'],
-            'checked_kst': now.isoformat(timespec='seconds'),
-            'market_gate_unchanged': True, 'reviews': reviews,
-            'counts': {status: sum(r['track_status'] == status for r in reviews)
-                       for status in ('KEEP','DROP','CHECK')},
-            'rule': '단타: 1시간 상승+4시간 비하락+BTC 상대강도 양수. 스윙: 일봉 상승+4시간 비하락(1시간 하락/이평 이격은 주의). 자료 부족은 탈락 처리 안 함. BUY 아님'}
+                verdict='REFERENCE';reason='최초 단타 기준 미충족 · 현재도 기준 미충족'
+        else:
+            stage=item.get('swing_stage','NONE'); d=item.get('daily_state');dev=item.get('h4_distance_ma5_pct')
+            if stage=='WATCH':
+                verdict='KEEP'
+                reason=('스윙 눌림 대기 → 1시간 상승 회복 · 반등 관찰로 전환'
+                        if e['previous_swing_stage']=='WAIT' or e['previous_status']=='WAIT'
+                        else '현재 스윙 반등 관찰 기준 충족 · 이전 전환 시점은 미확인')
+            elif stage=='WAIT':
+                verdict='WAIT';reason=item.get('swing_note','스윙 눌림 대기')
+            elif d=='up' and dev is not None and dev>2:
+                verdict='WAIT';reason='일봉 상승 유지 · 4시간 MA5 위 이격 큼, 눌림 대기'
+            elif d=='up' and dev is not None and dev>=-5:
+                verdict='REFERENCE';reason='일봉 상승이나 눌림·반등 기준 미충족 · 비교 참고'
+            elif e['origin_qualified'] or e['previous_status'] in ('KEEP','WAIT'):
+                verdict='DROP';reason='일봉 상승 추세 소멸 또는 4시간 눌림 범위 이탈'
+            else:
+                verdict='REFERENCE';reason='최초 스윙 기준 미충족 · 추세 확인만 하는 참고 종목'
+        price=finite_number(item.get('last_price'))
+        first_price=e['first_price']
+        drift=round((price/first_price-1)*100,3) if price is not None and first_price and first_price>0 else None
+        reviews.append({**e,'track_status':verdict,'track_reason':reason,
+                        'checked_kst':now.isoformat(timespec='seconds'),
+                        'snapshot_kst':snapshot['checked_kst'],
+                        'daily_state':item.get('daily_state'),'h4_state':item.get('h4_state'),
+                        'h1_state':item.get('h1_state'),'change_rate_pct':item.get('change_rate_pct'),
+                        'relative_4h_pct':item.get('relative_4h_pct'),
+                        'h4_distance_ma5_pct':item.get('h4_distance_ma5_pct'),
+                        'scalp_stage':item.get('scalp_stage'), 'swing_stage':item.get('swing_stage'),
+                        'last_price':price, 'last_closed_end':last_closed or e['previous_closed_end'],
+                        'price_change_since_seen_pct':drift})
+    return {'version':VERSION,'snapshot_kst':snapshot['checked_kst'],
+            'checked_kst':now.isoformat(timespec='seconds'),
+            'market_gate_unchanged':True,'reviews':reviews,
+            'counts':{status:sum(r['track_status']==status for r in reviews)
+                      for status in ('KEEP','WAIT','BAR_WAIT','REFERENCE','DROP','CHECK')},
+            'rule':'단타=1h·4h·BTC강도+30/15/5분 추격 점검. 스윙=일봉 상승 중 눌림 WAIT → 1h 회복 WATCH. 새 1h 마감 전에는 BAR_WAIT. BUY 아님'}
 
 
 def compute_status():
@@ -823,8 +869,8 @@ def compute_status():
             'concentration': 'BTC·스테이블코인·14일 이전 KRW 일봉이 없는 코인은 거래대금/집중도에서 제외. 정확한 상장일 추정 아님. 임시 집중 기준 1위 >=30% 또는 상위 10개 >=75%. 매수 허용 판정 불변',
             'age_filter': '기준 시각(KST)보다 14일 이전 일봉이 확인된 KRW 코인만 정제 거래대금에 포함. 조회 실패는 별도 제외·경고. 최초 검사 때 추가 API 조회 발생',
             'candidate': '시장 탐색 허용 시 정제 거래대금 상위 20개에서 단타 또는 스윙 관찰 후보 최대 2개. 조건은 후보 선택 연구 가설이며 BUY 신호 아님',
-            'diagnostic': '진단 버튼 누를 때만 시장 판정과 분리해 정제 종목 20개 이내에서 단타·스윙 참고 각 1개. 조건 미충족도 명시하며 실제 추천/BUY 아님',
-            'track': 'V3.17: 저장된 지난 관찰 종목은 시장 관망과 무관하게 후속 추세 검사. 단타=1h상승+4h비하락+BTC상대강도 양수; 스윙=일봉상승+4h비하락. 데이터 오류는 CHECK(탈락 아님). 브라우저에 이력 저장',
+            'diagnostic': '진단 버튼으로만 정제 종목 최대 20개 검사. 단타는 초기/추격/눌림, 스윙은 눌림 대기/반등 관찰. 각 1개 비교 참고. BUY 아님',
+            'track': 'V3.18: 시장 관망과 무관하게 재검사. 새 1시간 마감 전 BAR_WAIT, 단타 30·15·5분 추격 분류, 스윙 눌림 WAIT→반등 KEEP. 최초 기준 미충족 REFERENCE. 조회 실패 CHECK.',
             'caveat': '수익성 미검증·현재 상장 코인 기준·자동 주문/매수 신호 아님',
         },
     }
@@ -869,7 +915,8 @@ def export_csv(result, tracked=None):
               'candidate_rank', 'diagnostic_mode', 'diagnostic_qualified', 'diagnostic_note', 'snapshot_kst', 'diagnostic_checked_kst', 'daily_state', 'h4_state', 'h1_state', 'return_4h_pct', 'btc_return_4h_pct',
               'relative_4h_pct', 'h4_distance_ma5_pct', 'last_price', 'selected', 'can_search', 'candidate_rule',
               'track_mode', 'track_status', 'track_reason', 'first_seen_kst', 'track_checked_kst', 'track_origin',
-              'origin_qualified', 'price_change_since_seen_pct', 'track_first_price']
+              'origin_qualified', 'price_change_since_seen_pct', 'track_first_price',
+              'scalp_stage','scalp_note','swing_stage','swing_note']
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
     stamp = result['checked_kst']
@@ -945,7 +992,9 @@ def export_csv(result, tracked=None):
                       daily_state=r.get('daily_state'), h4_state=r.get('h4_state'), h1_state=r.get('h1_state'),
                       return_4h_pct=r.get('return_4h_pct'), btc_return_4h_pct=r.get('btc_return_4h_pct'),
                       relative_4h_pct=r.get('relative_4h_pct'), h4_distance_ma5_pct=r.get('h4_distance_ma5_pct'),
-                      last_price=r.get('last_price'), last_closed_end=r.get('last_closed_end'))
+                      last_price=r.get('last_price'), last_closed_end=r.get('last_closed_end'),
+                      scalp_stage=r.get('scalp_stage'),scalp_note=r.get('scalp_note'),
+                      swing_stage=r.get('swing_stage'),swing_note=r.get('swing_note'))
         write('CANDIDATE_REVIEW', **common)
         if r['market'] in ranks:
             write('CANDIDATE_SELECTED', **common)
@@ -967,7 +1016,9 @@ def export_csv(result, tracked=None):
                           selected=r['market'] in diag_ranks,
                           daily_state=r.get('daily_state'), h4_state=r.get('h4_state'), h1_state=r.get('h1_state'),
                           relative_4h_pct=r.get('relative_4h_pct'), h4_distance_ma5_pct=r.get('h4_distance_ma5_pct'),
-                          last_closed_end=r.get('last_closed_end'))
+                          last_closed_end=r.get('last_closed_end'),
+                          scalp_stage=r.get('scalp_stage'),scalp_note=r.get('scalp_note'),
+                          swing_stage=r.get('swing_stage'),swing_note=r.get('swing_note'))
             write('DIAGNOSTIC_REVIEW', **common)
         for r in diag['candidates']:
             write('DIAGNOSTIC_PICK', market=r['market'], state='REFERENCE_ONLY',
@@ -978,7 +1029,9 @@ def export_csv(result, tracked=None):
                   change_rate_pct=r['change_rate_pct'], turnover_24h_krw=r['turnover_24h_krw'],
                   daily_state=r.get('daily_state'), h4_state=r.get('h4_state'), h1_state=r.get('h1_state'),
                   relative_4h_pct=r.get('relative_4h_pct'), h4_distance_ma5_pct=r.get('h4_distance_ma5_pct'),
-                  last_closed_end=r.get('last_closed_end'))
+                  last_closed_end=r.get('last_closed_end'),
+                  scalp_stage=r.get('scalp_stage'),scalp_note=r.get('scalp_note'),
+                  swing_stage=r.get('swing_stage'),swing_note=r.get('swing_note'))
         for warning in diag['warnings']:
             write('DIAGNOSTIC_WARNING', reason=warning)
     if tracked is not None:
@@ -990,7 +1043,7 @@ def export_csv(result, tracked=None):
             market = str(row.get('market','')).upper()
             mode = str(row.get('mode','')).lower()
             status = str(row.get('track_status','')).upper()
-            if not TRACK_MARKET_RE.fullmatch(market) or mode not in ('scalp','swing') or status not in ('NEW','KEEP','DROP','CHECK'):
+            if not TRACK_MARKET_RE.fullmatch(market) or mode not in ('scalp','swing') or status not in ('NEW','KEEP','WAIT','BAR_WAIT','REFERENCE','DROP','CHECK'):
                 continue
             write('TRACK_HISTORY', market=market, state=status, track_status=status,
                   track_mode='단타' if mode == 'scalp' else '스윙',
@@ -1006,7 +1059,8 @@ def export_csv(result, tracked=None):
                   last_price=row.get('last_price'),
                   track_first_price=row.get('first_price'),
                   price_change_since_seen_pct=row.get('price_change_since_seen_pct'),
-                  last_closed_end=row.get('last_closed_end'))
+                  last_closed_end=row.get('last_closed_end'),
+                  scalp_stage=row.get('scalp_stage'),swing_stage=row.get('swing_stage'))
     for w in result['warnings']:
         write('DATA_WARNING', reason=w)
     return ('\ufeff' + output.getvalue()).encode('utf-8')
@@ -1014,7 +1068,7 @@ def export_csv(result, tracked=None):
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BITHUMB V3.17 · 시장 판단 + 지난 후보 추적</title>
+<title>BITHUMB V3.18 · 시장 판단 + 지난 후보 추적</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1324;--panel:#142038;--border:#2a3a55;--muted:#91a3c2;--white:#edf2fe;--green:#52d5a0;--red:#f28e91;--amber:#ffcf77}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(170deg,#12223d 0,#0b1324 45%);color:var(--white);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}
@@ -1034,13 +1088,13 @@ h1{font-size:25px;margin:6px 0 7px;letter-spacing:-.04em}p{color:var(--muted);li
 .actions{display:flex;gap:9px;margin:19px 0 6px}button{font:inherit;border:0;border-radius:11px;padding:13px 16px;font-weight:750;cursor:pointer}
 #go{background:#54dfac;color:#052219;flex:1}#csv{background:#263a57;color:var(--white);border:1px solid #405676;flex:1}button:disabled{opacity:.45;cursor:wait}
 #preview{background:#324560;color:#edf2fe;width:100%;border:1px solid #556b89;margin:8px 0} .previewpanel{border-color:#53627c}.diagnostic-tag{font-size:11px;font-weight:750;color:var(--amber)}.candidate .risk{color:var(--amber)}.candidates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.candidate{background:#0e192e;border:1px solid #334968;border-radius:12px;padding:12px;min-width:0}.candidate strong{display:block;font-size:18px;margin:5px 0}.candidate .mode{font-size:11px;color:var(--green)}.candidate p{font-size:12px;margin:5px 0;overflow-wrap:anywhere}.emptybox{font-size:13px;color:var(--muted);line-height:1.65}.statusline{font-size:12px;color:var(--muted);min-height:17px;margin-top:8px}.small{font-size:12px;color:var(--muted);line-height:1.6}
-.trackcard{background:#0e192e;border:1px solid #334968;border-radius:12px;padding:12px;margin:8px 0}.trackhead{display:flex;align-items:center;justify-content:space-between;gap:7px;flex-wrap:wrap}.trackstatus{font-size:12px;font-weight:800}.trackstatus.KEEP{color:var(--green)}.trackstatus.DROP{color:var(--red)}.trackstatus.CHECK,.trackstatus.NEW{color:var(--amber)}.trackcard p{font-size:12px;line-height:1.6;margin:5px 0}.trackmeta{font-size:11px;color:var(--muted);margin-top:5px}.tracktools{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.importlink{cursor:pointer;color:#a9c8fb;font-size:12px;text-decoration:underline;text-underline-offset:3px}.trackhint{font-size:11px;color:var(--muted);line-height:1.5;margin:6px 0}
+.trackcard{background:#0e192e;border:1px solid #334968;border-radius:12px;padding:12px;margin:8px 0}.trackhead{display:flex;align-items:center;justify-content:space-between;gap:7px;flex-wrap:wrap}.trackstatus{font-size:12px;font-weight:800}.trackstatus.KEEP{color:var(--green)}.trackstatus.DROP{color:var(--red)}.trackstatus.CHECK,.trackstatus.NEW,.trackstatus.WAIT,.trackstatus.BAR_WAIT,.trackstatus.REFERENCE{color:var(--amber)}.trackcard p{font-size:12px;line-height:1.6;margin:5px 0}.trackmeta{font-size:11px;color:var(--muted);margin-top:5px}.tracktools{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.importlink{cursor:pointer;color:#a9c8fb;font-size:12px;text-decoration:underline;text-underline-offset:3px}.trackhint{font-size:11px;color:var(--muted);line-height:1.5;margin:6px 0}
 .info{display:flex;justify-content:space-between;gap:9px;border-bottom:1px solid #273650;padding:8px 0;font-size:12px}
 .info:last-child{border-bottom:0}.info span{color:var(--muted)}.info b{text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 footer{font-size:12px;color:#7d90af;line-height:1.6;margin-top:20px}
 @media(max-width:390px){main{padding:17px 11px}.panel{padding:14px}.chip .name{font-size:10px}.chip .state{font-size:13px}.stats{gap:5px}.stat b{font-size:17px}.actions{flex-direction:column}.candidates{grid-template-columns:1fr}h1{font-size:22px}}
 </style></head><body><main>
-<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.17 시장 + 후보 추적</h1><p>① 시장 진입 가능한가? → ② 산다면 어떤 코인인가?<br>관망 중 진단 가능 · 다음 검색 때 이전 후보의 유지/탈락 자동 재확인 · BUY 아님</p></header>
+<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.18 시장 + 후보 추적</h1><p>① 시장 진입 가능한가? → ② 산다면 어떤 코인인가?<br>관망 중 진단 가능 · 단타 초기/추격 · 스윙 눌림/반등 · 지난 후보 재검사 · BUY 아님</p></header>
 <section id="hero" class="panel hero unknown"><div class="kicker">BTC + 빗썸 원화시장</div><div id="decision" class="headline">검사 전</div><div id="action" class="subline">버튼을 눌러 시장 상태를 확인해.</div><div id="detail" class="notice">매수 신호가 아닌 시장 상태 연구용 표시야.</div><div class="microline">단기 움직임: <b id="timing">검사 전</b><small id="timingdetail">30·15·5분 마감봉으로만 관찰</small></div></section>
 <section class="panel"><h2 class="sectiontitle">BTC 8개 시간봉 · 마감봉만</h2><div class="chips" id="chips">
 <div class="chip"><div class="name">월봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">주봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">일봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">4시간</div><div class="state unknown">—</div></div><div class="chip"><div class="name">1시간</div><div class="state unknown">—</div></div></div><div class="microcaption">작은 움직임 · 관찰 전용</div><div id="microchips" class="microchips"><div class="chip"><div class="name">30분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">15분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">5분</div><div class="state unknown">—</div></div></div><p class="small">마감봉 종가 &gt; 5이평 &gt; 10이평 = 상승, 역순 = 하락. 월·주 = 장기, 4시간·1시간 = 시장 방향, 30·15·5분 = 타이밍 관찰. 분봉 상승만으로 매수 허용하지 않아.</p></section>
@@ -1050,8 +1104,8 @@ footer{font-size:12px;color:#7d90af;line-height:1.6;margin-top:20px}
 <p class="small">시장 <b>관망</b>이어도 버튼을 누르면 기존 일반 알트 상위 20개를 따로 확인해. 공식 매수 후보는 여전히 0개야.</p>
 <button id="preview" disabled>진단용 후보 미리보기</button>
 <div id="previewbox" class="emptybox">시장 분석 후 별도 버튼을 눌러줘.</div>
-<p id="previewnote" class="small">단타 1개 · 스윙 1개를 비교용으로만 표시. 기준 미충족·시장 관망 상태에서도 BUY로 해석하면 안 돼.</p></section>
-<section class="panel" id="followpanel"><h2 class="sectiontitle">④ 지난 후보 추적 · 유지 / 탈락</h2>
+<p id="previewnote" class="small">단타 초기·추격 / 스윙 눌림·반등을 비교용으로 표시. 기준 미충족·시장 관망 상태에서도 BUY로 해석하면 안 돼.</p></section>
+<section class="panel" id="followpanel"><h2 class="sectiontitle">④ 지난 후보 추적 · 대기 / 유지 / 탈락</h2>
 <p class="small">다음 <b>시장 + 후보 분석하기</b> 때 지난 진단·공식 후보를 자동으로 다시 확인해. <b>관망 중에도 추적</b>하지만 매수 신호는 아니야.</p>
 <div id="followbox" class="emptybox">저장된 후보 없음 · 진단 미리보기를 실행하면 자동으로 기록돼.</div>
 <div class="tracktools"><label for="importcsv" class="importlink">이전 결과 CSV 가져오기 · 처음 등록/복원</label><input type="file" id="importcsv" accept=".csv,text/csv" style="display:none"/><button type="button" id="clearhistory" style="font-size:11px;padding:7px 10px;background:#283a54;color:#cfdef3">탈락 기록 정리</button></div>
@@ -1088,7 +1142,8 @@ function updateTracks(newItems,origin,when){
    first_seen_kst:String(when||new Date().toISOString()),first_price:Number.isFinite(Number(item.last_price))&&Number(item.last_price)>0?Number(item.last_price):null,
    track_status:'NEW',track_reason:'새 관찰 목록 등록 · 다음 시장 검색 때 추세 재확인',checked_kst:'',
    daily_state:item.daily_state||'',h4_state:item.h4_state||'',h1_state:item.h1_state||'',
-   relative_4h_pct:item.relative_4h_pct??null,h4_distance_ma5_pct:item.h4_distance_ma5_pct??null};
+   relative_4h_pct:item.relative_4h_pct??null,h4_distance_ma5_pct:item.h4_distance_ma5_pct??null,
+   scalp_stage:item.scalp_stage||'',swing_stage:item.swing_stage||'',last_closed_end:item.last_closed_end||''};
   list.unshift(newrow);added++;
  }
  const active=list.filter(x=>x.track_status!=='DROP').slice(0,TRACK_LIMIT);
@@ -1101,14 +1156,14 @@ function showTracks(){
  if(!list.length){box.className='emptybox';box.textContent='저장된 후보 없음 · 진단 미리보기를 실행하거나 이전 CSV를 가져와줘.';return}
  box.className='';
  const summary=document.createElement('p');summary.className='small';
- summary.textContent='추적 '+active.length+'개 · 탈락 기록 '+drops.length+'개 · 유지 '+list.filter(x=>x.track_status==='KEEP').length+'개 · 자료 확인 '+list.filter(x=>x.track_status==='CHECK').length+'개';
+ summary.textContent='추적 '+active.length+'개 · 탈락 기록 '+drops.length+'개 · 유지 '+list.filter(x=>x.track_status==='KEEP').length+'개 · 눌림 대기 '+list.filter(x=>x.track_status==='WAIT').length+'개 · 새 봉 대기 '+list.filter(x=>x.track_status==='BAR_WAIT').length+'개';
  box.append(summary);
  for(const x of [...active,...drops].slice(0,TRACK_LIMIT+5)){
   const card=document.createElement('div');card.className='trackcard';
   const head=document.createElement('div');head.className='trackhead';
   const title=document.createElement('strong');title.textContent=x.market+' · '+(x.mode==='scalp'?'단타':'스윙');
   const badge=document.createElement('span');badge.className='trackstatus '+x.track_status;
-  badge.textContent=({KEEP:'유지',DROP:'탈락',CHECK:'자료 확인 필요',NEW:'신규 등록'})[x.track_status]||'확인 대기';head.append(title,badge);
+  badge.textContent=({KEEP:'유지',WAIT:'눌림 대기',BAR_WAIT:'새 봉 대기',REFERENCE:'비교 참고',DROP:'탈락',CHECK:'자료 확인 필요',NEW:'신규 등록'})[x.track_status]||'확인 대기';head.append(title,badge);
   const reason=document.createElement('p');reason.textContent=x.track_reason||'다음 검색 때 추세 확인';
   const meta=document.createElement('div');meta.className='trackmeta';
   const value=x.price_change_since_seen_pct==null?'':' · 처음 관찰 가격 대비 '+f(Number(x.price_change_since_seen_pct));
@@ -1132,7 +1187,7 @@ async function recheckTracks(snapshot){
  const keep=updated.filter(x=>x.track_status!=='DROP').slice(0,TRACK_LIMIT);
  const archive=updated.filter(x=>x.track_status==='DROP').slice(0,TRACK_ARCHIVE_LIMIT);
  saveTrack([...keep,...archive]);showTracks();
- $('followhint').textContent='재검사 완료 · 유지 '+data.counts.KEEP+' / 탈락 '+data.counts.DROP+' / 자료 확인 '+data.counts.CHECK+' · 데이터는 이 브라우저에 저장';
+ $('followhint').textContent='재검사 완료 · 유지 '+data.counts.KEEP+' / 탈락 '+data.counts.DROP+' / 눌림 대기 '+data.counts.WAIT+' / 새 봉 대기 '+data.counts.BAR_WAIT+' / 자료 확인 '+data.counts.CHECK+' · 브라우저 저장';
 }
 function parseCSV(csv){
  const rows=[];let row=[],cell='',quoted=false;
@@ -1162,7 +1217,7 @@ async function importTrackCSV(file){
   if(kind==='TRACK_HISTORY'){
    const mode=modeOf(get(row,'track_mode'));
    const status=get(row,'track_status').toUpperCase();
-   if(!mode||!['NEW','KEEP','DROP','CHECK'].includes(status))continue;
+   if(!mode||!['NEW','KEEP','WAIT','BAR_WAIT','REFERENCE','DROP','CHECK'].includes(status))continue;
    historyKeys.add(market+'|'+mode);
    history.push({market,mode,origin:get(row,'track_origin')||'CSV 복원',
     origin_qualified:get(row,'origin_qualified').toLowerCase()==='true',
@@ -1174,13 +1229,15 @@ async function importTrackCSV(file){
     price_change_since_seen_pct:get(row,'price_change_since_seen_pct')===''?null:Number(get(row,'price_change_since_seen_pct')),
     daily_state:get(row,'daily_state'),h4_state:get(row,'h4_state'),h1_state:get(row,'h1_state'),
     relative_4h_pct:get(row,'relative_4h_pct')===''?null:Number(get(row,'relative_4h_pct')),
-    h4_distance_ma5_pct:get(row,'h4_distance_ma5_pct')===''?null:Number(get(row,'h4_distance_ma5_pct'))});
+    h4_distance_ma5_pct:get(row,'h4_distance_ma5_pct')===''?null:Number(get(row,'h4_distance_ma5_pct')),
+    scalp_stage:get(row,'scalp_stage'),swing_stage:get(row,'swing_stage'),last_closed_end:get(row,'last_closed_end')});
   }
   if(kind==='DIAGNOSTIC_PICK'||kind==='CANDIDATE_SELECTED'){
    const mode=kind==='DIAGNOSTIC_PICK'?get(row,'diagnostic_mode'):get(row,'candidate_mode');
    checked=get(row,'diagnostic_checked_kst')||get(row,'checked_kst')||checked;
    const qualified=kind==='DIAGNOSTIC_PICK'?get(row,'diagnostic_qualified').toLowerCase()==='true':true;
-   picks.push({market,diagnostic_mode:mode,diagnostic_qualified:qualified,last_price:get(row,'last_price')});
+   picks.push({market,diagnostic_mode:mode,diagnostic_qualified:qualified,last_price:get(row,'last_price'),
+    last_closed_end:get(row,'last_closed_end'),scalp_stage:get(row,'scalp_stage'),swing_stage:get(row,'swing_stage')});
   }
  }
  const existing=readTrack(), keys=new Set(existing.map(x=>x.market+'|'+x.mode));
@@ -1215,8 +1272,10 @@ function showPreview(pre){
    const name=document.createElement('strong');name.textContent=item.market||'—';
    const stats=document.createElement('p');stats.textContent='24시간 '+f(item.change_rate_pct)+' · 상대강도 '+f(item.relative_4h_pct);
    const desc=document.createElement('p');desc.textContent='일봉 '+(labels[item.daily_state]||'?')+' / 4시간 '+(labels[item.h4_state]||'?')+' / 1시간 '+(labels[item.h1_state]||'?');
+   const stage=document.createElement('p');stage.textContent=
+    String(item.diagnostic_mode||'').includes('단타')?'단타 단계: '+(item.scalp_note||'분봉 확인 필요'):'스윙 단계: '+(item.swing_note||'추세 확인 필요');
    const risk=document.createElement('p');risk.className='risk';risk.textContent='시장과 무관한 참고용 · 매수 신호 아님';
-   card.append(tag,name,stats,desc,risk);root.append(card);
+   card.append(tag,name,stats,desc,stage,risk);root.append(card);
   }
  }
  $('previewnote').textContent='시장 판정 '+(pre.market_gate_label||'—')+' 유지 · '+fmt(pre.checked)+' / '+fmt(pre.pool_size)+'개 조사 · 진단 '+fmt(entries.length)+'개 · 데이터 '+String(pre.checked_kst||'').replace('T',' ').slice(0,19)+' KST';
@@ -1273,7 +1332,7 @@ function show(d){
    const mode=document.createElement('div');mode.className='mode';mode.textContent=item.selected_mode||'관찰 후보';
    const title=document.createElement('strong');title.textContent=item.market||'—';
    const summary=document.createElement('p');summary.textContent='24시간 '+f(item.change_rate_pct)+' · 거래대금 '+fmt(Math.round((item.turnover_24h_krw||0)/1e8))+'억';
-   const detail=document.createElement('p');detail.textContent=item.selected_mode==='단타 관찰'?'BTC 대비 4시간 '+f(item.relative_4h_pct):'4시간 MA5 거리 '+f(item.h4_distance_ma5_pct);
+   const detail=document.createElement('p');detail.textContent=item.selected_mode==='단타 관찰'?(item.scalp_note||'BTC 대비 4시간 '+f(item.relative_4h_pct)):(item.swing_note||'4시간 MA5 거리 '+f(item.h4_distance_ma5_pct));
    card.append(mode,title,summary,detail);root.append(card);
   }
  }
@@ -1288,7 +1347,7 @@ async function go(){
   if(!r.ok)throw Error(d.error||'조회 실패');show(d);
   try{await recheckTracks(d.checked_kst)}catch(te){$('followhint').textContent='후보 재확인 오류: '+String(te.message||te).slice(0,130)+' · 탈락으로 처리하지 않았어.'}
   updateTracks(d.candidates&&d.candidates.candidates||[],'공식',d.checked_kst);
-  $('msg').textContent='시장 분석 완료 · 지난 후보 유지/탈락 확인';
+  $('msg').textContent='시장 분석 완료 · 지난 후보 새 봉/눌림/유지/탈락 확인';
  }catch(e){$('msg').textContent='조회 오류: '+String(e.message||e).slice(0,150)}
  finally{$('go').disabled=false;$('go').textContent='다시 분석하기'}
 }
@@ -1311,7 +1370,7 @@ async function download(){
   if(!r.ok)throw Error('CSV를 가져오지 못했어');
   const blob=await r.blob(),a=document.createElement('a'),url=URL.createObjectURL(blob);
   const cd=r.headers.get('Content-Disposition')||'';const name=cd.match(/filename="([^"]+)"/);
-  a.href=url;a.download=name?name[1]:'BITHUMB_V3_17_MARKET_GATE.csv';
+  a.href=url;a.download=name?name[1]:'BITHUMB_V3_18_MARKET_GATE.csv';
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
  }catch(e){$('msg').textContent=String(e.message||e)}finally{$('csv').disabled=false}
 }
@@ -1370,7 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(409, {'error':'시장 결과가 변경됐어. 다시 시장 분석해줘.'})
                 return self.respond(200, verify_tracked(snapshot, body.get('items', [])))
             return self.respond(200, export_csv(snapshot, body.get('tracked', [])), 'text/csv',
-                                f"BITHUMB_V3_17_MARKET_GATE_{snapshot['checked_kst'].replace('-','').replace(':','').replace('T','_')[:15]}.csv")
+                                f"BITHUMB_V3_18_MARKET_GATE_{snapshot['checked_kst'].replace('-','').replace(':','').replace('T','_')[:15]}.csv")
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             return self.respond(400, {'error':str(exc)[:200]})
         except Exception as exc:
@@ -1401,7 +1460,7 @@ class Handler(BaseHTTPRequestHandler):
             if result is None:
                 return self.respond(409, {'error': '먼저 시장 분석을 실행해줘.'})
             stamp = result['checked_kst'].replace('-', '').replace(':', '').replace('T', '_')[:15]
-            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_17_MARKET_GATE_{stamp}.csv')
+            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_18_MARKET_GATE_{stamp}.csv')
         return self.respond(404, {'error': '없는 주소야.'})
 
 
