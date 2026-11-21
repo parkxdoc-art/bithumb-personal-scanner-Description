@@ -1,0 +1,2 @@
+# BITHUMB × Binance futures research V1.0
+# Python >=3.9 standard library only; no packages required.
