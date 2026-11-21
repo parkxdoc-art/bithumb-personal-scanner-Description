@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BITHUMB × Binance futures lead-lag research V1.4 (READ-ONLY).
+"""BITHUMB × Binance futures lead-lag research V1.4.1 (READ-ONLY).
 
 Python >=3.9; no third-party dependencies. CLI and mobile-friendly local/Render web UI.
 Usage:
@@ -27,7 +27,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.4"
+VERSION = "1.4.1"
 BINANCE = "https://fapi.binance.com"
 BITHUMB = "https://api.bithumb.com"
 PERIOD_MS = 15 * 60_000
@@ -36,7 +36,7 @@ HOURS_MS = 60 * 60_000
 KST = timezone(timedelta(hours=9))
 MAX_DAYS = 13
 MAX_COINS = 20
-DEFAULT_COINS = "BTC,ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,PEPE,TRX,BCH,LTC,APT,ARB,OP,NEAR,INJ,UNI,ATOM"
+DEFAULT_COINS = "BTC,ETH,XRP,SOL,SUI"
 STABLES = {"USDT","USDC","DAI","FDUSD","TUSD","USDE","USD1","USDD","PYUSD","RLUSD","EURC","EURI"}
 MULTIPLIED = {"PEPE":"1000PEPE", "SHIB":"1000SHIB", "BONK":"1000BONK", "FLOKI":"1000FLOKI"}
 RULES = {
@@ -61,20 +61,87 @@ class APIError(Exception):
         self.status = status
 
 
+# Observe Binance 418 restriction of Render's outbound IP without bypassing it.
+# Seed the observed ban only on Render, not for local research installations.
+OBSERVED_RENDER_BAN_UNTIL_MS = 1795467298613
+_IS_RENDER = bool(os.environ.get('RENDER_SERVICE_ID') or os.environ.get('RENDER'))
+_BAN_LOCK = threading.RLock()
+_BINANCE_BAN_UNTIL_MS = OBSERVED_RENDER_BAN_UNTIL_MS if _IS_RENDER else 0
+_BINANCE_NEXT_REQUEST_MONO = 0.0
+_BITHUMB_NEXT_REQUEST_MONO = 0.0
+BINANCE_MIN_GAP_SECONDS = 2.0
+BITHUMB_MIN_GAP_SECONDS = 0.25
+
+
+def ban_until_ms():
+    with _BAN_LOCK:
+        return _BINANCE_BAN_UNTIL_MS if int(time.time()*1000) < _BINANCE_BAN_UNTIL_MS else 0
+
+
+def ban_message(until_ms):
+    stamp = datetime.fromtimestamp(until_ms/1000, KST).strftime('%Y-%m-%d %H:%M:%S KST')
+    return (f'바이낸스 API 요청 중단: {stamp}까지 IP 사용 제한. '
+            '더 실행해도 해제되지 않습니다. 차단 해제 후 제한된 속도로 다시 수집하세요.')
+
+
+def request_gate(base):
+    """Pace requests globally per server process; never request during ban."""
+    global _BINANCE_NEXT_REQUEST_MONO, _BITHUMB_NEXT_REQUEST_MONO
+    with _BAN_LOCK:
+        until = _BINANCE_BAN_UNTIL_MS if base == BINANCE else 0
+        if until and int(time.time()*1000) < until:
+            raise APIError(ban_message(until), 418)
+        next_at = _BINANCE_NEXT_REQUEST_MONO if base == BINANCE else _BITHUMB_NEXT_REQUEST_MONO
+        remaining = next_at - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        after = time.monotonic()
+        if base == BINANCE:
+            _BINANCE_NEXT_REQUEST_MONO = after + BINANCE_MIN_GAP_SECONDS
+        else:
+            _BITHUMB_NEXT_REQUEST_MONO = after + BITHUMB_MIN_GAP_SECONDS
+
+
+def register_limit_error(status, body, header_retry_after=None):
+    """Honor 429 cooldown or 418 ban; never retry either status immediately."""
+    global _BINANCE_BAN_UNTIL_MS
+    now_ms = int(time.time()*1000)
+    if status == 418:
+        match = re.search(r'\buntil\s+(\d{13})\b', body)
+        until = int(match.group(1)) if match else 0
+        if until <= now_ms:
+            until = now_ms + 24*HOURS_MS
+    else:
+        try:
+            retry_sec = max(0.0, float(header_retry_after))
+        except (TypeError, ValueError):
+            retry_sec = 300.0
+        until = now_ms + int(max(300.0, min(retry_sec, 3*24*3600))*1000)
+    with _BAN_LOCK:
+        _BINANCE_BAN_UNTIL_MS = max(_BINANCE_BAN_UNTIL_MS, until)
+        until = _BINANCE_BAN_UNTIL_MS
+    return ban_message(until)
+
+
 def fetch_json(base, path, params=None, headers=None):
     """Allowlisted hosts and paths only. Retry transient server/rate-limit failures."""
     if base not in (BINANCE, BITHUMB) or not path.startswith("/") or '//' in path:
         raise APIError("허용되지 않은 API 경로")
     url = base + path + ("?" + urlencode(params) if params else "")
-    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.4",
+    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.4.1",
                                 "Accept":"application/json", **(headers or {})})
     for attempt in range(3):
+        request_gate(base)
         try:
             with urlopen(req, timeout=14) as r:
                 return json.loads(r.read(8_000_000).decode("utf-8"))
         except HTTPError as e:
             content = e.read(500).decode("utf-8", "replace")
-            if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+            if base == BINANCE and e.code in (418, 429):
+                message = register_limit_error(e.code, content,
+                    e.headers.get('Retry-After') if e.headers else None)
+                raise APIError(message, e.code) from e
+            if e.code in (500, 502, 503, 504) and attempt < 2:
                 time.sleep(1.5 * (attempt + 1)); continue
             if e.code == 451:
                 raise APIError("지역/네트워크 제한으로 거래소 API에 접근할 수 없음 (HTTP 451)", 451)
@@ -228,7 +295,7 @@ def row_features(t, idx, times, oi, taker, prices):
 
 
 
-# V1.4 screens ONE candidate class (G). N and X are retrospective controls only.
+# V1.4.1 screens ONE candidate class (G). N and X are retrospective controls only.
 # Freeze V1.2 thresholds for out-of-sample comparisons; do not optimize to 6-day CSV.
 def early_candidate(f):
     return bool(f and -0.5 <= f["momentum"] <= 0.3
@@ -467,6 +534,8 @@ def csv_text(trades):
 
 
 def research(coins,days,on_progress=None,now_ms=None):
+    if now_ms is None and ban_until_ms():
+        raise APIError(ban_message(ban_until_ms()),418)
     if not 1<=days<=MAX_DAYS:
         raise ValueError(f'기간은 1~{MAX_DAYS}일만 가능')
     now_ms=now_ms or int(time.time()*1000)
@@ -488,7 +557,7 @@ def research(coins,days,on_progress=None,now_ms=None):
     if not mapped:
         raise APIError('빗썸 KRW+바이낸스 무기한 선물 공통 종목이 없습니다')
     progress('BTC 완료 5분봉 수집',4)
-    # BTC history is required for ALL V1.4 comparisons; never use proxy.
+    # BTC history is required for ALL V1.4.1 comparisons; never use proxy.
     btc_prices, btc_lows=bih_candles('BTC',fetch_since-HOURS_MS,end_ms,with_lows=True)
     if not btc_prices:
         raise APIError('BTC 5분봉 수집 실패: 비교 연구 불가')
@@ -511,9 +580,9 @@ def research(coins,days,on_progress=None,now_ms=None):
             return [],f'{coin}: {exc}',None
         except (KeyError,ValueError,TypeError,ZeroDivisionError) as exc:
             return [],f'{coin}: 데이터 값 오류: {str(exc)[:130]}',None
-    # 3 workers keep a 13d/20coin scan practical on Render free.
+    # 1 worker ensures no Binance parallel API requests on a shared-IP server.
     # Aggregate in one thread to avoid races in diagnostics and CSV.
-    with ThreadPoolExecutor(max_workers=min(3,len(mapped))) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         fs={pool.submit(one_coin,coin,symbol):coin for coin,symbol in mapped}
         for i,future in enumerate(as_completed(fs),1):
             coin=fs[future]
@@ -553,15 +622,16 @@ def selftest():
     f={'oi':0.9,'taker':1.1,'momentum':0.1}
     assert early_candidate(f) and not early_candidate(dict(f,momentum=0.6))
     assert rounded_end(t+20)==t and taker_end(t-PERIOD_MS)==t
-    print('SELFTEST PASS V1.4: fees, close-first, no-missing-silent, early gate, timestamps')
+    print('SELFTEST PASS V1.4.1: fees, close-first, no-missing-silent, early gate, timestamps')
 
 HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>선물 데이터 선행성 연구 V1.4</title>
+<title>선물 데이터 선행성 연구 V1.4.1</title>
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#0b1321;color:#eaf1fb;margin:0}main{max-width:980px;margin:auto;padding:14px 12px 55px}h1{font-size:24px;margin:6px 0}h2{font-size:17px;margin:12px 0}section{background:#162237;border:1px solid #2d435b;border-radius:14px;padding:15px;margin:14px 0}p,.note{color:#aebfd0;line-height:1.6;font-size:13px}.status{border:1px solid #537089;border-radius:8px;padding:10px}.top{font-size:12px;color:#79bec6}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{border:1px solid #364e65;border-radius:8px;padding:9px}.stat small{display:block;color:#aab8c8}.stat strong{display:block;font-size:19px;margin-top:5px}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;min-width:690px;font-size:12px}td,th{border-bottom:1px solid #36475c;padding:10px 7px;text-align:right}td:first-child,th:first-child{text-align:left}th{color:#b5c6dc;font-weight:600}input{width:100%;background:#0d182a;border:1px solid #475c76;color:white;border-radius:8px;padding:12px;margin:4px 0 12px;font-size:16px}button,.link{background:#287fd5;color:#fff;border:0;border-radius:9px;padding:12px 15px;display:inline-block;text-decoration:none;font-size:14px;font-weight:600;cursor:pointer}button:disabled{opacity:.5}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.5;color:#b7c4d6}.good{color:#82d8bd}.bad{color:#ffb0a3}.sub{font-size:12px;color:#91a7bf}#result[hidden]{display:none}@media(max-width:620px){.stats{grid-template-columns:repeat(2,1fr)}table{font-size:12px}}</style></head><body><main>
 <div class="top">BITHUMB × BINANCE · 독립 연구 · 자동매매 없음</div>
-<h1>선물 데이터 선행성 연구 V1.4</h1>
+<h1>선물 데이터 선행성 연구 V1.4.1</h1>
 <p>저성과 A/B/C/M/E/P 규칙을 주력 신호에서 제외하고, <b>G형만 연구 후보</b>로 남겼습니다. N(같은 BTC 상승 구간)과 X(BTC 하락 구간)는 <b>통계 비교용</b>이며 BUY 알림이 아닙니다.</p>
-<section><div class="sub">빗썸 KRW + 바이낸스 USDT 선물 공통 코인 (최대 20개)</div><input id="coins" value="BTC,ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,PEPE,TRX,BCH,LTC,APT,ARB,OP,NEAR,INJ,UNI,ATOM"><div class="sub">최근 연구 일수 (1~13)</div><input id="days" type="number" value="13" min="1" max="13"><button id="go" onclick="start()">연구 실행</button><p>기본 설정: 20개 코인, 최근 13일. 거래소 자료는 실제 API에서 불러오며 수집 중 다소 시간이 걸릴 수 있습니다.</p></section>
+<section><p><b>안전장치:</b> 바이낸스 IP 차단이 감지되면 차단 해제 시각까지 요청하지 않습니다. 최초 확인된 Render 차단 종료 시각은 2026-11-24 05:54:58 KST입니다. 기본 5종목·6일부터 재검증하세요.</p></section>
+<section><div class="sub">빗썸 KRW + 바이낸스 USDT 선물 공통 코인 (최대 20개)</div><input id="coins" value="BTC,ETH,XRP,SOL,SUI"><div class="sub">최근 연구 일수 (1~13)</div><input id="days" type="number" value="6" min="1" max="13"><button id="go" onclick="start()">연구 실행</button><p>기본 설정: 5개 코인, 최근 6일 (최대 20개·13일). IP 요청 제한 방지용 보수적 기본값. 거래소 자료는 실제 API에서 불러오며 수집 중 다소 시간이 걸릴 수 있습니다.</p></section>
 <section><h2>진행 상태</h2><div id="state" class="status">실행 전</div><p id="progress">연구 실행을 누르면 수집을 시작합니다.</p></section>
 <div id="result" hidden>
 <section><h2>G형 연구 범위</h2><div id="scope" class="stats"></div><p id="notice"></p></section>
@@ -576,7 +646,7 @@ const $=id=>document.getElementById(id);let timer=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const pct=v=>v===null||v===undefined?'—':Number(v).toFixed(2)+'%';
 async function start(){let coins=$('coins').value.trim(),days=Number($('days').value);$('go').disabled=true;$('state').textContent='접수 중';$('result').hidden=true;try{let r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({coins,days})});let j=await r.json();if(!r.ok)throw Error(j.error||'요청 실패');if(timer)clearInterval(timer);await poll();timer=setInterval(poll,1400)}catch(e){$('go').disabled=false;$('state').textContent='실행 오류';$('progress').textContent=e.message}}
-async function poll(){try{let r=await fetch('/api/status');let j=await r.json();$('state').textContent=({running:'수집 중',done:'연구 완료',error:'오류',idle:'실행 전'})[j.state]||'상태 조회';$('progress').textContent=(j.progress||'')+(j.pct?' ('+Math.round(j.pct)+'%)':'');if(j.state!=='running'){clearInterval(timer);$('go').disabled=false;if(j.state==='done')show(j.result);if(j.state==='error')$('progress').textContent=j.error||'오류';}}catch(e){clearInterval(timer);$('go').disabled=false;$('progress').textContent='상태 오류 '+e.message}}
+async function poll(){try{let r=await fetch('/api/status');let j=await r.json();$('state').textContent=j.binance_blocked_until_ms?'바이낸스 IP 요청 중단':(({running:'수집 중',done:'연구 완료',error:'오류',idle:'실행 전'})[j.state]||'상태 조회');$('progress').textContent=j.binance_blocked_notice||((j.progress||'')+(j.pct?' ('+Math.round(j.pct)+'%)':''));$('go').disabled=!!j.binance_blocked_until_ms;if(j.binance_blocked_until_ms){setTimeout(poll,60000)}if(j.state!=='running'){clearInterval(timer);$('go').disabled=!!j.binance_blocked_until_ms;if(j.state==='done')show(j.result);if(j.state==='error'&&!j.binance_blocked_until_ms)$('progress').textContent=j.error||'오류';}}catch(e){clearInterval(timer);$('go').disabled=false;$('progress').textContent='상태 오류 '+e.message}}
 function show(j){$('result').hidden=false;$('scope').innerHTML=[['기간',j.days+'일'],['공통 코인',j.mapped+'개'],['G형',j.g_count+'건'],['N 대응',j.matched_count+'건'],['BTC 하락 X',j.btc_down_count+'건'],['기간 끝',j.until_kst]].map(x=>'<div class="stat"><small>'+esc(x[0])+'</small><strong>'+esc(x[1])+'</strong></div>').join('');$('notice').textContent='분석 종목: '+(j.mapped_coins||[]).join(', ')+' / 제외: '+(j.skipped||[]).join(', ');const g=(j.summary||[]).find(x=>x.rule==='G');if(g){const di=[['G 후보',g.n+'건'],['초기 5분 약세(-0.3% 이하)',g.weak5_n+'건'],['초기 약세군 고정손절 평균',pct(g.weak5_fixed_avg)],['초기 비약세군 고정손절 평균',pct(g.strong5_fixed_avg)],['구조손절 비교 가능',g.struct_n+'건 / 제외 '+g.struct_excluded+'건'],['같은 신호 고정손절 평균',pct(g.fixed_paired_avg60)],['같은 신호 구조손절 평균',pct(g.struct_avg60)],['구조손절이 유리한 신호',g.struct_wins+'건'],['1봉 상승 확인 후 진입',g.confirm_n+'건'],['확인진입 평균 순수익',pct(g.confirm_avg60)],['동일 확인군 기존 진입 평균',pct(g.confirm_fixed_paired_avg60)]];$('diagnostics').innerHTML=di.map(x=>'<div class="stat"><small>'+esc(x[0])+'</small><strong>'+esc(x[1])+'</strong></div>').join('')}else{$('diagnostics').textContent='G형 신호 없음'};$('summary').innerHTML=(j.summary||[]).map(x=>'<tr><td>'+esc(x.rule+' '+x.label)+'</td><td>'+x.n+'</td><td>'+pct(x.avg15)+'</td><td>'+pct(x.avg30)+'</td><td>'+pct(x.avg60)+'</td><td>'+pct(x.avg180)+'</td><td>'+x.target_first+'</td><td>'+x.stop_first+'</td><td>'+pct(x.strategy_avg60)+'</td></tr>').join('');$('daily').innerHTML=(j.daily||[]).map(x=>'<tr><td>'+esc(x.day)+'</td><td>'+x.n+'</td><td>'+x.wins+'</td><td>'+x.losses+'</td><td>'+pct(x.mean)+'</td></tr>').join('');$('count').textContent='G 후보 '+j.g_count+'건 · N/X는 비교 전용 · 최근 최대 150개 표시, 전체 CSV 제공';$('trades').innerHTML=(j.trades||[]).slice().sort((a,b)=>b.signal_ms-a.signal_ms).slice(0,150).map(x=>'<tr><td>'+esc(x.coin)+'</td><td>'+esc(x.rule)+'</td><td>'+esc(new Date(x.signal_ms).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}))+'</td><td>'+pct(x.oi)+'</td><td>'+Number(x.taker).toFixed(2)+'</td><td>'+pct(x.btc1h)+'</td><td>'+pct(x.net15)+'</td><td>'+pct(x.net30)+'</td><td>'+pct(x.net60)+'</td><td>'+esc(x.first_event)+'</td><td>'+pct(x.strategy_net60)+'</td></tr>').join('');$('errors').textContent=[...(j.errors||[]),...(j.warnings||[])].join('\n')||'없음';}
 poll();
 </script></body></html>'''
@@ -616,23 +686,28 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTML if p=='/' else 'ok',ctype='text/html; charset=utf-8' if p=='/' else 'text/plain')
         elif p=='/api/status':
             with JOB_LOCK: data=dict(JOB)
+            ban = ban_until_ms()
+            data['binance_blocked_until_ms'] = ban
+            data['binance_blocked_notice'] = ban_message(ban) if ban else ''
             self.respond(json.dumps(data,ensure_ascii=False))
         elif p=='/api/csv':
             with JOB_LOCK: result=JOB.get('result')
             if not result: return self.respond(json.dumps({'error':'완료된 연구가 없습니다'}),404)
             data = '\ufeff' + csv_text(result['trades'])
-            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_4.csv"'})
+            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_4_1.csv"'})
         else: self.respond(json.dumps({'error':'not found'}),404)
 
     def do_POST(self):
         if urlsplit(self.path).path != '/api/run':
             return self.respond(json.dumps({'error':'not found'}),404)
+        if ban_until_ms():
+            return self.respond(json.dumps({'error':ban_message(ban_until_ms())},ensure_ascii=False),429)
         try:
             length = int(self.headers.get('Content-Length','0'))
             if length <= 0 or length>4096: raise ValueError('잘못된 요청 크기')
             obj = json.loads(self.rfile.read(length))
             coins = coins_parse(obj.get('coins',DEFAULT_COINS))
-            days = int(obj.get('days',13))
+            days = int(obj.get('days',6))
             if days < 1 or days > MAX_DAYS: raise ValueError('연구 기간 1~13일만 가능')
         except (ValueError,KeyError,TypeError,json.JSONDecodeError) as e:
             return self.respond(json.dumps({'error':str(e)},ensure_ascii=False),400)
@@ -645,13 +720,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.4 (읽기 전용)')
+    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.4.1 (읽기 전용)')
     p.add_argument('--web',action='store_true',help='모바일 대시보드 서버 시작')
     p.add_argument('--selftest',action='store_true',help='거래소 호출 없는 검증')
     p.add_argument('--coins',default=DEFAULT_COINS)
-    p.add_argument('--days',type=int,default=13)
+    p.add_argument('--days',type=int,default=6)
     p.add_argument('--port',type=int,default=int(os.environ.get('PORT',10000)))
-    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_4.csv')
+    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_4_1.csv')
     args=p.parse_args()
     if args.selftest: return selftest()
     if args.web:
