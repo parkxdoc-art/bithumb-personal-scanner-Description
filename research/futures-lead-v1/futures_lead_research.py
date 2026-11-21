@@ -693,6 +693,11 @@ class Handler(BaseHTTPRequestHandler):
             if not result: return self.respond(json.dumps({'error':'아직 완료된 결과 없음'},ensure_ascii=False),404)
             return self.respond(walletstudy.to_csv(result),ctype='text/csv; charset=utf-8',
                                 extra={'Content-Disposition':'attachment; filename="HYPERLIQUID_WALLET_STUDY_V1_5.csv"'})
+        if p == '/api/wallet-study/diagnostics.csv':
+            result=walletstudy.status().get('result')
+            if not result: return self.respond(json.dumps({'error':'아직 완료된 결과 없음'},ensure_ascii=False),404)
+            return self.respond(walletstudy.to_diagnostics_csv(result),ctype='text/csv; charset=utf-8',
+                                extra={'Content-Disposition':'attachment; filename="HYPERLIQUID_WALLET_STUDY_V1_5_1_DIAGNOSTICS.csv"'})
         if p in ('/','/health'):
             self.respond(HTML if p=='/' else 'ok',ctype='text/html; charset=utf-8' if p=='/' else 'text/plain')
         elif p=='/api/status':
