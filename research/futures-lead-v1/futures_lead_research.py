@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BITHUMB × Binance futures lead-lag research V1.3 (READ-ONLY).
+"""BITHUMB × Binance futures lead-lag research V1.4 (READ-ONLY).
 
 Python >=3.9; no third-party dependencies. CLI and mobile-friendly local/Render web UI.
 Usage:
@@ -21,12 +21,13 @@ import statistics
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.3"
+VERSION = "1.4"
 BINANCE = "https://fapi.binance.com"
 BITHUMB = "https://api.bithumb.com"
 PERIOD_MS = 15 * 60_000
@@ -35,7 +36,7 @@ HOURS_MS = 60 * 60_000
 KST = timezone(timedelta(hours=9))
 MAX_DAYS = 13
 MAX_COINS = 20
-DEFAULT_COINS = "ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,BTC,PEPE"
+DEFAULT_COINS = "BTC,ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,PEPE,TRX,BCH,LTC,APT,ARB,OP,NEAR,INJ,UNI,ATOM"
 STABLES = {"USDT","USDC","DAI","FDUSD","TUSD","USDE","USD1","USDD","PYUSD","RLUSD","EURC","EURI"}
 MULTIPLIED = {"PEPE":"1000PEPE", "SHIB":"1000SHIB", "BONK":"1000BONK", "FLOKI":"1000FLOKI"}
 RULES = {
@@ -48,7 +49,11 @@ FIELDS = ["코인","규칙","신호시각(KST)","진입시각(KST)","진입가(K
           "BTC 1시간 상승률(%)","15분 순수익률(%)","30분 순수익률(%)","60분 순수익률(%)","180분 순수익률(%)",
           "15분 최고 종가상승(%)","30분 최고 종가상승(%)","60분 최고 종가상승(%)",
           "60분내 순+0.5% 종가달성", "60분 먼저 도달", "첫 도달시각(KST)",
-          "첫 도달 순수익률(%)", "60분 목표/손절 모의청산 순수익률(%)"]
+          "첫 도달 순수익률(%)", "60분 목표/손절 모의청산 순수익률(%)",
+          "진입 후 첫5분 가격변화(%)", "첫5분 약세(-0.3% 이하)",
+          "30분 이전 저점 구조손절가(KRW)","구조손절폭(가격%)", "구조손절 적용상태",
+          "구조손절 먼저 도달", "구조손절 1시간 순수익률(%)",
+          "5분 확인진입 적용", "확인진입 1시간 모의청산 순수익률(%)"]
 
 class APIError(Exception):
     def __init__(self, message, status=None):
@@ -61,7 +66,7 @@ def fetch_json(base, path, params=None, headers=None):
     if base not in (BINANCE, BITHUMB) or not path.startswith("/") or '//' in path:
         raise APIError("허용되지 않은 API 경로")
     url = base + path + ("?" + urlencode(params) if params else "")
-    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.3",
+    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.4",
                                 "Accept":"application/json", **(headers or {})})
     for attempt in range(3):
         try:
@@ -166,9 +171,10 @@ def coins_parse(value):
     return tokens
 
 
-def bih_candles(coin, start_ms, end_ms):
+def bih_candles(coin, start_ms, end_ms, with_lows=False):
     """Fetch 5m closed Bithumb candles, paged by 'to' interpreted as KST."""
     result = {}
+    lows = {}
     cursor = end_ms
     for _ in range(25):
         to_kst = datetime.fromtimestamp(cursor/1000, KST).strftime("%Y-%m-%dT%H:%M:%S")
@@ -184,10 +190,12 @@ def bih_candles(coin, start_ms, end_ms):
             oldest = t if oldest is None else min(oldest, t)
             if start_ms <= t and t + CANDLE_MS <= end_ms:
                 result[t] = float(x["trade_price"])
+                if with_lows and x.get("low_price") is not None:
+                    lows[t] = float(x["low_price"])
         if oldest is None or oldest >= cursor or oldest <= start_ms or len(data) < 200:
             break
         cursor = oldest  # 'to' excludes candle opening at this time
-    return result
+    return (result, lows) if with_lows else result
 
 
 def percent_change(curr, prior):
@@ -220,7 +228,7 @@ def row_features(t, idx, times, oi, taker, prices):
 
 
 
-# V1.3 screens ONE candidate class (G). N and X are retrospective controls only.
+# V1.4 screens ONE candidate class (G). N and X are retrospective controls only.
 # Freeze V1.2 thresholds for out-of-sample comparisons; do not optimize to 6-day CSV.
 def early_candidate(f):
     return bool(f and -0.5 <= f["momentum"] <= 0.3
@@ -238,7 +246,7 @@ def btc_momentum(t, btc_prices):
                           btc_prices.get(t-HOURS_MS-CANDLE_MS))
 
 
-def outcomes_for_entry(entry_bar, entry_price, prices, fee_pct=0.5):
+def outcomes_for_entry(entry_bar, entry_price, prices, fee_pct=0.5, stop_price=None):
     """Evaluate post-entry fully closed 5m CLOSING prices only.
 
     Profit net +0.5% requires a gross +1.0% close at fee=0.5%.
@@ -248,7 +256,7 @@ def outcomes_for_entry(entry_bar, entry_price, prices, fee_pct=0.5):
     close_prices = [prices.get(entry_bar+i*CANDLE_MS) for i in range(1,37)]
     if any(c is None or c <= 0 for c in close_prices):
         return None
-    result = {}
+    result = {"first5_gross": (close_prices[0] / entry_price-1)*100}
     for m in (15,30,60,180):
         result[f"net{m}"] = (close_prices[m//5-1]/entry_price-1)*100-fee_pct
     for m in (15,30,60):
@@ -271,18 +279,69 @@ def outcomes_for_entry(entry_bar, entry_price, prices, fee_pct=0.5):
                    "first_event_net":first[2],
                    "strategy_net60":first[2],
                    "hit60": result["peak60"] >= tp_gross})
+    result['first5_weak'] = result['first5_gross'] <= -0.3  # diagnostic, not a pre-entry filter
+    if stop_price is not None:
+        # Same price targets, 5m completed-close logic and 60m horizon as fixed-stop.
+        sf = next(((('익절' if (c/entry_price-1)*100 >= tp_gross else '손절'),i,
+                     (c/entry_price-1)*100-fee_pct)
+                    for i,c in enumerate(close_prices[:12],start=1)
+                    if (c/entry_price-1)*100 >= tp_gross or c <= stop_price), None)
+        if sf is None:
+            sf = ('시간만료',12,result['net60'])
+        result['struct_event'] = sf[0]
+        result['struct_net60'] = sf[2]
+    else:
+        result['struct_event'] = None
+        result['struct_net60'] = None
     return result
 
 
-def make_row(coin, rule, t, features, btc1h, prices, fee_pct=0.5):
+def structural_stop(t, entry_price, lows):
+    """Six previously closed 5m candles, excluding signal/entry candle.
+
+    Use prior 30-minute LOW (not close), fixed buffer -0.15%. No future data.
+    Report missing/too-close/too-wide explicitly instead of cherry-picking rows.
+    """
+    if lows is None:
+        return (None,None,'저가 데이터 없음')
+    prev = [lows.get(t-i*CANDLE_MS) for i in range(1,7)]
+    if any(x is None or x <= 0 for x in prev):
+        return (None,None,'30분 저가 누락')
+    stop = min(prev) * 0.9985
+    gap = (1-stop/entry_price)*100
+    if gap <= 0:
+        return (round(stop,9),round(gap,4),'손절선 역전')
+    if gap < 0.30:
+        return (round(stop,9),round(gap,4),'너무 가까움(<0.30%)')
+    if gap > 3.0:
+        return (round(stop,9),round(gap,4),'너무 넓음(>3.0%)')
+    return (round(stop,9),round(gap,4),'비교 가능')
+
+
+def make_row(coin, rule, t, features, btc1h, prices, fee_pct=0.5, lows=None):
     entry_price=prices.get(t)  # first 5m candle closes at t+5m
     if entry_price is None or entry_price<=0:
         return None
-    outcome=outcomes_for_entry(t,entry_price,prices,fee_pct)
+    stop, gap, status = structural_stop(t, entry_price, lows)
+    outcome=outcomes_for_entry(t,entry_price,prices,fee_pct,
+                               stop_price=stop if status=='비교 가능' else None)
     if outcome is None:
         return None
+    # Confirmation signal is the NEXT 5m completed candle's CLOSE (t+10m).
+    # Only after confirmation can the following completed candle's close be
+    # used as entry (t+15m). This is a separate strategy on a selected subset.
+    confirmation = prices.get(t+CANDLE_MS)
+    confirm_eligible = confirmation is not None and confirmation > entry_price
+    confirm_net = None
+    if confirm_eligible and prices.get(t+2*CANDLE_MS):
+        confirm_entry = prices[t+2*CANDLE_MS]
+        confirm_out = outcomes_for_entry(t+2*CANDLE_MS,confirm_entry,prices,fee_pct)
+        if confirm_out is not None:
+            confirm_net = confirm_out['strategy_net60']
     return {"coin":coin,"rule":rule,"signal_ms":t,"entry_ms":t+CANDLE_MS,
-            "entry_price":entry_price,"btc1h":btc1h,**features,**outcome}
+            "entry_price":entry_price,"btc1h":btc1h,**features,**outcome,
+            "stop_price":stop,"stop_gap":gap,"struct_status":status,
+            "confirm_ok":confirm_net is not None,"confirm_net60":confirm_net}
 
 
 def select_controls(g_rows, q_rows):
@@ -307,7 +366,7 @@ def select_controls(g_rows, q_rows):
     return chosen
 
 
-def produce_trades(coin, oi, taker, prices, since_ms, until_ms, fee_pct=0.5, btc_prices=None):
+def produce_trades(coin, oi, taker, prices, since_ms, until_ms, fee_pct=0.5, btc_prices=None, lows=None):
     """Only G is an active candidate; N/X are internal diagnostics.
 
     Align each signal to t (complete Binance 15m). Entry uses the first 5m
@@ -332,7 +391,7 @@ def produce_trades(coin, oi, taker, prices, since_ms, until_ms, fee_pct=0.5, btc
             continue
         if rule in ("G","X") and t-last_used[rule]<180*60_000:
             continue
-        row=make_row(coin,rule,t,f,btc,prices,fee_pct)
+        row=make_row(coin,rule,t,f,btc,prices,fee_pct,lows=lows)
         if row is None:
             continue
         if rule=="G": g_rows.append(row);last_used[rule]=t
@@ -357,6 +416,19 @@ def describe(trades):
         item['stop_first']=sum(r['first_event']=='손절' for r in group)
         item['timeout']=sum(r['first_event']=='시간만료' for r in group)
         item['strategy_avg60']=round(statistics.mean(r['strategy_net60'] for r in group),3) if group else None
+        structural=[r for r in group if r.get('struct_status')=='비교 가능' and r.get('struct_net60') is not None]
+        item['struct_n']=len(structural)
+        item['struct_avg60']=round(statistics.mean(r['struct_net60'] for r in structural),3) if structural else None
+        item['fixed_paired_avg60']=round(statistics.mean(r['strategy_net60'] for r in structural),3) if structural else None
+        item['struct_excluded']=len(group)-len(structural)
+        item['struct_wins']=sum(r['struct_net60']>r['strategy_net60'] for r in structural)
+        item['weak5_n']=sum(r['first5_weak'] for r in group)
+        item['weak5_fixed_avg']=round(statistics.mean(r['strategy_net60'] for r in group if r['first5_weak']),3) if any(r['first5_weak'] for r in group) else None
+        item['strong5_fixed_avg']=round(statistics.mean(r['strategy_net60'] for r in group if not r['first5_weak']),3) if any(not r['first5_weak'] for r in group) else None
+        confirmed=[r['confirm_net60'] for r in group if r.get('confirm_ok')]
+        item['confirm_n']=len(confirmed)
+        item['confirm_avg60']=round(statistics.mean(confirmed),3) if confirmed else None
+        item['confirm_fixed_paired_avg60']=round(statistics.mean(r['strategy_net60'] for r in group if r.get('confirm_ok')),3) if confirmed else None
         result.append(item)
     return result
 
@@ -383,7 +455,14 @@ def csv_text(trades):
                     *[round(r[f'peak{m}'],3) for m in (15,30,60)],
                     'Y' if r['hit60'] else 'N',r['first_event'],
                     timestamp_fmt(r['first_event_ms']),round(r['first_event_net'],3),
-                    round(r['strategy_net60'],3)])
+                    round(r['strategy_net60'],3),
+                    round(r['first5_gross'],3),'Y' if r['first5_weak'] else 'N',
+                    '' if r['stop_price'] is None else r['stop_price'],
+                    '' if r['stop_gap'] is None else r['stop_gap'],r['struct_status'],
+                    r['struct_event'] or '',
+                    '' if r['struct_net60'] is None else round(r['struct_net60'],3),
+                    'Y' if r['confirm_ok'] else 'N',
+                    '' if r['confirm_net60'] is None else round(r['confirm_net60'],3)])
     return b.getvalue()
 
 
@@ -409,29 +488,44 @@ def research(coins,days,on_progress=None,now_ms=None):
     if not mapped:
         raise APIError('빗썸 KRW+바이낸스 무기한 선물 공통 종목이 없습니다')
     progress('BTC 완료 5분봉 수집',4)
-    # BTC history is required for ALL V1.3 comparisons; never use proxy.
-    btc_prices=bih_candles('BTC',fetch_since-HOURS_MS,end_ms)
+    # BTC history is required for ALL V1.4 comparisons; never use proxy.
+    btc_prices, btc_lows=bih_candles('BTC',fetch_since-HOURS_MS,end_ms,with_lows=True)
     if not btc_prices:
         raise APIError('BTC 5분봉 수집 실패: 비교 연구 불가')
     rows=[];errors=[];warnings=[]
-    for i,(coin,symbol) in enumerate(mapped,1):
-        progress(f'{coin} ({i}/{len(mapped)}) OI / taker',5+87*(i-1)/len(mapped))
+    def one_coin(coin,symbol):
         try:
             oi=history('/futures/data/openInterestHist',symbol,fetch_since,end_ms)
             taker=history('/futures/data/takerlongshortRatio',symbol,fetch_since,end_ms)
-            progress(f'{coin} 빗썸 5분봉',5+87*(i-0.5)/len(mapped))
-            prices=btc_prices if coin=='BTC' else bih_candles(coin,fetch_since-HOURS_MS,end_ms)
+            if coin=='BTC':
+                prices,lows=btc_prices,btc_lows
+            else:
+                prices,lows=bih_candles(coin,fetch_since-HOURS_MS,end_ms,with_lows=True)
             if not oi or not taker or not prices:
-                errors.append(f'{coin}: 데이터 부족 (OI={len(oi)}, taker={len(taker)}, KRW={len(prices)})')
-                continue
-            matched=produce_trades(coin,oi,taker,prices,since_ms,end_ms,btc_prices=btc_prices)
-            rows.extend(matched)
-            if not any(x['rule']=='G' for x in matched):
-                warnings.append(f'{coin}: G형 완료 신호 0건')
-        except APIError as e:
-            errors.append(f'{coin}: {e}')
-        except (KeyError,ValueError,TypeError,ZeroDivisionError) as e:
-            errors.append(f'{coin}: 데이터 값 오류: {str(e)[:130]}')
+                return [],f'{coin}: 데이터 부족 (OI={len(oi)}, taker={len(taker)}, KRW={len(prices)})',None
+            matched=produce_trades(coin,oi,taker,prices,since_ms,end_ms,
+                                   btc_prices=btc_prices,lows=lows)
+            warn=None if any(x['rule']=='G' for x in matched) else f'{coin}: G형 완료 신호 0건'
+            return matched,None,warn
+        except APIError as exc:
+            return [],f'{coin}: {exc}',None
+        except (KeyError,ValueError,TypeError,ZeroDivisionError) as exc:
+            return [],f'{coin}: 데이터 값 오류: {str(exc)[:130]}',None
+    # 3 workers keep a 13d/20coin scan practical on Render free.
+    # Aggregate in one thread to avoid races in diagnostics and CSV.
+    with ThreadPoolExecutor(max_workers=min(3,len(mapped))) as pool:
+        fs={pool.submit(one_coin,coin,symbol):coin for coin,symbol in mapped}
+        for i,future in enumerate(as_completed(fs),1):
+            coin=fs[future]
+            try:
+                matched,error,warn=future.result()
+                rows.extend(matched)
+                if error: errors.append(error)
+                if warn: warnings.append(warn)
+            except Exception as exc:
+                errors.append(f'{coin}: 처리 실패 {str(exc)[:130]}')
+            progress(f'데이터 수집 {i}/{len(mapped)} 완료',5+87*i/len(mapped))
+    rows.sort(key=lambda x:(x['signal_ms'],x['coin'],x['rule']))
     progress('G 및 동일 시기 비교군 집계',97)
     return {"version":VERSION,"days":days,"since_kst":timestamp_fmt(since_ms),
             "until_kst":timestamp_fmt(end_ms),"requested":len(coins),"mapped":len(mapped),
@@ -459,30 +553,31 @@ def selftest():
     f={'oi':0.9,'taker':1.1,'momentum':0.1}
     assert early_candidate(f) and not early_candidate(dict(f,momentum=0.6))
     assert rounded_end(t+20)==t and taker_end(t-PERIOD_MS)==t
-    print('SELFTEST PASS V1.3: fees, close-first, no-missing-silent, early gate, timestamps')
+    print('SELFTEST PASS V1.4: fees, close-first, no-missing-silent, early gate, timestamps')
 
 HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>선물 데이터 선행성 연구 V1.3</title>
+<title>선물 데이터 선행성 연구 V1.4</title>
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#0b1321;color:#eaf1fb;margin:0}main{max-width:980px;margin:auto;padding:14px 12px 55px}h1{font-size:24px;margin:6px 0}h2{font-size:17px;margin:12px 0}section{background:#162237;border:1px solid #2d435b;border-radius:14px;padding:15px;margin:14px 0}p,.note{color:#aebfd0;line-height:1.6;font-size:13px}.status{border:1px solid #537089;border-radius:8px;padding:10px}.top{font-size:12px;color:#79bec6}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{border:1px solid #364e65;border-radius:8px;padding:9px}.stat small{display:block;color:#aab8c8}.stat strong{display:block;font-size:19px;margin-top:5px}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;min-width:690px;font-size:12px}td,th{border-bottom:1px solid #36475c;padding:10px 7px;text-align:right}td:first-child,th:first-child{text-align:left}th{color:#b5c6dc;font-weight:600}input{width:100%;background:#0d182a;border:1px solid #475c76;color:white;border-radius:8px;padding:12px;margin:4px 0 12px;font-size:16px}button,.link{background:#287fd5;color:#fff;border:0;border-radius:9px;padding:12px 15px;display:inline-block;text-decoration:none;font-size:14px;font-weight:600;cursor:pointer}button:disabled{opacity:.5}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.5;color:#b7c4d6}.good{color:#82d8bd}.bad{color:#ffb0a3}.sub{font-size:12px;color:#91a7bf}#result[hidden]{display:none}@media(max-width:620px){.stats{grid-template-columns:repeat(2,1fr)}table{font-size:12px}}</style></head><body><main>
 <div class="top">BITHUMB × BINANCE · 독립 연구 · 자동매매 없음</div>
-<h1>선물 데이터 선행성 연구 V1.3</h1>
+<h1>선물 데이터 선행성 연구 V1.4</h1>
 <p>저성과 A/B/C/M/E/P 규칙을 주력 신호에서 제외하고, <b>G형만 연구 후보</b>로 남겼습니다. N(같은 BTC 상승 구간)과 X(BTC 하락 구간)는 <b>통계 비교용</b>이며 BUY 알림이 아닙니다.</p>
-<section><div class="sub">빗썸 KRW + 바이낸스 USDT 선물 공통 코인 (최대 20개)</div><input id="coins" value="ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,BTC,PEPE"><div class="sub">최근 연구 일수 (1~13)</div><input id="days" type="number" value="6" min="1" max="13"><button id="go" onclick="start()">연구 실행</button><p>기본 설정: 10개 코인, 최근 6일. 거래소 자료는 실제 API에서 불러오며 수집 중 다소 시간이 걸릴 수 있습니다.</p></section>
+<section><div class="sub">빗썸 KRW + 바이낸스 USDT 선물 공통 코인 (최대 20개)</div><input id="coins" value="BTC,ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,PEPE,TRX,BCH,LTC,APT,ARB,OP,NEAR,INJ,UNI,ATOM"><div class="sub">최근 연구 일수 (1~13)</div><input id="days" type="number" value="13" min="1" max="13"><button id="go" onclick="start()">연구 실행</button><p>기본 설정: 20개 코인, 최근 13일. 거래소 자료는 실제 API에서 불러오며 수집 중 다소 시간이 걸릴 수 있습니다.</p></section>
 <section><h2>진행 상태</h2><div id="state" class="status">실행 전</div><p id="progress">연구 실행을 누르면 수집을 시작합니다.</p></section>
 <div id="result" hidden>
 <section><h2>G형 연구 범위</h2><div id="scope" class="stats"></div><p id="notice"></p></section>
 <section><h2>G형 vs 비교군 (순수익률, 왕복 0.5%)</h2><p>G = 지난 1시간 가격 -0.5~+0.3%, 선물 OI +0.8% 이상, taker 매수/매도비 1.08 이상, BTC 1시간 비하락. N은 G와 같은 코인·날짜의 3시간 이내 BTC 비하락 가격횡보 구간 중 G 조건에 해당하지 않는 1:1 근접 비교군. X는 같은 선물 조건이지만 BTC가 하락한 경우.</p><div class="scroll"><table><thead><tr><th>규칙</th><th>건수</th><th>15분</th><th>30분</th><th>1시간</th><th>3시간</th><th>+0.5%순 목표 먼저</th><th>-1% 총손절 먼저</th><th>1시간 모의청산 평균</th></tr></thead><tbody id="summary"></tbody></table></div></section>
-<section><h2>G형 날짜별 기록 (1시간 모의청산)</h2><div class="scroll"><table style="min-width:490px"><thead><tr><th>날짜(KST)</th><th>G건수</th><th>수익</th><th>손실</th><th>평균 순수익률</th></tr></thead><tbody id="daily"></tbody></table></div></section>
+<section><h2>G형 진입 후 5분·손절 비교 (동일 신호)</h2><p>구조 손절은 진입 전 30분간 완료된 5분봉 저가의 최솟값에 0.15% 버퍼를 적용합니다. 손절폭 0.30~3.00%만 비교 가능으로 표시하며, 제외 건수도 기록합니다. 5분 확인 진입은 다음 봉 상승 마감이 확인된 뒤 그 다음 봉 종가에 진입하는 별도 가정입니다.</p><div id="diagnostics" class="stats"></div></section>
+<section><h2>G형 날짜별 기록 (1시간 고정손절 모의청산)</h2><div class="scroll"><table style="min-width:490px"><thead><tr><th>날짜(KST)</th><th>G건수</th><th>수익</th><th>손실</th><th>평균 순수익률</th></tr></thead><tbody id="daily"></tbody></table></div></section>
 <section><h2>G형 및 비교 기록</h2><a class="link" href="/api/csv" target="_blank">CSV 내려받기</a><p id="count"></p><div class="scroll"><table><thead><tr><th>코인</th><th>규칙</th><th>신호(KST)</th><th>OI 1h</th><th>매수/매도</th><th>BTC1h</th><th>15분</th><th>30분</th><th>1시간</th><th>목표/손절</th><th>모의 순수익</th></tr></thead><tbody id="trades"></tbody></table></div></section>
 <section><h2>데이터 오류 / 누락</h2><pre id="errors"></pre></section></div>
-<section><h2>계산 기준과 한계</h2><p>① 이 연구는 <b>완성된 5분봉 종가</b>만 사용합니다. G 신호 후 다음 5분봉 종가를 가상 진입가로 놓고, 그 이후 15/30/60/180분 성과를 계산합니다. ② 순익 +0.5% 목표는 가격 +1.0%(왕복 수수료 0.5%)에 해당합니다. 손절은 가격 -1.0%이고 수수료 포함 시 약 -1.5%입니다. ③ 1시간 내 목표와 손절 중 <b>어느 조건을 먼저 만족한 완료봉 종가가 있었는지</b> 평가합니다. 해당 봉의 종가로 모의 청산한 것이며 실제 조건부 주문 체결을 뜻하지 않습니다. ④ N 비교군은 사후적으로 같은 코인·날짜·BTC 조건에서 가까운 사례를 선정합니다. G는 N이 없더라도 보존되므로 완전한 대응 실험은 아닙니다. ⑤ 실제 주문·호가·슬리피지·미세 유동성·선물 펀딩비는 반영하지 않았고, 연구 결과는 실전 BUY 권고가 아닙니다.</p></section>
+<section><h2>계산 기준과 한계</h2><p>① 손절 도달·익절 판정은 <b>완성된 5분봉 종가</b>만 사용합니다. G 신호 후 다음 5분봉 종가를 가상 진입가로 놓고, 그 이후 15/30/60/180분 성과를 계산합니다. ② 순익 +0.5% 목표는 가격 +1.0%(왕복 수수료 0.5%)에 해당합니다. 손절은 가격 -1.0%이고 수수료 포함 시 약 -1.5%입니다. ③ 1시간 내 목표와 손절 중 <b>어느 조건을 먼저 만족한 완료봉 종가가 있었는지</b> 평가합니다. 해당 봉의 종가로 모의 청산한 것이며 실제 조건부 주문 체결을 뜻하지 않습니다. ④ N 비교군은 사후적으로 같은 코인·날짜·BTC 조건에서 가까운 사례를 선정합니다. G는 N이 없더라도 보존되므로 완전한 대응 실험은 아닙니다. ⑤ 구조손절에는 진입 전 완료봉의 <b>실제 저가</b>를 사용하지만 진입 이후 조건 충족은 여전히 <b>종가만</b> 사용하므로 실전 손절체결을 의미하지 않습니다. 구조손절 비적용 사례는 성과 평균에서 제외하되 건수를 공개합니다. ⑥ 5분 약세군은 진입 후 사후에 분류되므로 미리 알 수 있는 조건이 아니며, 확인진입 평균도 확인된 일부 신호에만 해당합니다. ⑦ 실제 주문·호가·슬리피지·미세 유동성·선물 펀딩비는 반영하지 않았고, 연구 결과는 실전 BUY 권고가 아닙니다.</p></section>
 </main><script>
 const $=id=>document.getElementById(id);let timer=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const pct=v=>v===null||v===undefined?'—':Number(v).toFixed(2)+'%';
 async function start(){let coins=$('coins').value.trim(),days=Number($('days').value);$('go').disabled=true;$('state').textContent='접수 중';$('result').hidden=true;try{let r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({coins,days})});let j=await r.json();if(!r.ok)throw Error(j.error||'요청 실패');if(timer)clearInterval(timer);await poll();timer=setInterval(poll,1400)}catch(e){$('go').disabled=false;$('state').textContent='실행 오류';$('progress').textContent=e.message}}
 async function poll(){try{let r=await fetch('/api/status');let j=await r.json();$('state').textContent=({running:'수집 중',done:'연구 완료',error:'오류',idle:'실행 전'})[j.state]||'상태 조회';$('progress').textContent=(j.progress||'')+(j.pct?' ('+Math.round(j.pct)+'%)':'');if(j.state!=='running'){clearInterval(timer);$('go').disabled=false;if(j.state==='done')show(j.result);if(j.state==='error')$('progress').textContent=j.error||'오류';}}catch(e){clearInterval(timer);$('go').disabled=false;$('progress').textContent='상태 오류 '+e.message}}
-function show(j){$('result').hidden=false;$('scope').innerHTML=[['기간',j.days+'일'],['공통 코인',j.mapped+'개'],['G형',j.g_count+'건'],['N 대응',j.matched_count+'건'],['BTC 하락 X',j.btc_down_count+'건'],['기간 끝',j.until_kst]].map(x=>'<div class="stat"><small>'+esc(x[0])+'</small><strong>'+esc(x[1])+'</strong></div>').join('');$('notice').textContent='분석 종목: '+(j.mapped_coins||[]).join(', ')+' / 제외: '+(j.skipped||[]).join(', ');$('summary').innerHTML=(j.summary||[]).map(x=>'<tr><td>'+esc(x.rule+' '+x.label)+'</td><td>'+x.n+'</td><td>'+pct(x.avg15)+'</td><td>'+pct(x.avg30)+'</td><td>'+pct(x.avg60)+'</td><td>'+pct(x.avg180)+'</td><td>'+x.target_first+'</td><td>'+x.stop_first+'</td><td>'+pct(x.strategy_avg60)+'</td></tr>').join('');$('daily').innerHTML=(j.daily||[]).map(x=>'<tr><td>'+esc(x.day)+'</td><td>'+x.n+'</td><td>'+x.wins+'</td><td>'+x.losses+'</td><td>'+pct(x.mean)+'</td></tr>').join('');$('count').textContent='G 후보 '+j.g_count+'건 · N/X는 비교 전용 · 최근 최대 150개 표시, 전체 CSV 제공';$('trades').innerHTML=(j.trades||[]).slice().sort((a,b)=>b.signal_ms-a.signal_ms).slice(0,150).map(x=>'<tr><td>'+esc(x.coin)+'</td><td>'+esc(x.rule)+'</td><td>'+esc(new Date(x.signal_ms).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}))+'</td><td>'+pct(x.oi)+'</td><td>'+Number(x.taker).toFixed(2)+'</td><td>'+pct(x.btc1h)+'</td><td>'+pct(x.net15)+'</td><td>'+pct(x.net30)+'</td><td>'+pct(x.net60)+'</td><td>'+esc(x.first_event)+'</td><td>'+pct(x.strategy_net60)+'</td></tr>').join('');$('errors').textContent=[...(j.errors||[]),...(j.warnings||[])].join('\n')||'없음';}
+function show(j){$('result').hidden=false;$('scope').innerHTML=[['기간',j.days+'일'],['공통 코인',j.mapped+'개'],['G형',j.g_count+'건'],['N 대응',j.matched_count+'건'],['BTC 하락 X',j.btc_down_count+'건'],['기간 끝',j.until_kst]].map(x=>'<div class="stat"><small>'+esc(x[0])+'</small><strong>'+esc(x[1])+'</strong></div>').join('');$('notice').textContent='분석 종목: '+(j.mapped_coins||[]).join(', ')+' / 제외: '+(j.skipped||[]).join(', ');const g=(j.summary||[]).find(x=>x.rule==='G');if(g){const di=[['G 후보',g.n+'건'],['초기 5분 약세(-0.3% 이하)',g.weak5_n+'건'],['초기 약세군 고정손절 평균',pct(g.weak5_fixed_avg)],['초기 비약세군 고정손절 평균',pct(g.strong5_fixed_avg)],['구조손절 비교 가능',g.struct_n+'건 / 제외 '+g.struct_excluded+'건'],['같은 신호 고정손절 평균',pct(g.fixed_paired_avg60)],['같은 신호 구조손절 평균',pct(g.struct_avg60)],['구조손절이 유리한 신호',g.struct_wins+'건'],['1봉 상승 확인 후 진입',g.confirm_n+'건'],['확인진입 평균 순수익',pct(g.confirm_avg60)],['동일 확인군 기존 진입 평균',pct(g.confirm_fixed_paired_avg60)]];$('diagnostics').innerHTML=di.map(x=>'<div class="stat"><small>'+esc(x[0])+'</small><strong>'+esc(x[1])+'</strong></div>').join('')}else{$('diagnostics').textContent='G형 신호 없음'};$('summary').innerHTML=(j.summary||[]).map(x=>'<tr><td>'+esc(x.rule+' '+x.label)+'</td><td>'+x.n+'</td><td>'+pct(x.avg15)+'</td><td>'+pct(x.avg30)+'</td><td>'+pct(x.avg60)+'</td><td>'+pct(x.avg180)+'</td><td>'+x.target_first+'</td><td>'+x.stop_first+'</td><td>'+pct(x.strategy_avg60)+'</td></tr>').join('');$('daily').innerHTML=(j.daily||[]).map(x=>'<tr><td>'+esc(x.day)+'</td><td>'+x.n+'</td><td>'+x.wins+'</td><td>'+x.losses+'</td><td>'+pct(x.mean)+'</td></tr>').join('');$('count').textContent='G 후보 '+j.g_count+'건 · N/X는 비교 전용 · 최근 최대 150개 표시, 전체 CSV 제공';$('trades').innerHTML=(j.trades||[]).slice().sort((a,b)=>b.signal_ms-a.signal_ms).slice(0,150).map(x=>'<tr><td>'+esc(x.coin)+'</td><td>'+esc(x.rule)+'</td><td>'+esc(new Date(x.signal_ms).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}))+'</td><td>'+pct(x.oi)+'</td><td>'+Number(x.taker).toFixed(2)+'</td><td>'+pct(x.btc1h)+'</td><td>'+pct(x.net15)+'</td><td>'+pct(x.net30)+'</td><td>'+pct(x.net60)+'</td><td>'+esc(x.first_event)+'</td><td>'+pct(x.strategy_net60)+'</td></tr>').join('');$('errors').textContent=[...(j.errors||[]),...(j.warnings||[])].join('\n')||'없음';}
 poll();
 </script></body></html>'''
 
@@ -526,7 +621,7 @@ class Handler(BaseHTTPRequestHandler):
             with JOB_LOCK: result=JOB.get('result')
             if not result: return self.respond(json.dumps({'error':'완료된 연구가 없습니다'}),404)
             data = '\ufeff' + csv_text(result['trades'])
-            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_3.csv"'})
+            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_4.csv"'})
         else: self.respond(json.dumps({'error':'not found'}),404)
 
     def do_POST(self):
@@ -537,7 +632,7 @@ class Handler(BaseHTTPRequestHandler):
             if length <= 0 or length>4096: raise ValueError('잘못된 요청 크기')
             obj = json.loads(self.rfile.read(length))
             coins = coins_parse(obj.get('coins',DEFAULT_COINS))
-            days = int(obj.get('days',6))
+            days = int(obj.get('days',13))
             if days < 1 or days > MAX_DAYS: raise ValueError('연구 기간 1~13일만 가능')
         except (ValueError,KeyError,TypeError,json.JSONDecodeError) as e:
             return self.respond(json.dumps({'error':str(e)},ensure_ascii=False),400)
@@ -550,13 +645,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.3 (읽기 전용)')
+    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.4 (읽기 전용)')
     p.add_argument('--web',action='store_true',help='모바일 대시보드 서버 시작')
     p.add_argument('--selftest',action='store_true',help='거래소 호출 없는 검증')
     p.add_argument('--coins',default=DEFAULT_COINS)
-    p.add_argument('--days',type=int,default=6)
+    p.add_argument('--days',type=int,default=13)
     p.add_argument('--port',type=int,default=int(os.environ.get('PORT',10000)))
-    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_3.csv')
+    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_4.csv')
     args=p.parse_args()
     if args.selftest: return selftest()
     if args.web:
