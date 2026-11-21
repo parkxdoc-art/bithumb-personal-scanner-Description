@@ -1,8 +1,9 @@
-"""BITHUMB V3.14 | BTC 8개 시간봉 + 신규·스테이블코인 제외 거래대금.
+"""BITHUMB V3.15 | 시장 진입 여부 → 단타·스윙 관찰 후보 최대 2개.
 
 BTC 월/주/일/4시간/1시간과 30/15/5분의 마감된 캔들만 분석한다.
 큰 흐름/시장 상태 판정은 V3.11과 동일, 초단기 흐름 및 정제 거래대금은 관찰만 한다.
-KRW 알트코인들의 전일 대비 상승 참여율을 확인한다. BUY 신호, 자동 주문, 수익률 백테스트 없음.
+시장이 탐색 가능할 때만 기존 일반 알트코인 중 최대 2개를 관찰 후보로 선정한다.
+BUY 신호, 자동 주문, 수익률 백테스트 없음. 가격 조건 및 후보 선별은 연구 가설이며 수익성 검증 전.
 
 pip install requests
 python bithumb_v3_scanner.py
@@ -24,10 +25,15 @@ from urllib.parse import urlparse
 
 import requests
 
-VERSION = 'V3.14'
+VERSION = 'V3.15'
 API = 'https://api.bithumb.com/v1'
 AGE_DAYS = 14
 AGE_WORKERS = 12
+CANDIDATE_WORKERS = 6
+CANDIDATE_POOL = 20
+MAX_CANDIDATES = 2
+MIN_TURNOVER_KRW = 500_000_000
+MAX_RISE_24H_PCT = 10.0
 # Price-pegged assets: explicit, inspectable list; never use ticker-name heuristics.
 STABLE_CODES = frozenset({'USDT','USDC','DAI','FDUSD','TUSD','PYUSD','USDE','USDS','USDD','RLUSD','USD1','EURC','FRAX','GHO','LUSD','SUSD'})
 AGE_LOCK = threading.Lock()
@@ -66,7 +72,7 @@ def get_api(path, params=None, max_attempts=3, timeout=(4, 12)):
     for attempt in range(max_attempts):
         try:
             response = requests.get(API + path, params=params, timeout=timeout,
-                                    headers={'Accept': 'application/json', 'User-Agent': 'v314-market-gate/1.0'})
+                                    headers={'Accept': 'application/json', 'User-Agent': 'v315-market-gate/1.0'})
             if response.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f'HTTP {response.status_code} 요청 제한/일시 오류')
             response.raise_for_status()
@@ -147,6 +153,7 @@ def classify_trend(bars, tf):
         'last_closed_start': bars[-1]['start'].isoformat(),
         'last_closed_end': end_of_candle(bars[-1]['start'], tf).isoformat(),
         'bars': len(bars),
+        'return_4h_pct': round((closes[-1] / closes[-5] - 1) * 100, 4) if tf == '1h' else None,
     }
 
 
@@ -397,6 +404,139 @@ def assess_micro(tf):
             'detail': '30·15·5분 방향이 서로 달라. 진입 신호로 쓰지 않아.'}
 
 
+
+
+def analyze_candidate_market(market, ticker, btc_4h_change, reader=None, now=None):
+    """Read-only candidate review. Uses completed candles only; never places orders."""
+    reader = reader or get_api
+    now = now or now_kst()
+    tf = {}
+    issues = []
+    for key, path in (('day', '/candles/days'), ('4h', '/candles/minutes/240'), ('1h', '/candles/minutes/60')):
+        try:
+            raw = reader(path, {'market': market, 'count': 20})
+            tf[key] = classify_trend(completed_candles(raw, key, now), key)
+            # A continuous but old candle series is not a current-entry candidate.
+            latest_end = tf[key].get('last_closed_end')
+            if latest_end and now - datetime.fromisoformat(latest_end) > {'day': timedelta(hours=48), '4h': timedelta(hours=8), '1h': timedelta(hours=2)}[key]:
+                issues.append(f'{key}: 최신 마감봉이 오래됨')
+        except Exception as exc:
+            tf[key] = {'state': 'unknown', 'reason': '캔들 API 조회 실패'}
+            issues.append(f'{key}: {str(exc)[:80]}')
+    states = {k: tf[k]['state'] for k in ('day', '4h', '1h')}
+    strength = tf['1h'].get('return_4h_pct')
+    relative = round(strength - btc_4h_change, 4) if strength is not None and btc_4h_change is not None else None
+    h4 = tf['4h']
+    deviation = (round((h4['close'] / h4['ma5'] - 1) * 100, 4)
+                 if h4.get('ma5') and h4.get('close') else None)
+    common = {
+        'market': market, 'turnover_24h_krw': ticker['turnover_24h_krw'],
+        'change_rate_pct': ticker['change_rate_pct'],
+        'daily_state': states['day'], 'h4_state': states['4h'], 'h1_state': states['1h'],
+        'return_4h_pct': strength, 'btc_return_4h_pct': btc_4h_change,
+        'relative_4h_pct': relative, 'h4_distance_ma5_pct': deviation,
+        'last_price': tf['1h'].get('close'),
+        'last_closed_end': tf['1h'].get('last_closed_end'),
+        'issues': issues,
+    }
+    if issues or any(state == 'unknown' for state in states.values()) or relative is None or deviation is None:
+        return {**common, 'scalp_ok': False, 'swing_ok': False,
+                'state': 'DATA_INCOMPLETE', 'reason': '마감봉 연속 이력 또는 API 자료 부족', 'selected_mode': ''}
+    if not (0 <= ticker['change_rate_pct'] <= MAX_RISE_24H_PCT):
+        return {**common, 'scalp_ok': False, 'swing_ok': False,
+                'state': 'REJECT', 'reason': '24시간 상승률 0~10% 범위 밖(급등 추격 방지)', 'selected_mode': ''}
+    scalp_ok = states['1h'] == 'up' and states['4h'] in ('up', 'side') and relative > 0
+    swing_ok = (states['day'] == 'up' and states['4h'] in ('up', 'side')
+                and states['1h'] in ('up', 'side') and -2 <= deviation <= 2)
+    reason = ('단타·스윙 모두 관찰 가능' if scalp_ok and swing_ok else
+              '단타 관찰 기준 충족' if scalp_ok else
+              '스윙 관찰 기준 충족' if swing_ok else '기준 미충족 · 매수 신호 없음')
+    return {**common, 'scalp_ok': scalp_ok, 'swing_ok': swing_ok,
+            'state': 'ELIGIBLE' if scalp_ok or swing_ok else 'REJECT',
+            'reason': reason, 'selected_mode': ''}
+
+
+def select_candidates(decision, breadth, btc, reader=None, now=None):
+    """Gate first. No candidate candle requests when market is WAIT/SWING_WAIT/UNKNOWN.
+
+    Each mode has separate predeclared review rules; at most two unique symbols total.
+    'swing' gate is a WAIT state, so swing candidates do not appear until gate permits.
+    """
+    output = {'state': 'BLOCKED', 'label': '시장 관망 · 후보 탐색 안 함',
+              'gate': decision.get('key'), 'pool_size': 0, 'checked': 0,
+              'candidates': [], 'reviews': [], 'warnings': [],
+              'rules': {
+                  'universe': f'14일 이전 거래 확인된 일반 알트 중 거래대금 >=5억원, 24시간 상승률 0~10% 상위 {CANDIDATE_POOL}개',
+                  'exclude': '신규·이력 미확인·스테이블·BTC 제외. 24시간 +10% 초과 추격 제외',
+                  'scalp': '1시간 상승·4시간 비하락·BTC 대비 최근 4시간 상대강도 양수',
+                  'swing': '일봉 상승·4시간 비하락·1시간 비하락·4시간 종가가 SMA5 ±2% 이내',
+                  'limit': '단타 시장은 단타 최대 2개, 추세 시장은 단타 1개+스윙 1개 우선, 총 2개',
+                  'limitations': '관찰 후보만 표시. 미래 수익·체결 검증 없음. 실전 BUY/자동주문 없음',
+              }}
+    if not decision.get('can_search') or decision.get('key') not in ('scalp', 'trend'):
+        return output
+    btc_4h = btc.get('1h', {}).get('return_4h_pct')
+    if btc_4h is None:
+        output.update(state='DATA_INCOMPLETE', label='BTC 4시간 상대강도 자료 부족')
+        return output
+    pool = sorted((r for r in breadth.get('rows', []) if r.get('turnover_included')
+                   and r['turnover_24h_krw'] >= MIN_TURNOVER_KRW
+                   and 0 <= r['change_rate_pct'] <= MAX_RISE_24H_PCT),
+                  key=lambda r: (-r['turnover_24h_krw'], r['market']))[:CANDIDATE_POOL]
+    output['pool_size'] = len(pool)
+    if not pool:
+        output.update(state='NO_CANDIDATE', label='조건에 맞는 거래대금 종목 없음')
+        return output
+    now = now or now_kst()
+    with ThreadPoolExecutor(max_workers=CANDIDATE_WORKERS) as executor:
+        tasks = {executor.submit(analyze_candidate_market, row['market'], row, btc_4h, reader, now): row for row in pool}
+        for future in as_completed(tasks):
+            row = tasks[future]
+            try:
+                data = future.result()
+            except Exception as exc:
+                data = {'market': row['market'], 'turnover_24h_krw': row['turnover_24h_krw'],
+                        'change_rate_pct': row['change_rate_pct'], 'state': 'DATA_ERROR',
+                        'reason': '종목 검사 실패', 'issues': [str(exc)[:120]],
+                        'scalp_ok': False, 'swing_ok': False, 'selected_mode': ''}
+            output['reviews'].append(data)
+            if data.get('issues'):
+                output['warnings'].append(row['market'] + ': ' + '; '.join(data['issues'])[:100])
+    output['reviews'].sort(key=lambda r: (-r['turnover_24h_krw'], r['market']))
+    output['checked'] = len(output['reviews'])
+    scalps = sorted((r for r in output['reviews'] if r.get('scalp_ok')),
+                    key=lambda r: (-r['relative_4h_pct'], -r['turnover_24h_krw'], r['market']))
+    swings = sorted((r for r in output['reviews'] if r.get('swing_ok')),
+                    key=lambda r: (abs(r['h4_distance_ma5_pct']), -r['turnover_24h_krw'], r['market']))
+    chosen = []
+    used = set()
+    def add(rows, mode):
+        for r in rows:
+            if r['market'] not in used:
+                used.add(r['market'])
+                r['selected_mode'] = mode
+                chosen.append(r)
+                return
+    if decision['key'] == 'scalp':
+        for r in scalps[:MAX_CANDIDATES]:
+            r['selected_mode'] = '단타 관찰'
+            chosen.append(r)
+    else:
+        add(scalps, '단타 관찰')
+        add(swings, '스윙 관찰')
+        while len(chosen) < MAX_CANDIDATES:
+            before = len(chosen)
+            add(scalps, '단타 관찰')
+            if len(chosen) < MAX_CANDIDATES:
+                add(swings, '스윙 관찰')
+            if len(chosen) == before:
+                break
+    output.update(state='READY' if chosen else 'NO_CANDIDATE',
+                  label=f'관찰 후보 {len(chosen)}개' if chosen else '기준을 통과한 관찰 후보 없음',
+                  candidates=chosen)
+    return output
+
+
 def compute_status():
     warnings = []
     tf = {}
@@ -430,9 +570,10 @@ def compute_status():
         warnings.append(f'원화마켓 조회 실패: {str(exc)[:140]}')
     decision = decide(tf, breadth)
     timing = assess_micro(tf)
+    candidate_data = select_candidates(decision, breadth, tf)
     return {
         'version': VERSION, 'checked_kst': now_kst().isoformat(timespec='seconds'),
-        'btc': tf, 'breadth': breadth, 'decision': decision, 'timing': timing, 'warnings': warnings,
+        'btc': tf, 'breadth': breadth, 'decision': decision, 'timing': timing, 'candidates': candidate_data, 'warnings': warnings,
         'rules': {
             'trend': '마감봉 종가 > SMA5 > SMA10 = 상승; 종가 < SMA5 < SMA10 = 하락; 나머지 혼조',
             'long': '월봉·주봉 합의', 'short': '4시간봉·1시간봉 합의', 'day': '일봉은 참고 표시',
@@ -441,6 +582,7 @@ def compute_status():
             'coverage': '전체 현존 KRW 알트의 80% 이상·20종목 이상 확인해야 판정',
             'concentration': 'BTC·스테이블코인·14일 이전 KRW 일봉이 없는 코인은 거래대금/집중도에서 제외. 정확한 상장일 추정 아님. 임시 집중 기준 1위 >=30% 또는 상위 10개 >=75%. 매수 허용 판정 불변',
             'age_filter': '기준 시각(KST)보다 14일 이전 일봉이 확인된 KRW 코인만 정제 거래대금에 포함. 조회 실패는 별도 제외·경고. 최초 검사 때 추가 API 조회 발생',
+            'candidate': '시장 탐색 허용 시 정제 거래대금 상위 20개에서 단타 또는 스윙 관찰 후보 최대 2개. 조건은 후보 선택 연구 가설이며 BUY 신호 아님',
             'caveat': '수익성 미검증·현재 상장 코인 기준·자동 주문/매수 신호 아님',
         },
     }
@@ -480,7 +622,10 @@ def export_csv(result):
               'turnover_ex_top1_24h_krw', 'turnover_rank', 'turnover_share_pct',
               'raw_turnover_24h_krw', 'adjusted_turnover_24h_krw', 'stable_excluded_krw',
               'recent_excluded_krw', 'unverified_excluded_krw', 'age_status',
-              'age_evidence', 'turnover_included', 'exclusion_reason', 'turnover_cutoff_kst', 'age_checked_share_pct']
+              'age_evidence', 'turnover_included', 'exclusion_reason', 'turnover_cutoff_kst', 'age_checked_share_pct',
+              'candidate_mode', 'candidate_gate', 'pool_size', 'candidate_checked',
+              'candidate_rank', 'daily_state', 'h4_state', 'h1_state', 'return_4h_pct', 'btc_return_4h_pct',
+              'relative_4h_pct', 'h4_distance_ma5_pct', 'last_price', 'selected', 'can_search', 'candidate_rule']
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
     stamp = result['checked_kst']
@@ -539,6 +684,29 @@ def export_csv(result):
         write('EXCLUDED_MARKET', market=row['market'], state=row['age_status'],
               turnover_24h_krw=row['turnover_24h_krw'], reason=row['exclusion_reason'],
               age_evidence=row['age_evidence'], turnover_cutoff_kst=br['turnover_cutoff_kst'])
+    candidate_data = result.get('candidates', {})
+    write('CANDIDATE_GATE', state=candidate_data.get('state'), candidate_gate=dec.get('key'),
+          decision=candidate_data.get('label'), can_search=dec.get('can_search'),
+          pool_size=candidate_data.get('pool_size'), candidate_checked=candidate_data.get('checked'),
+          value=len(candidate_data.get('candidates', [])))
+    for key, rule in candidate_data.get('rules', {}).items():
+        write('CANDIDATE_RULE', state=key, candidate_rule=rule)
+    ranked_candidates = candidate_data.get('candidates', [])
+    ranks = {r['market']: i for i, r in enumerate(ranked_candidates, 1)}
+    for r in candidate_data.get('reviews', []):
+        common = dict(market=r['market'], state=r['state'], reason=r.get('reason'),
+                      change_rate_pct=r.get('change_rate_pct'), turnover_24h_krw=r.get('turnover_24h_krw'),
+                      candidate_mode=r.get('selected_mode'), candidate_rank=ranks.get(r['market']),
+                      selected=r['market'] in ranks,
+                      daily_state=r.get('daily_state'), h4_state=r.get('h4_state'), h1_state=r.get('h1_state'),
+                      return_4h_pct=r.get('return_4h_pct'), btc_return_4h_pct=r.get('btc_return_4h_pct'),
+                      relative_4h_pct=r.get('relative_4h_pct'), h4_distance_ma5_pct=r.get('h4_distance_ma5_pct'),
+                      last_price=r.get('last_price'), last_closed_end=r.get('last_closed_end'))
+        write('CANDIDATE_REVIEW', **common)
+        if r['market'] in ranks:
+            write('CANDIDATE_SELECTED', **common)
+    for w in candidate_data.get('warnings', []):
+        write('CANDIDATE_WARNING', reason=w)
     for w in result['warnings']:
         write('DATA_WARNING', reason=w)
     return ('\ufeff' + output.getvalue()).encode('utf-8')
@@ -546,7 +714,7 @@ def export_csv(result):
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BITHUMB V3.14 · 시장 + 단기 흐름 + 거래대금 집중</title>
+<title>BITHUMB V3.15 · 시장 판단 + 후보 2개</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1324;--panel:#142038;--border:#2a3a55;--muted:#91a3c2;--white:#edf2fe;--green:#52d5a0;--red:#f28e91;--amber:#ffcf77}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(170deg,#12223d 0,#0b1324 45%);color:var(--white);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}
@@ -565,19 +733,20 @@ h1{font-size:25px;margin:6px 0 7px;letter-spacing:-.04em}p{color:var(--muted);li
 .concentration{border-top:1px solid #2a3a55;margin-top:12px;padding-top:11px}.conctitle{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:13px;font-weight:750;margin-bottom:3px}.conctitle b{color:var(--muted)}.conctitle b.high{color:var(--amber)}.conctitle b.normal{color:var(--green)}
 .actions{display:flex;gap:9px;margin:19px 0 6px}button{font:inherit;border:0;border-radius:11px;padding:13px 16px;font-weight:750;cursor:pointer}
 #go{background:#54dfac;color:#052219;flex:1}#csv{background:#263a57;color:var(--white);border:1px solid #405676;flex:1}button:disabled{opacity:.45;cursor:wait}
-.statusline{font-size:12px;color:var(--muted);min-height:17px;margin-top:8px}.small{font-size:12px;color:var(--muted);line-height:1.6}
+.candidates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.candidate{background:#0e192e;border:1px solid #334968;border-radius:12px;padding:12px;min-width:0}.candidate strong{display:block;font-size:18px;margin:5px 0}.candidate .mode{font-size:11px;color:var(--green)}.candidate p{font-size:12px;margin:5px 0;overflow-wrap:anywhere}.emptybox{font-size:13px;color:var(--muted);line-height:1.65}.statusline{font-size:12px;color:var(--muted);min-height:17px;margin-top:8px}.small{font-size:12px;color:var(--muted);line-height:1.6}
 .info{display:flex;justify-content:space-between;gap:9px;border-bottom:1px solid #273650;padding:8px 0;font-size:12px}
 .info:last-child{border-bottom:0}.info span{color:var(--muted)}.info b{text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 footer{font-size:12px;color:#7d90af;line-height:1.6;margin-top:20px}
-@media(max-width:390px){main{padding:17px 11px}.panel{padding:14px}.chip .name{font-size:10px}.chip .state{font-size:13px}.stats{gap:5px}.stat b{font-size:17px}.actions{flex-direction:column}h1{font-size:22px}}
+@media(max-width:390px){main{padding:17px 11px}.panel{padding:14px}.chip .name{font-size:10px}.chip .state{font-size:13px}.stats{gap:5px}.stat b{font-size:17px}.actions{flex-direction:column}.candidates{grid-template-columns:1fr}h1{font-size:22px}}
 </style></head><body><main>
-<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.14 시장 판단</h1><p>① 시장 진입 가능? → ② 단타·스윙? → ③ 분봉 움직임 확인<br>시장 상태와 단기 움직임을 구분해서 보여줘.</p></header>
+<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.15 시장 + 코인 후보</h1><p>① 시장 진입 가능한가? → ② 산다면 어떤 코인인가?<br>시장 허용 시 관찰 후보 최대 2개 · BUY 신호 아님</p></header>
 <section id="hero" class="panel hero unknown"><div class="kicker">BTC + 빗썸 원화시장</div><div id="decision" class="headline">검사 전</div><div id="action" class="subline">버튼을 눌러 시장 상태를 확인해.</div><div id="detail" class="notice">매수 신호가 아닌 시장 상태 연구용 표시야.</div><div class="microline">단기 움직임: <b id="timing">검사 전</b><small id="timingdetail">30·15·5분 마감봉으로만 관찰</small></div></section>
 <section class="panel"><h2 class="sectiontitle">BTC 8개 시간봉 · 마감봉만</h2><div class="chips" id="chips">
 <div class="chip"><div class="name">월봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">주봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">일봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">4시간</div><div class="state unknown">—</div></div><div class="chip"><div class="name">1시간</div><div class="state unknown">—</div></div></div><div class="microcaption">작은 움직임 · 관찰 전용</div><div id="microchips" class="microchips"><div class="chip"><div class="name">30분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">15분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">5분</div><div class="state unknown">—</div></div></div><p class="small">마감봉 종가 &gt; 5이평 &gt; 10이평 = 상승, 역순 = 하락. 월·주 = 장기, 4시간·1시간 = 시장 방향, 30·15·5분 = 타이밍 관찰. 분봉 상승만으로 매수 허용하지 않아.</p></section>
 <section class="panel"><h2 class="sectiontitle">알트코인 상승 참여</h2><div class="stats"><div class="stat"><small>상승 참여율</small><b id="breadth">—</b></div><div class="stat"><small>상승 / 확인</small><b id="rising">—</b></div><div class="stat"><small>정제 24시간 거래대금</small><b id="money">—</b></div></div><div class="meter"><div id="meterfill"></div></div><p id="mnote" class="small">현재 상장된 빗썸 원화 알트코인의 전일 대비 상승 비율. 55% 이상은 임시 연구 기준.</p><div class="concentration"><div class="conctitle"><span>거래대금 집중</span><b id="concstate">분석 전</b></div><div id="concinfo" class="small">신규·스테이블 제외 후 거래대금 쏠림 확인</div><div id="concrest" class="small"></div><div id="exclusions" class="small"></div></div></section>
+<section class="panel"><h2 class="sectiontitle">② 종목 관찰 후보 · 최대 2개</h2><div id="candidatebox" class="emptybox">시장 분석 전 · 시장이 허용할 때만 종목 탐색</div><p id="candidatenote" class="small">기존 일반 알트 중 거래대금 상위 20개만 검사. 시장 관망이면 종목 캔들을 조회하지 않아.</p></section>
 <section class="panel"><h2 class="sectiontitle">판정 요약</h2><div class="info"><span>BTC 장기 / 단기</span><b id="direction">— / —</b></div><div class="info"><span>시장 판단</span><b id="state">—</b></div><div class="info"><span>단기 움직임</span><b id="microstate">—</b></div><div class="info"><span>자료 확인 비율</span><b id="coverage">—</b></div><div class="info"><span>검사 시각 (KST)</span><b id="checked">—</b></div><div class="statusline" id="warning"></div></section>
-<div class="actions"><button id="go">시장 분석하기</button><button id="csv" disabled>결과 CSV 저장</button></div><div id="msg" class="statusline">첫 번째 연구판 · 자동 주문 기능 없음</div>
+<div class="actions"><button id="go">시장 + 후보 분석하기</button><button id="csv" disabled>결과 CSV 저장</button></div><div id="msg" class="statusline">첫 번째 연구판 · 자동 주문 기능 없음</div>
 <footer>단타는 짧은 가격 움직임, 스윙은 더 큰 가격 움직임을 관찰한다는 의미야. 투자금을 크게 늘리라는 뜻은 아니야. 이 규칙은 아직 수익성 검증 전이며 진입 결정은 별도 확인해야 해.</footer>
 </main><script>
 'use strict';
@@ -587,6 +756,7 @@ const fmt = v => v===null||v===undefined?'—':Number(v).toLocaleString('ko-KR')
 const f = v => Number.isFinite(v)?Number(v).toFixed(1)+'%':'—';
 function show(d){
  const dec=d.decision, br=d.breadth, micro=d.timing||{label:'자료 확인 필요',detail:'분봉 자료 없음'};
+ const cand=d.candidates||{state:'BLOCKED',label:'시장 관망',candidates:[],checked:0,pool_size:0};
  $('hero').className='panel hero '+dec.key;
  $('decision').textContent=dec.label; $('action').textContent=dec.action; $('detail').textContent=dec.detail;
  $('timing').textContent=micro.label;$('timingdetail').textContent=micro.detail;$('microstate').textContent=micro.label;
@@ -626,10 +796,25 @@ function show(d){
  $('coverage').textContent=f(br.coverage_pct)+' ('+fmt(br.valid_markets)+' / '+fmt(br.total_markets)+')';
  $('checked').textContent=d.checked_kst.replace('T',' ').slice(0,19);
  $('warning').textContent=(d.warnings||[]).length?'자료 경고: '+d.warnings.join(' / '):'마감된 BTC 캔들만 사용 · 거래 신호 아님';
+ const root=$('candidatebox'); root.replaceChildren();
+ if(!Array.isArray(cand.candidates)||cand.candidates.length===0){
+  root.className='emptybox';root.textContent=cand.label||'관찰 후보 없음';
+ }else{
+  root.className='candidates';
+  for(const item of cand.candidates.slice(0,2)){
+   const card=document.createElement('div');card.className='candidate';
+   const mode=document.createElement('div');mode.className='mode';mode.textContent=item.selected_mode||'관찰 후보';
+   const title=document.createElement('strong');title.textContent=item.market||'—';
+   const summary=document.createElement('p');summary.textContent='24시간 '+f(item.change_rate_pct)+' · 거래대금 '+fmt(Math.round((item.turnover_24h_krw||0)/1e8))+'억';
+   const detail=document.createElement('p');detail.textContent=item.selected_mode==='단타 관찰'?'BTC 대비 4시간 '+f(item.relative_4h_pct):'4시간 MA5 거리 '+f(item.h4_distance_ma5_pct);
+   card.append(mode,title,summary,detail);root.append(card);
+  }
+ }
+ $('candidatenote').textContent='시장 '+dec.label+' · 검사 '+fmt(cand.checked)+' / '+fmt(cand.pool_size)+'개 · 후보는 매수 신호가 아니며 진입 위치와 위험은 아직 미검증';
  $('csv').disabled=false;
 }
 async function go(){
- $('go').disabled=true;$('go').textContent='시장 확인 중…';$('msg').textContent='BTC 8개 시간봉과 원화시장 자료를 확인하고 있어.';
+ $('go').disabled=true;$('go').textContent='시장 + 후보 분석 중…';$('msg').textContent='BTC 8개 시간봉 → 시장 상태 → 허용 시 후보 20개를 확인하고 있어.';
  try{
   const r=await fetch('/api/status?refresh=1',{cache:'no-store'});const d=await r.json();
   if(!r.ok)throw Error(d.error||'조회 실패');show(d);$('msg').textContent='분석 완료 · 데이터 상태를 확인해줘.';
@@ -643,7 +828,7 @@ async function download(){
   if(!r.ok)throw Error('CSV를 가져오지 못했어');
   const blob=await r.blob(),a=document.createElement('a'),url=URL.createObjectURL(blob);
   const cd=r.headers.get('Content-Disposition')||'';const name=cd.match(/filename="([^"]+)"/);
-  a.href=url;a.download=name?name[1]:'BITHUMB_V3_14_MARKET_GATE.csv';
+  a.href=url;a.download=name?name[1]:'BITHUMB_V3_15_MARKET_GATE.csv';
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
  }catch(e){$('msg').textContent=String(e.message||e)}finally{$('csv').disabled=false}
 }
@@ -693,7 +878,7 @@ class Handler(BaseHTTPRequestHandler):
             if result is None:
                 return self.respond(409, {'error': '먼저 시장 분석을 실행해줘.'})
             stamp = result['checked_kst'].replace('-', '').replace(':', '').replace('T', '_')[:15]
-            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_14_MARKET_GATE_{stamp}.csv')
+            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_15_MARKET_GATE_{stamp}.csv')
         return self.respond(404, {'error': '없는 주소야.'})
 
 
