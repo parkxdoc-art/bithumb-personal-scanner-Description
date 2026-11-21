@@ -1,4 +1,4 @@
-"""V1.3 offline regression tests. Deterministic fixtures; NOT market performance."""
+"""V1.4.1 offline regression tests. Deterministic fixtures; NOT market performance."""
 import importlib.util
 import io
 import csv
@@ -11,7 +11,7 @@ from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('futures_lead_research',os.path.join(os.path.dirname(__file__),'futures_lead_research.py'))
 r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
 
-class TestV13(unittest.TestCase):
+class TestV141(unittest.TestCase):
     def setUp(self):
         self.t=25000*r.PERIOD_MS
         self.prices={self.t+i*r.CANDLE_MS:100 for i in range(-1000,2500)}
@@ -25,9 +25,9 @@ class TestV13(unittest.TestCase):
         return oi,taker
 
     def test_version_integrity(self):
-        self.assertEqual(r.VERSION,'1.3')
-        self.assertIn('V1.3',r.HTML)
-        self.assertIn('BITHUMB_FUTURES_LEAD_V1_3.csv',open(r.__file__,encoding='utf8').read())
+        self.assertEqual(r.VERSION,'1.4.1')
+        self.assertIn('V1.4.1',r.HTML)
+        self.assertIn('BITHUMB_FUTURES_LEAD_V1_4_1.csv',open(r.__file__,encoding='utf8').read())
         self.assertEqual(list(r.RULES),['G','N','X'])
         self.assertNotIn('BINANCE_API_KEY',r.research.__code__.co_names)
 
@@ -122,7 +122,7 @@ class TestV13(unittest.TestCase):
         data=list(csv.reader(io.StringIO(r.csv_text([a,b]))))
         self.assertEqual(len(data),3)
         self.assertEqual(len(data[0]),len(data[1]))
-        self.assertEqual(len(data[0]),21)
+        self.assertEqual(len(data[0]),30)
 
     def test_no_api_key_top_trader_calls(self):
         now=self.t+75*r.PERIOD_MS
@@ -134,11 +134,70 @@ class TestV13(unittest.TestCase):
         with patch.object(r,'bih_markets',return_value={'ETH'}),\
              patch.object(r,'bin_symbols',return_value={'ETH':'ETHUSDT'}),\
              patch.object(r,'history',side_effect=fake_hist),\
-             patch.object(r,'bih_candles',return_value=self.prices):
+             patch.object(r,'bih_candles',side_effect=lambda *a, **k: (self.prices, {t:self.prices[t]*0.999 for t in self.prices}) if k.get('with_lows') else self.prices):
             results=r.research('ETH',1,now_ms=now)
         self.assertEqual(results['mapped'],1)
         self.assertGreater(results['g_count'],0)
         self.assertTrue(all(x['rule'] in ('G','N','X') for x in results['trades']))
+
+    def test_structural_stop_uses_only_pre_signal_low(self):
+        lows={self.t-i*r.CANDLE_MS:100 for i in range(1,7)}
+        lows[self.t-4*r.CANDLE_MS]=99.1
+        lows[self.t]=50
+        stop,gap,status=r.structural_stop(self.t,100,lows)
+        self.assertAlmostEqual(stop,99.1*0.9985)
+        self.assertEqual(status,'비교 가능')
+        self.assertGreater(gap,0.8)
+
+    def test_structural_stop_failures_are_not_hidden(self):
+        self.assertIn('누락',r.structural_stop(self.t,100,{})[2])
+        lows={self.t-i*r.CANDLE_MS:99.99 for i in range(1,7)}
+        self.assertIn('너무 가까움',r.structural_stop(self.t,100,lows)[2])
+        lows={self.t-i*r.CANDLE_MS:90 for i in range(1,7)}
+        self.assertIn('너무 넓음',r.structural_stop(self.t,100,lows)[2])
+
+    def test_fixed_vs_structural_first_touch_differs_and_paired(self):
+        p=self.prices.copy();p[self.t+r.CANDLE_MS]=99.2
+        p[self.t+2*r.CANDLE_MS]=101.2
+        out=r.outcomes_for_entry(self.t,100,p,stop_price=99.4)
+        self.assertEqual(out['first_event'],'익절')
+        self.assertEqual(out['struct_event'],'손절')
+        self.assertGreater(out['strategy_net60'],out['struct_net60'])
+        a=r.make_row('ETH','G',self.t,{'oi':.9,'momentum':.1,'taker':1.2},.2,p,
+                     lows={self.t-i*r.CANDLE_MS:99.55 for i in range(1,7)})
+        self.assertEqual(a['struct_status'],'비교 가능')
+        self.assertIsNotNone(a['struct_net60'])
+        report=r.describe([a])[0]
+        self.assertEqual(report['struct_n'],1)
+        self.assertEqual(report['struct_excluded'],0)
+
+    def test_confirmation_is_after_one_completed_bar(self):
+        p=self.prices.copy()
+        p[self.t+r.CANDLE_MS]=101
+        p[self.t+2*r.CANDLE_MS]=99
+        out=r.make_row('ETH','G',self.t,{'oi':1.0,'taker':1.2,'momentum':0},0.1,p)
+        self.assertTrue(out['confirm_ok'])
+        self.assertAlmostEqual(out['confirm_net60'],(100/99-1)*100-0.5)
+        p[self.t+r.CANDLE_MS]=99.5
+        out2=r.make_row('ETH','G',self.t,{'oi':1.0,'taker':1.2,'momentum':0},0.1,p)
+        self.assertFalse(out2['confirm_ok'])
+        self.assertIsNone(out2['confirm_net60'])
+
+    def test_13d_20coins_options_available(self):
+        self.assertEqual(r.MAX_DAYS,13)
+        self.assertEqual(len(r.coins_parse(r.DEFAULT_COINS)),5)
+        self.assertIn('value="6"',r.HTML)
+        self.assertIn('value="BTC,ETH,XRP',r.HTML)
+        self.assertIn('id="diagnostics"',r.HTML)
+
+    def test_diagnostics_csv_consistency(self):
+        p=self.prices.copy();p[self.t+r.CANDLE_MS]=99.6
+        data=r.make_row('ETH','G',self.t,{'oi':1,'taker':1.2,'momentum':0},0.2,p)
+        rows=list(csv.reader(io.StringIO(r.csv_text([data]))))
+        self.assertEqual(len(rows[0]),len(rows[1]))
+        self.assertEqual(rows[1][-8],'Y')
+        self.assertTrue(data['first5_weak'])
+        self.assertEqual(r.describe([data])[0]['struct_excluded'],1)
 
     def test_endtime_400_fallback(self):
         rows=[{'timestamp':self.t+i*r.PERIOD_MS,'sumOpenInterest':'1000'} for i in range(480)]
@@ -152,5 +211,43 @@ class TestV13(unittest.TestCase):
             got=r.history('/futures/data/openInterestHist','ETHUSDT',self.t,self.t+480*r.PERIOD_MS)
         self.assertEqual(len(got),480)
         self.assertTrue(len(calls)>5)
+
+    def test_hard_block_418_prevents_requests(self):
+        with patch.object(r,'_BINANCE_BAN_UNTIL_MS',1795467298613):
+            with patch.object(r.time,'time',return_value=1795000000.0):
+                with patch.object(r,'urlopen') as network:
+                    with self.assertRaises(r.APIError) as e:
+                        r.fetch_json(r.BINANCE,'/fapi/v1/exchangeInfo')
+                    self.assertEqual(e.exception.status,418)
+                    network.assert_not_called()
+
+    def test_418_error_sets_until_and_never_retries(self):
+        from urllib.error import HTTPError
+        body=b'{"code":-1003,"msg":"Way too many requests; IP banned until 1795467298613."}'
+        err=HTTPError('https://fapi.binance.com',418,'banned',{},io.BytesIO(body))
+        with patch.object(r,'_BINANCE_BAN_UNTIL_MS',0),patch.object(r,'BINANCE_MIN_GAP_SECONDS',0):
+            with patch.object(r,'urlopen',side_effect=err) as network:
+                with self.assertRaises(r.APIError) as e:
+                    r.fetch_json(r.BINANCE,'/fapi/v1/exchangeInfo')
+                self.assertEqual(e.exception.status,418)
+                self.assertIn('2026-11-24 05:54:58',str(e.exception))
+                self.assertEqual(network.call_count,1)
+                self.assertEqual(r.ban_until_ms(),1795467298613)
+
+    def test_429_cooldown_honors_retry_after_without_retry(self):
+        from urllib.error import HTTPError
+        err=HTTPError('https://fapi.binance.com',429,'over limit',{'Retry-After':'900'},io.BytesIO(b'{"code":-1003}'))
+        with patch.object(r,'_BINANCE_BAN_UNTIL_MS',0),patch.object(r,'BINANCE_MIN_GAP_SECONDS',0):
+            with patch.object(r,'urlopen',side_effect=err) as network:
+                with self.assertRaises(r.APIError) as e:
+                    r.fetch_json(r.BINANCE,'/fapi/v1/exchangeInfo')
+                self.assertEqual(e.exception.status,429)
+                self.assertEqual(network.call_count,1)
+                self.assertGreaterEqual(r.ban_until_ms()-int(__import__('time').time()*1000),899000)
+
+    def test_render_bootstrap_ban_and_display_consistency(self):
+        self.assertEqual(r.OBSERVED_RENDER_BAN_UNTIL_MS,1795467298613)
+        self.assertIn('binance_blocked_until_ms',r.HTML)
+        self.assertIn('max_workers=1',__import__('pathlib').Path(r.__file__).read_text(encoding='utf8'))
 
 if __name__=='__main__': unittest.main(verbosity=2)
