@@ -231,7 +231,8 @@ def to_diagnostics_csv(data):
 HTML = '''<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>공개 트레이더 체결 연구 V1.5.1</title><style>
 *{box-sizing:border-box}body{background:#0c1526;color:#edf3fa;font:15px system-ui,sans-serif;line-height:1.65;margin:0}main{max-width:960px;margin:auto;padding:22px}article{background:#17243a;border:1px solid #334762;padding:18px;border-radius:16px;margin:20px 0}h1{font-size:25px}h2{font-size:19px}button,a.link{display:inline-block;color:white;background:#277dcb;border:0;border-radius:9px;padding:12px 17px;font-weight:700;text-decoration:none;cursor:pointer}button:disabled{opacity:.55}p,small{color:#afc0d4}.scroll{overflow:auto}table{border-collapse:collapse;min-width:700px;width:100%}td,th{padding:9px;border-bottom:1px solid #34445d;text-align:left;font-size:13px}th{color:#aac3e1}code{word-break:break-all;color:#b4e0ff}#err{white-space:pre-wrap;color:#ffb7b7}a{color:#8bceff} .kpi{font-size:18px;font-weight:bold}select{background:#091326;color:white;border:1px solid #506888;border-radius:7px;padding:12px}
 </style></head><body><main>
-<small>HYPERLIQUID · 공개 지갑 연구 · 투자 주문 없음</small><h1>유명 트레이더 체결 패턴 연구 V1.5.1</h1>
+<small>HYPERLIQUID · 공개 지갑 연구 · 투자 주문 없음</small>
+<p><a href="/traders/offline" style="font-weight:700">새 V1.6: CSV/JSON 파일 기반 연구실 열기 (API 요청 없음)</a></p><h1>유명 트레이더 체결 패턴 연구 V1.5.1</h1>
 <p>공개 지갑 3개를 대상으로 BTC·ETH·SOL·XRP·SUI의 실제 체결을 조회합니다. 개인 실명·전략 의도는 확인되지 않았습니다. 바이낸스 API는 사용하지 않습니다.</p>
 <article><h2>연구 실행</h2><p>가장 최근 6일 기준, 지갑별 완료된 왕복 포지션과 5~240분 보유 포지션을 분리합니다. 일부 체결이 누락되면 완전한 기록으로 해석하지 않습니다.</p>
 <label>연구 기간 <select id="days"><option value="6">최근 6일</option><option value="13">최근 13일</option></select></label>
