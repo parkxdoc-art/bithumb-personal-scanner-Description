@@ -1,8 +1,8 @@
-"""BITHUMB V3.15 | 시장 진입 여부 → 단타·스윙 관찰 후보 최대 2개.
+"""BITHUMB V3.16 | 시장 판단 + 분리된 진단용 후보 미리보기.
 
 BTC 월/주/일/4시간/1시간과 30/15/5분의 마감된 캔들만 분석한다.
 큰 흐름/시장 상태 판정은 V3.11과 동일, 초단기 흐름 및 정제 거래대금은 관찰만 한다.
-시장이 탐색 가능할 때만 기존 일반 알트코인 중 최대 2개를 관찰 후보로 선정한다.
+실제 관찰 후보는 시장 탐색이 허용될 때만 선정한다. 관망 중 진단 버튼은 매수 신호가 아닌 비교용 별도 목록만 제공한다.
 BUY 신호, 자동 주문, 수익률 백테스트 없음. 가격 조건 및 후보 선별은 연구 가설이며 수익성 검증 전.
 
 pip install requests
@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 import requests
 
-VERSION = 'V3.15'
+VERSION = 'V3.16'
 API = 'https://api.bithumb.com/v1'
 AGE_DAYS = 14
 AGE_WORKERS = 12
@@ -41,6 +41,7 @@ AGE_CACHE = {}
 KST = timezone(timedelta(hours=9))
 CACHE_SECONDS = 60
 LOCK = threading.Lock()
+PREVIEW_LOCK = threading.Lock()
 CACHE = {'time': 0.0, 'result': None}
 TIMEFRAMES = (
     ('month', '월봉', '/candles/months'),
@@ -72,7 +73,7 @@ def get_api(path, params=None, max_attempts=3, timeout=(4, 12)):
     for attempt in range(max_attempts):
         try:
             response = requests.get(API + path, params=params, timeout=timeout,
-                                    headers={'Accept': 'application/json', 'User-Agent': 'v315-market-gate/1.0'})
+                                    headers={'Accept': 'application/json', 'User-Agent': 'v316-market-gate/1.0'})
             if response.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f'HTTP {response.status_code} 요청 제한/일시 오류')
             response.raise_for_status()
@@ -537,6 +538,109 @@ def select_candidates(decision, breadth, btc, reader=None, now=None):
     return output
 
 
+
+def diagnostic_preview(snapshot, reader=None, now=None):
+    """Explicit, separate, read-only lookahead-free diagnostic on the same market snapshot.
+
+    Never touches decision.can_search or the official V3.15 candidate list. Two
+    comparison examples (scalp/swing), NOT recommendations. A nonqualifying
+    example is labelled as such rather than being silently promoted to a BUY.
+    """
+    now = now or now_kst()
+    reader = reader or get_api
+    br = snapshot['breadth']
+    tf = snapshot['btc']
+    diag = {
+        'state': 'NO_DATA', 'label': '진단 대상 없음', 'snapshot_kst': snapshot['checked_kst'],
+        'checked_kst': now.isoformat(timespec='seconds'),
+        'market_gate': snapshot['decision']['key'],
+        'market_gate_label': snapshot['decision']['label'],
+        'official_gate_unchanged': True, 'pool_size': 0, 'checked': 0,
+        'candidates': [], 'reviews': [], 'warnings': [],
+        'rule': '시장 상태와 무관하게 정제 거래대금 상위 20종목(일간 -5~+10%)만 점검. 단타·스윙 비교용 각 최대 1종목. BUY 신호/추천 아님.'
+    }
+    btc_4h = tf.get('1h', {}).get('return_4h_pct')
+    if btc_4h is None:
+        diag.update(state='DATA_INCOMPLETE', label='BTC 최근 4시간 기준값 부족')
+        return diag
+    pool = sorted((row for row in br.get('rows', [])
+                   if row.get('turnover_included')
+                   and row['turnover_24h_krw'] >= MIN_TURNOVER_KRW
+                   and -5 <= row['change_rate_pct'] <= MAX_RISE_24H_PCT),
+                  key=lambda row: (-row['turnover_24h_krw'], row['market']))[:CANDIDATE_POOL]
+    diag['pool_size'] = len(pool)
+    if not pool:
+        return diag
+    with ThreadPoolExecutor(max_workers=CANDIDATE_WORKERS) as executor:
+        tasks = {executor.submit(analyze_candidate_market, row['market'], row, btc_4h, reader, now): row for row in pool}
+        for future in as_completed(tasks):
+            row = tasks[future]
+            try:
+                item = future.result()
+            except Exception as exc:
+                item = {'market': row['market'], 'turnover_24h_krw':row['turnover_24h_krw'],
+                        'change_rate_pct': row['change_rate_pct'], 'state':'DATA_ERROR',
+                        'reason':'종목 데이터 조회 오류', 'issues':[str(exc)[:110]],
+                        'scalp_ok': False, 'swing_ok': False}
+            diag['reviews'].append(item)
+            if item.get('issues'):
+                diag['warnings'].append(row['market'] + ': ' + '; '.join(item['issues'])[:100])
+    diag['reviews'].sort(key=lambda row: (-row['turnover_24h_krw'], row['market']))
+    diag['checked'] = len(diag['reviews'])
+    usable = [r for r in diag['reviews'] if not r.get('issues')
+              and r.get('relative_4h_pct') is not None
+              and r.get('h4_distance_ma5_pct') is not None
+              and r.get('last_closed_end')]
+    if not usable:
+        diag.update(state='DATA_INCOMPLETE', label='연속된 종목 캔들 부족')
+        return diag
+    # Fixed, simple comparison ordering: 1h strength for scalp and daily/4h
+    # plus proximity to MA5 for swing. Display strict condition compliance.
+    scalp_rank = sorted(usable, key=lambda r:(
+        -int(bool(r.get('scalp_ok'))),
+        -int(r.get('h1_state')=='up'),
+        -int(r.get('h4_state') in ('up','side')),
+        -r['relative_4h_pct'], -r['turnover_24h_krw'], r['market']))
+    swing_rank = sorted(usable, key=lambda r:(
+        -int(bool(r.get('swing_ok'))),
+        -int(r.get('daily_state')=='up'),
+        -int(r.get('h4_state') in ('up','side')),
+        abs(r['h4_distance_ma5_pct']), -r['turnover_24h_krw'], r['market']))
+    picked = set()
+    for mode, ranked, flag in [('단타 진단',scalp_rank,'scalp_ok'), ('스윙 진단',swing_rank,'swing_ok')]:
+        for item in ranked:
+            if item['market'] in picked:
+                continue
+            picked.add(item['market'])
+            copy = dict(item)
+            copy['diagnostic_mode'] = mode
+            copy['diagnostic_qualified'] = bool(item.get(flag))
+            copy['diagnostic_note'] = (mode + ' 관찰 조건 충족 · 그래도 현재 시장 매수 허용과 무관' if copy['diagnostic_qualified']
+                                       else mode + ' 관찰 조건 미충족 · 비교 참고만 가능')
+            diag['candidates'].append(copy)
+            break
+    if diag['candidates']:
+        diag.update(state='READY', label='진단 비교 ' + str(len(diag['candidates'])) + '개 · 매수 추천 아님')
+    return diag
+
+
+def preview_cached():
+    """One explicit preview call per market snapshot. Never overwrite a refreshed snapshot."""
+    with PREVIEW_LOCK:
+        with LOCK:
+            snapshot = CACHE['result']
+            if snapshot is None:
+                raise ValueError('먼저 시장 분석하기를 실행해줘.')
+            existing = snapshot.get('diagnostic')
+            if existing is not None:
+                return existing
+        preview = diagnostic_preview(snapshot)
+        with LOCK:
+            if CACHE['result'] is not snapshot:
+                raise RuntimeError('시장 분석 결과가 갱신됐어. 진단 버튼을 다시 눌러줘.')
+            snapshot['diagnostic'] = preview
+        return preview
+
 def compute_status():
     warnings = []
     tf = {}
@@ -583,6 +687,7 @@ def compute_status():
             'concentration': 'BTC·스테이블코인·14일 이전 KRW 일봉이 없는 코인은 거래대금/집중도에서 제외. 정확한 상장일 추정 아님. 임시 집중 기준 1위 >=30% 또는 상위 10개 >=75%. 매수 허용 판정 불변',
             'age_filter': '기준 시각(KST)보다 14일 이전 일봉이 확인된 KRW 코인만 정제 거래대금에 포함. 조회 실패는 별도 제외·경고. 최초 검사 때 추가 API 조회 발생',
             'candidate': '시장 탐색 허용 시 정제 거래대금 상위 20개에서 단타 또는 스윙 관찰 후보 최대 2개. 조건은 후보 선택 연구 가설이며 BUY 신호 아님',
+            'diagnostic': '진단 버튼 누를 때만 시장 판정과 분리해 정제 종목 20개 이내에서 단타·스윙 참고 각 1개. 조건 미충족도 명시하며 실제 추천/BUY 아님',
             'caveat': '수익성 미검증·현재 상장 코인 기준·자동 주문/매수 신호 아님',
         },
     }
@@ -624,7 +729,7 @@ def export_csv(result):
               'recent_excluded_krw', 'unverified_excluded_krw', 'age_status',
               'age_evidence', 'turnover_included', 'exclusion_reason', 'turnover_cutoff_kst', 'age_checked_share_pct',
               'candidate_mode', 'candidate_gate', 'pool_size', 'candidate_checked',
-              'candidate_rank', 'daily_state', 'h4_state', 'h1_state', 'return_4h_pct', 'btc_return_4h_pct',
+              'candidate_rank', 'diagnostic_mode', 'diagnostic_qualified', 'diagnostic_note', 'snapshot_kst', 'diagnostic_checked_kst', 'daily_state', 'h4_state', 'h1_state', 'return_4h_pct', 'btc_return_4h_pct',
               'relative_4h_pct', 'h4_distance_ma5_pct', 'last_price', 'selected', 'can_search', 'candidate_rule']
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
@@ -707,6 +812,36 @@ def export_csv(result):
             write('CANDIDATE_SELECTED', **common)
     for w in candidate_data.get('warnings', []):
         write('CANDIDATE_WARNING', reason=w)
+    # Diagnostic review is completely separate from official market-gated selections.
+    diag = result.get('diagnostic')
+    if diag:
+        write('DIAGNOSTIC_GATE', state=diag['state'], decision=diag['market_gate_label'],
+              value=len(diag['candidates']), pool_size=diag['pool_size'], candidate_checked=diag['checked'],
+              snapshot_kst=diag['snapshot_kst'], diagnostic_checked_kst=diag['checked_kst'],
+              reason='기존 시장 허용 판정 불변 · 진단 버튼 수동 실행 · 실전 BUY 아님')
+        write('DIAGNOSTIC_RULE', reason=diag['rule'])
+        diag_ranks = {r['market']:i for i,r in enumerate(diag['candidates'],1)}
+        for r in diag['reviews']:
+            common = dict(market=r['market'], state=r['state'], reason=r.get('reason'),
+                          change_rate_pct=r.get('change_rate_pct'), turnover_24h_krw=r.get('turnover_24h_krw'),
+                          diagnostic_mode=r.get('diagnostic_mode'), candidate_rank=diag_ranks.get(r['market']),
+                          selected=r['market'] in diag_ranks,
+                          daily_state=r.get('daily_state'), h4_state=r.get('h4_state'), h1_state=r.get('h1_state'),
+                          relative_4h_pct=r.get('relative_4h_pct'), h4_distance_ma5_pct=r.get('h4_distance_ma5_pct'),
+                          last_closed_end=r.get('last_closed_end'))
+            write('DIAGNOSTIC_REVIEW', **common)
+        for r in diag['candidates']:
+            write('DIAGNOSTIC_PICK', market=r['market'], state='REFERENCE_ONLY',
+                  reason=r.get('reason'), candidate_rank=diag_ranks[r['market']],
+                  diagnostic_mode=r['diagnostic_mode'], diagnostic_qualified=r['diagnostic_qualified'],
+                  diagnostic_note=r['diagnostic_note'],
+                  snapshot_kst=diag['snapshot_kst'], diagnostic_checked_kst=diag['checked_kst'],
+                  change_rate_pct=r['change_rate_pct'], turnover_24h_krw=r['turnover_24h_krw'],
+                  daily_state=r.get('daily_state'), h4_state=r.get('h4_state'), h1_state=r.get('h1_state'),
+                  relative_4h_pct=r.get('relative_4h_pct'), h4_distance_ma5_pct=r.get('h4_distance_ma5_pct'),
+                  last_closed_end=r.get('last_closed_end'))
+        for warning in diag['warnings']:
+            write('DIAGNOSTIC_WARNING', reason=warning)
     for w in result['warnings']:
         write('DATA_WARNING', reason=w)
     return ('\ufeff' + output.getvalue()).encode('utf-8')
@@ -714,7 +849,7 @@ def export_csv(result):
 
 PAGE = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BITHUMB V3.15 · 시장 판단 + 후보 2개</title>
+<title>BITHUMB V3.16 · 시장 판단 + 진단 미리보기</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1324;--panel:#142038;--border:#2a3a55;--muted:#91a3c2;--white:#edf2fe;--green:#52d5a0;--red:#f28e91;--amber:#ffcf77}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(170deg,#12223d 0,#0b1324 45%);color:var(--white);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}
@@ -733,18 +868,23 @@ h1{font-size:25px;margin:6px 0 7px;letter-spacing:-.04em}p{color:var(--muted);li
 .concentration{border-top:1px solid #2a3a55;margin-top:12px;padding-top:11px}.conctitle{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:13px;font-weight:750;margin-bottom:3px}.conctitle b{color:var(--muted)}.conctitle b.high{color:var(--amber)}.conctitle b.normal{color:var(--green)}
 .actions{display:flex;gap:9px;margin:19px 0 6px}button{font:inherit;border:0;border-radius:11px;padding:13px 16px;font-weight:750;cursor:pointer}
 #go{background:#54dfac;color:#052219;flex:1}#csv{background:#263a57;color:var(--white);border:1px solid #405676;flex:1}button:disabled{opacity:.45;cursor:wait}
-.candidates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.candidate{background:#0e192e;border:1px solid #334968;border-radius:12px;padding:12px;min-width:0}.candidate strong{display:block;font-size:18px;margin:5px 0}.candidate .mode{font-size:11px;color:var(--green)}.candidate p{font-size:12px;margin:5px 0;overflow-wrap:anywhere}.emptybox{font-size:13px;color:var(--muted);line-height:1.65}.statusline{font-size:12px;color:var(--muted);min-height:17px;margin-top:8px}.small{font-size:12px;color:var(--muted);line-height:1.6}
+#preview{background:#324560;color:#edf2fe;width:100%;border:1px solid #556b89;margin:8px 0} .previewpanel{border-color:#53627c}.diagnostic-tag{font-size:11px;font-weight:750;color:var(--amber)}.candidate .risk{color:var(--amber)}.candidates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.candidate{background:#0e192e;border:1px solid #334968;border-radius:12px;padding:12px;min-width:0}.candidate strong{display:block;font-size:18px;margin:5px 0}.candidate .mode{font-size:11px;color:var(--green)}.candidate p{font-size:12px;margin:5px 0;overflow-wrap:anywhere}.emptybox{font-size:13px;color:var(--muted);line-height:1.65}.statusline{font-size:12px;color:var(--muted);min-height:17px;margin-top:8px}.small{font-size:12px;color:var(--muted);line-height:1.6}
 .info{display:flex;justify-content:space-between;gap:9px;border-bottom:1px solid #273650;padding:8px 0;font-size:12px}
 .info:last-child{border-bottom:0}.info span{color:var(--muted)}.info b{text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 footer{font-size:12px;color:#7d90af;line-height:1.6;margin-top:20px}
 @media(max-width:390px){main{padding:17px 11px}.panel{padding:14px}.chip .name{font-size:10px}.chip .state{font-size:13px}.stats{gap:5px}.stat b{font-size:17px}.actions{flex-direction:column}.candidates{grid-template-columns:1fr}h1{font-size:22px}}
 </style></head><body><main>
-<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.15 시장 + 코인 후보</h1><p>① 시장 진입 가능한가? → ② 산다면 어떤 코인인가?<br>시장 허용 시 관찰 후보 최대 2개 · BUY 신호 아님</p></header>
+<header><div class="eyebrow">BITHUMB · MARKET GATE</div><h1>V3.16 시장 + 코인 진단</h1><p>① 시장 진입 가능한가? → ② 산다면 어떤 코인인가?<br>시장 관망 시에도 별도 진단 버튼으로 코인 2개 비교 · BUY 신호 아님</p></header>
 <section id="hero" class="panel hero unknown"><div class="kicker">BTC + 빗썸 원화시장</div><div id="decision" class="headline">검사 전</div><div id="action" class="subline">버튼을 눌러 시장 상태를 확인해.</div><div id="detail" class="notice">매수 신호가 아닌 시장 상태 연구용 표시야.</div><div class="microline">단기 움직임: <b id="timing">검사 전</b><small id="timingdetail">30·15·5분 마감봉으로만 관찰</small></div></section>
 <section class="panel"><h2 class="sectiontitle">BTC 8개 시간봉 · 마감봉만</h2><div class="chips" id="chips">
 <div class="chip"><div class="name">월봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">주봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">일봉</div><div class="state unknown">—</div></div><div class="chip"><div class="name">4시간</div><div class="state unknown">—</div></div><div class="chip"><div class="name">1시간</div><div class="state unknown">—</div></div></div><div class="microcaption">작은 움직임 · 관찰 전용</div><div id="microchips" class="microchips"><div class="chip"><div class="name">30분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">15분</div><div class="state unknown">—</div></div><div class="chip"><div class="name">5분</div><div class="state unknown">—</div></div></div><p class="small">마감봉 종가 &gt; 5이평 &gt; 10이평 = 상승, 역순 = 하락. 월·주 = 장기, 4시간·1시간 = 시장 방향, 30·15·5분 = 타이밍 관찰. 분봉 상승만으로 매수 허용하지 않아.</p></section>
 <section class="panel"><h2 class="sectiontitle">알트코인 상승 참여</h2><div class="stats"><div class="stat"><small>상승 참여율</small><b id="breadth">—</b></div><div class="stat"><small>상승 / 확인</small><b id="rising">—</b></div><div class="stat"><small>정제 24시간 거래대금</small><b id="money">—</b></div></div><div class="meter"><div id="meterfill"></div></div><p id="mnote" class="small">현재 상장된 빗썸 원화 알트코인의 전일 대비 상승 비율. 55% 이상은 임시 연구 기준.</p><div class="concentration"><div class="conctitle"><span>거래대금 집중</span><b id="concstate">분석 전</b></div><div id="concinfo" class="small">신규·스테이블 제외 후 거래대금 쏠림 확인</div><div id="concrest" class="small"></div><div id="exclusions" class="small"></div></div></section>
-<section class="panel"><h2 class="sectiontitle">② 종목 관찰 후보 · 최대 2개</h2><div id="candidatebox" class="emptybox">시장 분석 전 · 시장이 허용할 때만 종목 탐색</div><p id="candidatenote" class="small">기존 일반 알트 중 거래대금 상위 20개만 검사. 시장 관망이면 종목 캔들을 조회하지 않아.</p></section>
+<section class="panel"><h2 class="sectiontitle">② 공식 종목 관찰 후보 · 시장 허용 시만</h2><div id="candidatebox" class="emptybox">시장 분석 전 · 시장이 허용할 때만 종목 탐색</div><p id="candidatenote" class="small">기존 일반 알트 중 거래대금 상위 20개만 검사. 시장 관망이면 종목 캔들을 조회하지 않아.</p></section>
+<section class="panel previewpanel"><h2 class="sectiontitle">③ 진단용 코인 미리보기 · 매수 추천 아님</h2>
+<p class="small">시장 <b>관망</b>이어도 버튼을 누르면 기존 일반 알트 상위 20개를 따로 확인해. 공식 매수 후보는 여전히 0개야.</p>
+<button id="preview" disabled>진단용 후보 미리보기</button>
+<div id="previewbox" class="emptybox">시장 분석 후 별도 버튼을 눌러줘.</div>
+<p id="previewnote" class="small">단타 1개 · 스윙 1개를 비교용으로만 표시. 기준 미충족·시장 관망 상태에서도 BUY로 해석하면 안 돼.</p></section>
 <section class="panel"><h2 class="sectiontitle">판정 요약</h2><div class="info"><span>BTC 장기 / 단기</span><b id="direction">— / —</b></div><div class="info"><span>시장 판단</span><b id="state">—</b></div><div class="info"><span>단기 움직임</span><b id="microstate">—</b></div><div class="info"><span>자료 확인 비율</span><b id="coverage">—</b></div><div class="info"><span>검사 시각 (KST)</span><b id="checked">—</b></div><div class="statusline" id="warning"></div></section>
 <div class="actions"><button id="go">시장 + 후보 분석하기</button><button id="csv" disabled>결과 CSV 저장</button></div><div id="msg" class="statusline">첫 번째 연구판 · 자동 주문 기능 없음</div>
 <footer>단타는 짧은 가격 움직임, 스윙은 더 큰 가격 움직임을 관찰한다는 의미야. 투자금을 크게 늘리라는 뜻은 아니야. 이 규칙은 아직 수익성 검증 전이며 진입 결정은 별도 확인해야 해.</footer>
@@ -754,6 +894,26 @@ const $ = id => document.getElementById(id);
 const labels={up:'상승',down:'하락',side:'혼조',unknown:'자료부족',mixed:'혼조',strong:'상승 참여 우세',weak:'상승 참여 약세',mixedMarket:'혼조'};
 const fmt = v => v===null||v===undefined?'—':Number(v).toLocaleString('ko-KR');
 const f = v => Number.isFinite(v)?Number(v).toFixed(1)+'%':'—';
+function showPreview(pre){
+ const root=$('previewbox'); root.replaceChildren();
+ if(!pre){root.className='emptybox';root.textContent='아직 진단을 실행하지 않았어. 시장 판정과 관계없이 별도 버튼으로 검사할 수 있어.';
+  $('previewnote').textContent='진단 결과는 공식 후보·매수 허용 판단을 변경하지 않아.';return;}
+ const entries=Array.isArray(pre.candidates)?pre.candidates:[];
+ if(!entries.length){root.className='emptybox';root.textContent=pre.label||'비교할 데이터 없음';}
+ else{
+  root.className='candidates';
+  for(const item of entries){
+   const card=document.createElement('div');card.className='candidate';
+   const tag=document.createElement('div');tag.className='diagnostic-tag';tag.textContent=item.diagnostic_mode+' · '+(item.diagnostic_qualified?'관찰 기준 충족':'기준 미충족');
+   const name=document.createElement('strong');name.textContent=item.market||'—';
+   const stats=document.createElement('p');stats.textContent='24시간 '+f(item.change_rate_pct)+' · 상대강도 '+f(item.relative_4h_pct);
+   const desc=document.createElement('p');desc.textContent='일봉 '+(labels[item.daily_state]||'?')+' / 4시간 '+(labels[item.h4_state]||'?')+' / 1시간 '+(labels[item.h1_state]||'?');
+   const risk=document.createElement('p');risk.className='risk';risk.textContent='시장과 무관한 참고용 · 매수 신호 아님';
+   card.append(tag,name,stats,desc,risk);root.append(card);
+  }
+ }
+ $('previewnote').textContent='시장 판정 '+(pre.market_gate_label||'—')+' 유지 · '+fmt(pre.checked)+' / '+fmt(pre.pool_size)+'개 조사 · 진단 '+fmt(entries.length)+'개 · 데이터 '+String(pre.checked_kst||'').replace('T',' ').slice(0,19)+' KST';
+}
 function show(d){
  const dec=d.decision, br=d.breadth, micro=d.timing||{label:'자료 확인 필요',detail:'분봉 자료 없음'};
  const cand=d.candidates||{state:'BLOCKED',label:'시장 관망',candidates:[],checked:0,pool_size:0};
@@ -811,6 +971,7 @@ function show(d){
   }
  }
  $('candidatenote').textContent='시장 '+dec.label+' · 검사 '+fmt(cand.checked)+' / '+fmt(cand.pool_size)+'개 · 후보는 매수 신호가 아니며 진입 위치와 위험은 아직 미검증';
+ showPreview(d.diagnostic||null);$('preview').disabled=false;
  $('csv').disabled=false;
 }
 async function go(){
@@ -821,6 +982,16 @@ async function go(){
  }catch(e){$('msg').textContent='조회 오류: '+String(e.message||e).slice(0,150)}
  finally{$('go').disabled=false;$('go').textContent='다시 분석하기'}
 }
+async function previewOnly(){
+ $('preview').disabled=true;$('preview').textContent='별도 진단 중…';
+ $('previewnote').textContent='이 분석은 시장 판정과 분리되어 있어. 기존 알트 20개 이하만 검사해.';
+ try{
+  const r=await fetch('/api/preview',{cache:'no-store'});const d=await r.json();
+  if(!r.ok)throw Error(d.error||'진단 조회 실패');
+  showPreview(d.diagnostic);$('msg').textContent='진단 미리보기 완료 · 공식 시장 판정은 변경되지 않았어.';
+ }catch(e){$('previewnote').textContent='진단 오류: '+String(e.message||e).slice(0,140);}
+ finally{$('preview').disabled=false;$('preview').textContent='진단용 후보 미리보기';}
+}
 async function download(){
  $('csv').disabled=true;
  try{
@@ -828,11 +999,11 @@ async function download(){
   if(!r.ok)throw Error('CSV를 가져오지 못했어');
   const blob=await r.blob(),a=document.createElement('a'),url=URL.createObjectURL(blob);
   const cd=r.headers.get('Content-Disposition')||'';const name=cd.match(/filename="([^"]+)"/);
-  a.href=url;a.download=name?name[1]:'BITHUMB_V3_15_MARKET_GATE.csv';
+  a.href=url;a.download=name?name[1]:'BITHUMB_V3_16_MARKET_GATE.csv';
   document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
  }catch(e){$('msg').textContent=String(e.message||e)}finally{$('csv').disabled=false}
 }
-$('go').addEventListener('click',go);$('csv').addEventListener('click',download);
+$('go').addEventListener('click',go);$('csv').addEventListener('click',download);$('preview').addEventListener('click',previewOnly);
 </script></body></html>'''
 
 
@@ -872,13 +1043,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, status_cached(force='refresh=1' in parsed.query))
             except Exception as exc:
                 return self.respond(502, {'error': str(exc)[:300]})
+        if path == '/api/preview':
+            try:
+                return self.respond(200, {'diagnostic': preview_cached()})
+            except ValueError as exc:
+                return self.respond(409, {'error': str(exc)[:200]})
+            except Exception as exc:
+                return self.respond(502, {'error': str(exc)[:200]})
         if path == '/api/csv':
             with LOCK:
                 result = CACHE['result']
             if result is None:
                 return self.respond(409, {'error': '먼저 시장 분석을 실행해줘.'})
             stamp = result['checked_kst'].replace('-', '').replace(':', '').replace('T', '_')[:15]
-            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_15_MARKET_GATE_{stamp}.csv')
+            return self.respond(200, export_csv(result), 'text/csv', f'BITHUMB_V3_16_MARKET_GATE_{stamp}.csv')
         return self.respond(404, {'error': '없는 주소야.'})
 
 
