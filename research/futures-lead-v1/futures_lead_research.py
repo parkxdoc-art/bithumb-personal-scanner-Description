@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BITHUMB × Binance futures lead-lag research V1.0 (READ-ONLY).
+"""BITHUMB × Binance futures lead-lag research V1.1 (READ-ONLY).
 
 Python >=3.9; no third-party dependencies. CLI and mobile-friendly local/Render web UI.
 Usage:
@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.0"
+VERSION = "1.1"
 BINANCE = "https://fapi.binance.com"
 BITHUMB = "https://api.bithumb.com"
 PERIOD_MS = 15 * 60_000
@@ -59,7 +59,7 @@ def fetch_json(base, path, params=None, headers=None):
     if base not in (BINANCE, BITHUMB) or not path.startswith("/") or '//' in path:
         raise APIError("허용되지 않은 API 경로")
     url = base + path + ("?" + urlencode(params) if params else "")
-    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.0",
+    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.1",
                                 "Accept":"application/json", **(headers or {})})
     for attempt in range(3):
         try:
@@ -93,31 +93,48 @@ def taker_end(ts):
 
 
 def history(path, symbol, start_ms, end_ms, headers=None):
-    """Fetch Binance statistics 15m; no future records and no silent 500-row truncation."""
+    """Page 15m Binance metrics with bounded startTime/endTime windows.
+
+    Asking for a 6-day range with ``limit=500`` in one request can be rejected
+    as HTTP 400/-1130 (invalid endTime) even though both parameters are allowed.
+    Request at most 400 intervals per page, keep exact non-overlapping ranges,
+    and retry using 96-interval pages only if Binance still rejects endTime.
+    Empty intermediate windows do not prevent scanning subsequent windows.
+    """
+    if end_ms < start_ms:
+        return {}
     out = {}
-    cursor = start_ms - PERIOD_MS
-    for _ in range(8):  # 13 days ~ 1248 rows; 3 calls, with slack
-        data = fetch_json(BINANCE, path, {
-            "symbol": symbol, "period":"15m", "startTime": cursor,
-            "endTime": end_ms, "limit": 500}, headers)
+    cursor = start_ms - PERIOD_MS  # Include raw taker start-time at first boundary.
+    slots_per_page = 400
+    for _ in range(40):  # 13 days with fallback 1-day windows needs < 20 calls.
+        if cursor > end_ms:
+            return out
+        page_end = min(end_ms, cursor + slots_per_page * PERIOD_MS - 1)
+        params = {
+            "symbol": symbol, "period": "15m", "startTime": int(cursor),
+            "endTime": int(page_end), "limit": 500,
+        }
+        try:
+            data = fetch_json(BINANCE, path, params, headers)
+        except APIError as e:
+            if e.status == 400 and "endTime" in str(e) and slots_per_page > 96:
+                slots_per_page = 96
+                continue
+            raise APIError(
+                f"{path} 기간별 조회 실패 ({timestamp_fmt(cursor)}~"
+                f"{timestamp_fmt(page_end)}, {slots_per_page}구간): {e}", e.status
+            ) from e
         if not isinstance(data, list):
             raise APIError(f"바이낸스 반환 형식 오류 ({path}): {str(data)[:120]}")
-        if not data:
-            break
-        max_raw = cursor
-        for r in data:
-            raw = int(r["timestamp"])
-            max_raw = max(max_raw, raw)
-            if path.endswith("takerlongshortRatio"):
-                t = taker_end(raw)
-            else:
-                t = rounded_end(raw)
+        for row in data:
+            raw = int(row["timestamp"])
+            t = taker_end(raw) if path.endswith("takerlongshortRatio") else rounded_end(raw)
             if start_ms <= t <= end_ms:
-                out[t] = r
-        if max_raw <= cursor or len(data) < 500:
-            break
-        cursor = max_raw + 1
-    return out
+                out[t] = row
+        # Always advance by the *requested* window, even if Binance returns
+        # fewer than 500 observations (e.g. no trades or missing data).
+        cursor = page_end + 1
+    raise APIError(f"바이낸스 페이지 조회 한도 초과 ({path})")
 
 
 def bih_markets():
@@ -379,9 +396,9 @@ def selftest():
 
 # Mobile first, no external JS/CSS/CDN.
 HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>선물 선행성 연구 V1.0</title>
+<title>선물 선행성 연구 V1.1</title>
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{background:#0e1421;color:#e6ebf5;font-family:system-ui,-apple-system,sans-serif;margin:0}main{max-width:1000px;padding:22px 14px 60px;margin:auto}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:24px 0 12px}.sub{color:#a1aec1;font-size:14px;line-height:1.6}section{background:#172234;border:1px solid #2a3c52;border-radius:14px;padding:16px;margin:15px 0}.label{font-size:13px;color:#a5b4c8}input{width:100%;background:#0e1728;border:1px solid #41546d;border-radius:9px;color:white;padding:12px;margin:5px 0 13px;font-size:16px}button,.link{border:0;color:white;padding:12px 16px;border-radius:10px;background:#257ad2;font-size:15px;cursor:pointer;text-decoration:none;display:inline-block}button:disabled{opacity:.45}table{border-collapse:collapse;width:100%;font-size:13px;min-width:730px}td,th{border-bottom:1px solid #314056;padding:11px 8px;text-align:right}td:first-child,th:first-child{text-align:left}th{color:#a1b0c6;font-weight:500}.scroll{overflow:auto}.bad{color:#ffb68e}.ok{color:#85d8bd}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{padding:9px;border:1px solid #334a65;border-radius:9px}.stat strong{display:block;margin-top:6px;font-size:18px}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;color:#adbcd3}.muted{color:#97a5b9}small{font-size:12px}@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}table{font-size:12px}main{padding:12px}}</style></head><body><main>
-<div class="label">BITHUMB × BINANCE / 독립 연구용 · 주문 기능 없음</div><h1>선물 데이터 선행성 연구 V1.0</h1><p class="sub">선물의 미결제약정(OI)·상위 트레이더 롱/숏 비율·시장가 매수/매도량 변화가 <b>빗썸 현물 가격 상승보다 먼저</b> 나타나는지 검증합니다. 투자 신호가 아닌 과거 통계 연구입니다.</p>
+<div class="label">BITHUMB × BINANCE / 독립 연구용 · 주문 기능 없음</div><h1>선물 데이터 선행성 연구 V1.1</h1><p class="sub">선물의 미결제약정(OI)·상위 트레이더 롱/숏 비율·시장가 매수/매도량 변화가 <b>빗썸 현물 가격 상승보다 먼저</b> 나타나는지 검증합니다. 투자 신호가 아닌 과거 통계 연구입니다.</p>
 <section><div class="label">연구 종목 (쉼표로 구분, 최대 20개)</div><input id="coins" value="ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,BTC,PEPE"/><div class="label">최근 연구 일수 (1~13)</div><input id="days" type="number" value="6" min="1" max="13"/><button id="go" onclick="start()">연구 실행</button><p class="sub">6일: 바이낸스 15분봉과 빗썸 5분봉을 실제 API로 수집합니다. 서버에 따라 수집이 오래 걸릴 수 있습니다. 조건에 맞는 신호가 0건이어도 정상입니다.</p></section>
 <section><div class="label">진행 상태</div><h2 id="state">실행 전</h2><div class="sub" id="progress">실제 거래소 API를 호출하려면 연구 실행을 눌러주세요.</div></section>
 <div id="result" hidden><section><h2>연구 범위</h2><div id="scope" class="stats"></div><p id="notice" class="sub"></p></section>
@@ -453,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
             with JOB_LOCK: result=JOB.get('result')
             if not result: return self.respond(json.dumps({'error':'완료된 연구가 없습니다'}),404)
             data = '\ufeff' + csv_text(result['trades'])
-            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_0.csv"'})
+            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_1.csv"'})
         else: self.respond(json.dumps({'error':'not found'}),404)
 
     def do_POST(self):
@@ -477,13 +494,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.0 (읽기 전용)')
+    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.1 (읽기 전용)')
     p.add_argument('--web',action='store_true',help='모바일 대시보드 서버 시작')
     p.add_argument('--selftest',action='store_true',help='거래소 호출 없는 검증')
     p.add_argument('--coins',default=DEFAULT_COINS)
     p.add_argument('--days',type=int,default=6)
     p.add_argument('--port',type=int,default=int(os.environ.get('PORT',10000)))
-    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_0.csv')
+    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_1.csv')
     args=p.parse_args()
     if args.selftest: return selftest()
     if args.web:
