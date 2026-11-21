@@ -684,6 +684,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urlsplit(self.path).path
+        if p == '/traders/offline':
+            try:
+                with open(os.path.join(os.path.dirname(__file__), 'trader_offline_v16.html'), encoding='utf-8') as fp:
+                    offline_page = fp.read()
+            except OSError:
+                return self.respond('오프라인 연구판 파일을 찾을 수 없습니다', status=500, ctype='text/plain; charset=utf-8')
+            return self.respond(offline_page, ctype='text/html; charset=utf-8')
         if p == '/traders':
             return self.respond(walletstudy.HTML,ctype='text/html; charset=utf-8')
         if p == '/api/wallet-study/status':
