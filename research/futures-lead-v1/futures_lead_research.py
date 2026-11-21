@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BITHUMB × Binance futures lead-lag research V1.1 (READ-ONLY).
+"""BITHUMB × Binance futures lead-lag research V1.2 (READ-ONLY).
 
 Python >=3.9; no third-party dependencies. CLI and mobile-friendly local/Render web UI.
 Usage:
@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.1"
+VERSION = "1.2"
 BINANCE = "https://fapi.binance.com"
 BITHUMB = "https://api.bithumb.com"
 PERIOD_MS = 15 * 60_000
@@ -39,14 +39,20 @@ DEFAULT_COINS = "ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,BTC,PEPE"
 STABLES = {"USDT","USDC","DAI","FDUSD","TUSD","USDE","USD1","USDD","PYUSD","RLUSD","EURC","EURI"}
 MULTIPLIED = {"PEPE":"1000PEPE", "SHIB":"1000SHIB", "BONK":"1000BONK", "FLOKI":"1000FLOKI"}
 RULES = {
-    "A": "롱·OI·매수 동행",
-    "B": "OI 감소·롱비율 상승",
-    "C": "OI·매수 강세(비율 제외)",
-    "M": "비교군: 가격 상승만",
+    "A": "기존: 롱·OI·매수 동행 + 가격상승",
+    "B": "기존: OI 감소·롱비율 상승 + 가격상승",
+    "C": "기존: OI·매수 강세 + 가격상승",
+    "M": "기존 비교군: 가격 상승만",
+    "E": "선행형: OI·매수↑ / 가격 횡보",
+    "G": "선행형 E + BTC 1시간 비하락",
+    "P": "선행형 E → 종가 눌림·재상승",
+    "N": "선행 비교군: 가격 횡보 (E 제외)",
 }
 FIELDS = ["코인","규칙","신호시각(KST)","진입시각(KST)","진입가(KRW)",
           "1시간 OI 변화(%)","1시간 롱숏비 변화(%)","최근1시간 매수/매도량비",
-          "이전1시간 빗썸 상승률(%)","30분 순수익률(%)","60분 순수익률(%)","180분 순수익률(%)"]
+          "이전1시간 빗썸 상승률(%)","30분 순수익률(%)","60분 순수익률(%)","180분 순수익률(%)",
+          "BTC 1시간 상승률(%)","진입방식","눌림깊이(%)","60분내 최고 종가상승(%)",
+          "60분내 종가 +1% 달성"]
 
 class APIError(Exception):
     def __init__(self, message, status=None):
@@ -59,7 +65,7 @@ def fetch_json(base, path, params=None, headers=None):
     if base not in (BINANCE, BITHUMB) or not path.startswith("/") or '//' in path:
         raise APIError("허용되지 않은 API 경로")
     url = base + path + ("?" + urlencode(params) if params else "")
-    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.1",
+    req = Request(url, headers={"User-Agent": "BithumbBinanceReadOnlyResearch/1.2",
                                 "Accept":"application/json", **(headers or {})})
     for attempt in range(3):
         try:
@@ -235,31 +241,119 @@ def classify(f):
     return flags
 
 
-def produce_trades(coin, oi, lsr, taker, prices, since_ms, until_ms, fee_pct=0.5):
+def early_candidate(f):
+    """No prior +0.5% pump is required; deliberately choose a flat price regime."""
+    return bool(f and -0.5 <= f["momentum"] <= 0.3
+                and f["oi"] >= 0.8 and f["taker"] >= 1.08)
+
+
+def price_flat(f):
+    return bool(f and -0.5 <= f["momentum"] <= 0.3)
+
+
+def btc_momentum(t, btc_prices):
+    """Only prices of BTC candles fully closed by t are observable."""
+    if not btc_prices:
+        return None
+    return percent_change(btc_prices.get(t-CANDLE_MS),
+                          btc_prices.get(t-HOURS_MS-CANDLE_MS))
+
+
+def pullback_entry(t, prices, reference):
+    """Find a 5m CLOSE pullback and recovery inside 30m, then enter on NEXT completed close.
+
+    No wick/limit order assumption; do not silently fill missing candles.
+    Returns the entry 5m candle OPEN and the deepest observed dip percentage.
+    """
+    dipped = False
+    lowest = reference
+    previous = reference
+    for i in range(6):  # completed 5m candles at t+5, t+10, ..., t+30
+        bar_start = t + i*CANDLE_MS
+        close = prices.get(bar_start)
+        if close is None:
+            return None
+        lowest = min(lowest, close)
+        if dipped and close > previous and close <= reference*1.003:
+            next_bar = bar_start + CANDLE_MS
+            if prices.get(next_bar) is None:
+                return None
+            return next_bar, (lowest/reference - 1)*100
+        if close <= reference*0.998:
+            dipped = True
+        previous = close
+    return None
+
+
+def trade_row(coin, rule, t, entry_bar, f, prices, fee_pct, btc_pct=None,
+              pullback_pct=None):
+    entry = prices.get(entry_bar)
+    if entry is None or entry <= 0:
+        return None
+    exits = {m:prices.get(entry_bar + m*60_000) for m in (30,60,180)}
+    if any(v is None or v <= 0 for v in exits.values()):
+        return None
+    forward_closes = [prices.get(entry_bar + i*CANDLE_MS) for i in range(1,13)]
+    peak = (max(forward_closes)/entry-1)*100 if all(x is not None for x in forward_closes) else None
+    row = {"coin":coin,"rule":rule,"signal_ms":t,
+           "entry_ms":entry_bar+CANDLE_MS,"entry_price":entry,
+           "entry_style":"눌림 확인 뒤 다음 5분 종가" if rule=="P" else "신호 뒤 첫 5분 종가",
+           "btc1h":btc_pct,"pullback":pullback_pct,"peak60":peak,
+           "hit60":None if peak is None else peak>=1.0, **f}
+    for minutes,exitprice in exits.items():
+        row[f"net{minutes}"] = (exitprice/entry-1)*100 - fee_pct
+    return row
+
+
+def produce_trades(coin, oi, lsr, taker, prices, since_ms, until_ms,
+                   fee_pct=0.5, btc_prices=None):
+    """Candidate signal at 15m close t; no data after t may determine E/G/N.
+
+    Legacy A/B/C/M preserved. The P strategy waits up to 30m for a completed-bar
+    bounce, then enters after another completed candle. All horizons start at entry.
+    Exclude the last 225m for every rule to avoid asymmetric censoring.
+    """
     times = sorted(x for x in oi if x <= until_ms)
-    last_used = {r: -10**18 for r in RULES}
-    result = []
+    last_used = {rule: -10**18 for rule in RULES}
+    rows = []
     for idx,t in enumerate(times):
-        if not (since_ms <= t <= until_ms - 180*60_000 - CANDLE_MS): continue
-        f = row_features(t, idx, times, oi, lsr, taker, prices)
-        rules = classify(f)
-        if not rules: continue
-        # Signal becomes known at 15-minute END t; earliest tradable observation
-        # is the close of the NEXT 5m candle, which opens at t.
-        entry = prices.get(t)
-        # t is the opening of the entry candle; it closes at t+5m.
-        if entry is None: continue
-        exits = {minutes:prices.get(t + minutes*60_000) for minutes in (30,60,180)}
-        if any(v is None for v in exits.values()): continue
-        for rule in rules:
-            if t - last_used[rule] < 180*60_000: continue
-            last_used[rule] = t
-            row = {"coin":coin, "rule":rule, "signal_ms":t,
-                   "entry_ms":t+CANDLE_MS, "entry_price":entry, **f}
-            for minutes,exitprice in exits.items():
-                row[f"net{minutes}"] = (exitprice/entry-1)*100 - fee_pct
-            result.append(row)
-    return result
+        if not (since_ms <= t <= until_ms-225*60_000):
+            continue
+        f = row_features(t,idx,times,oi,lsr,taker,prices)
+        if not f:
+            continue
+        # The original classifications are intentionally unchanged.
+        flags = classify(f)
+        early = early_candidate(f)
+        b1h = btc_momentum(t,btc_prices)
+        if price_flat(f) and not early:
+            flags.append("N")  # disjoint from E in same flat-price cohort
+        if early:
+            flags.append("E")
+            if b1h is not None and b1h >= 0:
+                flags.append("G")
+        accepted_early = False
+        for rule in flags:
+            if t-last_used[rule] < 180*60_000:
+                continue
+            record = trade_row(coin,rule,t,t,f,prices,fee_pct,btc_pct=b1h)
+            if record is None:
+                continue
+            last_used[rule]=t
+            rows.append(record)
+            if rule == "E":
+                accepted_early=True
+        # P can only follow a *selected* E candidate, not every 15m repetition.
+        if accepted_early:
+            confirmation = pullback_entry(t,prices,prices.get(t-CANDLE_MS))
+            if confirmation:
+                entry_bar,depth=confirmation
+                record=trade_row(coin,"P",t,entry_bar,f,prices,fee_pct,
+                                 btc_pct=b1h,pullback_pct=depth)
+                if record:
+                    rows.append(record)
+                    last_used["P"]=t
+    return rows
 
 
 def describe(trades):
@@ -272,6 +366,8 @@ def describe(trades):
             item[f"avg{mins}"] = round(statistics.mean(vals),3) if vals else None
             item[f"med{mins}"] = round(statistics.median(vals),3) if vals else None
             item[f"win{mins}"] = round(100 * sum(v>0 for v in vals)/len(vals),1) if vals else None
+        hits = [r["hit60"] for r in group if r.get("hit60") is not None]
+        item["touch60"] = round(100*sum(hits)/len(hits),1) if hits else None
         out.append(item)
     return out
 
@@ -296,7 +392,11 @@ def csv_text(trades):
         w.writerow([r['coin'],r['rule'],timestamp_fmt(r['signal_ms']), timestamp_fmt(r['entry_ms']),
                     r['entry_price'],round(r['oi'],3),
                     '' if r['ratio'] is None else round(r['ratio'],3),round(r['taker'],3),
-                    round(r['momentum'],3),round(r['net30'],3),round(r['net60'],3),round(r['net180'],3)])
+                    round(r['momentum'],3),round(r['net30'],3),round(r['net60'],3),round(r['net180'],3),
+                    '' if r['btc1h'] is None else round(r['btc1h'],3),r['entry_style'],
+                    '' if r['pullback'] is None else round(r['pullback'],3),
+                    '' if r['peak60'] is None else round(r['peak60'],3),
+                    '' if r['hit60'] is None else ('Y' if r['hit60'] else 'N')])
     return b.getvalue()
 
 
@@ -322,6 +422,16 @@ def research(coins, days, on_progress=None, now_ms=None):
     if not mapped:
         raise APIError("공통 종목이 없습니다. 빗썸 KRW와 바이낸스 USDT 무기한 선물 상장 여부를 확인해 주세요")
     rows,errors,warnings = [],[],[]
+    # Read BTC spot once, including when BTC was not part of the requested symbols.
+    # Failing this optional fetch disables G but does not discard the other rules.
+    btc_prices = None
+    try:
+        progress("BTC 기준 시장 방향(5분 완료봉) 수집",4)
+        btc_prices = bih_candles("BTC",fetch_since-HOURS_MS,end_ms)
+        if not btc_prices:
+            warnings.append("BTC 시세 수집 누락: G(BTC 필터) 결과가 생성되지 않습니다")
+    except APIError as e:
+        warnings.append(f"BTC 시장 방향 조회 실패 (G 비활성화): {e}")
     ratio_disabled = False
     for k,(coin,symbol) in enumerate(mapped,1):
         progress(f"{coin} ({k}/{len(mapped)}) 15분봉 선물 데이터 수집", 5 + 87*(k-1)/len(mapped))
@@ -341,11 +451,11 @@ def research(coins, days, on_progress=None, now_ms=None):
                     else:
                         raise
             progress(f"{coin} 빗썸 5분봉과 선물 지표 정렬", 5 + 87*(k-0.5)/len(mapped))
-            prices = bih_candles(coin,fetch_since-HOURS_MS,end_ms)
+            prices = btc_prices if coin=="BTC" and btc_prices else bih_candles(coin,fetch_since-HOURS_MS,end_ms)
             if not oi or not taker or not prices:
                 errors.append(f"{coin}: 필요한 과거 데이터가 부족함 (OI={len(oi)}, 매수매도={len(taker)}, 빗썸={len(prices)})")
                 continue
-            matches = produce_trades(coin,oi,lsr,taker,prices,since_ms,end_ms)
+            matches = produce_trades(coin,oi,lsr,taker,prices,since_ms,end_ms,btc_prices=btc_prices)
             rows.extend(matches)
             if not matches:
                 errors.append(f"{coin}: 조건에 맞는 완결 신호 0건 (OI={len(oi)}, 매수매도={len(taker)}, 비율={len(lsr)}, 빗썸={len(prices)})")
@@ -358,7 +468,11 @@ def research(coins, days, on_progress=None, now_ms=None):
             "until_kst":timestamp_fmt(end_ms),"requested":len(coins),"mapped":len(mapped),
             "mapped_coins":[a for a,b in mapped],"skipped":skip,"errors":errors,
             "warnings":warnings,"ratio_available":not ratio_disabled and any(r["ratio"] is not None for r in rows),
-            "trades":rows,"summary":describe(rows),"daily":describe_daily(rows),"completed_at":timestamp_fmt(int(time.time()*1000))}
+            "trades":rows,"summary":describe(rows),"daily":describe_daily(rows),
+            "early_eligible":sum(r["rule"]=="E" for r in rows),
+            "pullback_fills":sum(r["rule"]=="P" for r in rows),
+            "btc_gate_available":bool(btc_prices),
+            "completed_at":timestamp_fmt(int(time.time()*1000))}
 
 
 def selftest():
@@ -392,21 +506,27 @@ def selftest():
     assert abs(r['net30']-expected)<1e-9
     assert len([x for x in signals if x['rule']=='A']) <= 3  # 3h cooldown
     assert "30분 순수익률(%)" in csv_text(signals)
-    print("SELFTEST PASS: timestamp alignment, closed-bar entry, no-lookahead, cooldown, fee, CSV")
+    f0={"oi":0.9,"taker":1.1,"momentum":0.1,"ratio":None}
+    assert early_candidate(f0) and price_flat(f0)
+    assert not early_candidate(dict(f0,momentum=0.8))
+    pb={t-CANDLE_MS:100,t:99.6,t+CANDLE_MS:99.0,
+        t+2*CANDLE_MS:99.5,t+3*CANDLE_MS:99.7}
+    assert pullback_entry(t,pb,100)[0] == t+3*CANDLE_MS
+    print("SELFTEST PASS V1.2: timestamp, no-lookahead, cooldown, fee, early, pullback, CSV")
 
 # Mobile first, no external JS/CSS/CDN.
 HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>선물 선행성 연구 V1.1</title>
+<title>선물 선행성 연구 V1.2</title>
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{background:#0e1421;color:#e6ebf5;font-family:system-ui,-apple-system,sans-serif;margin:0}main{max-width:1000px;padding:22px 14px 60px;margin:auto}h1{font-size:23px;margin:8px 0}h2{font-size:18px;margin:24px 0 12px}.sub{color:#a1aec1;font-size:14px;line-height:1.6}section{background:#172234;border:1px solid #2a3c52;border-radius:14px;padding:16px;margin:15px 0}.label{font-size:13px;color:#a5b4c8}input{width:100%;background:#0e1728;border:1px solid #41546d;border-radius:9px;color:white;padding:12px;margin:5px 0 13px;font-size:16px}button,.link{border:0;color:white;padding:12px 16px;border-radius:10px;background:#257ad2;font-size:15px;cursor:pointer;text-decoration:none;display:inline-block}button:disabled{opacity:.45}table{border-collapse:collapse;width:100%;font-size:13px;min-width:730px}td,th{border-bottom:1px solid #314056;padding:11px 8px;text-align:right}td:first-child,th:first-child{text-align:left}th{color:#a1b0c6;font-weight:500}.scroll{overflow:auto}.bad{color:#ffb68e}.ok{color:#85d8bd}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{padding:9px;border:1px solid #334a65;border-radius:9px}.stat strong{display:block;margin-top:6px;font-size:18px}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;color:#adbcd3}.muted{color:#97a5b9}small{font-size:12px}@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}table{font-size:12px}main{padding:12px}}</style></head><body><main>
-<div class="label">BITHUMB × BINANCE / 독립 연구용 · 주문 기능 없음</div><h1>선물 데이터 선행성 연구 V1.1</h1><p class="sub">선물의 미결제약정(OI)·상위 트레이더 롱/숏 비율·시장가 매수/매도량 변화가 <b>빗썸 현물 가격 상승보다 먼저</b> 나타나는지 검증합니다. 투자 신호가 아닌 과거 통계 연구입니다.</p>
+<div class="label">BITHUMB × BINANCE / 독립 연구용 · 주문 기능 없음</div><h1>선물 데이터 선행성 연구 V1.2</h1><p class="sub">기존 A/B/C/M과 신규 E/G/P/N을 같은 구간에 비교합니다. <b>E는 직전 1시간 가격 -0.5%~+0.3%에서 선물 OI·매수량이 선행하는지</b> 검증하고, G는 BTC 필터, P는 눌림 뒤 진입을 실험합니다. <b>실전 매매 추천이 아닌 과거 가상 실험</b>입니다.</p>
 <section><div class="label">연구 종목 (쉼표로 구분, 최대 20개)</div><input id="coins" value="ETH,XRP,SOL,DOGE,ADA,LINK,AVAX,SUI,BTC,PEPE"/><div class="label">최근 연구 일수 (1~13)</div><input id="days" type="number" value="6" min="1" max="13"/><button id="go" onclick="start()">연구 실행</button><p class="sub">6일: 바이낸스 15분봉과 빗썸 5분봉을 실제 API로 수집합니다. 서버에 따라 수집이 오래 걸릴 수 있습니다. 조건에 맞는 신호가 0건이어도 정상입니다.</p></section>
 <section><div class="label">진행 상태</div><h2 id="state">실행 전</h2><div class="sub" id="progress">실제 거래소 API를 호출하려면 연구 실행을 눌러주세요.</div></section>
 <div id="result" hidden><section><h2>연구 범위</h2><div id="scope" class="stats"></div><p id="notice" class="sub"></p></section>
-<section><h2>규칙별 성과 (편도 수수료 0.25% × 2 반영)</h2><p class="sub">30·60·180분 뒤 순수익률 평균 / 순이익 발생 비율. 수익률은 각 시점의 종가 기준이며, 실제 체결·슬리피지는 반영되지 않습니다.</p><div class="scroll"><table><thead><tr><th>규칙</th><th>건수</th><th>30분 평균</th><th>30분 승률</th><th>1시간 평균</th><th>1시간 승률</th><th>3시간 평균</th><th>3시간 승률</th></tr></thead><tbody id="summary"></tbody></table></div><p class="sub">A: OI↑ + 상위 롱비율↑ + 매수우세 + 가격↑<br/>B: OI↓ + 상위 롱비율↑ + 매수우세 + 가격↑<br/>C: OI↑ + 매수우세 + 가격↑ (비율 조건 제거)<br/>M: 가격↑만으로 선별한 비교군. 각 규칙당 같은 코인 연속 신호는 3시간 동안 중복 제외합니다.</p></section>
+<section><h2>기존 A/B/C/M + 선행 E/G/P/N 비교 (왕복 수수료 0.5%)</h2><p class="sub">30·60·180분 뒤 순수익률 평균 / 순이익 발생 비율. 가격 급등 이후 추격이 아닌 선물 데이터 선행 여부를 분리 검증합니다. 실제 체결·슬리피지는 반영하지 않습니다.</p><div class="scroll"><table><thead><tr><th>규칙</th><th>건수</th><th>30분 평균</th><th>30분 승률</th><th>1시간 평균</th><th>1시간 승률</th><th>3시간 평균</th><th>3시간 승률</th><th>1h내 +1% 최고종가</th></tr></thead><tbody id="summary"></tbody></table></div><p class="sub">E: 가격 -0.5~+0.3%, OI 1시간 +0.8% 이상, 매수/매도량비 1.08 이상. G: E 중 BTC 직전 1시간 수익률 0% 이상. P: E 신호 뒤 30분 이내 완료 5분봉 종가가 기준보다 -0.2% 이하 눌렸다가 상승 전환하면 <b>다음 5분봉 종가</b>에 진입. N: E를 제외한 같은 가격 횡보 구간 비교군. 기존 A/B/C/M 규칙도 유지합니다. <b>같은 종목 각 규칙은 3시간 중복 신호 억제</b>; E와 G/P는 중복될 수 있습니다. P 미체결은 수익률 집계에서 제외되므로 진입률도 같이 보세요.</p><p class="sub" id="fillstats"></p></section>
 <section><h2>날짜별 결과 (1시간 후)</h2><p class="sub">KST 날짜별 순수익 건수·손실 건수·평균 순수익률입니다. 통계상 건수가 적은 날은 해석에 주의하세요.</p><div class="scroll"><table style="min-width:520px"><thead><tr><th>날짜</th><th>규칙</th><th>수익건</th><th>손실건</th><th>평균 순수익률</th></tr></thead><tbody id="daily"></tbody></table></div></section>
-<section><h2>상세 기록</h2><a class="link" href="/api/csv" target="_blank">CSV 내려받기</a><p class="sub" id="count"></p><div class="scroll"><table><thead><tr><th>종목</th><th>규칙</th><th>신호시각(KST)</th><th>OI 1h</th><th>비율 1h</th><th>매수/매도</th><th>30m 순</th><th>1h 순</th><th>3h 순</th></tr></thead><tbody id="trades"></tbody></table></div></section>
+<section><h2>상세 기록</h2><a class="link" href="/api/csv" target="_blank">CSV 내려받기</a><p class="sub" id="count"></p><div class="scroll"><table><thead><tr><th>종목</th><th>규칙</th><th>신호시각(KST)</th><th>OI 1h</th><th>비율 1h</th><th>매수/매도</th><th>30m 순</th><th>1h 순</th><th>3h 순</th><th>BTC1h</th><th>진입형태</th></tr></thead><tbody id="trades"></tbody></table></div></section>
 <section><h2>데이터 오류 / 누락</h2><pre id="errors"></pre></section></div>
-<section class="sub"><b>데이터 해석 주의</b><p>① 롱/숏 비율 상승은 신규 롱 매수의 직접 증거가 아닙니다. ② Binance OI·상위 비율 시각은 구간 종료이고 taker량 시각은 구간 시작이므로 맞춰서 비교합니다. ③ 신호 종료 후 다음 빗썸 5분봉 종가를 가상 진입가로 설정합니다. ④ 모든 기간은 최근 30일 이하만 사용하고 완전히 끝난 캔들만 계산합니다. ⑤ 일부 선물 API는 API 키가 필요할 수 있으며 접근 거절 시 해당 항목을 누락으로 표시합니다. 신규상장 코인 연령은 자동 검증하지 않습니다.</p></section></main>
+<section class="sub"><b>데이터 해석 주의</b><p>① 롱/숏 비율은 매수 주도 체결을 확정하지 않습니다. ② Binance OI·상위 비율 시각은 구간 종료, taker량 시각은 구간 시작으로 정렬합니다. ③ 신호 이후 완료되는 5분봉 종가를 가상 진입가로 사용하며, P는 눌림 확인 뒤에도 한 봉 더 기다립니다. ④ 30/60/180분 성과는 <b>각각의 진입 시각 기준</b>, 수수료 왕복 0.5%·슬리피지 0%, P 미진입은 제외합니다. ⑤ 1h내 +1% 지표는 시가·고가가 아닌 <b>완료된 5분봉 종가의 최대값</b> 기준이므로 실제 급등 확률과 다릅니다. ⑥ 연구 기간은 최대 13일, 신규상장 코인 연령은 자동 검증하지 않습니다.</p></section></main>
 <script>
 const $=x=>document.getElementById(x);let timer=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -418,13 +538,14 @@ async function start(){
 }
 async function poll(){try{let r=await fetch('/api/status');let j=await r.json();$('state').textContent=j.state==='running'?'수집 중':j.state==='done'?'연구 완료':j.state==='error'?'오류': '실행 전';$('progress').textContent=(j.progress||'') + (j.pct?' ('+Math.round(j.pct)+'%)':''); if(j.state!=='running'){clearInterval(timer);$('go').disabled=false;if(j.state==='done')show(j.result);if(j.state==='error')$('progress').textContent=j.error||'오류';}}catch(e){clearInterval(timer);$('go').disabled=false;$('progress').textContent='상태 조회 실패: '+e.message}}
 function show(j){$('result').hidden=false;
- $('scope').innerHTML=[['기간',j.days+'일'],['공통 종목',j.mapped+'개'],['총 신호',j.trades.length+'건'],['롱/숏 비율',j.ratio_available?'수집 확인':'미확인/누락'],['기간 시작',j.since_kst],['기간 끝',j.until_kst]].map(x=>'<div class="stat"><small>'+esc(x[0])+'</small><strong>'+esc(x[1])+'</strong></div>').join('');
+ $('scope').innerHTML=[['기간',j.days+'일'],['공통 종목',j.mapped+'개'],['총 신호',j.trades.length+'건'],['E/P 진입',j.early_eligible+' / '+j.pullback_fills+'건'],['BTC 기준',j.btc_gate_available?'수집':'누락'],['롱/숏 비율',j.ratio_available?'수집 확인':'미확인/누락'],['기간 시작',j.since_kst],['기간 끝',j.until_kst]].map(x=>'<div class="stat"><small>'+esc(x[0])+'</small><strong>'+esc(x[1])+'</strong></div>').join('');
  $('notice').textContent='분석 종목: '+(j.mapped_coins||[]).join(', ')+' / 제외: '+(j.skipped||[]).join(', ');
+ $('fillstats').textContent='E '+j.early_eligible+'건 중 P 눌림진입 '+j.pullback_fills+'건 ('+(j.early_eligible? (100*j.pullback_fills/j.early_eligible).toFixed(1)+'%':'—')+') · N은 E를 제외한 동일 가격 구간 비교군';
  const fmt=v=>v===null?'—':Number(v).toFixed(2)+'%';
- $('summary').innerHTML=j.summary.map(x=>'<tr><td>'+esc(x.rule+' '+x.label)+'</td><td>'+x.n+'</td><td>'+fmt(x.avg30)+'</td><td>'+fmt(x.win30)+'</td><td>'+fmt(x.avg60)+'</td><td>'+fmt(x.win60)+'</td><td>'+fmt(x.avg180)+'</td><td>'+fmt(x.win180)+'</td></tr>').join('');
+ $('summary').innerHTML=j.summary.map(x=>'<tr><td>'+esc(x.rule+' '+x.label)+'</td><td>'+x.n+'</td><td>'+fmt(x.avg30)+'</td><td>'+fmt(x.win30)+'</td><td>'+fmt(x.avg60)+'</td><td>'+fmt(x.win60)+'</td><td>'+fmt(x.avg180)+'</td><td>'+fmt(x.win180)+'</td><td>'+fmt(x.touch60)+'</td></tr>').join('');
  $('daily').innerHTML=(j.daily||[]).map(x=>'<tr><td>'+esc(x.day)+'</td><td>'+esc(x.rule)+'</td><td>'+x.wins+'</td><td>'+x.losses+'</td><td>'+fmt(x.mean_net60)+'</td></tr>').join('');
  $('count').textContent='총 '+j.trades.length+'건 · 최근 신호부터 최대 150개 화면 표시, 전체는 CSV에서 확인';
- $('trades').innerHTML=j.trades.slice().sort((a,b)=>b.signal_ms-a.signal_ms).slice(0,150).map(x=>'<tr><td>'+esc(x.coin)+'</td><td>'+esc(x.rule)+'</td><td>'+esc(new Date(x.signal_ms).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}))+'</td><td>'+Number(x.oi).toFixed(2)+'%</td><td>'+(x.ratio===null?'—':Number(x.ratio).toFixed(2)+'%')+'</td><td>'+Number(x.taker).toFixed(2)+'</td><td>'+fmt(x.net30)+'</td><td>'+fmt(x.net60)+'</td><td>'+fmt(x.net180)+'</td></tr>').join('');
+ $('trades').innerHTML=j.trades.slice().sort((a,b)=>b.signal_ms-a.signal_ms).slice(0,150).map(x=>'<tr><td>'+esc(x.coin)+'</td><td>'+esc(x.rule)+'</td><td>'+esc(new Date(x.signal_ms).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}))+'</td><td>'+Number(x.oi).toFixed(2)+'%</td><td>'+(x.ratio===null?'—':Number(x.ratio).toFixed(2)+'%')+'</td><td>'+Number(x.taker).toFixed(2)+'</td><td>'+fmt(x.net30)+'</td><td>'+fmt(x.net60)+'</td><td>'+fmt(x.net180)+'</td><td>'+fmt(x.btc1h)+'</td><td>'+esc(x.entry_style)+'</td></tr>').join('');
  $('errors').textContent=[...(j.warnings||[]),...(j.errors||[])].join('\n')||'없음';
 }
 poll();
@@ -470,7 +591,7 @@ class Handler(BaseHTTPRequestHandler):
             with JOB_LOCK: result=JOB.get('result')
             if not result: return self.respond(json.dumps({'error':'완료된 연구가 없습니다'}),404)
             data = '\ufeff' + csv_text(result['trades'])
-            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_1.csv"'})
+            self.respond(data,ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="BITHUMB_FUTURES_LEAD_V1_2.csv"'})
         else: self.respond(json.dumps({'error':'not found'}),404)
 
     def do_POST(self):
@@ -494,13 +615,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.1 (읽기 전용)')
+    p=argparse.ArgumentParser(description='Bithumb × Binance 선물 선행성 연구 V1.2 (읽기 전용)')
     p.add_argument('--web',action='store_true',help='모바일 대시보드 서버 시작')
     p.add_argument('--selftest',action='store_true',help='거래소 호출 없는 검증')
     p.add_argument('--coins',default=DEFAULT_COINS)
     p.add_argument('--days',type=int,default=6)
     p.add_argument('--port',type=int,default=int(os.environ.get('PORT',10000)))
-    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_1.csv')
+    p.add_argument('--csv',default='BITHUMB_FUTURES_LEAD_V1_2.csv')
     args=p.parse_args()
     if args.selftest: return selftest()
     if args.web:
