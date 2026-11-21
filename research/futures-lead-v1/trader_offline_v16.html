@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hyperliquid 파일 기반 매매 연구 V1.6.1</title>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hyperliquid 파일 기반 매매 연구 V1.6.2</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif}*{box-sizing:border-box}body{margin:0;background:#0e1728;color:#f0f5fc;line-height:1.62}main{max-width:1120px;margin:auto;padding:18px 15px 80px}h1{font-size:25px;line-height:1.35;margin:8px 0 12px}h2{font-size:19px;margin:0 0 9px}.sub{color:#a8bdd5;font-size:13px}.box{background:#17253a;border:1px solid #344863;border-radius:14px;padding:18px;margin:14px 0}.pill{background:#273953;border:1px solid #40577a;border-radius:999px;padding:3px 10px;font-size:12px;color:#c5d9ef}.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.col{flex:1;min-width:210px}label{display:block;margin:9px 0 4px;font-size:13px;color:#c2d5ea}input,select{font:inherit;background:#101d30;color:#fff;border:1px solid #526982;border-radius:9px;padding:10px;max-width:100%}input[type=file]{width:100%;padding:14px}.btn{border:0;border-radius:9px;background:#3787db;color:#fff;font-weight:700;font-size:14px;padding:11px 15px;cursor:pointer}.btn:disabled{opacity:.45;cursor:default}.btn.secondary{background:#263b58;border:1px solid #536d8c}.btn.small{padding:8px 11px;font-size:13px}a{color:#8dcbff}.warn{color:#ffbeaa}.good{color:#85dfae}.hidden{display:none!important}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:9px}.stat{border:1px solid #354b66;background:#101e31;padding:11px;border-radius:9px}.number{font-size:25px;font-weight:800;font-variant-numeric:tabular-nums}.muted{font-size:12px;color:#a6bad0}.scroll{overflow:auto}table{border-collapse:collapse;min-width:760px;width:100%}th,td{border-bottom:1px solid #344a64;padding:9px 8px;text-align:left;font-size:12px;white-space:nowrap}th{color:#b9cee4}td{font-variant-numeric:tabular-nums}#errors{white-space:pre-wrap;color:#ffbeaa}details{margin:12px 0}summary{cursor:pointer;color:#cde1f6}code{font-family:ui-monospace,Consolas,monospace;color:#b7eaff}ul{padding-left:21px}li{margin:5px 0}.linkback{font-size:12px}
 </style></head><body><main>
-<div class="row"><span class="pill">Hyperliquid 파일 연구 · V1.6.1</span><span class="pill">API 호출 0회</span><span class="pill">실제 주문 없음</span></div>
-<h1>유명 트레이더 공개 매매 패턴 연구 V1.6.1</h1>
+<div class="row"><span class="pill">Hyperliquid 파일 연구 · V1.6.2</span><span class="pill">API 호출 0회</span><span class="pill">실제 주문 없음</span></div>
+<h1>유명 트레이더 공개 매매 패턴 연구 V1.6.2</h1>
 <p class="sub">파일을 브라우저 안에서만 분석합니다. 파일 원본은 Render 서버로 전송하지 않으며, 데이터 조회·지갑 연결·카피 거래는 하지 않습니다. 지갑 별칭만으로 실제 인물을 인증하지 않습니다.</p>
 <div class="box"><h2>1. 거래 기록 파일 선택</h2>
 <p class="sub">Hyperliquid 체결 내역 CSV/JSON 또는 CSV.GZ/JSON.GZ 압축파일을 그대로 선택해 주세요. 압축 해제는 브라우저가 자동 처리합니다. 여러 파일을 한 번에 선택할 수 있습니다. 파일 하나당 한 지갑 기록을 권장합니다.</p>
@@ -12,7 +12,7 @@
 <div class="row"><div class="col"><label for="period">비교 기간 (파일에 포함된 마지막 기록 시각 기준)</label><select id="period"><option value="6">최근 6일</option><option value="13">최근 13일</option><option value="all">전체 파일 기간</option></select></div><div class="col"><label for="coins">관찰 코인</label><select id="coins"><option value="core">BTC·ETH·SOL·XRP·SUI</option><option value="all">파일에 포함된 전체 종목</option></select></div></div>
 <div class="row" style="margin-top:14px"><button id="go" class="btn">선택한 파일 분석</button><button id="template" class="btn secondary small">빈 체결 CSV 템플릿</button><button id="template2" class="btn secondary small">빈 완결거래 CSV 템플릿</button></div>
 <div id="errors" role="status" aria-live="polite"></div>
-<details><summary>지원하는 원본 파일 형식과 제한</summary><ul><li><b>원시 체결:</b> <code>time,coin,side,px,sz,startPosition,closedPnl,fee</code> 필요. JSON 배열도 가능. 선택적으로 <code>wallet,feeToken,tid,dir</code> 지원</li><li><b>완결 거래:</b> <code>coin,side,entry_kst,exit_kst,net_proxy_usdc</code> 또는 동등한 영문 필드 필요. 원시 체결과 섞여 있으면 형식별로 처리</li><li>원시 체결의 포지션 시작·종료가 파일 안에 모두 있어야 왕복 거래로 인정. 누락 구간·부분 청산·포지션 방향 전환은 보수적으로 처리</li><li>숫자 UNIX 시각/시간대가 붙은 시각이 우선입니다. 시각에 시간대 표시가 없으면 원시 체결·entry_time은 UTC, entry_kst는 한국시간으로 해석합니다</li><li>일반 CSV/JSON 최대 64MB, GZIP 압축파일 최대 40MB(압축 해제 후 64MB), 최대 120,000행/파일, 최대 12개 파일. ZIP은 지원하지 않음. 대용량 파일은 휴대폰 메모리 부족으로 중단될 수 있음</li><li>수수료 단위가 USDC가 아닌 체결은 분석에서 제외. 수익률 대신 계좌 전체와 다른 USDC 추정 손익만 제공</li></ul></details></div>
+<details><summary>지원하는 원본 파일 형식과 제한</summary><ul><li><b>원시 체결:</b> <code>time,coin,side,px,sz,startPosition,closedPnl,fee</code> 필요. JSON 배열도 가능. 선택적으로 <code>wallet,feeToken,tid,dir</code> 지원</li><li><b>완결 거래:</b> <code>coin,side,entry_kst,exit_kst,net_proxy_usdc</code> 또는 동등한 영문 필드 필요. 원시 체결과 섞여 있으면 형식별로 처리</li><li>원시 체결의 포지션 시작·종료가 파일 안에 모두 있어야 왕복 거래로 인정. 누락 구간·부분 청산·포지션 방향 전환은 보수적으로 처리</li><li>숫자 UNIX 시각/시간대가 붙은 시각이 우선입니다. 시각에 시간대 표시가 없으면 원시 체결·entry_time은 UTC, entry_kst는 한국시간으로 해석합니다</li><li>CSV 및 CSV.GZ를 분할 해제·줄 단위 처리: 압축파일 최대 80MB·압축 해제 데이터 최대 512MB, 선택 종목 기록 최대 20만 행, 최대 12개 파일. JSON은 기존 64MB 제한. ZIP은 지원하지 않음. 대용량 파일은 휴대폰에 따라 처리 시간이 길어질 수 있음</li><li>수수료 단위가 USDC가 아닌 체결은 분석에서 제외. 수익률 대신 계좌 전체와 다른 USDC 추정 손익만 제공</li></ul></details></div>
 <div class="box hidden" id="results"><h2>2. 실제 파일 분석 결과</h2><p id="coverage" class="sub"></p>
 <div class="stats" id="kpis"></div>
 <h2 style="margin-top:20px">파일·지갑별 수집 상태</h2><div class="scroll"><table><thead><tr><th>구분</th><th>파일</th><th>원본 행</th><th>복원 거래</th><th>단타 거래</th><th>누락/제외</th><th>비고</th></tr></thead><tbody id="fileRows"></tbody></table></div>
@@ -39,11 +39,11 @@ function number(v){if(v===undefined||v===null||String(v).trim()==='')return null
 function timestamp(v,naiveZone='+09:00'){if(v===null||v===undefined||v==='')return null;if(typeof v==='number'||/^\d{10,13}$/.test(String(v).trim())){const n=Number(v);const t=n<1e11?n*1000:n;return Number.isFinite(t)&&t>0&&t<4102444800000?t:null;}let s=String(v).trim();if(/^\d{4}-\d\d-\d\d[ T]\d\d:\d\d(?::\d\d(?:\.\d+)?)?$/.test(s))s=s.replace(' ','T')+naiveZone;const n=Date.parse(s);return Number.isFinite(n)?n:null;}
 function parseCSV(source){const text=source.replace(/^\uFEFF/,'');let rows=[],row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){const ch=text[i];if(quoted){if(ch==='"'&&text[i+1]==='"'){cell+='"';i++;}else if(ch==='"')quoted=false;else cell+=ch;}else if(ch==='"'&&cell==='')quoted=true;else if(ch===','){row.push(cell);cell='';}else if(ch==='\n'||ch==='\r'){row.push(cell);if(row.some(x=>x.trim()!==''))rows.push(row);row=[];cell='';if(ch==='\r'&&text[i+1]==='\n')i++;}else cell+=ch;}if(quoted)throw Error('CSV 따옴표가 닫히지 않았습니다');row.push(cell);if(row.some(x=>x.trim()!==''))rows.push(row);if(!rows.length)return[];const headers=rows[0].map(x=>x.trim());if(!headers.some(Boolean))throw Error('CSV 헤더가 없습니다');return rows.slice(1).map(r=>Object.fromEntries(headers.map((h,i)=>[h,r[i]??''])));}
 function inputRows(text,name){if(/\.json(?:\.gz)?$/i.test(name)){const j=JSON.parse(text);const rows=Array.isArray(j)?j:(Array.isArray(j.fills)?j.fills:Array.isArray(j.data)?j.data:Array.isArray(j.result)?j.result:null);if(!rows)throw Error('지원하지 않는 JSON: 체결 배열이 필요합니다');return rows;}return parseCSV(text);}
-const MAX_COMPRESSED_BYTES=40*1024*1024, MAX_DECODED_BYTES=64*1024*1024, MAX_FILE_ROWS=120000;
+const MAX_COMPRESSED_BYTES=80*1024*1024, MAX_DECODED_BYTES=64*1024*1024, MAX_STREAM_BYTES=512*1024*1024, MAX_SELECTED_ROWS=200000;
 async function readLocalFile(file){
  const zipped=/\.(?:csv|json)\.gz$/i.test(file.name);
  if(zipped){
-   if(file.size>MAX_COMPRESSED_BYTES)throw Error('압축파일 40MB 제한을 넘었습니다. 내보내기 기간을 줄여주세요.');
+   if(file.size>MAX_COMPRESSED_BYTES)throw Error('압축파일 80MB 제한을 넘었습니다. 내보내기 기간을 줄여주세요.');
    if(typeof DecompressionStream!=='function')throw Error('이 브라우저는 GZIP 압축 해제를 지원하지 않습니다. Chrome 또는 삼성 인터넷 최신 버전을 사용해 주세요.');
    const reader=file.stream().pipeThrough(new DecompressionStream('gzip')).getReader();
    const decoder=new TextDecoder('utf-8');let size=0;const chunks=[];
@@ -70,6 +70,75 @@ async function readLocalFile(file){
  if(file.size>MAX_DECODED_BYTES)throw Error('일반 파일 64MB 제한을 넘었습니다. 기간을 나눠 주세요.');
  return await file.text();
 }
+
+/** Constant-memory CSV state machine: preserves quoted newlines and UTF-8 chunk boundaries. */
+function createCSVRowParser(onRow){
+ let row=[],field='',quoted=false,pendingQuote=false,skipLF=false,physicalRow=0;
+ const cell=()=>{row.push(field);field='';};
+ const finish=()=>{
+   cell();if(row.some(v=>v.trim()!=='')){
+     if(!physicalRow && row.length)row[0]=row[0].replace(/^\uFEFF/,'');
+     onRow(row,physicalRow);physicalRow++;
+   }row=[];
+ };
+ return {
+   push(source){
+     for(let i=0;i<source.length;i++){
+       const ch=source[i];
+       if(skipLF){skipLF=false;if(ch==='\n')continue;}
+       if(quoted){
+         if(pendingQuote){
+           if(ch==='"'){field+='"';pendingQuote=false;continue;}
+           quoted=false;pendingQuote=false;
+         }else if(ch==='"'){pendingQuote=true;continue;}
+         else{field+=ch;continue;}
+       }
+       if(ch==='"'&&field===''){quoted=true;
+       }else if(ch===','){cell();
+       }else if(ch==='\r'||ch==='\n'){finish();if(ch==='\r')skipLF=true;
+       }else{field+=ch;}
+     }
+   },
+   finish(){
+     if(quoted&&!pendingQuote)throw Error('CSV 따옴표가 닫히지 않았습니다');
+     if(field!==''||row.length){finish();}
+     return physicalRow;
+   }
+ };
+}
+/** Stream CSV/GZIP without allocating the entire inflated file. Keep only chosen coins. */
+async function streamCSV(file,coinPredicate,progress=()=>{}){
+ const gz=/\.csv\.gz$/i.test(file.name);
+ if(!/\.csv(?:\.gz)?$/i.test(file.name))throw Error('CSV 또는 CSV.GZ만 분할 분석할 수 있습니다');
+ if(file.size>(gz?MAX_COMPRESSED_BYTES:MAX_STREAM_BYTES))throw Error('파일 크기 안전 제한을 초과했습니다');
+ if(gz&&typeof DecompressionStream!=='function')throw Error('이 브라우저는 GZIP 자동 해제를 지원하지 않습니다');
+ const src=gz?file.stream().pipeThrough(new DecompressionStream('gzip')):file.stream();
+ const reader=src.getReader(),decoder=new TextDecoder('utf-8');
+ let bytes=0,rawRows=0,filtered=0,headers=null,coinIndex=-1;
+ const retained=[];
+ const parser=createCSVRowParser((cells,index)=>{
+   if(!headers){headers=cells.map(x=>x.trim());coinIndex=headers.findIndex(x=>['coin','symbol','코인','종목'].includes(canon(x)));return;}
+   rawRows++;
+   if(coinIndex>=0&&!coinPredicate(String(cells[coinIndex]??'').toUpperCase().replace(/-PERP$/,'').trim())){filtered++;return;}
+   if(retained.length>=MAX_SELECTED_ROWS)throw Error('선택한 코인 기록이 20만 행을 넘습니다. 기간 또는 관찰 코인을 줄여주세요.');
+   retained.push(Object.fromEntries(headers.map((h,i)=>[h,cells[i]??''])));
+ });
+ try{
+   let parts=0;
+   while(true){
+     const part=await reader.read();if(part.done)break;
+     bytes+=part.value.byteLength;
+     if(bytes>MAX_STREAM_BYTES)throw Error('압축 해제 데이터 512MB 안전 제한을 넘었습니다. 기간을 줄여주세요.');
+     parser.push(decoder.decode(part.value,{stream:true}));
+     if(++parts%24===0){progress(rawRows,bytes);await new Promise(resolve=>setTimeout(resolve,0));}
+   }
+   parser.push(decoder.decode());parser.finish();
+   if(!headers)throw Error('CSV 헤더가 없습니다');
+   return{rows:retained,rawRows,filtered,bytes};
+ }catch(e){try{await reader.cancel();}catch(_){}throw e;
+ }finally{try{reader.releaseLock();}catch(_){}}
+}
+
 function dataKind(rows){if(!rows.length)return'empty';const r=rows[0];if(get(r,'startPosition')!==undefined&&get(r,'px','price')!==undefined&&get(r,'sz','size')!==undefined)return'fills';if(get(r,'entry_kst','entry_time','entryTime')!==undefined&&get(r,'exit_kst','exit_time','exitTime')!==undefined&&get(r,'net_proxy_usdc','net_usdc','netPnl')!==undefined)return'completed';throw Error('지원하지 않는 파일 형식: startPosition 포함 체결 또는 진입·청산·순손익이 있는 완결 거래 필요');}
 function normalizeFill(r,alias,index){const coin=String(get(r,'coin','symbol')||'').toUpperCase().replace(/-PERP$/,'').trim();const time=timestamp(get(r,'time','timestamp','fillTime'),'Z');const start=number(get(r,'startPosition')),size=number(get(r,'sz','size')),price=number(get(r,'px','price')),pnl=number(get(r,'closedPnl','closedPnlUsdc')??0),fee=number(get(r,'fee')??0),side=String(get(r,'side')||'').toUpperCase();const feeToken=String(get(r,'feeToken')||'USDC').toUpperCase();if(!coin||time===null||start===null||size===null||price===null||pnl===null||fee===null||size<=0||price<=0||(side!=='B'&&side!=='A')||feeToken!=='USDC'||/^SPOT/i.test(String(get(r,'dir')||'')))return null;const label=String(get(r,'alias','wallet','user')||alias).trim().slice(0,100);return{coin,time,start,size,price,pnl,fee,side,label,tid:String(get(r,'tid','tradeId')??''),hash:String(get(r,'hash')??''),index};}
 function reconstruct(records,filename,coins){let byWallet=new Map(),bad=0,excluded=0,duplicates=0,preexisting=0,flips=0,unfinished=0,malformed=0;const seen=new Set();for(const [i,row] of records.entries()){const f=normalizeFill(row,filename,i);if(!f){bad++;continue;}if(!coins(f.coin)){excluded++;continue;}const key=[f.label,f.coin,f.time,f.tid,f.hash,f.start,f.size,f.price,f.side].join('|');if(seen.has(key)){duplicates++;continue;}seen.add(key);if(!byWallet.has(f.label))byWallet.set(f.label,[]);byWallet.get(f.label).push(f);}
@@ -95,10 +164,10 @@ const group=new Map();for(const t of a.intraday){if(!group.has(t.label))group.se
 $('holdRows').innerHTML=[[5,30],[30,60],[60,240]].map(([lo,hi],i)=>{const p=a.intraday.filter(t=>t.hold>=lo&&(i===2?t.hold<=hi:t.hold<hi)),k=summarize(p);return'<tr><td>'+lo+'~'+hi+'분</td><td>'+k.n+'</td><td>'+fmt(k.rate,1)+'%</td><td>'+fmt(k.total)+'</td></tr>';}).join('');
 $('tradesRows').innerHTML=a.eligible.slice(0,100).map(t=>'<tr><td>'+esc(t.label)+'</td><td>'+esc(t.coin)+'</td><td>'+esc(t.side)+'</td><td>'+kst(t.entry)+'</td><td>'+kst(t.exit)+'</td><td>'+fmt(t.hold,1)+'</td><td>'+fmt(t.net)+'</td><td>'+esc(t.kind)+'</td></tr>').join('')||'<tr><td colspan="8">완결 거래 없음: 체결 항목 또는 파일 누락을 확인해 주세요</td></tr>';
 }
-async function run(){const files=[...$('files').files];$('errors').textContent='';$('results').classList.add('hidden');if(!files.length){$('errors').textContent='CSV 또는 JSON 파일을 먼저 선택해 주세요.';return;}if(files.length>12){$('errors').textContent='한 번에 파일은 최대 12개입니다.';return;}$('go').disabled=true;const res=[],errors=[];try{for(const file of files){try{$('errors').textContent=file.name+' 분석 중입니다. 압축파일은 시간이 걸릴 수 있습니다.';await new Promise(resolve=>setTimeout(resolve,30));const text=await readLocalFile(file);const rows=inputRows(text,file.name);if(rows.length>MAX_FILE_ROWS)throw Error('120,000행 제한: 내보내기 기간을 줄여주세요.');const fn=$('coins').value==='all'?()=>true:c=>CORE.has(c);const kind=dataKind(rows);let result=kind==='fills'?reconstruct(rows,file.name,fn):kind==='completed'?completed(rows,file.name,fn):{trades:[],diag:{filename:file.name,kind:'빈 파일',rows:0,valid:0,reconstructed:0,bad:0,excluded:0,duplicates:0,preexisting:0,flips:0,malformed:0,unfinished:0}};res.push(result);}catch(e){errors.push(file.name+': '+e.message);}}if(res.length){draw(res,$('period').value);$('errors').textContent=(errors.length?'미처리 파일: '+errors.join(' / ')+'\n':'')+(!last.all.length?'복원된 왕복 거래가 없습니다. 진단 행의 미관측·누락을 확인해 주세요.':'');}else $('errors').textContent=errors.join('\n');}finally{$('go').disabled=false;}}
+async function run(){const files=[...$('files').files];$('errors').textContent='';$('results').classList.add('hidden');if(!files.length){$('errors').textContent='CSV 또는 JSON 파일을 먼저 선택해 주세요.';return;}if(files.length>12){$('errors').textContent='한 번에 파일은 최대 12개입니다.';return;}$('go').disabled=true;const res=[],errors=[];try{for(const file of files){try{$('errors').textContent=file.name+' 분석 중입니다. 압축파일은 시간이 걸릴 수 있습니다.';await new Promise(resolve=>setTimeout(resolve,30));const fn=$('coins').value==='all'?()=>true:c=>CORE.has(c);const stream=/\.csv(?:\.gz)?$/i.test(file.name)?await streamCSV(file,fn,(n,b)=>{$('errors').textContent=file.name+' 분석 중 · 읽은 '+n.toLocaleString('ko-KR')+'행 · '+Math.round(b/1024/1024)+'MB';}):null;const rows=stream?stream.rows:inputRows(await readLocalFile(file),file.name);if(!stream&&rows.length>120000)throw Error('JSON 12만 행 제한: 기간을 줄여주세요.');const kind=dataKind(rows);let result=kind==='fills'?reconstruct(rows,file.name,fn):kind==='completed'?completed(rows,file.name,fn):{trades:[],diag:{filename:file.name,kind:'빈 파일',rows:0,valid:0,reconstructed:0,bad:0,excluded:0,duplicates:0,preexisting:0,flips:0,malformed:0,unfinished:0}};if(stream){result.diag.rows=stream.rawRows;result.diag.excluded+=stream.filtered;}res.push(result);}catch(e){errors.push(file.name+': '+e.message);}}if(res.length){draw(res,$('period').value);$('errors').textContent=(errors.length?'미처리 파일: '+errors.join(' / ')+'\n':'')+(!last.all.length?'복원된 왕복 거래가 없습니다. 진단 행의 미관측·누락을 확인해 주세요.':'');}else $('errors').textContent=errors.join('\n');}finally{$('go').disabled=false;}}
 $('go').addEventListener('click',run);$('period').addEventListener('change',()=>{if(lastFiles.length)draw(lastFiles,$('period').value)});
-$('template').addEventListener('click',()=>download('HYPERLIQUID_V1_6_1_FILL_TEMPLATE.csv',[['time','coin','side','px','sz','startPosition','closedPnl','fee','feeToken','tid','wallet']].map(r=>r.map(csvCell).join(',')).join('\n')));
-$('template2').addEventListener('click',()=>download('HYPERLIQUID_V1_6_1_CLOSED_TRADES_TEMPLATE.csv',[['alias','coin','side','entry_kst','exit_kst','entry_px','gross_usdc','fees_usdc','net_proxy_usdc']].map(r=>r.map(csvCell).join(',')).join('\n')));
-$('download').addEventListener('click',()=>{if(!last)return;download('HYPERLIQUID_WALLET_OFFLINE_V1_6_1_TRADES.csv',csvOut([['alias','coin','side','entry_kst','exit_kst','entry_price','hold_min','gross_usdc','fees_usdc','net_proxy_usdc','source_file','source_kind'],...last.eligible.map(t=>[t.label,t.coin,t.side,kst(t.entry),kst(t.exit),t.entryPrice,fmt(t.hold,2),t.gross,t.fees,fmt(t.net,4),t.filename,t.kind])]));});
-$('diagDownload').addEventListener('click',()=>{if(!lastFiles.length)return;download('HYPERLIQUID_WALLET_OFFLINE_V1_6_1_DIAGNOSTICS.csv',csvOut([['filename','kind','input_rows','valid_rows','roundtrips','bad','excluded','duplicates','preexisting','flips','malformed','unfinished'],...lastFiles.map(x=>{const d=x.diag;return[d.filename,d.kind,d.rows,d.valid,d.reconstructed,d.bad,d.excluded,d.duplicates,d.preexisting,d.flips,d.malformed,d.unfinished];})]));});
+$('template').addEventListener('click',()=>download('HYPERLIQUID_V1_6_2_FILL_TEMPLATE.csv',[['time','coin','side','px','sz','startPosition','closedPnl','fee','feeToken','tid','wallet']].map(r=>r.map(csvCell).join(',')).join('\n')));
+$('template2').addEventListener('click',()=>download('HYPERLIQUID_V1_6_2_CLOSED_TRADES_TEMPLATE.csv',[['alias','coin','side','entry_kst','exit_kst','entry_px','gross_usdc','fees_usdc','net_proxy_usdc']].map(r=>r.map(csvCell).join(',')).join('\n')));
+$('download').addEventListener('click',()=>{if(!last)return;download('HYPERLIQUID_WALLET_OFFLINE_V1_6_2_TRADES.csv',csvOut([['alias','coin','side','entry_kst','exit_kst','entry_price','hold_min','gross_usdc','fees_usdc','net_proxy_usdc','source_file','source_kind'],...last.eligible.map(t=>[t.label,t.coin,t.side,kst(t.entry),kst(t.exit),t.entryPrice,fmt(t.hold,2),t.gross,t.fees,fmt(t.net,4),t.filename,t.kind])]));});
+$('diagDownload').addEventListener('click',()=>{if(!lastFiles.length)return;download('HYPERLIQUID_WALLET_OFFLINE_V1_6_2_DIAGNOSTICS.csv',csvOut([['filename','kind','input_rows','valid_rows','roundtrips','bad','excluded','duplicates','preexisting','flips','malformed','unfinished'],...lastFiles.map(x=>{const d=x.diag;return[d.filename,d.kind,d.rows,d.valid,d.reconstructed,d.bad,d.excluded,d.duplicates,d.preexisting,d.flips,d.malformed,d.unfinished];})]));});
 </script></body></html>
