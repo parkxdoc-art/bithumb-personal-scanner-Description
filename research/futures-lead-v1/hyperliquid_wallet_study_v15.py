@@ -228,7 +228,7 @@ def to_diagnostics_csv(data):
         w.writerow(['RESEARCH','','ERROR','','','','','','','',err])
     return '\ufeff' + out.getvalue()
 
-HTML = '''<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>공개 트레이더 체결 연구 V1.5</title><style>
+HTML = '''<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>공개 트레이더 체결 연구 V1.5.1</title><style>
 *{box-sizing:border-box}body{background:#0c1526;color:#edf3fa;font:15px system-ui,sans-serif;line-height:1.65;margin:0}main{max-width:960px;margin:auto;padding:22px}article{background:#17243a;border:1px solid #334762;padding:18px;border-radius:16px;margin:20px 0}h1{font-size:25px}h2{font-size:19px}button,a.link{display:inline-block;color:white;background:#277dcb;border:0;border-radius:9px;padding:12px 17px;font-weight:700;text-decoration:none;cursor:pointer}button:disabled{opacity:.55}p,small{color:#afc0d4}.scroll{overflow:auto}table{border-collapse:collapse;min-width:700px;width:100%}td,th{padding:9px;border-bottom:1px solid #34445d;text-align:left;font-size:13px}th{color:#aac3e1}code{word-break:break-all;color:#b4e0ff}#err{white-space:pre-wrap;color:#ffb7b7}a{color:#8bceff} .kpi{font-size:18px;font-weight:bold}select{background:#091326;color:white;border:1px solid #506888;border-radius:7px;padding:12px}
 </style></head><body><main>
 <small>HYPERLIQUID · 공개 지갑 연구 · 투자 주문 없음</small><h1>유명 트레이더 체결 패턴 연구 V1.5.1</h1>
@@ -312,7 +312,7 @@ if __name__=='__main__':
     p.add_argument('--selftest',action='store_true')
     p.add_argument('--fetch',action='store_true')
     p.add_argument('--days',type=int,default=6)
-    p.add_argument('--csv',default='HYPERLIQUID_WALLET_STUDY_V1_5.csv')
+    p.add_argument('--csv',default='HYPERLIQUID_WALLET_STUDY_V1_5_1.csv')
     args=p.parse_args()
     if args.selftest:selftest()
     elif args.fetch:
