@@ -18,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '1.5'
+VERSION = '1.5.1'
 API = 'https://api.hyperliquid.xyz/info'
 DAY_MS = 24*60*60*1000
 KST = timezone(timedelta(hours=9))
@@ -207,23 +207,44 @@ def to_csv(data):
     return '\ufeff'+out.getvalue()
 
 
+
+def to_diagnostics_csv(data):
+    """Keep API errors and acquisition status separate from closed-trades CSV."""
+    out = io.StringIO()
+    w = csv.writer(out)
+    fields = ['alias','wallet','collection_status','fills','roundtrips','intraday_5_240',
+              'api_calls','pre_existing_or_unobserved','flips','malformed','error']
+    w.writerow(fields)
+    for row in data.get('wallets', []):
+        skipped = row.get('skipped') or {}
+        w.writerow([row.get('alias',''),row.get('wallet',''),
+                    'ERROR' if row.get('error') else 'OK',
+                    row.get('fills',''),row.get('roundtrips',''),
+                    row.get('intraday',''),row.get('api_calls',''),
+                    skipped.get('pre_existing_or_unobserved',''),
+                    skipped.get('flips',''),skipped.get('malformed',''),
+                    row.get('error','')])
+    for err in data.get('errors', []):
+        w.writerow(['RESEARCH','','ERROR','','','','','','','',err])
+    return '\ufeff' + out.getvalue()
+
 HTML = '''<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>공개 트레이더 체결 연구 V1.5</title><style>
 *{box-sizing:border-box}body{background:#0c1526;color:#edf3fa;font:15px system-ui,sans-serif;line-height:1.65;margin:0}main{max-width:960px;margin:auto;padding:22px}article{background:#17243a;border:1px solid #334762;padding:18px;border-radius:16px;margin:20px 0}h1{font-size:25px}h2{font-size:19px}button,a.link{display:inline-block;color:white;background:#277dcb;border:0;border-radius:9px;padding:12px 17px;font-weight:700;text-decoration:none;cursor:pointer}button:disabled{opacity:.55}p,small{color:#afc0d4}.scroll{overflow:auto}table{border-collapse:collapse;min-width:700px;width:100%}td,th{padding:9px;border-bottom:1px solid #34445d;text-align:left;font-size:13px}th{color:#aac3e1}code{word-break:break-all;color:#b4e0ff}#err{white-space:pre-wrap;color:#ffb7b7}a{color:#8bceff} .kpi{font-size:18px;font-weight:bold}select{background:#091326;color:white;border:1px solid #506888;border-radius:7px;padding:12px}
 </style></head><body><main>
-<small>HYPERLIQUID · 공개 지갑 연구 · 투자 주문 없음</small><h1>유명 트레이더 체결 패턴 연구 V1.5</h1>
+<small>HYPERLIQUID · 공개 지갑 연구 · 투자 주문 없음</small><h1>유명 트레이더 체결 패턴 연구 V1.5.1</h1>
 <p>공개 지갑 3개를 대상으로 BTC·ETH·SOL·XRP·SUI의 실제 체결을 조회합니다. 개인 실명·전략 의도는 확인되지 않았습니다. 바이낸스 API는 사용하지 않습니다.</p>
 <article><h2>연구 실행</h2><p>가장 최근 6일 기준, 지갑별 완료된 왕복 포지션과 5~240분 보유 포지션을 분리합니다. 일부 체결이 누락되면 완전한 기록으로 해석하지 않습니다.</p>
 <label>연구 기간 <select id="days"><option value="6">최근 6일</option><option value="13">최근 13일</option></select></label>
 <button id="start" onclick="run()">체결 기록 조사</button> <b id="state">미실행</b><p id="progress"></p><p id="err"></p></article>
 <article><h2>선정된 관측 대상 (실명 확인 아님)</h2><p>BobbyBigSize · x35767 · 0xb83d…6e36</p><small>공개 순위표 기반 사전 후보이며 수익성 검증 전입니다. 같은 전략을 모방하지 않습니다.</small></article>
-<article id="results" hidden><h2>지갑별 연구 결과</h2><div class="scroll"><table><thead><tr><th>지갑</th><th>체결 수</th><th>완료 포지션</th><th>5~240분</th><th>승률(추정)</th><th>중위 보유분</th><th>최대 손실(USDC 추정)</th></tr></thead><tbody id="wallets"></tbody></table></div><p><a id="csv" href="/api/wallet-study/csv">완료 포지션 CSV 받기</a></p>
-<h2>최근 완료 포지션</h2><div class="scroll"><table><thead><tr><th>지갑</th><th>코인</th><th>방향</th><th>진입(KST)</th><th>청산(KST)</th><th>보유분</th><th>손익 추정(USDC)</th></tr></thead><tbody id="episodes"></tbody></table></div><p id="note"></p></article>
+<article id="results" hidden><h2>지갑별 연구 결과</h2><div class="scroll"><table><thead><tr><th>지갑</th><th>체결 수</th><th>완료 포지션</th><th>5~240분</th><th>승률(추정)</th><th>중위 보유분</th><th>최대 손실(USDC 추정)</th></tr></thead><tbody id="wallets"></tbody></table></div><p><a id="csv" href="/api/wallet-study/csv">완료 포지션 CSV 받기</a> · <a href="/api/wallet-study/diagnostics.csv">수집 진단 CSV 받기 (체결 수·오류)</a></p>
+<h2>최근 완료 포지션</h2><div class="scroll"><table><thead><tr><th>지갑</th><th>코인</th><th>방향</th><th>진입(KST)</th><th>청산(KST)</th><th>보유분</th><th>손익 추정(USDC)</th></tr></thead><tbody id="episodes"></tbody></table></div><p id="fetchwarn" style="font-weight:bold;color:#ffb7b7"></p><p id="note"></p></article>
 <article><h2>해석 주의</h2><p>① 전체 계좌 수익률이 아닌 완료 포지션의 추정치입니다. ② 단일 체결이 여러 번 쪼개질 수 있으므로 체결 수≠거래 횟수입니다. ③ 지갑은 거래소 외부 헤지·입출금이 있을 수 있습니다. ④ 출처 API는 최근 체결 수 제한이 있습니다. ⑤ 익숙한 트레이더의 닉네임이 실제 인물 신원을 인증하지 않습니다.</p></article>
 </main><script>
 const $=x=>document.getElementById(x);const esc=s=>String(s??'—').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));let timer=null;
 async function run(){ $('err').textContent='';$('start').disabled=true;try{let r=await fetch('/api/wallet-study/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:Number($('days').value)})});let v=await r.json();if(!r.ok){throw Error(v.error||'요청 실패')}poll();timer=setInterval(poll,1300)}catch(e){$('err').textContent=e.message;$('start').disabled=false}}
 async function poll(){try{let r=await fetch('/api/wallet-study/status');let j=await r.json();$('state').textContent=j.state==='running'?'조회 중':j.state==='done'?'완료':j.state==='error'?'오류':'미실행';$('progress').textContent=j.progress||'';if(j.state!=='running'){if(timer){clearInterval(timer);timer=null}$('start').disabled=false;if(j.state==='error')$('err').textContent=j.error||'조회 실패';if(j.state==='done'&&j.result)show(j.result)}}catch(e){$('err').textContent=e.message}}
-function show(j){$('results').hidden=false;$('wallets').innerHTML=(j.wallets||[]).map(x=>'<tr><td title="'+esc(x.wallet)+'">'+esc(x.alias)+'</td><td>'+esc(x.fills)+'</td><td>'+esc(x.roundtrips)+'</td><td>'+esc(x.intraday)+'</td><td>'+esc(x.win_rate===null?'—':x.win_rate+'%')+'</td><td>'+esc(x.median_hold_min)+'</td><td>'+esc(x.largest_loss_proxy_usdc)+'</td></tr>').join('');$('episodes').innerHTML=(j.episodes||[]).slice(0,60).map(x=>'<tr><td>'+esc(x.alias)+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.side)+'</td><td>'+esc(x.entry_kst)+'</td><td>'+esc(x.exit_kst)+'</td><td>'+esc(x.hold_min)+'</td><td>'+esc(x.net_proxy_usdc)+'</td></tr>').join('');$('note').textContent=[...(j.errors||[]),...(j.limits||[])].join(' / ')}poll();
+function show(j){$('results').hidden=false;$('wallets').innerHTML=(j.wallets||[]).map(x=>'<tr><td title="'+esc(x.wallet)+'">'+esc(x.alias)+'</td><td>'+esc(x.fills)+'</td><td>'+esc(x.roundtrips)+'</td><td>'+esc(x.intraday)+'</td><td>'+esc(x.win_rate===null?'—':x.win_rate+'%')+'</td><td>'+esc(x.median_hold_min)+'</td><td>'+esc(x.largest_loss_proxy_usdc)+'</td></tr>').join('');$('episodes').innerHTML=(j.episodes||[]).slice(0,60).map(x=>'<tr><td>'+esc(x.alias)+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.side)+'</td><td>'+esc(x.entry_kst)+'</td><td>'+esc(x.exit_kst)+'</td><td>'+esc(x.hold_min)+'</td><td>'+esc(x.net_proxy_usdc)+'</td></tr>').join('');$('fetchwarn').textContent=(j.errors||[]).length?('수집 오류: '+j.errors.join(' / ')):((j.episodes||[]).length===0?'완료된 포지션 0건. 체결 수와 제외 사유는 진단 CSV에서 확인해 주세요.':'');$('note').textContent=(j.limits||[]).join(' / ')}poll();
 </script></body></html>'''
 
 STATE = {'state':'idle','progress':'','result':None,'error':None}
@@ -279,6 +300,10 @@ def selftest():
     got,n=get_fills(wallet,t-100,t+DAY_MS,api=fake,pause=0)
     assert len(got)==4 and n==2 and calls[0][1]+1==calls[1][0]
     assert '\ufeff' in to_csv({'episodes':episodes})
+    diagnostic = to_diagnostics_csv({'wallets':[{'alias':'test','wallet':wallet,'fills':4,'roundtrips':1,'intraday':1,'skipped':{'malformed':2}}], 'errors':[]})
+    assert 'test' in diagnostic and '4,1,1' in diagnostic and 'OK' in diagnostic
+    fail_diagnostic = to_diagnostics_csv({'wallets':[{'alias':'test','wallet':wallet,'error':'HTTP 429'}],'errors':['요청 제한으로 중단']})
+    assert 'HTTP 429' in fail_diagnostic and '요청 제한으로 중단' in fail_diagnostic
     print('V1.5 SELFTEST PASS: closed positions, partial fills, fees, unknown entry excluded, pagination, CSV')
 
 
