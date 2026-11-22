@@ -634,7 +634,49 @@ function renderResults(){
    +'<p>수수료 편도 '+fee.toFixed(2)+'% · 완료봉 '+esc(m.closed_kst)+' KST</p>'+bttext+'</div></details>';
  }).join('');
 }
-$('start').onclick=async()=>{if(busy)return;reset();busy=true;runId++;const id=runId,btn=$('start');btn.disabled=true;btn.textContent='검색 중…';let cfg={mode,strategy,tf:$('tf').value,fee:Number($('fee').value)};if(mode==='backtest')cfg.at=$('at').value.replace('T',' ')+':00';lastCfg=cfg;try{const [list,b]=await Promise.all([get('/api/universe'),post('/api/btc',cfg)]);if(runId!==id)return;btcDraw(b.context);if(mode==='live')cfg.snapshot_at=b.context.asof_kst;const count=$('scope').value;const items=list.items.filter(x=>mode==='backtest'||x.turnover>=500000000);universe=(count==='all'?items:items.slice(0,Number(count)));if(!universe.length)throw Error('검색 가능한 코인 목록 없음');$('btinfo').textContent=mode==='backtest'?'과거 1회 스냅샷 · 현재 상장/거래대금 순위로 대상 선택(생존/미래정보 편향 주의) · 미확정 별도 표시':'24시간 거래대금 5억원 이상 · 완료봉만 사용 · 신호 없는 종목 제외';let cursor=0;const work=async()=>{while(cursor<universe.length){const index=cursor++,coin=universe[index];try{const j=await post('/api/coin',{...cfg,market:coin.market});if(j.signal)results.push({market:coin.market,name:coin.name,at:cfg.at||'LIVE',signal:j.signal});if(j.issue)problems++;}catch(e){problems++;}completed++;if(completed%4===0||completed===universe.length){summary();renderResults();}await Promise.resolve();}};await Promise.all(Array.from({length:Math.min(5,universe.length)},work));}catch(e){$('error').textContent='검사를 완료하지 못했어: '+e.message;}finally{busy=false;btn.disabled=false;btn.textContent='검색 시작';summary();renderResults();$('csv').disabled=!completed;}};
+$('start').onclick=async()=>{
+ if(busy)return;reset();busy=true;runId++;const id=runId,btn=$('start');btn.disabled=true;btn.textContent='검색 중…';
+ const cfg={mode,strategy,tf:$('tf').value,fee:Number($('fee').value)};
+ if(mode==='backtest')cfg.at=$('at').value.replace('T',' ')+':00';lastCfg={...cfg};
+ try{
+  const list=await get('/api/universe');const scope=$('scope').value;
+  let items=list.items.filter(x=>mode==='backtest'||x.turnover>=500000000);
+  items=scope==='all'?items:items.slice(0,Number(scope));
+  const daysCount=mode==='backtest'?Number($('days').value):1;
+  if(daysCount>1)items=items.slice(0,daysCount===7?10:20);
+  if(!items.length)throw Error('검색 가능한 종목이 없어');
+  const dates=[];
+  for(let day=0;day<daysCount;day++){
+   const c={...cfg};
+   if(mode==='backtest'){const d=new Date(cfg.at.replace(' ','T'));d.setDate(d.getDate()-day);c.at=dt(d).replace('T',' ')+':00';}
+   dates.push(c);
+  }
+  universe=dates.flatMap(c=>items.map(x=>({...x,at:c.at||'LIVE'})));
+  $('btinfo').textContent=mode==='backtest'
+    ?daysCount+'일 × 하루 같은 시각 1회 · '+items.length+'개 현재 상장 종목. 현재 거래대금 순위 사용: 생존편향/미래정보 편향 주의!'
+    :'현재 24시간 거래대금 5억원 이상 · 완료봉만 사용 · 신호 없는 코인은 표시하지 않음';
+  for(const c of dates){
+   const b=await post('/api/btc',c);
+   if(runId!==id)break;
+   btcDraw(b.context);
+   if(mode==='live')c.snapshot_at=b.context.asof_kst;
+   let cursor=0;
+   const work=async()=>{while(cursor<items.length){
+    const coin=items[cursor++];
+    try{
+     const j=await post('/api/coin',{...c,market:coin.market});
+     if(j.signal)results.push({market:coin.market,name:coin.name,at:c.at||'LIVE',signal:j.signal});
+     if(j.issue)problems++;
+    }catch(e){problems++;}
+    completed++;
+    if(completed%4===0||completed===universe.length){summary();renderResults();}
+    await Promise.resolve();
+   }};
+   await Promise.all(Array.from({length:Math.min(4,items.length)},work));
+  }
+ }catch(ex){$('error').textContent='검사를 완료하지 못했어: '+ex.message;}
+ finally{busy=false;btn.disabled=false;btn.textContent='검색 시작';summary();renderResults();$('csv').disabled=!completed;}
+};
 $('csv').onclick=()=>{
  if(!lastCfg)return;
  const fields=['version','strategy','mode','snapshot_kst','tf','fee_each_pct','market','name','signal','closed_kst','relative_pct','btc_change_pct','coin_change_pct','breakout_pct','volume_ratio','atr_pct','rise24_pct','structure_risk_pct','reason','tp1_net','tp1_fraction','tp2_net','tp2_fraction','stop_gross','max_minutes','bt_status','bt_net_pct','bt_stop','bt_tp1','bt_tp2','bt_minutes','bt_ambiguous','bt_reason'];
