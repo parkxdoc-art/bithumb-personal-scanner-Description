@@ -1,0 +1,996 @@
+BITHUMB BTC MTF V1.3 | FULL BACKUP (MAIN + V1.3 SCORE + V1.2 INDICATORS + REQUIREMENTS)
+Repository branch: https://github.com/parkxdoc-art/bithumb-personal-scanner-Description/tree/btc-mtf-v1-3
+Deploy: https://bithumb-btc-mtf-v13.onrender.com/
+NOTICE: This is a multi-file concatenated backup; save each ===== filename ===== section as its own file to run.
+
+
+======== BEGIN bithumb_btc_mtf_v1.py ========
+"""BITHUMB BTC MTF V1.1 | Read-only LIVE + historical snapshot research.
+
+BTC: month/week/day/4h/1h/30m/15m/5m/3m/1m trends, all closed candles.
+Coin scan: 5m/15m/1h/4h/day, BUY/WATCH with audit reasons.
+Fees: 0.04% or 0.25% each side. No private endpoints or automatic orders.
+Backtest: one dated KST snapshot, next 240m of observed 5m OHLC; no lookahead.
+"""
+from __future__ import annotations
+
+import calendar
+import math
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import requests
+from flask import Flask, jsonify, request, Response
+import btc_mtf_rebound_v13 as rebound
+
+VERSION = "BTC MTF V1.3"
+KST = ZoneInfo("Asia/Seoul")
+API = "https://api.bithumb.com"
+TIMEFRAMES = ("month", "week", "day", "4h", "1h", "30m", "15m", "5m", "3m", "1m")
+SCAN_TF = ("5m", "15m", "1h", "4h", "day")
+STRATEGIES = ("scalp", "swing")
+STABLES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USD1", "PYUSD", "USDE", "USDD", "RLUSD", "EURC", "EURI"}
+MARKET_RE = re.compile(r"^KRW-[A-Z0-9]+$")
+MIN_TURNOVER = 500_000_000  # live only: 24h ticker value
+FEE_CHOICES = (0.04, 0.25)
+_CACHE = {}
+_LOCK = threading.Lock()
+app = Flask(__name__)
+
+
+def now_kst():
+    return datetime.now(KST)
+
+
+def ttl_get(key):
+    with _LOCK:
+        value = _CACHE.get(key)
+        return value[1] if value and value[0] > time.monotonic() else None
+
+
+def ttl_put(key, value, seconds):
+    with _LOCK:
+        if len(_CACHE) > 1600:
+            _CACHE.clear()
+        _CACHE[key] = (time.monotonic() + seconds, value)
+
+
+def api_get(path, params=None):
+    err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(API + path, params=params, timeout=(4, 13), headers={
+                "Accept": "application/json", "User-Agent": "bithumb-btc-mtf-personal-v1/1.0"
+            })
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"temporary HTTP {r.status_code}")
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list):
+                raise RuntimeError("API array expected")
+            return data
+        except Exception as ex:
+            err = ex
+            if attempt < 2:
+                time.sleep(.35 * (attempt + 1))
+    raise RuntimeError(f"Bithumb {path}: {str(err)[:95]}")
+
+
+def endpoint(tf):
+    if tf not in TIMEFRAMES:
+        raise ValueError("Unsupported timeframe")
+    return "/v1/candles/" + ({"month": "months", "week": "weeks", "day": "days"}.get(tf, "minutes/" + str({"4h": 240, "1h": 60, "30m": 30, "15m": 15, "5m": 5, "3m": 3, "1m": 1}.get(tf, 5))))
+
+
+def tf_end(start, tf):
+    if tf == "month":
+        m = start.month + 1
+        y = start.year + (m > 12)
+        m = (m - 1) % 12 + 1
+        return start.replace(year=y, month=m, day=min(start.day, calendar.monthrange(y, m)[1]))
+    if tf == "week":
+        return start + timedelta(days=7)
+    if tf == "day":
+        return start + timedelta(days=1)
+    return start + timedelta(minutes={"4h": 240, "1h": 60, "30m": 30, "15m": 15, "5m": 5, "3m": 3, "1m": 1}[tf])
+
+
+def candles(market, tf, at=None, count=70):
+    params = {"market": market, "count": min(200, count)}
+    if at is not None:
+        params["to"] = at.strftime("%Y-%m-%d %H:%M:%S")
+    raw = api_get(endpoint(tf), params)
+    clock = at or now_kst()
+    result = {}
+    for x in raw:
+        try:
+            start = datetime.fromisoformat(x["candle_date_time_kst"]).replace(tzinfo=KST)
+            if tf_end(start, tf) > clock - timedelta(seconds=2):
+                continue  # never use unfinished candle
+            op, hi, lo, cl = [float(x[k]) for k in ("opening_price", "high_price", "low_price", "trade_price")]
+            vol = float(x.get("candle_acc_trade_price") or 0)
+            if not (math.isfinite(op) and math.isfinite(hi) and math.isfinite(lo) and math.isfinite(cl) and min(op, hi, lo, cl) > 0):
+                continue
+            result[start] = {"t": start, "o": op, "h": hi, "l": lo, "c": cl, "turnover": vol}
+        except (KeyError, ValueError, TypeError, OverflowError):
+            continue
+    return sorted(result.values(), key=lambda r: r["t"])
+
+
+def is_contiguous(rows, tf, n=10):
+    if len(rows) < n:
+        return False
+    tail = rows[-n:]
+    return all(tf_end(x["t"], tf) == y["t"] for x, y in zip(tail, tail[1:]))
+
+
+def trend(rows, tf):
+    if not is_contiguous(rows, tf, 10):
+        return {"state": "unknown", "reason": "연속 마감봉 10개 부족", "bars": len(rows)}
+    prices = [x["c"] for x in rows[-10:]]
+    m5 = sum(prices[-5:]) / 5
+    m10 = sum(prices) / 10
+    c = prices[-1]
+    state = "up" if c > m5 > m10 else "down" if c < m5 < m10 else "side"
+    return {"state": state, "close": c, "ma5": m5, "ma10": m10,
+            "closed_kst": tf_end(rows[-1]["t"], tf).isoformat(), "bars": len(rows)}
+
+
+def aggregate(trends):
+    states = [s for s in trends if s in ("up", "down", "side")]
+    if len(states) < max(2, len(trends)//2):
+        return "unknown"
+    up, down = states.count("up"), states.count("down")
+    return "up" if up > down and up >= (len(states)+1)//2 else "down" if down > up and down >= (len(states)+1)//2 else "side"
+
+
+def historical_time(s):
+    try:
+        d = datetime.fromisoformat(str(s))
+        if d.tzinfo is not None:
+            raise ValueError("KST local date/time expected")
+        d = d.replace(tzinfo=KST)
+        if d.minute % 5 or d.second:
+            raise ValueError("5분 단위 시각만 지원")
+        if d > now_kst() - timedelta(minutes=245):
+            raise ValueError("청산 240분이 지난 과거 시각만 검증 가능")
+        if d < now_kst() - timedelta(days=360):
+            raise ValueError("최근 360일 이내 시각 선택")
+        return d
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"검증 시각 오류: {ex}")
+
+
+def request_cfg(raw, need_market=False):
+    if not isinstance(raw, dict):
+        raise ValueError("요청 형식 오류")
+    mode = raw.get("mode", "live")
+    strategy = raw.get("strategy", "scalp")
+    if strategy not in STRATEGIES:
+        raise ValueError("단타/스윙 모드 오류")
+    tf = raw.get("tf", "5m")
+    if mode not in ("live", "backtest") or tf not in SCAN_TF:
+        raise ValueError("모드 또는 시간봉 오류")
+    fee = float(raw.get("fee", .04))
+    if fee not in FEE_CHOICES:
+        raise ValueError("편도 수수료는 0.04 또는 0.25만 선택")
+    if mode == "backtest":
+        at = historical_time(raw.get("at"))
+    elif raw.get("snapshot_at"):
+        try:
+            at = datetime.fromisoformat(str(raw["snapshot_at"]).replace(" ", "T")).replace(tzinfo=KST)
+            if abs((now_kst()-at).total_seconds()) > 900:
+                raise ValueError("실시간 스캔 시각이 15분 이상 오래됨")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"실시간 기준 시각 오류: {exc}")
+    else:
+        at = now_kst()
+    market = raw.get("market") if need_market else None
+    if mode == "backtest" and strategy == "swing" and at > now_kst() - timedelta(hours=121):
+        raise ValueError("스윙은 과거 기준 시각 이후 120시간이 지나야 검증할 수 있어")
+    if need_market and (not isinstance(market, str) or not MARKET_RE.fullmatch(market) or market.split("-", 1)[1] in STABLES):
+        raise ValueError("KRW 코인 마켓만 조회 가능")
+    return mode, tf, fee, at, market, strategy
+
+
+def market_list():
+    cached = ttl_get("markets-v1")
+    if cached is not None:
+        return cached
+    data = api_get("/v1/market/all", {"isDetails": "true"})
+    names = {x["market"]: x.get("korean_name", x["market"]) for x in data if isinstance(x, dict) and MARKET_RE.fullmatch(str(x.get("market", ""))) and x["market"].split("-", 1)[1] not in STABLES}
+    ttl_put("markets-v1", names, 600)
+    return names
+
+
+def universe():
+    cached = ttl_get("ranked-markets-v1")
+    if cached is not None:
+        return cached
+    names = market_list()
+    ticker = {}
+    ms = list(names)
+    for i in range(0, len(ms), 50):
+        try:
+            arr = api_get("/v1/ticker", {"markets": ",".join(ms[i:i+50])})
+            ticker.update({x["market"]: x for x in arr if isinstance(x, dict) and x.get("market")})
+        except Exception:
+            pass
+    rows = []
+    for market, name in names.items():
+        if market == "KRW-BTC":
+            continue  # BTC only on market trend board
+        t = ticker.get(market) or {}
+        turnover = float(t.get("acc_trade_price_24h") or 0)
+        rows.append({"market": market, "name": name, "turnover": turnover,
+                     "change24": round(float(t.get("signed_change_rate") or 0)*100, 3)})
+    rows.sort(key=lambda x: (-x["turnover"], x["market"]))
+    ttl_put("ranked-markets-v1", rows, 300)
+    return rows
+
+
+def btc_context(cfg):
+    mode, selected, fee, at, _, strategy = cfg
+    key = ("btc", mode, selected, at.strftime("%Y-%m-%d %H:%M"))
+    cached = ttl_get(key)
+    if cached is not None:
+        return cached
+    states = {}
+    last4 = None
+    rows4 = []
+    def run_tf(tf):
+        try:
+            # at is the snapshot clock; 1m candles are not *currently forming*.
+            rs = candles("KRW-BTC", tf, at, count=48)
+            return tf, trend(rs, tf), rs
+        except Exception as exc:
+            return tf, {"state": "unknown", "reason": str(exc)[:100]}, []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for tf, state, rows in pool.map(run_tf, TIMEFRAMES):
+            states[tf] = state
+            if tf == selected:
+                last4 = rows
+            if tf == "4h":
+                rows4 = rows
+    lng = aggregate([states[tf]["state"] for tf in ("month", "week", "day", "4h")])
+    sht = aggregate([states[tf]["state"] for tf in ("1h", "30m", "15m", "5m", "3m", "1m")])
+    selected_return = round((last4[-1]["c"]/last4[-5]["c"]-1)*100, 4) if last4 and is_contiguous(last4, selected, 5) else None
+    context = {"tf": states, "long": lng, "short": sht,
+               "selected_return": selected_return, "selected_tf": selected,
+               "asof_kst": at.strftime("%Y-%m-%d %H:%M:%S")}
+    ttl_put(key, context, 3600 if mode == "backtest" else 900)
+    ttl_put(("btc-h4",mode,at.strftime("%Y-%m-%d %H:%M")), rows4, 3600 if mode == "backtest" else 900)
+    return context
+
+
+def coin_metrics(rows, tf, btc_ret):
+    if not is_contiguous(rows, tf, 23) or btc_ret is None:
+        return None, "종목 23봉 연속 이력 또는 같은 봉 BTC 수익률 부족"
+    closes = [x["c"] for x in rows]
+    last, prev = rows[-1], rows[-2]
+    m5 = sum(closes[-5:]) / 5
+    m20 = sum(closes[-20:]) / 20
+    prev6high = max(r["h"] for r in rows[-7:-1])
+    breakout = (last["c"] / prev6high - 1) * 100
+    change4 = (closes[-1]/closes[-5]-1)*100
+    relative = change4-btc_ret
+    volprev = sum(x["turnover"] for x in rows[-21:-1])/20
+    volratio = last["turnover"]/volprev if volprev>0 else 0
+    body = (last["c"]-last["o"])/max(last["h"]-last["l"], 1e-14)
+    tr = [max(x["h"]-x["l"], abs(x["h"]-y["c"]), abs(x["l"]-y["c"])) for x,y in zip(rows[-14:], rows[-15:-1])]
+    atr = sum(tr)/len(tr)/last["c"]*100 if tr else None
+    return {"close": last["c"], "ma5": m5, "ma20": m20,
+            "breakout_pct": round(breakout, 4), "coin_return_pct": round(change4, 4),
+            "btc_return_pct": btc_ret, "relative_pct": round(relative, 4),
+            "volume_ratio": round(volratio, 3), "body_ratio": round(body, 3),
+            "atr_pct": round(atr, 3) if atr is not None else None,
+            "closed_kst": tf_end(last["t"], tf).strftime("%Y-%m-%d %H:%M")}, None
+
+
+def coin_signal(metrics, ctx, fee):
+    m = metrics
+    conditions = {
+        "trend": m["close"] > m["ma5"] > m["ma20"],
+        "breakout": m["breakout_pct"] > 0,
+        "relative": m["relative_pct"] >= .5,
+        "volume": m["volume_ratio"] >= .7,
+        "candle": m["body_ratio"] >= .5,
+    }
+    bear = ctx["long"] == "down" and ctx["short"] == "down"
+    independent = m["relative_pct"] >= 1.5 and m["breakout_pct"] >= .25
+    buy = all(conditions.values()) and (not bear or independent)
+    watch = (conditions["trend"] or conditions["breakout"]) and m["relative_pct"] > 0 and m["body_ratio"] > 0
+    if not buy and not watch:
+        return None
+    kind = "BUY" if buy else "WATCH"
+    causes = []
+    causes.append(f"같은 {ctx['selected_tf']} 기준 BTC 대비 상대강도 {m['relative_pct']:+.2f}%p (코인 {m['coin_return_pct']:+.2f}% / BTC {m['btc_return_pct']:+.2f}%)")
+    causes.append(f"직전 6봉 고점 대비 마감 돌파폭 {m['breakout_pct']:+.2f}% · 거래대금 배수 {m['volume_ratio']:.2f}배")
+    causes.append(f"종가 > MA5 > MA20 {'충족' if conditions['trend'] else '미충족'} · 양봉 몸통 비중 {m['body_ratio']*100:.0f}%")
+    causes.append(f"BTC 장기 {state_ko(ctx['long'])}, 단기 {state_ko(ctx['short'])}" + (" · 약세장 상대강도 강화 충족" if bear and independent else ""))
+    if kind == "WATCH":
+        missing = [k for k, ok in conditions.items() if not ok]
+        names = {"trend": "상승 배열", "breakout": "직전 고점 돌파", "relative": "BTC 대비 0.5%p 우위", "volume": "거래대금 0.7배", "candle": "양봉 몸통 50%"}
+        causes.append("BUY 보류: " + (", ".join(names[k] for k in missing) if missing else "BTC 동시 강한 하락 중 독립 상승 강도 부족"))
+    else:
+        causes.append("모든 진입 품질 조건 충족 · 실제 주문이 아닌 연구용 BUY 후보")
+    # Exchange fee applies per leg; backtest uses the same target levels.
+    gross_tp1 = ((1+.01)*(1+fee/100)/(1-fee/100)-1)*100
+    gross_tp2 = ((1+.10)*(1+fee/100)/(1-fee/100)-1)*100
+    return {"signal": kind, "metrics": m, "explanation": causes,
+            "plan": {"tp1_net": 1.0, "tp1_fraction": .7, "tp2_net": 10.0,
+                     "tp2_fraction": .3, "stop_gross": -2.0, "max_minutes": 240,
+                     "tp1_gross_pct": round(gross_tp1, 3), "tp2_gross_pct": round(gross_tp2, 3)}}
+
+
+def state_ko(s):
+    return {"up": "상승", "side": "횡보", "down": "하락", "unknown": "자료 부족"}.get(s, "자료 부족")
+
+
+def backtest_exit(market, at, fee, getter=candles):
+    """Simulate one snapshot entry at the 5m open and 240m observed path.
+
+    Both stop and TP within a 5-minute candle: conservatively stop first.
+    Prior 5-minute candles are not traded, and no synthetic candles are made.
+    """
+    out = {"status": "UNKNOWN", "net_pct": None, "reason": "", "tp1": False, "tp2": False,
+           "stop": False, "minutes": None, "ambiguous": False}
+    try:
+        rows = getter(market, "5m", at+timedelta(minutes=241), count=100)
+    except Exception as ex:
+        return {**out, "reason": "청산 경로 조회 실패: " + str(ex)[:80]}
+    indexed = {r["t"]:r for r in rows}
+    if any(at+timedelta(minutes=5*k) not in indexed for k in range(48)):
+        return {**out, "reason": "240분 중 5분봉 누락: 미래 가격 경로 확인 불가"}
+    entry = indexed[at]["o"]
+    if entry <= 0:
+        return {**out, "reason": "진입 시가 없음"}
+    cost = fee / 100
+    p1 = entry*(1.01)*(1+cost)/(1-cost)
+    p2 = entry*(1.10)*(1+cost)/(1-cost)
+    stop = entry*.98
+    fraction, realized = 1.0, 0.0
+    tp1 = tp2 = False
+    def net(px):
+        return (px*(1-cost)/(entry*(1+cost))-1)*100
+    for k in range(48):
+        b = indexed[at+timedelta(minutes=5*k)]
+        op, hi, lo, cl = b["o"], b["h"], b["l"], b["c"]
+        if lo <= stop:
+            ambiguous = (hi >= p1 if not tp1 else hi >= p2)
+            return {**out, "status": "RESOLVED", "net_pct": round(realized + fraction*net(min(op,stop)), 6),
+                    "reason": "", "tp1": tp1, "tp2": tp2, "stop": True,
+                    "minutes": (k+1)*5, "ambiguous": ambiguous}
+        if not tp1 and hi >= p1:
+            realized += .7*net(p1)
+            fraction = .3
+            tp1 = True
+        if tp1 and hi >= p2:
+            realized += fraction*net(p2)
+            return {**out, "status": "RESOLVED", "net_pct": round(realized, 6),
+                    "reason": "", "tp1": True, "tp2": True, "stop": False,
+                    "minutes": (k+1)*5, "ambiguous": False}
+        if k == 47:
+            return {**out, "status": "RESOLVED", "net_pct": round(realized + fraction*net(cl), 6),
+                    "reason": "", "tp1": tp1, "tp2": False, "stop": False,
+                    "minutes": 240, "ambiguous": False}
+    return {**out, "reason": "결과 확인 불가"}
+
+
+def _avg(values):
+    return sum(values)/len(values)
+
+
+def swing_metrics(day, h4, h1, btc4, at):
+    """Only completed candles at the snapshot and synchronized BTC 4h series."""
+    if not (is_contiguous(day, "day", 24) and is_contiguous(h4, "4h", 34)
+            and is_contiguous(h1, "1h", 16)):
+        return None, "스윙 판정용 연속 마감봉 부족(일 24, 4시간 34, 1시간 16)"
+    if at-tf_end(h4[-1]["t"],"4h") > timedelta(hours=8) or at-tf_end(h1[-1]["t"],"1h") > timedelta(hours=3):
+        return None, "4시간/1시간 최신 완료봉이 오래됨"
+    btcmap={b["t"]:b["c"] for b in btc4}
+    if h4[-1]["t"] not in btcmap or h4[-5]["t"] not in btcmap:
+        return None, "BTC와 코인의 동일 시각 4시간봉 부족"
+    d=[x["c"] for x in day]; f=[x["c"] for x in h4]; hour=[x["c"] for x in h1]
+    day_ma20=_avg(d[-20:]); day_prev20=_avg(d[-24:-4])
+    ma7=_avg(f[-7:]); ma14=_avg(f[-14:]); ma30=_avg(f[-30:]); prev7=_avg(f[-10:-3])
+    h1ma7=_avg(hour[-7:]); h1ma14=_avg(hour[-14:])
+    ret16=(f[-1]/f[-5]-1)*100; btc16=(btcmap[h4[-1]["t"]]/btcmap[h4[-5]["t"]]-1)*100
+    prev12high=max(x["h"] for x in h4[-13:-1]); high6=max(x["h"] for x in h4[-7:-1])
+    lo_recent=min(x["l"] for x in h4[-7:-1]); lo_prior=min(x["l"] for x in h4[-13:-7])
+    volbase=_avg([x["turnover"] for x in h4[-21:-1]]); ratio=h4[-1]["turnover"]/volbase if volbase else 0
+    tr=[max(x["h"]-x["l"],abs(x["h"]-y["c"]),abs(x["l"]-y["c"])) for x,y in zip(h4[-14:],h4[-15:-1])]
+    atr=_avg(tr)/f[-1]*100
+    dayrise=(d[-1]/d[-2]-1)*100; ret24=(f[-1]/f[-7]-1)*100
+    ext=(f[-1]/ma7-1)*100; support=lo_recent*.998
+    risk=(f[-1]/support-1)*100
+    breakout=(f[-1]/prev12high-1)*100
+    return {
+      "close":f[-1],"ma5":ma7,"ma20":ma14,"day_ma20":round(day_ma20,6),"h4_ma30":round(ma30,6),
+      "coin_return_pct":round(ret16,4),"btc_return_pct":round(btc16,4),"relative_pct":round(ret16-btc16,4),
+      "breakout_pct":round(breakout,4),"volume_ratio":round(ratio,3),"atr_pct":round(atr,3),
+      "h4_distance_ma7_pct":round(ext,3),"structure_risk_pct":round(risk,3),"support":round(support,8),
+      "day_rise_pct":round(dayrise,3),"rise24_pct":round(ret24,3),
+      "h4_higher_low":lo_recent>lo_prior,"h4_higher_high":high6>max(x["h"] for x in h4[-13:-7]),
+      "day_up":d[-1]>day_ma20 and day_ma20>day_prev20,
+      "h4_up":f[-1]>ma7>ma14 and ma7>prev7,
+      "h1_up":hour[-1]>h1ma7>h1ma14,
+      "recovery":min(x["l"] for x in h4[-3:-1])<=ma7*1.016 and f[-1]>f[-2],
+      "closed_kst":tf_end(h4[-1]["t"],"4h").strftime("%Y-%m-%d %H:%M"),
+      "body_ratio":round((h4[-1]["c"]-h4[-1]["o"])/max(h4[-1]["h"]-h4[-1]["l"],1e-14),3),
+    },None
+
+
+def swing_signal(m,ctx,fee):
+    rel=m["relative_pct"];bear=ctx["long"]=="down" or ctx["short"]=="down"
+    strong_rel=rel>=(2.0 if bear else 1.0)
+    excessive=m["h4_distance_ma7_pct"]>7.5 or m["rise24_pct"]>22.0 or m["structure_risk_pct"]>12
+    setup=m["breakout_pct"]>0 or m["recovery"]
+    good=(m["day_up"] and m["h4_up"] and m["h1_up"] and strong_rel
+          and m["h4_higher_low"] and setup and m["volume_ratio"]>=.7
+          and m["structure_risk_pct"]<=8.0 and m.get("timing_ok",True) and not excessive)
+    watch=((m["day_up"] or m["h4_up"]) and rel>=.3 and
+           (m["h4_up"] or m["h4_higher_high"] or m["breakout_pct"]>0))
+    if not good and not watch:return None
+    kind="BUY" if good else "WATCH"
+    checks={
+      "일봉 MA20 상회·우상향":m["day_up"],
+      "4시간봉 MA7·MA14 상승":m["h4_up"],
+      "4시간봉 저점 상승":m["h4_higher_low"],
+      "1시간봉 재상승":m["h1_up"],
+      "BTC 대비 강도 충족":strong_rel,
+      "4시간봉 돌파·눌림 회복":setup,
+      "4시간봉 거래대금 0.7배 이상":m["volume_ratio"]>=.7,
+      "구조적 손절 거리 8% 이내":m["structure_risk_pct"]<=8.0,
+      "선택한 검색봉 상승 확인":m.get("timing_ok",True),
+      "급등 추격 위험 낮음":not excessive,
+    }
+    causes=[
+      f"스윙: 일봉 {'상승' if m['day_up'] else '미확정'} · 4시간봉 {'상승' if m['h4_up'] else '미확정'} · 1시간봉 {'상승' if m['h1_up'] else '미확정'}",
+      f"동일한 16시간 동안 코인 {m['coin_return_pct']:+.2f}%, BTC {m['btc_return_pct']:+.2f}% → 상대강도 {rel:+.2f}%p",
+      f"4시간봉 고점 돌파폭 {m['breakout_pct']:+.2f}% · 최근 고점/저점 상승 {m['h4_higher_high']}/{m['h4_higher_low']}",
+      f"4시간봉 MA7 이격 {m['h4_distance_ma7_pct']:+.2f}% · 최근 24시간 {m['rise24_pct']:+.2f}% · 구조적 지지까지 {m['structure_risk_pct']:.2f}%",
+      f"4시간봉 거래대금 배수 {m['volume_ratio']:.2f}배 · BTC 장기 {state_ko(ctx['long'])}, 단기 {state_ko(ctx['short'])}",
+      f"선택 검색봉 {m.get('selected_tf','4h')} 추세 {'상승' if m.get('timing_ok',True) else '미확정'}",
+    ]
+    if kind=="WATCH":
+        missing=[k for k,v in checks.items() if not v]
+        causes.append("BUY 보류: "+(", ".join(missing) if missing else "상승 확인 대기"))
+    else:
+        causes.append("스윙 구조 조건 충족 · 체결 전 호가/집중보유/공시 위험 별도 확인")
+    if excessive:causes.append("⚠ 급등 추격 위험: 이미 많이 오른 시점이므로 신규 진입은 WATCH")
+    cost=fee/100
+    tp1=((1.05)*(1+cost)/(1-cost)-1)*100
+    tp2=((1.12)*(1+cost)/(1-cost)-1)*100
+    return {"signal":kind,"metrics":m,"explanation":causes,"plan":{
+      "tp1_net":5.0,"tp1_fraction":.5,"tp2_net":12.0,"tp2_fraction":.5,
+      "stop_gross":-5.0,"max_minutes":7200,
+      "tp1_gross_pct":round(tp1,3),"tp2_gross_pct":round(tp2,3),
+      "support":m["support"],"support_risk_pct":m["structure_risk_pct"]}}
+
+
+def swing_backtest_exit(market,at,fee,getter=candles):
+    """120 observed hourly candles; pessimistic stop priority, gaps at open."""
+    out={"status":"UNKNOWN","net_pct":None,"reason":"","tp1":False,"tp2":False,
+         "stop":False,"minutes":None,"ambiguous":False}
+    entry_at=at.replace(minute=0,second=0,microsecond=0)
+    if entry_at<at:entry_at+=timedelta(hours=1)
+    end=entry_at+timedelta(hours=120)
+    try:
+        rows=getter(market,"1h",end+timedelta(minutes=1),count=140)
+    except Exception as ex:
+        return {**out,"reason":"스윙 120시간 청산 경로 조회 실패: "+str(ex)[:80]}
+    indexed={r["t"]:r for r in rows}
+    if any(entry_at+timedelta(hours=i) not in indexed for i in range(120)):
+        return {**out,"reason":"120시간 중 1시간봉 누락: 신뢰할 수 있는 청산 판정 불가"}
+    entry=indexed[entry_at]["o"]
+    if entry<=0:return {**out,"reason":"진입가 자료 없음"}
+    cost=fee/100
+    p1=entry*1.05*(1+cost)/(1-cost);p2=entry*1.12*(1+cost)/(1-cost);sl=entry*.95
+    rest=1.0;realized=0.0;tp1=False
+    def net(px):return (px*(1-cost)/(entry*(1+cost))-1)*100
+    for i in range(120):
+        r=indexed[entry_at+timedelta(hours=i)]
+        if r["l"]<=sl:
+            amb=r["h"]>=(p2 if tp1 else p1)
+            return {**out,"status":"RESOLVED","net_pct":round(realized+rest*net(min(r["o"],sl)),6),
+                    "tp1":tp1,"stop":True,"minutes":(i+1)*60,"ambiguous":amb}
+        if not tp1 and r["h"]>=p1:
+            tp1=True;realized+=.5*net(p1);rest=.5
+        if tp1 and r["h"]>=p2:
+            return {**out,"status":"RESOLVED","net_pct":round(realized+rest*net(p2),6),
+                    "tp1":True,"tp2":True,"minutes":(i+1)*60}
+        if i==119:
+            return {**out,"status":"RESOLVED","net_pct":round(realized+rest*net(r["c"]),6),
+                    "tp1":tp1,"minutes":120*60}
+    return {**out,"reason":"스윙 경로 판정 불가"}
+
+
+@app.get("/")
+def page():
+    return Response(HTML, content_type="text/html; charset=utf-8")
+
+
+@app.get("/health")
+def health():
+    return jsonify(ok=True, version=VERSION, mode="read-only")
+
+
+@app.get("/api/universe")
+def universe_api():
+    try:
+        return jsonify(ok=True, items=universe(), version=VERSION, min_turnover_live=MIN_TURNOVER)
+    except Exception as ex:
+        return jsonify(ok=False, error=str(ex)[:150]), 502
+
+
+@app.post("/api/btc")
+def btc_api():
+    try:
+        cfg = request_cfg(request.get_json(silent=True))
+        return jsonify(ok=True, context=btc_context(cfg), version=VERSION)
+    except Exception as ex:
+        return jsonify(ok=False, error=str(ex)[:160]), 400
+
+
+@app.post("/api/coin")
+def coin_api():
+    try:
+        raw = request.get_json(silent=True)
+        cfg = request_cfg(raw, True)
+        mode, tf, fee, at, market, strategy = cfg
+        if market not in market_list():
+            raise ValueError("현재 KRW 마켓 목록에 없음")
+        ctx = btc_context(cfg)
+        if strategy == "swing":
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                fday=pool.submit(candles,market,"day",at,80)
+                fh4=pool.submit(candles,market,"4h",at,90)
+                fh1=pool.submit(candles,market,"1h",at,50)
+                day,h4,h1=fday.result(),fh4.result(),fh1.result()
+            btc4=ttl_get(("btc-h4",mode,at.strftime("%Y-%m-%d %H:%M")))
+            if btc4 is None:
+                btc4=candles("KRW-BTC","4h",at,50)
+            baseline,issue=swing_metrics(day,h4,h1,btc4,at)
+            if baseline is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            m,issue=rebound.bottom_rebound_metrics(day,h4,h1,btc4,at,baseline,is_contiguous,tf_end)
+            if m is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            if tf in ("5m","15m"):
+                timing_rows=candles(market,tf,at,count=18)
+                m["timing_ok"]=trend(timing_rows,tf).get("state")=="up"
+            else:
+                m["timing_ok"]={"1h":m["checks"]["h1_confirm"],"4h":m["checks"]["ma_recover"],"day":m["day_ma20_distance_pct"]>=-6}[tf]
+            m["selected_tf"]=tf
+            signal=rebound.rebound_signal(m,ctx,fee)
+        else:
+            rows=candles(market,tf,at,count=50)
+            m,issue=coin_metrics(rows,tf,ctx.get("selected_return"))
+            if m is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            signal=coin_signal(m,ctx,fee)
+        if signal is None:
+            return jsonify(ok=True, market=market, signal=None)
+        if mode == "backtest":
+            signal["backtest"] = swing_backtest_exit(market,at,fee) if strategy == "swing" else backtest_exit(market,at,fee)
+        return jsonify(ok=True, market=market, signal=signal, strategy=strategy)
+    except Exception as ex:
+        return jsonify(ok=False, error=str(ex)[:170]), 400
+
+
+HTML = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BITHUMB · BTC MTF V1.3 · 반등 점수제</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1120;--panel:#161f33;--panel2:#202c46;--ink:#edf4ff;--muted:#93a4bd;--line:#34445f;--cyan:#45cfce;--green:#39d7a1;--yellow:#ffc56d;--red:#ff7d85}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,'Noto Sans KR',sans-serif;color:var(--ink);line-height:1.5}main{max-width:1100px;margin:auto;padding:18px 16px 48px}h1{font-size:1.4rem;line-height:1.3;margin:0}h2{font-size:1.08rem;margin:0 0 11px}small,.muted{color:var(--muted)}header{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:5px 0 19px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:1px}.tag{border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);white-space:nowrap;font-size:11px}.surface{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;margin-bottom:14px}.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:15px}.tabs button{font-size:15px;font-weight:750;padding:13px}.tabs button.on{background:#145c64;border-color:var(--cyan);color:white}button,select,input{border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--ink);font:inherit;padding:10px;min-width:0}button{cursor:pointer}button:disabled{opacity:.42;cursor:default}button.primary{background:var(--cyan);border-color:var(--cyan);color:#09252a;font-weight:800}button.secondary{background:transparent}.toolbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px}.field label{color:var(--muted);font-size:12px;font-weight:650}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.timebox{display:flex;gap:8px}.timebox input{flex:1;min-width:0}.action{margin-top:14px}.action button{padding:11px 20px}.help{font-size:12px;color:var(--muted);margin-top:9px}.btc-agg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.agg{background:#101d32;border:1px solid var(--line);padding:12px;border-radius:12px}.agg strong{display:block;font-size:1.16rem;margin-top:4px}.tf-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.tf{background:#101b2e;border:1px solid var(--line);border-radius:12px;padding:10px}.tf .name{font-size:12px;color:var(--muted)}.tf .status{font-size:16px;font-weight:750;margin-top:2px}.up{color:var(--green)}.down{color:var(--red)}.side{color:var(--yellow)}.unknown{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.metric{padding:13px;background:#101b2e;border:1px solid var(--line);border-radius:12px}.metric strong{font-size:22px;display:block}.metric span{font-size:12px;color:var(--muted)}.bar{height:6px;background:#27354a;overflow:hidden;border-radius:8px;margin-top:12px}.bar i{display:block;background:var(--cyan);height:100%;width:0%;transition:width .2s}.result{border:1px solid var(--line);background:#101c30;border-radius:13px;margin-top:9px;padding:12px}.result summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.score-chip{border:1px solid #4c7087;background:#17374a;color:#c4f5f0;border-radius:7px;padding:3px 6px;font-weight:850;font-size:12px;white-space:nowrap}.entry-price{border:1px solid #466380;background:#243553;border-radius:8px;padding:4px 9px;font-size:13px;font-weight:750;color:#ebf6ff;white-space:nowrap}.entry-price.watch-entry{background:#352f24;color:#ffe8b3;border-color:#7b623c}.entry-note{border:1px solid #364b67;background:#172943;padding:10px;border-radius:9px;margin:8px 0}.entry-metrics{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.entry-metrics span{border:1px solid #364b67;padding:6px 9px;border-radius:8px;font-size:12px}.result summary::-webkit-details-marker{display:none}.result summary b{font-size:16px}.badge{font-size:11px;font-weight:900;padding:4px 8px;border-radius:7px}.badge.buy{background:#115e4c;color:#9ff9d5}.badge.watch{background:#59421e;color:#ffdca5}.push{margin-left:auto;color:var(--muted);font-size:12px}.reason{font-size:13px;color:#cfdaeb;margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}.reason p{margin:5px 0}.pnl{font-size:13px;margin-top:7px}.empty{font-size:13px;color:var(--muted);padding:15px 0}.notice{font-size:12px;color:#b6c7df;margin-top:12px}.foot{margin-top:26px;color:var(--muted);font-size:12px}#error{color:var(--red);font-size:13px;margin-top:9px;white-space:pre-wrap}#scanstatus{color:var(--muted);font-size:13px}.hidden{display:none!important}
+@media(max-width:760px){main{padding:14px 11px 30px}header{align-items:flex-start}.toolbar{grid-template-columns:1fr 1fr}.tf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.surface{padding:13px}.btc-agg{grid-template-columns:1fr 1fr}}
+@media(max-width:355px){.toolbar{grid-template-columns:1fr 1fr}.row{gap:6px}.action button{flex:1}}
+</style></head><body><main>
+<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.3 · 반등 점수 10점제 · 단타 보존</small></div><span class="tag">KRW ONLY</span></header>
+<div class="tabs"><button id="live-tab" class="on" type="button">● 실시간 검색</button><button id="backtest-tab" type="button">◷ 과거 백테스트</button></div>
+<section class="surface"><h2>검색 설정</h2><div class="tabs"><button id="scalp-tab" type="button">⚡ 단타</button><button id="swing-tab" class="on" type="button">🌱 스윙 · 점수제</button></div><div class="toolbar">
+<div class="field"><label for="tf">코인 검색 시간봉</label><select id="tf"><option value="5m">5분봉</option><option value="15m">15분봉</option><option value="1h">1시간봉</option><option value="4h" selected>4시간봉</option><option value="day">일봉</option></select></div>
+<div class="field"><label for="fee">편도 수수료</label><select id="fee"><option value="0.04">0.04%</option><option value="0.25">0.25%</option></select></div>
+<div class="field"><label for="scope">검색 범위</label><select id="scope"><option value="20">거래대금 상위 20</option><option value="40" selected>거래대금 상위 40</option><option value="80">거래대금 상위 80</option><option value="all">전체 KRW</option></select></div>
+<div class="field"><label for="focus">관찰 코인 지정 (선택)</label><input id="focus" placeholder="예: PIEVERSE" maxlength="18"></div><div class="field" id="backtest-date-field" style="display:none"><label for="at">과거 검사 시각 (한국시간)</label><input type="datetime-local" id="at" step="300"></div><div class="field" id="backtest-days-field" style="display:none"><label for="days">자체 백테스트</label><select id="days"><option value="1">1일 · 1회</option><option value="3">3일 · 매일 같은 시각</option><option value="7">7일 · 매일 같은 시각</option></select></div>
+</div><div class="action row"><button class="primary" id="start" type="button">검색 시작</button><button class="secondary" id="csv" disabled type="button">CSV 받기</button><small id="scanstatus">검사 전</small></div><div id="error"></div>
+<div class="help" id="strategy-help">스윙: 지표 7점 + BTC 상대강도·초기 위치·지지 위험 3점 = 10점. 7점 이상 WATCH, 8점 이상 및 1시간봉 반등 등 필수 조건 확인 시 BUY. 급등 추격 후보 제외.</div><div class="help" id="live-help">현재 거래대금 상위 순서로 검색. 마감봉만 사용하며 BUY/WATCH는 참고 신호야. 수동 실행만 지원해.</div>
+<div class="help hidden" id="backtest-help">선택 시각의 과거 <b>완료봉만 사용</b>해 신호를 판정하고 단타는 240분/스윙은 120시간을 가상 청산해. 3·7일은 지정한 시각에 하루 1번씩 반복. 현재 상장 목록과 현재 거래대금 순위를 쓰므로 생존·미래정보 편향이 있어. 미확정 봉은 따로 표시해.</div>
+</section>
+<section class="surface"><h2>BTC 장기·단기 추세 <small id="btcts"></small></h2><div class="btc-agg"><div class="agg"><small>장기 · 월/주/일/4시간</small><strong id="long" class="unknown">검사 전</strong></div><div class="agg"><small>단기 · 1시간~1분</small><strong id="short" class="unknown">검사 전</strong></div></div><div id="tf-grid" class="tf-grid"></div><div class="notice">판정: 완료봉 종가와 MA5·MA10 배열. 종가 &gt; MA5 &gt; MA10은 상승, 반대는 하락, 그 외 횡보. 10봉 연속 자료 부족이면 미확인.</div></section>
+<section class="surface"><h2>코인 후보 <small>BUY / WATCH</small></h2><div class="metrics"><div class="metric"><span>검사 완료</span><strong id="done">0</strong></div><div class="metric"><span>BUY</span><strong id="nbuy" class="up">0</strong></div><div class="metric"><span>WATCH</span><strong id="nwatch" class="side">0</strong></div><div class="metric"><span>오류 / 자료 부족</span><strong id="nerr">0</strong></div></div><div class="bar"><i id="progress"></i></div><div class="notice" id="btinfo"></div><div id="bt-summary" class="notice"></div><div id="results" class="empty">검사 시작을 누르면 BUY·WATCH 후보만 나타나.</div></section>
+<div class="foot">모든 신호는 연구용 가상 판정이며 투자 권유나 주문 지시가 아니야. 실제 체결과 손익은 슬리피지·호가·갭으로 달라질 수 있어. 빗썸 공개 API만 사용하고 계정·주문 API는 호출하지 않아.</div>
+</main><script>
+(()=>{
+const $=id=>document.getElementById(id), ST={up:'상승',down:'하락',side:'횡보',unknown:'자료 부족'},TF={'month':'월','week':'주','day':'일','4h':'4시간','1h':'1시간','30m':'30분','15m':'15분','5m':'5분','3m':'3분','1m':'1분'},order=['month','week','day','4h','1h','30m','15m','5m','3m','1m'];
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let mode='live',strategy='swing',busy=false,results=[],problems=0,completed=0,universe=[],runId=0,lastCfg=null;
+const dt=(d)=>{const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':00'};
+let d=new Date();d.setDate(d.getDate()-1);d.setHours(15,0,0,0);$('at').value=dt(d);
+function modeSet(next){if(busy)return;mode=next;$('live-tab').classList.toggle('on',mode==='live');$('backtest-tab').classList.toggle('on',mode==='backtest');$('backtest-date-field').style.display=mode==='backtest'?'flex':'none';$('backtest-days-field').style.display=mode==='backtest'?'flex':'none';$('live-help').classList.toggle('hidden',mode!=='live');$('backtest-help').classList.toggle('hidden',mode!=='backtest');reset()}
+function strategySet(next){if(busy)return;strategy=next;$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙: 7개 반등 지표 + 3개 진입 품질 = 10점. 7점 이상 WATCH, 8점 이상 + 1시간봉 반등 등 필수 조건 확인되면 BUY. 저점에서 멀어진 코인 제외.':'단타: 빠른 돌파·BTC 상대강도 · +1% 70% / +10% 30% · -2% 손절 / 240분.';if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
+$('scalp-tab').onclick=()=>strategySet('scalp');$('swing-tab').onclick=()=>strategySet('swing');
+$('live-tab').onclick=()=>modeSet('live');$('backtest-tab').onclick=()=>modeSet('backtest');
+function reset(){results=[];completed=problems=0;$('results').innerHTML='검사 시작을 누르면 BUY·WATCH 후보만 나타나.';$('csv').disabled=true;['done','nbuy','nwatch','nerr'].forEach(k=>$(k).textContent='0');$('long').textContent='검사 전';$('short').textContent='검사 전';$('tf-grid').innerHTML='';$('progress').style.width='0%';$('scanstatus').textContent='검사 전';$('btinfo').textContent='';$('bt-summary').textContent='';$('error').textContent='';$('btcts').textContent=''}
+async function post(url,body){const rsp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await rsp.json();if(!rsp.ok||!j.ok)throw Error(j.error||'데이터 요청 실패');return j}
+async function get(url){const rsp=await fetch(url);const j=await rsp.json();if(!rsp.ok||!j.ok)throw Error(j.error||'목록 조회 실패');return j}
+function btcDraw(ctx){$('long').textContent=ST[ctx.long]||'미확인';$('long').className=ctx.long;$('short').textContent=ST[ctx.short]||'미확인';$('short').className=ctx.short;$('btcts').textContent='· '+ctx.asof_kst+' KST';$('tf-grid').innerHTML=order.map(k=>{const x=ctx.tf[k]||{state:'unknown'},why=x.reason?' · '+x.reason:'';return `<div class="tf" title="${esc(why)}"><div class="name">BTC ${TF[k]}</div><div class="status ${x.state}">${ST[x.state]||'자료 부족'}</div></div>`}).join('')}
+function summary(){
+ const buy=results.filter(x=>x.signal.signal==='BUY').length,watch=results.length-buy;
+ $('done').textContent=completed;$('nbuy').textContent=buy;$('nwatch').textContent=watch;$('nerr').textContent=problems;
+ $('progress').style.width=universe.length?Math.round(completed/universe.length*100)+'%':'0%';
+ $('scanstatus').textContent=(busy?'검사 중 ':'검사 완료 ')+completed+'/'+universe.length;
+ const ok=results.filter(x=>x.signal.signal==='BUY'&&x.signal.backtest&&x.signal.backtest.status==='RESOLVED'),unk=buy-ok.length,wins=ok.filter(x=>x.signal.backtest.net_pct>0).length;
+ $('bt-summary').textContent=mode==='backtest'?'BUY '+buy+'건 · 청산 확정 '+ok.length+' · 미확정 '+unk+' · 확정 승률 '+(ok.length?(wins/ok.length*100).toFixed(1)+'%':'—')+' · 확정 평균 순익 '+(ok.length?(ok.reduce((v,x)=>v+Number(x.signal.backtest.net_pct),0)/ok.length).toFixed(3)+'%':'—')+' (WATCH 미포함)':'';
+}
+function renderResults(){
+ const sorted=results.slice().sort((a,b)=>(a.signal.signal==='BUY'?0:1)-(b.signal.signal==='BUY'?0:1)||b.signal.metrics.relative_pct-a.signal.metrics.relative_pct);
+ if(!sorted.length){$('results').innerHTML='조건을 충족한 BUY·WATCH 후보가 없어. 거래하지 않아도 돼.';return;}
+ const num=x=>Number.isFinite(Number(x))?Number(x).toLocaleString('ko-KR',{maximumFractionDigits:8}):'—';
+ $('results').classList.remove('empty');
+ $('results').innerHTML=sorted.map(x=>{
+  const si=x.signal,m=si.metrics,p=si.plan,bt=si.backtest,fee=Number(lastCfg.fee),base=Number(m.close);
+  const bttext=mode!=='backtest'?'':bt&&bt.status==='RESOLVED'
+   ?'<p class="pnl '+(bt.net_pct>=0?'up':'down')+'">'+(si.signal==='BUY'?'BUY 가상거래':'WATCH 가상 경로(거래 미가정)')+' · '+(strategy==='swing'?'120시간':'240분')+' 순익 '+(bt.net_pct>=0?'+':'')+Number(bt.net_pct).toFixed(3)+'% · '+(bt.stop?'손절':bt.tp2?'2차 익절':bt.tp1?'1차 익절 후 청산':'만료')+(bt.ambiguous?' · 동일 봉 순서 불명':'')+'</p>'
+   :'<p class="pnl side">미확정: '+esc(bt&&bt.reason||'봉 누락')+'</p>';
+  return '<details class="result"><summary><span class="badge '+si.signal.toLowerCase()+'">'+si.signal+'</span><small>'+esc(si.stage||'')+'</small><span class="score-chip">'+(m.score_total===10?m.score+'/10점':'')+'</span><b>'+esc(x.name||x.market)+' <small>'+esc(x.market)+'</small></b><span class="entry-price '+(si.signal==='WATCH'?'watch-entry':'')+'">'+(si.signal==='BUY'?'진입 참고가 ':'WATCH 관찰가 ')+num(base)+'원</span><span class="push">'+esc(x.at||'')+' · 상대강도 '+(m.relative_pct>=0?'+':'')+Number(m.relative_pct).toFixed(2)+'%p · 상세 ▾</span></summary><div class="reason">'
+   +'<div class="entry-note"><strong>'+(si.signal==='BUY'?'BUY 진입 참고가: ':'WATCH 관찰 기준가: ')+num(base)+'원</strong> · '+(si.signal==='BUY'?'신호가 확인된 마지막 마감봉 종가. 실제 주문가는 다를 수 있어.':'아직 BUY 조건 미충족. 표시된 금액은 참고 가격이며 매수를 뜻하지 않아.')+'</div>'
+   +'<div class="entry-metrics"><span>1차 익절 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원</span><span>2차 익절 예상 '+num(base*(1+p.tp2_gross_pct/100))+'원</span><span>가상 손절 '+num(base*(1+p.stop_gross/100))+'원</span></div>'
+   +si.explanation.map(z=>'<p>• '+esc(z)+'</p>').join('')
+   +'<p>가상 청산: 순익 +'+p.tp1_net+'% '+Math.round(p.tp1_fraction*100)+'%, +'+p.tp2_net+'% '+Math.round(p.tp2_fraction*100)+'% · 손절 '+p.stop_gross+'% · '+p.max_minutes/60+'시간</p>'
+   +'<p>완료봉 참고가 '+num(base)+'원 · 1차 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원 · 2차 '+num(base*(1+p.tp2_gross_pct/100))+'원 · 가상 손절 '+num(base*(1+p.stop_gross/100))+'원'+(m.support?' · 구조 지지 '+num(m.support)+'원':'')+' (실제 체결가 아님)</p>'
+   +'<p>수수료 편도 '+fee.toFixed(2)+'% · 완료봉 '+esc(m.closed_kst)+' KST</p>'+bttext+'</div></details>';
+ }).join('');
+}
+$('start').onclick=async()=>{
+ if(busy)return;reset();busy=true;runId++;const id=runId,btn=$('start');btn.disabled=true;btn.textContent='검색 중…';
+ const cfg={mode,strategy,tf:$('tf').value,fee:Number($('fee').value)};
+ if(mode==='backtest')cfg.at=$('at').value.replace('T',' ')+':00';lastCfg={...cfg};
+ try{
+  const list=await get('/api/universe');const scope=$('scope').value;
+  let items=list.items.filter(x=>mode==='backtest'||x.turnover>=500000000);
+  items=scope==='all'?items:items.slice(0,Number(scope));
+  const daysCount=mode==='backtest'?Number($('days').value):1;
+  if(daysCount>1)items=items.slice(0,daysCount===7?10:20);
+  const pinned=$('focus').value.trim().toUpperCase().replace(/^KRW-/, '');if(pinned){const found=list.items.find(x=>x.market==='KRW-'+pinned||x.name===$('focus').value.trim());if(found&&!items.some(x=>x.market===found.market))items=[found,...items];else if(!found)throw Error('관찰 코인을 찾지 못했어: '+pinned);}if(!items.length)throw Error('검색 가능한 종목이 없어');
+  const dates=[];
+  for(let day=0;day<daysCount;day++){
+   const c={...cfg};
+   if(mode==='backtest'){const d=new Date(cfg.at.replace(' ','T'));d.setDate(d.getDate()-day);c.at=dt(d).replace('T',' ')+':00';}
+   dates.push(c);
+  }
+  universe=dates.flatMap(c=>items.map(x=>({...x,at:c.at||'LIVE'})));
+  $('btinfo').textContent=mode==='backtest'
+    ?daysCount+'일 × 하루 같은 시각 1회 · '+items.length+'개 현재 상장 종목. 현재 거래대금 순위 사용: 생존편향/미래정보 편향 주의!'
+    :'현재 24시간 거래대금 5억원 이상 · BTC 후보 제외 · 점수 및 진입 위치 품질 필터 · 낮은 점수는 제외';
+  for(const c of dates){
+   const b=await post('/api/btc',c);
+   if(runId!==id)break;
+   btcDraw(b.context);
+   if(mode==='live')c.snapshot_at=b.context.asof_kst;
+   let cursor=0;
+   const work=async()=>{while(cursor<items.length){
+    const coin=items[cursor++];
+    try{
+     const j=await post('/api/coin',{...c,market:coin.market});
+     if(j.signal)results.push({market:coin.market,name:coin.name,at:c.at||'LIVE',signal:j.signal});
+     if(j.issue)problems++;
+    }catch(e){problems++;}
+    completed++;
+    if(completed%4===0||completed===universe.length){summary();renderResults();}
+    await Promise.resolve();
+   }};
+   await Promise.all(Array.from({length:Math.min(4,items.length)},work));
+  }
+ }catch(ex){$('error').textContent='검사를 완료하지 못했어: '+ex.message;}
+ finally{busy=false;btn.disabled=false;btn.textContent='검색 시작';summary();renderResults();$('csv').disabled=!completed;}
+};
+$('csv').onclick=()=>{
+ if(!lastCfg)return;
+ const fields=['version','strategy','mode','snapshot_kst','tf','fee_each_pct','market','name','signal','closed_kst','entry_ref_price_krw','entry_ref_type','tp1_ref_price_krw','tp2_ref_price_krw','stop_ref_price_krw','relative_pct','btc_change_pct','coin_change_pct','breakout_pct','volume_ratio','atr_pct','rise24_pct','structure_risk_pct','rebound_from_low_pct','technical_score','quality_score','score_total','quality_btc_strength','quality_entry_zone','quality_risk_control','bb_position','rsi14','macd_hist','ichimoku_tenkan','ichimoku_kijun','score','stage','reason','tp1_net','tp1_fraction','tp2_net','tp2_fraction','stop_gross','max_minutes','bt_status','bt_net_pct','bt_stop','bt_tp1','bt_tp2','bt_minutes','bt_ambiguous','bt_reason'];
+ const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"',lines=[fields.join(',')];
+ for(const x of results){
+  const si=x.signal,m=si.metrics,t=si.backtest||{},p=si.plan;
+  lines.push(['BTC-MTF-V1.3',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':'WATCH 관찰 기준가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??''].map(quote).join(','));
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_3_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+
+})();
+</script></body></html>'''
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
+======== END bithumb_btc_mtf_v1.py ========
+
+======== BEGIN btc_mtf_rebound_v13.py ========
+"""BTC MTF V1.3 | quality-weighted early rebound classification.
+Keeps V1.2's 7 completed-candle technical checks and adds three independent
+quality checks. A score is a research heuristic, not a probability of profit.
+"""
+from btc_mtf_rebound_v12 import bottom_rebound_metrics as _metrics
+from btc_mtf_rebound_v12 import rebound_signal as _legacy_signal
+
+RULE_VERSION = "REBOUND_V1.3_SCORE10"
+MAX_SCORE = 10
+
+def bottom_rebound_metrics(*args, **kwargs):
+    m, issue = _metrics(*args, **kwargs)
+    if m is None:
+        return m, issue
+    quality = {
+        "btc_strength": m["relative_pct"] >= 0.5,
+        "entry_zone": 1.2 <= m["rebound_from_low_pct"] <= 11.0 and m["rise24_pct"] <= 12,
+        "risk_control": 0 <= m["structure_risk_pct"] <= 11,
+    }
+    m["technical_score"] = m["score"]
+    m["quality_checks"] = quality
+    m["quality_score"] = sum(quality.values())
+    m["score"] = m["technical_score"] + m["quality_score"]
+    m["score_total"] = MAX_SCORE
+    m["score_rule"] = RULE_VERSION
+    return m, None
+
+def rebound_signal(m, ctx, fee):
+    if not m:
+        return None
+    c = m["checks"]
+    q = m["quality_checks"]
+    from_low = m["rebound_from_low_pct"]
+    risk = m["structure_risk_pct"]
+    rel = m["relative_pct"]
+    bearish = ctx["long"] == "down" or ctx["short"] == "down"
+    relative_floor = 0.8 if bearish else 0.5
+
+    # Mandatory prefilters: scores never excuse bad entry location or
+    # relative weakness. Already-exploded coins are excluded, not WATCH.
+    watch_eligible = (
+        m["score"] >= 7
+        and m["technical_score"] >= 4
+        and rel >= relative_floor
+        and 1.2 <= from_low <= 11
+        and 0 <= risk <= 11
+        and m["rise24_pct"] <= 12
+        and 0.15 <= m["bb_position"] <= 1.0
+        and m["volume_ratio"] >= 0.35
+        and m["rsi14"] <= 73
+    )
+    if not watch_eligible:
+        return None
+
+    trigger = (
+        c["h1_confirm"] and c["ma_recover"]
+        and c["rsi_recover"] and c["macd_recover"]
+        and (c["bb_recover"] or c["ichimoku_recover"])
+    )
+    buy = (
+        m["score"] >= 8 and trigger and rel >= relative_floor
+        and m["volume_ratio"] >= 0.7
+        and from_low <= 9.0 and risk <= 9.0
+        and m["bb_position"] <= 0.95
+        and m.get("timing_ok", True)
+    )
+    kind = "BUY" if buy else "WATCH"
+    stage = "반등 확인 BUY" if buy else ("반등 직전 WATCH" if m["score"] >= 8 else "반등 준비 WATCH")
+    legacy = dict(m)
+    legacy["score"] = m["technical_score"]  # preserve legacy /7 explanation and plan
+    raw = _legacy_signal(legacy, ctx, fee)
+    if raw is None:
+        return None
+
+    names = {
+        "bb_recover": "볼린저밴드 회복", "ma_recover": "MA5 기울기 회복",
+        "ichimoku_recover": "일목 전환선", "rsi_recover": "RSI 상승",
+        "macd_recover": "MACD 모멘텀", "volume_recover": "4시간 거래대금",
+        "h1_confirm": "1시간봉 반등"
+    }
+    quality_names = {
+        "btc_strength": "BTC 대비 +0.5%p 이상",
+        "entry_zone": "저점에서 +1.2~11% 초기 구간",
+        "risk_control": "저점 지지까지 11% 이내"
+    }
+    tech_details = " · ".join(("✓ " if passed else "× ") + names[k] for k, passed in c.items())
+    qual_details = " · ".join(("✓ " if passed else "× ") + quality_names[k] for k, passed in q.items())
+    why = [
+        f"반등 점수 {m['score']}/10 = 지표 {m['technical_score']}/7 + 진입 품질 {m['quality_score']}/3",
+        f"판정 {stage} · 10점이어도 반등 확정이 아니며 BUY 필수 확인 조건 적용",
+        "기술 지표: " + tech_details,
+        "진입 품질: " + qual_details,
+        *raw["explanation"][1:7],
+        f"저점 대비 +{from_low:.2f}% · 저점 기준 위험 거리 {risk:.2f}% · 24시간 등락 {m['rise24_pct']:+.2f}%",
+    ]
+    if not buy:
+        missing = [names[k] for k in ("h1_confirm", "ma_recover", "rsi_recover", "macd_recover") if not c[k]]
+        if not (c["bb_recover"] or c["ichimoku_recover"]):
+            missing.append("볼밴 또는 일목 회복")
+        if m["score"] < 8:
+            missing.append("BUY 점수 8/10")
+        if m["volume_ratio"] < 0.7:
+            missing.append("거래대금 0.7배")
+        if from_low > 9 or risk > 9:
+            missing.append("BUY 진입 위치 안전 기준")
+        if not m.get("timing_ok", True):
+            missing.append("선택한 검색 시간봉 확인")
+        why.append("BUY 보류 이유: " + (", ".join(missing) if missing else "반등 확인 추가 대기"))
+    else:
+        why.append("완료봉 기준 반등 확인. 실제 주문 신호나 수익 보장은 아님")
+
+    return {"signal": kind, "stage": stage, "metrics": m, "explanation": why, "plan": raw["plan"]}
+
+======== END btc_mtf_rebound_v13.py ========
+
+======== BEGIN btc_mtf_rebound_v12.py ========
+"""BTC MTF V1.2 | early swing rebound indicators using completed OHLC only."""
+from __future__ import annotations
+from math import sqrt
+from datetime import timedelta
+
+RULE_VERSION = "REBOUND_V1.2"
+
+def average(xs): return sum(xs)/len(xs)
+
+def ema_series(xs,period):
+    a=2/(period+1);v=None;out=[]
+    for p in xs:
+        v=p if v is None else v+a*(p-v)
+        out.append(v)
+    return out
+
+def rsi_series(closes,length=14):
+    if len(closes)<=length:return []
+    gains=[max(y-x,0) for x,y in zip(closes,closes[1:])]
+    losses=[max(x-y,0) for x,y in zip(closes,closes[1:])]
+    up=average(gains[:length]);dn=average(losses[:length])
+    def rsi(u,d):
+        return 50.0 if u==d==0 else (100.0 if d==0 else 100-100/(1+u/d))
+    out=[rsi(up,dn)]
+    for u,d in zip(gains[length:],losses[length:]):
+        up=(up*(length-1)+u)/length;dn=(dn*(length-1)+d)/length
+        out.append(rsi(up,dn))
+    return out
+
+def macd_hist(closes):
+    e12,e26=ema_series(closes,12),ema_series(closes,26)
+    macd=[a-b for a,b in zip(e12,e26)]
+    sig=ema_series(macd,9)
+    return [m-s for m,s in zip(macd,sig)],macd[-1],sig[-1]
+
+def bollinger(closes,index=None):
+    i=len(closes)-1 if index is None else index
+    xs=closes[i-19:i+1]
+    mid=average(xs);sd=sqrt(average([(v-mid)**2 for v in xs]))
+    width=max(4*sd,mid*1e-8)
+    return mid,mid-2*sd,mid+2*sd,(closes[i]-(mid-2*sd))/width
+
+def midpoint(tail):
+    return (max(x['h'] for x in tail)+min(x['l'] for x in tail))/2
+
+def ichimoku(rows):
+    # Span at current candle = computed 26 completed bars earlier, no future data.
+    tenkan=midpoint(rows[-9:]);kijun=midpoint(rows[-26:])
+    prev_tenkan=midpoint(rows[-10:-1])
+    old=rows[:-26]
+    span_a=(midpoint(old[-9:])+midpoint(old[-26:]))/2
+    span_b=midpoint(old[-52:])
+    return tenkan,kijun,prev_tenkan,max(span_a,span_b)
+
+def bottom_rebound_metrics(day,h4,h1,btc4,at,baseline,contiguous,bar_end):
+    if not (contiguous(day,'day',24) and contiguous(h4,'4h',80) and contiguous(h1,'1h',24)):
+        return None,'반등 지표 연속 마감봉 부족: 일24 / 4시간80 / 1시간24 필요'
+    if at-bar_end(h4[-1]['t'],'4h')>timedelta(hours=8):
+        return None,'4시간 최신 마감봉이 오래됨'
+    if at-bar_end(h1[-1]['t'],'1h')>timedelta(hours=3):
+        return None,'1시간 최신 마감봉이 오래됨'
+    btc={x['t']:x['c'] for x in btc4}
+    if h4[-1]['t'] not in btc or h4[-5]['t'] not in btc:
+        return None,'동일 시각 BTC 4시간봉 부족'
+    m=dict(baseline)
+    f=[x['c'] for x in h4]; hour=[x['c'] for x in h1];d=[x['c'] for x in day]
+    cur=f[-1];rsi=rsi_series(f);h1rsi=rsi_series(hour)
+    hist,macd,sig=macd_hist(f);tenkan,kijun,prev_tenkan,cloud=ichimoku(h4)
+    ma5=average(f[-5:]);prevma5=average(f[-6:-1]);ma20=average(f[-20:])
+    bbmid,bblow,bbup,bbpos=bollinger(f)
+    prevpos=bollinger(f,len(f)-2)[-1]
+    lo=min(x['l'] for x in h4[-25:-1])
+    recent_lo=min(x['l'] for x in h4[-6:]);prior_lo=min(x['l'] for x in h4[-12:-6])
+    from_low=(cur/lo-1)*100
+    h1up=hour[-1]>average(hour[-7:]) and hour[-1]>hour[-2] and h1rsi[-1]>=45
+    volbase=average([x['turnover'] for x in h4[-21:-1]])
+    volratio=h4[-1]['turnover']/volbase if volbase>0 else 0
+    btc16=(btc[h4[-1]['t']]/btc[h4[-5]['t']]-1)*100
+    coin16=(f[-1]/f[-5]-1)*100
+    support=lo*.998
+    checks={
+        'bb_recover':.20<=bbpos<=.95 and bbpos>prevpos+.035,
+        'ma_recover':cur>ma5 and ma5>prevma5,
+        'ichimoku_recover':cur>tenkan and (tenkan>=prev_tenkan or tenkan>=kijun*.995),
+        'rsi_recover':40<=rsi[-1]<=72 and rsi[-1]>rsi[-3]+.4,
+        'macd_recover':hist[-1]>hist[-3] and (hist[-1]>hist[-2] or hist[-1]>0),
+        'volume_recover':volratio>=1.10,
+        'h1_confirm':h1up,
+    }
+    m.update({
+        'setup_name':'바닥 반등 초입','close':cur,'bottom_ref':round(lo,8),
+        'rebound_from_low_pct':round(from_low,3),
+        'recent_low_higher':recent_lo>prior_lo,
+        'day_ma20_distance_pct':round((d[-1]/average(d[-20:])-1)*100,3),
+        'bb_mid':round(bbmid,8),'bb_lower':round(bblow,8),'bb_upper':round(bbup,8),
+        'bb_position':round(bbpos,3),'bb_prev_position':round(prevpos,3),
+        'ma5':round(ma5,8),'ma20':round(ma20,8),
+        'ichimoku_tenkan':round(tenkan,8),'ichimoku_kijun':round(kijun,8),
+        'ichimoku_cloud_top':round(cloud,8),
+        'rsi14':round(rsi[-1],2),'rsi14_prev2':round(rsi[-3],2),
+        'macd_hist':round(hist[-1],8),'macd_hist_prev2':round(hist[-3],8),
+        'macd_value':round(macd,8),'macd_signal':round(sig,8),
+        'volume_ratio':round(volratio,3),
+        'relative_pct':round(coin16-btc16,3),
+        'coin_return_pct':round(coin16,3),'btc_return_pct':round(btc16,3),
+        'rise24_pct':round((f[-1]/f[-7]-1)*100,3),
+        'structure_risk_pct':round((cur/support-1)*100,3),'support':round(support,8),
+        'checks':checks,'score':sum(checks.values()),
+        'closed_kst':bar_end(h4[-1]['t'],'4h').strftime('%Y-%m-%d %H:%M'),
+        'day_rise_pct':round((d[-1]/d[-2]-1)*100,3),
+    })
+    return m,None
+
+def rebound_signal(m,ctx,fee):
+    if not m:return None
+    c=m['checks'];relative=m['relative_pct'];from_low=m['rebound_from_low_pct']
+    bearish=ctx['long']=='down' or ctx['short']=='down'
+    strength=relative>=(1.1 if bearish else .5)
+    too_late=from_low>13 or m['rise24_pct']>16 or m['structure_risk_pct']>11 or m['rsi14']>73
+    early=.5<=from_low<=19 and m['score']>=3 and relative>=-.7
+    trigger=c['h1_confirm'] and c['ma_recover'] and (c['bb_recover'] or c['ichimoku_recover'])
+    buy=(early and not too_late and 1.2<=from_low<=11 and m['score']>=5 and trigger and
+         c['rsi_recover'] and c['macd_recover'] and m['volume_ratio']>=.9 and
+         strength and m['structure_risk_pct']<=8 and m.get('timing_ok',True))
+    if not (buy or early):return None
+    kind='BUY' if buy else 'WATCH'
+    stage='반등 시작 확인' if buy else ('급등 추격 대기' if too_late else '바닥 회복 관찰')
+    names={'bb_recover':'볼밴 하단→중심 회복','ma_recover':'4시간 MA5 회복',
+           'ichimoku_recover':'일목 전환선 회복','rsi_recover':'RSI 상승 전환',
+           'macd_recover':'MACD 모멘텀 개선','volume_recover':'거래대금 증가',
+           'h1_confirm':'1시간봉 재상승'}
+    why=[
+        f"단계: {stage} · 최근 저점 {m['bottom_ref']:.6g}원에서 {from_low:+.2f}% (완전 바닥 예측 아님)",
+        f"볼린저밴드 위치 {m['bb_position']:.2f} (0 하단/1 상단) · 중심선 {m['bb_mid']:.6g} · {'회복' if c['bb_recover'] else '대기'}",
+        f"MA5 {m['ma5']:.6g} / MA20 {m['ma20']:.6g} · {'회복' if c['ma_recover'] else '미확인'}",
+        f"일목 전환선 {m['ichimoku_tenkan']:.6g}, 기준선 {m['ichimoku_kijun']:.6g}, 선행 구름 상단 {m['ichimoku_cloud_top']:.6g}",
+        f"RSI(14) {m['rsi14']:.1f} (2봉 전 {m['rsi14_prev2']:.1f}) · MACD 히스토그램 {m['macd_hist']:.6g} (2봉 전 {m['macd_hist_prev2']:.6g})",
+        f"4시간 거래대금 {m['volume_ratio']:.2f}배 · 1시간 반등 {'확인' if c['h1_confirm'] else '대기'}",
+        f"16시간 BTC {m['btc_return_pct']:+.2f}%, 코인 {m['coin_return_pct']:+.2f}% → 상대강도 {relative:+.2f}%p",
+        f"반등 징후 {m['score']}/7 · 저점 지지까지 {m['structure_risk_pct']:.2f}% · 24시간 상승 {m['rise24_pct']:+.2f}%",
+    ]
+    if kind=='WATCH':
+        missing=[names[k] for k,v in c.items() if not v]
+        if not strength:missing.append('BTC 상대강도')
+        if not m.get('timing_ok',True):missing.append('선택 검색봉')
+        if too_late:missing.append('급등 추격 위험')
+        why.append('BUY 보류: '+(', '.join(missing) if missing else '반등 확인 조건·이격 거리'))
+    else:why.append('완료봉으로 반등 시작 확인 · 실제 주문은 하지 않음')
+    cost=fee/100
+    plan={'tp1_net':5.0,'tp1_fraction':.5,'tp2_net':12.0,'tp2_fraction':.5,
+          'stop_gross':-5.0,'max_minutes':7200,
+          'tp1_gross_pct':round((1.05*(1+cost)/(1-cost)-1)*100,3),
+          'tp2_gross_pct':round((1.12*(1+cost)/(1-cost)-1)*100,3),
+          'support':m['support'],'support_risk_pct':m['structure_risk_pct']}
+    return {'signal':kind,'stage':stage,'metrics':m,'explanation':why,'plan':plan}
+
+======== END btc_mtf_rebound_v12.py ========
+
+======== BEGIN requirements.txt ========
+Flask>=3.0,<4.0
+requests>=2.31,<3.0
+gunicorn>=22.0,<24.0
+
+======== END requirements.txt ========
