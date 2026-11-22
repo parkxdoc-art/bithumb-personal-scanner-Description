@@ -19,8 +19,9 @@ from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify, request, Response
+import btc_mtf_rebound_v12 as rebound
 
-VERSION = "BTC MTF V1.1"
+VERSION = "BTC MTF V1.2"
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com"
 TIMEFRAMES = ("month", "week", "day", "4h", "1h", "30m", "15m", "5m", "3m", "1m")
@@ -540,22 +541,25 @@ def coin_api():
         if strategy == "swing":
             with ThreadPoolExecutor(max_workers=3) as pool:
                 fday=pool.submit(candles,market,"day",at,80)
-                fh4=pool.submit(candles,market,"4h",at,80)
+                fh4=pool.submit(candles,market,"4h",at,90)
                 fh1=pool.submit(candles,market,"1h",at,50)
                 day,h4,h1=fday.result(),fh4.result(),fh1.result()
             btc4=ttl_get(("btc-h4",mode,at.strftime("%Y-%m-%d %H:%M")))
             if btc4 is None:
                 btc4=candles("KRW-BTC","4h",at,50)
-            m,issue=swing_metrics(day,h4,h1,btc4,at)
+            baseline,issue=swing_metrics(day,h4,h1,btc4,at)
+            if baseline is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            m,issue=rebound.bottom_rebound_metrics(day,h4,h1,btc4,at,baseline,is_contiguous,tf_end)
             if m is None:
                 return jsonify(ok=True,market=market,signal=None,issue=issue)
             if tf in ("5m","15m"):
                 timing_rows=candles(market,tf,at,count=18)
                 m["timing_ok"]=trend(timing_rows,tf).get("state")=="up"
             else:
-                m["timing_ok"]={"1h":m["h1_up"],"4h":m["h4_up"],"day":m["day_up"]}[tf]
+                m["timing_ok"]={"1h":m["checks"]["h1_confirm"],"4h":m["checks"]["ma_recover"],"day":m["day_ma20_distance_pct"]>=-6}[tf]
             m["selected_tf"]=tf
-            signal=swing_signal(m,ctx,fee)
+            signal=rebound.rebound_signal(m,ctx,fee)
         else:
             rows=candles(market,tf,at,count=50)
             m,issue=coin_metrics(rows,tf,ctx.get("selected_return"))
@@ -573,22 +577,22 @@ def coin_api():
 
 HTML = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BITHUMB · BTC MTF V1.1</title>
+<title>BITHUMB · BTC MTF V1.2 · 반등 초입</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1120;--panel:#161f33;--panel2:#202c46;--ink:#edf4ff;--muted:#93a4bd;--line:#34445f;--cyan:#45cfce;--green:#39d7a1;--yellow:#ffc56d;--red:#ff7d85}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,'Noto Sans KR',sans-serif;color:var(--ink);line-height:1.5}main{max-width:1100px;margin:auto;padding:18px 16px 48px}h1{font-size:1.4rem;line-height:1.3;margin:0}h2{font-size:1.08rem;margin:0 0 11px}small,.muted{color:var(--muted)}header{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:5px 0 19px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:1px}.tag{border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);white-space:nowrap;font-size:11px}.surface{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;margin-bottom:14px}.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:15px}.tabs button{font-size:15px;font-weight:750;padding:13px}.tabs button.on{background:#145c64;border-color:var(--cyan);color:white}button,select,input{border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--ink);font:inherit;padding:10px;min-width:0}button{cursor:pointer}button:disabled{opacity:.42;cursor:default}button.primary{background:var(--cyan);border-color:var(--cyan);color:#09252a;font-weight:800}button.secondary{background:transparent}.toolbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px}.field label{color:var(--muted);font-size:12px;font-weight:650}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.timebox{display:flex;gap:8px}.timebox input{flex:1;min-width:0}.action{margin-top:14px}.action button{padding:11px 20px}.help{font-size:12px;color:var(--muted);margin-top:9px}.btc-agg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.agg{background:#101d32;border:1px solid var(--line);padding:12px;border-radius:12px}.agg strong{display:block;font-size:1.16rem;margin-top:4px}.tf-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.tf{background:#101b2e;border:1px solid var(--line);border-radius:12px;padding:10px}.tf .name{font-size:12px;color:var(--muted)}.tf .status{font-size:16px;font-weight:750;margin-top:2px}.up{color:var(--green)}.down{color:var(--red)}.side{color:var(--yellow)}.unknown{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.metric{padding:13px;background:#101b2e;border:1px solid var(--line);border-radius:12px}.metric strong{font-size:22px;display:block}.metric span{font-size:12px;color:var(--muted)}.bar{height:6px;background:#27354a;overflow:hidden;border-radius:8px;margin-top:12px}.bar i{display:block;background:var(--cyan);height:100%;width:0%;transition:width .2s}.result{border:1px solid var(--line);background:#101c30;border-radius:13px;margin-top:9px;padding:12px}.result summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px}.result summary::-webkit-details-marker{display:none}.result summary b{font-size:16px}.badge{font-size:11px;font-weight:900;padding:4px 8px;border-radius:7px}.badge.buy{background:#115e4c;color:#9ff9d5}.badge.watch{background:#59421e;color:#ffdca5}.push{margin-left:auto;color:var(--muted);font-size:12px}.reason{font-size:13px;color:#cfdaeb;margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}.reason p{margin:5px 0}.pnl{font-size:13px;margin-top:7px}.empty{font-size:13px;color:var(--muted);padding:15px 0}.notice{font-size:12px;color:#b6c7df;margin-top:12px}.foot{margin-top:26px;color:var(--muted);font-size:12px}#error{color:var(--red);font-size:13px;margin-top:9px;white-space:pre-wrap}#scanstatus{color:var(--muted);font-size:13px}.hidden{display:none!important}
 @media(max-width:760px){main{padding:14px 11px 30px}header{align-items:flex-start}.toolbar{grid-template-columns:1fr 1fr}.tf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.surface{padding:13px}.btc-agg{grid-template-columns:1fr 1fr}}
 @media(max-width:355px){.toolbar{grid-template-columns:1fr 1fr}.row{gap:6px}.action button{flex:1}}
 </style></head><body><main>
-<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.1 · 단타/스윙 · 신호 분석 전용</small></div><span class="tag">KRW ONLY</span></header>
+<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.2 · 스윙 저점 반등 초입 · 단타 유지</small></div><span class="tag">KRW ONLY</span></header>
 <div class="tabs"><button id="live-tab" class="on" type="button">● 실시간 검색</button><button id="backtest-tab" type="button">◷ 과거 백테스트</button></div>
-<section class="surface"><h2>검색 설정</h2><div class="tabs"><button id="scalp-tab" class="on" type="button">⚡ 단타</button><button id="swing-tab" type="button">📈 스윙</button></div><div class="toolbar">
-<div class="field"><label for="tf">코인 검색 시간봉</label><select id="tf"><option value="5m">5분봉</option><option value="15m">15분봉</option><option value="1h">1시간봉</option><option value="4h">4시간봉</option><option value="day">일봉</option></select></div>
+<section class="surface"><h2>검색 설정</h2><div class="tabs"><button id="scalp-tab" type="button">⚡ 단타</button><button id="swing-tab" class="on" type="button">🌱 스윙 · 반등 초입</button></div><div class="toolbar">
+<div class="field"><label for="tf">코인 검색 시간봉</label><select id="tf"><option value="5m">5분봉</option><option value="15m">15분봉</option><option value="1h">1시간봉</option><option value="4h" selected>4시간봉</option><option value="day">일봉</option></select></div>
 <div class="field"><label for="fee">편도 수수료</label><select id="fee"><option value="0.04">0.04%</option><option value="0.25">0.25%</option></select></div>
 <div class="field"><label for="scope">검색 범위</label><select id="scope"><option value="20">거래대금 상위 20</option><option value="40" selected>거래대금 상위 40</option><option value="80">거래대금 상위 80</option><option value="all">전체 KRW</option></select></div>
-<div class="field" id="backtest-date-field" style="display:none"><label for="at">과거 검사 시각 (한국시간)</label><input type="datetime-local" id="at" step="300"></div><div class="field" id="backtest-days-field" style="display:none"><label for="days">자체 백테스트</label><select id="days"><option value="1">1일 · 1회</option><option value="3">3일 · 매일 같은 시각</option><option value="7">7일 · 매일 같은 시각</option></select></div>
+<div class="field"><label for="focus">관찰 코인 지정 (선택)</label><input id="focus" placeholder="예: PIEVERSE" maxlength="18"></div><div class="field" id="backtest-date-field" style="display:none"><label for="at">과거 검사 시각 (한국시간)</label><input type="datetime-local" id="at" step="300"></div><div class="field" id="backtest-days-field" style="display:none"><label for="days">자체 백테스트</label><select id="days"><option value="1">1일 · 1회</option><option value="3">3일 · 매일 같은 시각</option><option value="7">7일 · 매일 같은 시각</option></select></div>
 </div><div class="action row"><button class="primary" id="start" type="button">검색 시작</button><button class="secondary" id="csv" disabled type="button">CSV 받기</button><small id="scanstatus">검사 전</small></div><div id="error"></div>
-<div class="help" id="strategy-help">단타: 순익 +1%에 70%, +10%에 30%, 가격 -2% 손절 · 240분.</div><div class="help" id="live-help">현재 거래대금 상위 순서로 검색. 마감봉만 사용하며 BUY/WATCH는 참고 신호야. 수동 실행만 지원해.</div>
+<div class="help" id="strategy-help">스윙: 바닥 반등 초입을 볼밴·일목·이평·RSI·MACD·거래대금·BTC 상대강도로 검증. 1시간봉 확인 후 BUY, 이전 단계 WATCH. +5%·+12% 분할 / -5% 손절 / 120시간.</div><div class="help" id="live-help">현재 거래대금 상위 순서로 검색. 마감봉만 사용하며 BUY/WATCH는 참고 신호야. 수동 실행만 지원해.</div>
 <div class="help hidden" id="backtest-help">선택 시각의 과거 <b>완료봉만 사용</b>해 신호를 판정하고 단타는 240분/스윙은 120시간을 가상 청산해. 3·7일은 지정한 시각에 하루 1번씩 반복. 현재 상장 목록과 현재 거래대금 순위를 쓰므로 생존·미래정보 편향이 있어. 미확정 봉은 따로 표시해.</div>
 </section>
 <section class="surface"><h2>BTC 장기·단기 추세 <small id="btcts"></small></h2><div class="btc-agg"><div class="agg"><small>장기 · 월/주/일/4시간</small><strong id="long" class="unknown">검사 전</strong></div><div class="agg"><small>단기 · 1시간~1분</small><strong id="short" class="unknown">검사 전</strong></div></div><div id="tf-grid" class="tf-grid"></div><div class="notice">판정: 완료봉 종가와 MA5·MA10 배열. 종가 &gt; MA5 &gt; MA10은 상승, 반대는 하락, 그 외 횡보. 10봉 연속 자료 부족이면 미확인.</div></section>
@@ -598,11 +602,11 @@ HTML = r'''<!doctype html>
 (()=>{
 const $=id=>document.getElementById(id), ST={up:'상승',down:'하락',side:'횡보',unknown:'자료 부족'},TF={'month':'월','week':'주','day':'일','4h':'4시간','1h':'1시간','30m':'30분','15m':'15분','5m':'5분','3m':'3분','1m':'1분'},order=['month','week','day','4h','1h','30m','15m','5m','3m','1m'];
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let mode='live',strategy='scalp',busy=false,results=[],problems=0,completed=0,universe=[],runId=0,lastCfg=null;
+let mode='live',strategy='swing',busy=false,results=[],problems=0,completed=0,universe=[],runId=0,lastCfg=null;
 const dt=(d)=>{const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':00'};
 let d=new Date();d.setDate(d.getDate()-1);d.setHours(15,0,0,0);$('at').value=dt(d);
 function modeSet(next){if(busy)return;mode=next;$('live-tab').classList.toggle('on',mode==='live');$('backtest-tab').classList.toggle('on',mode==='backtest');$('backtest-date-field').style.display=mode==='backtest'?'flex':'none';$('backtest-days-field').style.display=mode==='backtest'?'flex':'none';$('live-help').classList.toggle('hidden',mode!=='live');$('backtest-help').classList.toggle('hidden',mode!=='backtest');reset()}
-function strategySet(next){if(busy)return;strategy=next;$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙: 일봉+4시간 추세, 1시간 반등, BTC 상대강도 · 급등 추격 WATCH · +5% 50% / +12% 50% · -5% 손절 / 120시간. 선택 검색봉 추가 확인.':'단타: 순익 +1%에 70%, +10%에 30%, 가격 -2% 손절 · 240분.';if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
+function strategySet(next){if(busy)return;strategy=next;$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙: 바닥 반등 초입 · 볼밴/일목/이평/RSI/MACD/거래대금/상대강도+1시간 확인. WATCH 후 반등 확인 BUY. +5% 50% / +12% 50% · -5% 손절 / 120시간.':'단타: 빠른 돌파·BTC 상대강도 · +1% 70% / +10% 30% · -2% 손절 / 240분.';if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
 $('scalp-tab').onclick=()=>strategySet('scalp');$('swing-tab').onclick=()=>strategySet('swing');
 $('live-tab').onclick=()=>modeSet('live');$('backtest-tab').onclick=()=>modeSet('backtest');
 function reset(){results=[];completed=problems=0;$('results').innerHTML='검사 시작을 누르면 BUY·WATCH 후보만 나타나.';$('csv').disabled=true;['done','nbuy','nwatch','nerr'].forEach(k=>$(k).textContent='0');$('long').textContent='검사 전';$('short').textContent='검사 전';$('tf-grid').innerHTML='';$('progress').style.width='0%';$('scanstatus').textContent='검사 전';$('btinfo').textContent='';$('bt-summary').textContent='';$('error').textContent='';$('btcts').textContent=''}
@@ -627,7 +631,7 @@ function renderResults(){
   const bttext=mode!=='backtest'?'':bt&&bt.status==='RESOLVED'
    ?'<p class="pnl '+(bt.net_pct>=0?'up':'down')+'">'+(si.signal==='BUY'?'BUY 가상거래':'WATCH 가상 경로(거래 미가정)')+' · '+(strategy==='swing'?'120시간':'240분')+' 순익 '+(bt.net_pct>=0?'+':'')+Number(bt.net_pct).toFixed(3)+'% · '+(bt.stop?'손절':bt.tp2?'2차 익절':bt.tp1?'1차 익절 후 청산':'만료')+(bt.ambiguous?' · 동일 봉 순서 불명':'')+'</p>'
    :'<p class="pnl side">미확정: '+esc(bt&&bt.reason||'봉 누락')+'</p>';
-  return '<details class="result"><summary><span class="badge '+si.signal.toLowerCase()+'">'+si.signal+'</span><b>'+esc(x.name||x.market)+' <small>'+esc(x.market)+'</small></b><span class="push">'+esc(x.at||'')+' · 상대강도 '+(m.relative_pct>=0?'+':'')+Number(m.relative_pct).toFixed(2)+'%p · 상세 ▾</span></summary><div class="reason">'
+  return '<details class="result"><summary><span class="badge '+si.signal.toLowerCase()+'">'+si.signal+'</span><small>'+esc(si.stage||'')+'</small><b>'+esc(x.name||x.market)+' <small>'+esc(x.market)+'</small></b><span class="push">'+esc(x.at||'')+' · 상대강도 '+(m.relative_pct>=0?'+':'')+Number(m.relative_pct).toFixed(2)+'%p · 상세 ▾</span></summary><div class="reason">'
    +si.explanation.map(z=>'<p>• '+esc(z)+'</p>').join('')
    +'<p>가상 청산: 순익 +'+p.tp1_net+'% '+Math.round(p.tp1_fraction*100)+'%, +'+p.tp2_net+'% '+Math.round(p.tp2_fraction*100)+'% · 손절 '+p.stop_gross+'% · '+p.max_minutes/60+'시간</p>'
    +'<p>완료봉 참고가 '+num(base)+'원 · 1차 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원 · 2차 '+num(base*(1+p.tp2_gross_pct/100))+'원 · 가상 손절 '+num(base*(1+p.stop_gross/100))+'원'+(m.support?' · 구조 지지 '+num(m.support)+'원':'')+' (실제 체결가 아님)</p>'
@@ -644,7 +648,7 @@ $('start').onclick=async()=>{
   items=scope==='all'?items:items.slice(0,Number(scope));
   const daysCount=mode==='backtest'?Number($('days').value):1;
   if(daysCount>1)items=items.slice(0,daysCount===7?10:20);
-  if(!items.length)throw Error('검색 가능한 종목이 없어');
+  const pinned=$('focus').value.trim().toUpperCase().replace(/^KRW-/, '');if(pinned){const found=list.items.find(x=>x.market==='KRW-'+pinned||x.name===$('focus').value.trim());if(found&&!items.some(x=>x.market===found.market))items=[found,...items];else if(!found)throw Error('관찰 코인을 찾지 못했어: '+pinned);}if(!items.length)throw Error('검색 가능한 종목이 없어');
   const dates=[];
   for(let day=0;day<daysCount;day++){
    const c={...cfg};
@@ -679,14 +683,14 @@ $('start').onclick=async()=>{
 };
 $('csv').onclick=()=>{
  if(!lastCfg)return;
- const fields=['version','strategy','mode','snapshot_kst','tf','fee_each_pct','market','name','signal','closed_kst','relative_pct','btc_change_pct','coin_change_pct','breakout_pct','volume_ratio','atr_pct','rise24_pct','structure_risk_pct','reason','tp1_net','tp1_fraction','tp2_net','tp2_fraction','stop_gross','max_minutes','bt_status','bt_net_pct','bt_stop','bt_tp1','bt_tp2','bt_minutes','bt_ambiguous','bt_reason'];
+ const fields=['version','strategy','mode','snapshot_kst','tf','fee_each_pct','market','name','signal','closed_kst','relative_pct','btc_change_pct','coin_change_pct','breakout_pct','volume_ratio','atr_pct','rise24_pct','structure_risk_pct','rebound_from_low_pct','bb_position','rsi14','macd_hist','ichimoku_tenkan','ichimoku_kijun','score','stage','reason','tp1_net','tp1_fraction','tp2_net','tp2_fraction','stop_gross','max_minutes','bt_status','bt_net_pct','bt_stop','bt_tp1','bt_tp2','bt_minutes','bt_ambiguous','bt_reason'];
  const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"',lines=[fields.join(',')];
  for(const x of results){
   const si=x.signal,m=si.metrics,t=si.backtest||{},p=si.plan;
-  lines.push(['BTC-MTF-V1.1',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,x.market,x.name,si.signal,m.closed_kst,m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??''].map(quote).join(','));
+  lines.push(['BTC-MTF-V1.2',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,x.market,x.name,si.signal,m.closed_kst,m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??''].map(quote).join(','));
  }
  const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
- a.href=url;a.download='BITHUMB_BTC_MTF_V1_1_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_2_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 
 })();
