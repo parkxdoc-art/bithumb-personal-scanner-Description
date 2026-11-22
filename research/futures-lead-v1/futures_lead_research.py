@@ -28,6 +28,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 import hyperliquid_wallet_study_v15 as walletstudy
 import classic_priceaction_lab as classiclab
+import lw_breakout_lab_V1_0 as lwlab
 import brooks_confirm_lab_V1_1 as brookslab
 
 VERSION = "1.4.1"
@@ -686,6 +687,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urlsplit(self.path).path
+        if p == '/lw' or p.startswith('/api/lw/'):
+            return lwlab.handle_get(self,p)
         if p == '/classic/brooks' or p.startswith('/api/brooks-v11/'):
             return brookslab.handle_get(self,p)
         if p == '/classic' or p.startswith('/api/classic/'):
@@ -727,6 +730,8 @@ class Handler(BaseHTTPRequestHandler):
         else: self.respond(json.dumps({'error':'not found'}),404)
 
     def do_POST(self):
+        if urlsplit(self.path).path == '/api/lw/run':
+            return lwlab.handle_post(self,'/api/lw/run')
         if urlsplit(self.path).path == '/api/brooks-v11/run':
             return brookslab.handle_post(self,'/api/brooks-v11/run')
         if urlsplit(self.path).path == '/api/classic/run':
