@@ -128,7 +128,7 @@ JS = r"""<script>
    const o=e.split7030_compare?.[st]?.[t]||{},values=['CORE17 SPLIT70/30 V1.0',date,e.market,e.base_id,e.signal_time_kst,e.entry_time_kst,e.tp_compare_fee,e.tp_compare_slip,1,.7,t,.3,st,common,o.status,o.outcome,o.net_pct,o.reason,o.minutes,o.first_filled,o.second_filled,o.stop_triggered,JSON.stringify(o.exit_legs||[])];
    rows.push(values.map(quote).join(','));
   }}
-  const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='BITHUMB_CORE17_SPLIT7030_V1_0_COMPARE.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);
+  const blob=new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),downloadLink=document.createElement('a');downloadLink.href=url;downloadLink.download='BITHUMB_CORE17_SPLIT7030_V1_0_COMPARE.csv';downloadLink.click();setTimeout(()=>URL.revokeObjectURL(url),3000);
  };
 })();
 </script>"""
