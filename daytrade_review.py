@@ -15,6 +15,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from flask import jsonify, render_template_string, request
 import core17_stop_lab_v1 as stoplab
+import core17_split7030_lab_v1 as splitlab
 
 MARKET_RE = re.compile(r'^KRW-[A-Z0-9]+$')
 LAB_WARMUP_BARS = 26
@@ -2135,6 +2136,7 @@ def evaluate_core17_focus(rows5, cfg, core16):
         ev['tp_compare_slip'] = cfg['slip']
         ev['tp_compare'] = {'0.5': scenarios['SCALE_05_5_10'], **{str(t):core16_simulate_scale(rows5,i,cfg,False,t) for t in (1,2,3)}}
         ev['stop_compare'] = stoplab.compare(rows5,i,cfg,ev['tp_compare'])
+        ev['split7030_compare'] = splitlab.compare(ev['stop_compare'])
         full=bool(old.get('core16_full_path'))
         ev.update(core17_scenarios=scenarios,
                   core17_full_path=full,
@@ -2183,6 +2185,10 @@ def register_daytrade_review(app, deps):
     api_get, get_markets, kst = deps['api_get'], deps['get_markets'], deps['KST']
     cache = {'at': 0., 'markets': [], 'results': {}, 'ticker_at': 0., 'sorted': [], 'btc': {}}
     lock = Lock()
+
+    @app.get('/v2-core17-split')
+    def v2_core17_split_page():
+        return render_template_string(splitlab.make_page(stoplab.make_page(tp_compare_page())))
 
     @app.get('/v2-core17-sl')
     def v2_core17_sl_page():
