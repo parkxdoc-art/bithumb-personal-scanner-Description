@@ -21,7 +21,7 @@ import requests
 from flask import Flask, jsonify, request, Response
 import btc_mtf_rebound_v13 as rebound
 
-VERSION = "BTC MTF V1.3"
+VERSION = "BTC MTF V1.3.1"
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com"
 TIMEFRAMES = ("month", "week", "day", "4h", "1h", "30m", "15m", "5m", "3m", "1m")
@@ -29,7 +29,7 @@ SCAN_TF = ("5m", "15m", "1h", "4h", "day")
 STRATEGIES = ("scalp", "swing")
 STABLES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USD1", "PYUSD", "USDE", "USDD", "RLUSD", "EURC", "EURI"}
 MARKET_RE = re.compile(r"^KRW-[A-Z0-9]+$")
-MIN_TURNOVER = 500_000_000  # live only: 24h ticker value
+MIN_TURNOVER = 100_000_000  # UI default, selectable 50M/100M/500M/unlimited
 FEE_CHOICES = (0.04, 0.25)
 _CACHE = {}
 _LOCK = threading.Lock()
@@ -579,23 +579,24 @@ def coin_api():
 
 HTML = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BITHUMB · BTC MTF V1.3 · 반등 점수제</title>
+<title>BITHUMB · BTC MTF V1.3.1 · 거래대금 선택</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1120;--panel:#161f33;--panel2:#202c46;--ink:#edf4ff;--muted:#93a4bd;--line:#34445f;--cyan:#45cfce;--green:#39d7a1;--yellow:#ffc56d;--red:#ff7d85}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,'Noto Sans KR',sans-serif;color:var(--ink);line-height:1.5}main{max-width:1100px;margin:auto;padding:18px 16px 48px}h1{font-size:1.4rem;line-height:1.3;margin:0}h2{font-size:1.08rem;margin:0 0 11px}small,.muted{color:var(--muted)}header{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:5px 0 19px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:1px}.tag{border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);white-space:nowrap;font-size:11px}.surface{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;margin-bottom:14px}.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:15px}.tabs button{font-size:15px;font-weight:750;padding:13px}.tabs button.on{background:#145c64;border-color:var(--cyan);color:white}button,select,input{border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--ink);font:inherit;padding:10px;min-width:0}button{cursor:pointer}button:disabled{opacity:.42;cursor:default}button.primary{background:var(--cyan);border-color:var(--cyan);color:#09252a;font-weight:800}button.secondary{background:transparent}.toolbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px}.field label{color:var(--muted);font-size:12px;font-weight:650}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.timebox{display:flex;gap:8px}.timebox input{flex:1;min-width:0}.action{margin-top:14px}.action button{padding:11px 20px}.help{font-size:12px;color:var(--muted);margin-top:9px}.btc-agg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.agg{background:#101d32;border:1px solid var(--line);padding:12px;border-radius:12px}.agg strong{display:block;font-size:1.16rem;margin-top:4px}.tf-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.tf{background:#101b2e;border:1px solid var(--line);border-radius:12px;padding:10px}.tf .name{font-size:12px;color:var(--muted)}.tf .status{font-size:16px;font-weight:750;margin-top:2px}.up{color:var(--green)}.down{color:var(--red)}.side{color:var(--yellow)}.unknown{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.metric{padding:13px;background:#101b2e;border:1px solid var(--line);border-radius:12px}.metric strong{font-size:22px;display:block}.metric span{font-size:12px;color:var(--muted)}.bar{height:6px;background:#27354a;overflow:hidden;border-radius:8px;margin-top:12px}.bar i{display:block;background:var(--cyan);height:100%;width:0%;transition:width .2s}.result{border:1px solid var(--line);background:#101c30;border-radius:13px;margin-top:9px;padding:12px}.result summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.score-chip{border:1px solid #4c7087;background:#17374a;color:#c4f5f0;border-radius:7px;padding:3px 6px;font-weight:850;font-size:12px;white-space:nowrap}.entry-price{border:1px solid #466380;background:#243553;border-radius:8px;padding:4px 9px;font-size:13px;font-weight:750;color:#ebf6ff;white-space:nowrap}.entry-price.watch-entry{background:#352f24;color:#ffe8b3;border-color:#7b623c}.entry-note{border:1px solid #364b67;background:#172943;padding:10px;border-radius:9px;margin:8px 0}.entry-metrics{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.entry-metrics span{border:1px solid #364b67;padding:6px 9px;border-radius:8px;font-size:12px}.result summary::-webkit-details-marker{display:none}.result summary b{font-size:16px}.badge{font-size:11px;font-weight:900;padding:4px 8px;border-radius:7px}.badge.buy{background:#115e4c;color:#9ff9d5}.badge.watch{background:#59421e;color:#ffdca5}.push{margin-left:auto;color:var(--muted);font-size:12px}.reason{font-size:13px;color:#cfdaeb;margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}.reason p{margin:5px 0}.pnl{font-size:13px;margin-top:7px}.empty{font-size:13px;color:var(--muted);padding:15px 0}.notice{font-size:12px;color:#b6c7df;margin-top:12px}.foot{margin-top:26px;color:var(--muted);font-size:12px}#error{color:var(--red);font-size:13px;margin-top:9px;white-space:pre-wrap}#scanstatus{color:var(--muted);font-size:13px}.hidden{display:none!important}
 @media(max-width:760px){main{padding:14px 11px 30px}header{align-items:flex-start}.toolbar{grid-template-columns:1fr 1fr}.tf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.surface{padding:13px}.btc-agg{grid-template-columns:1fr 1fr}}
 @media(max-width:355px){.toolbar{grid-template-columns:1fr 1fr}.row{gap:6px}.action button{flex:1}}
 </style></head><body><main>
-<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.3 · 반등 점수 10점제 · 단타 보존</small></div><span class="tag">KRW ONLY</span></header>
+<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.3.1 · 거래대금 선택 · 단타/스윙</small></div><span class="tag">KRW ONLY</span></header>
 <div class="tabs"><button id="live-tab" class="on" type="button">● 실시간 검색</button><button id="backtest-tab" type="button">◷ 과거 백테스트</button></div>
 <section class="surface"><h2>검색 설정</h2><div class="tabs"><button id="scalp-tab" type="button">⚡ 단타</button><button id="swing-tab" class="on" type="button">🌱 스윙 · 점수제</button></div><div class="toolbar">
 <div class="field"><label for="tf">코인 검색 시간봉</label><select id="tf"><option value="5m">5분봉</option><option value="15m">15분봉</option><option value="1h">1시간봉</option><option value="4h" selected>4시간봉</option><option value="day">일봉</option></select></div>
 <div class="field"><label for="fee">편도 수수료</label><select id="fee"><option value="0.04">0.04%</option><option value="0.25">0.25%</option></select></div>
+<div class="field"><label for="turnover">24시간 거래대금 하한</label><select id="turnover"><option value="50000000">5천만 원 이상</option><option value="100000000" selected>1억 원 이상</option><option value="500000000">5억 원 이상</option><option value="0">제한 없음</option></select></div>
 <div class="field"><label for="scope">검색 범위</label><select id="scope"><option value="20">거래대금 상위 20</option><option value="40" selected>거래대금 상위 40</option><option value="80">거래대금 상위 80</option><option value="all">전체 KRW</option></select></div>
 <div class="field"><label for="focus">관찰 코인 지정 (선택)</label><input id="focus" placeholder="예: PIEVERSE" maxlength="18"></div><div class="field" id="backtest-date-field" style="display:none"><label for="at">과거 검사 시각 (한국시간)</label><input type="datetime-local" id="at" step="300"></div><div class="field" id="backtest-days-field" style="display:none"><label for="days">자체 백테스트</label><select id="days"><option value="1">1일 · 1회</option><option value="3">3일 · 매일 같은 시각</option><option value="7">7일 · 매일 같은 시각</option></select></div>
 </div><div class="action row"><button class="primary" id="start" type="button">검색 시작</button><button class="secondary" id="csv" disabled type="button">CSV 받기</button><small id="scanstatus">검사 전</small></div><div id="error"></div>
-<div class="help" id="strategy-help">스윙: 지표 7점 + BTC 상대강도·초기 위치·지지 위험 3점 = 10점. 7점 이상 WATCH, 8점 이상 및 1시간봉 반등 등 필수 조건 확인 시 BUY. 급등 추격 후보 제외.</div><div class="help" id="live-help">현재 거래대금 상위 순서로 검색. 마감봉만 사용하며 BUY/WATCH는 참고 신호야. 수동 실행만 지원해.</div>
-<div class="help hidden" id="backtest-help">선택 시각의 과거 <b>완료봉만 사용</b>해 신호를 판정하고 단타는 240분/스윙은 120시간을 가상 청산해. 3·7일은 지정한 시각에 하루 1번씩 반복. 현재 상장 목록과 현재 거래대금 순위를 쓰므로 생존·미래정보 편향이 있어. 미확정 봉은 따로 표시해.</div>
+<div class="help" id="strategy-help">스윙: 지표 7점 + BTC 상대강도·초기 위치·지지 위험 3점 = 10점. 7점 이상 WATCH, 8점 이상 및 1시간봉 반등 등 필수 조건 확인 시 BUY. 급등 추격 후보 제외.</div><div class="help" id="live-help">설정한 24시간 거래대금 하한을 넘는 KRW 코인만 검색해. 제한 없음을 선택하면 거래가 거의 없는 코인까지 포함되어 자료 부족이 늘 수 있어. 마감봉만 사용하며 자동 주문은 없어.</div>
+<div class="help hidden" id="backtest-help">선택 시각의 과거 <b>완료봉만 사용</b>해 신호를 판정하고 단타는 240분/스윙은 120시간을 가상 청산해. 3·7일은 지정한 시각에 하루 1번씩 반복. 현재 상장 목록과 현재 24시간 거래대금 순위·하한을 쓰므로 생존·미래정보 편향이 있어. 미확정 봉은 따로 표시해.</div>
 </section>
 <section class="surface"><h2>BTC 장기·단기 추세 <small id="btcts"></small></h2><div class="btc-agg"><div class="agg"><small>장기 · 월/주/일/4시간</small><strong id="long" class="unknown">검사 전</strong></div><div class="agg"><small>단기 · 1시간~1분</small><strong id="short" class="unknown">검사 전</strong></div></div><div id="tf-grid" class="tf-grid"></div><div class="notice">판정: 완료봉 종가와 MA5·MA10 배열. 종가 &gt; MA5 &gt; MA10은 상승, 반대는 하락, 그 외 횡보. 10봉 연속 자료 부족이면 미확인.</div></section>
 <section class="surface"><h2>코인 후보 <small>BUY / WATCH</small></h2><div class="metrics"><div class="metric"><span>검사 완료</span><strong id="done">0</strong></div><div class="metric"><span>BUY</span><strong id="nbuy" class="up">0</strong></div><div class="metric"><span>WATCH</span><strong id="nwatch" class="side">0</strong></div><div class="metric"><span>오류 / 자료 부족</span><strong id="nerr">0</strong></div></div><div class="bar"><i id="progress"></i></div><div class="notice" id="btinfo"></div><div id="bt-summary" class="notice"></div><div id="results" class="empty">검사 시작을 누르면 BUY·WATCH 후보만 나타나.</div></section>
@@ -644,11 +645,11 @@ function renderResults(){
 }
 $('start').onclick=async()=>{
  if(busy)return;reset();busy=true;runId++;const id=runId,btn=$('start');btn.disabled=true;btn.textContent='검색 중…';
- const cfg={mode,strategy,tf:$('tf').value,fee:Number($('fee').value)};
+ const cfg={mode,strategy,tf:$('tf').value,fee:Number($('fee').value),min_turnover_24h_krw:Number($('turnover').value)};
  if(mode==='backtest')cfg.at=$('at').value.replace('T',' ')+':00';lastCfg={...cfg};
  try{
   const list=await get('/api/universe');const scope=$('scope').value;
-  let items=list.items.filter(x=>mode==='backtest'||x.turnover>=500000000);
+  let items=list.items.filter(x=>Number(x.turnover)>=cfg.min_turnover_24h_krw);
   items=scope==='all'?items:items.slice(0,Number(scope));
   const daysCount=mode==='backtest'?Number($('days').value):1;
   if(daysCount>1)items=items.slice(0,daysCount===7?10:20);
@@ -661,8 +662,8 @@ $('start').onclick=async()=>{
   }
   universe=dates.flatMap(c=>items.map(x=>({...x,at:c.at||'LIVE'})));
   $('btinfo').textContent=mode==='backtest'
-    ?daysCount+'일 × 하루 같은 시각 1회 · '+items.length+'개 현재 상장 종목. 현재 거래대금 순위 사용: 생존편향/미래정보 편향 주의!'
-    :'현재 24시간 거래대금 5억원 이상 · BTC 후보 제외 · 점수 및 진입 위치 품질 필터 · 낮은 점수는 제외';
+    ?daysCount+'일 × 하루 같은 시각 1회 · '+items.length+'개 현재 상장 종목. 거래대금 하한 '+($('turnover').selectedOptions[0]?.textContent||'')+' · 현재 거래대금 기준: 과거 시점 정보가 아니므로 생존·미래정보 편향 주의!'
+    :'24시간 거래대금 '+($('turnover').selectedOptions[0]?.textContent||'')+' · BTC 후보 제외 · 반등 점수 및 진입 위치 필터';
   for(const c of dates){
    const b=await post('/api/btc',c);
    if(runId!==id)break;
@@ -673,7 +674,7 @@ $('start').onclick=async()=>{
     const coin=items[cursor++];
     try{
      const j=await post('/api/coin',{...c,market:coin.market});
-     if(j.signal)results.push({market:coin.market,name:coin.name,at:c.at||'LIVE',signal:j.signal});
+     if(j.signal)results.push({market:coin.market,name:coin.name,at:c.at||'LIVE',turnover24h:coin.turnover,signal:j.signal});
      if(j.issue)problems++;
     }catch(e){problems++;}
     completed++;
@@ -687,14 +688,14 @@ $('start').onclick=async()=>{
 };
 $('csv').onclick=()=>{
  if(!lastCfg)return;
- const fields=['version','strategy','mode','snapshot_kst','tf','fee_each_pct','market','name','signal','closed_kst','entry_ref_price_krw','entry_ref_type','tp1_ref_price_krw','tp2_ref_price_krw','stop_ref_price_krw','relative_pct','btc_change_pct','coin_change_pct','breakout_pct','volume_ratio','atr_pct','rise24_pct','structure_risk_pct','rebound_from_low_pct','technical_score','quality_score','score_total','quality_btc_strength','quality_entry_zone','quality_risk_control','bb_position','rsi14','macd_hist','ichimoku_tenkan','ichimoku_kijun','score','stage','reason','tp1_net','tp1_fraction','tp2_net','tp2_fraction','stop_gross','max_minutes','bt_status','bt_net_pct','bt_stop','bt_tp1','bt_tp2','bt_minutes','bt_ambiguous','bt_reason'];
+ const fields=['version','strategy','mode','snapshot_kst','tf','fee_each_pct','min_turnover_24h_krw','market_turnover_24h_krw','market','name','signal','closed_kst','entry_ref_price_krw','entry_ref_type','tp1_ref_price_krw','tp2_ref_price_krw','stop_ref_price_krw','relative_pct','btc_change_pct','coin_change_pct','breakout_pct','volume_ratio','atr_pct','rise24_pct','structure_risk_pct','rebound_from_low_pct','technical_score','quality_score','score_total','quality_btc_strength','quality_entry_zone','quality_risk_control','bb_position','rsi14','macd_hist','ichimoku_tenkan','ichimoku_kijun','score','stage','reason','tp1_net','tp1_fraction','tp2_net','tp2_fraction','stop_gross','max_minutes','bt_status','bt_net_pct','bt_stop','bt_tp1','bt_tp2','bt_minutes','bt_ambiguous','bt_reason'];
  const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"',lines=[fields.join(',')];
  for(const x of results){
   const si=x.signal,m=si.metrics,t=si.backtest||{},p=si.plan;
-  lines.push(['BTC-MTF-V1.3',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':'WATCH 관찰 기준가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??''].map(quote).join(','));
+  lines.push(['BTC-MTF-V1.3.1',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':'WATCH 관찰 기준가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??''].map(quote).join(','));
  }
  const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
- a.href=url;a.download='BITHUMB_BTC_MTF_V1_3_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_3_1_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 
 })();
