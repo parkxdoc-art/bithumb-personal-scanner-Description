@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LW-inspired Bithumb KRW research, V1.0. Standard library; no orders."""
+"""LW-inspired Bithumb KRW research, V1.1. Standard library; no orders."""
 import csv, io, json, math, os, re, time, threading, argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
-VERSION='1.0'; STEP=300000; DAY=86400000; KST=timezone(timedelta(hours=9))
+VERSION='1.1'; STEP=300000; DAY=86400000; KST=timezone(timedelta(hours=9))
 FEE=.0025; TARGET=.005; STOP=.01; MIN_LIQ=500_000_000
 DEFAULT='BTC,ETH,SOL,XRP,DOGE,ADA,LINK,AVAX,SUI,PEPE'
 KS=(.3,.5,.7); ENTRIES=('A','B','C'); EXITS=('DAY','SCALP')
@@ -25,7 +25,7 @@ def get(path,params):
         if time.monotonic()<BLOCK:raise DataError('API 요청 제한: 중단')
         time.sleep(max(0,NEXT-time.monotonic()));NEXT=time.monotonic()+.55
         try:
-            req=Request('https://api.bithumb.com/v1'+path+'?'+urlencode(params),headers={'Accept':'application/json','User-Agent':'LW-KRW-Research/1.0'})
+            req=Request('https://api.bithumb.com/v1'+path+'?'+urlencode(params),headers={'Accept':'application/json','User-Agent':'LW-KRW-Research/1.1'})
             with urlopen(req,timeout=15) as res: data=json.loads(res.read(4_000_000))
         except HTTPError as e:
             if e.code in (418,429):BLOCK=time.monotonic()+600;raise DataError('API 요청 제한 HTTP '+str(e.code))
@@ -40,18 +40,17 @@ def parse(r,step):
     if t%step or not all(map(math.isfinite,(o,h,l,c,q))) or not (0<l<=min(o,c)<=max(o,c)<=h and q>=0):raise ValueError('invalid candle')
     return t,o,h,l,c,q
 
+def aggregate_day(bars,d):
+    rows=[bars.get(t) for t in range(d,d+DAY,STEP)]
+    if any(r is None for r in rows):return None
+    return (d,rows[0][1],max(r[2] for r in rows),min(r[3] for r in rows),rows[-1][4],math.fsum(r[5] for r in rows))
+
 def collect(coin,start,end,fetch=get,progress=lambda x:None):
-    daily={}; bars={}; invalid=0; cursor=end+DAY
-    # Completed daily bars are requested through the last complete session only.
-    for r in fetch('/candles/days',{'market':'KRW-'+coin,'count':min(200,(end-start)//DAY+2),'to':stamp(end).replace(' ','T')+':00'}):
-        try:
-            x=parse(r,DAY)
-            if start-DAY<=x[0]<end:daily[x[0]]=x
-        except (KeyError,ValueError,TypeError,OverflowError):invalid+=1
-    # Include one subsequent completed five-minute bar to know the next session open.
-    cursor=end+STEP
+    # Reconstruct daily OHLCV exclusively from complete UTC sessions (09:00 KST).
+    # Fetch one extra previous session; never fill missing candles.
+    daily={};bars={};invalid=0;cursor=end+STEP;warm=start-DAY
     for page in range(100):
-        if cursor<=start:break
+        if cursor<=warm:break
         progress(f'{coin} 5분봉 {page+1}페이지')
         response=fetch('/candles/minutes/5',{'market':'KRW-'+coin,'count':200,'to':stamp(cursor).replace(' ','T')+':00'})
         if not response:break
@@ -59,11 +58,14 @@ def collect(coin,start,end,fetch=get,progress=lambda x:None):
         for r in response:
             try:
                 x=parse(r,STEP);ts.append(x[0])
-                if start<=x[0]<end+STEP:bars[x[0]]=x
+                if warm<=x[0]<end+STEP:bars[x[0]]=x
             except (KeyError,ValueError,TypeError,OverflowError):invalid+=1
         if not ts or min(ts)>=cursor:raise DataError('캔들 페이지 진행 실패')
         cursor=min(ts)
     else:raise DataError('페이지 제한 초과')
+    for d in range(warm,end,DAY):
+        x=aggregate_day(bars,d)
+        if x:daily[d]=x
     return daily,bars,invalid
 
 def entries(rows,line):
@@ -102,12 +104,13 @@ def evaluate(coin,daily,bars,start,end):
         prev=daily.get(d-DAY);cur=daily.get(d);nxt=bars.get(d+DAY)
         rows=[bars[t] for t in range(d,d+DAY,STEP) if t in bars]
         reason='OK'
-        if not prev or not cur:reason='일봉 없음'
+        if not prev:reason='전일 5분봉 누락: 일봉 재구성 불가'
+        elif not cur:reason='당일 5분봉 누락: 일봉 재구성 불가'
         elif prev[5]<MIN_LIQ:reason='전일 거래대금 5억 미만'
         elif prev[2]<=prev[3]:reason='전일 변동폭 0'
         elif len(rows)!=288 or not nxt:reason='5분봉/익일 시가 누락'
         elif not math.isclose(cur[1],rows[0][1],rel_tol=1e-8):reason='일봉/분봉 시가 불일치'
-        diag={'coin':coin,'day':stamp(d)[:10],'bars':len(rows),'next_open':bool(nxt),'prev_krw':prev[5] if prev else None,'status':reason}
+        diag={'coin':coin,'day':stamp(d)[:10],'bars':len(rows),'next_open':bool(nxt),'prev_krw':prev[5] if prev else None,'prev_bars':sum(t in bars for t in range(d-DAY,d,STEP)),'daily_source':'5분봉 재구성','status':reason}
         audit.append(diag)
         if reason!='OK':continue
         for k in KS:
@@ -153,7 +156,7 @@ def run(coins=DEFAULT,days=30,progress=lambda x:None,now=None,acquire=collect):
     return {'version':VERSION,'from':stamp(start),'until':stamp(end),'coins':cs,'days':days,'rows':kept,'audit':audit,'errors':errors,'raw_trades':len(rows),'summary':summarize(kept,audit),'uncapped_summary':summarize(rows,audit),'coverage':dict(Counter(x['status'] for x in audit))}
 
 FIELDS=['coin','day','k','entry_type','exit_type','line','entry','entry_ms','entry_price','exit','exit_price','net_pct','reason']
-AUDIT=['coin','day','bars','next_open','prev_krw','status']
+AUDIT=['coin','day','bars','next_open','prev_krw','prev_bars','daily_source','status']
 
 def csv_text(rows,fields):
     f=io.StringIO();w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(rows);return '\ufeff'+f.getvalue()
@@ -168,7 +171,7 @@ def start(coins,days):
         finally:LOCK.release()
     threading.Thread(target=work,daemon=True).start();return True
 
-HTML='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LW 변동성 돌파 연구 V1.0</title><style>body{font:15px system-ui;background:#101a2b;color:#eaf1fc;max-width:1000px;margin:auto;padding:16px}section{background:#192a40;border:1px solid #354b65;border-radius:12px;padding:16px;margin:12px 0}input,select,button{font:inherit;background:#0e1c30;color:white;border:1px solid #56708f;padding:10px;border-radius:8px;box-sizing:border-box}input{width:100%}button{background:#286cb1}button:disabled{opacity:.5}a{color:#a0d6ff}small{color:#b5c6dc}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #354b65;padding:8px;white-space:nowrap;text-align:right}.scroll{overflow:auto}h1{font-size:24px}h2{font-size:18px}</style><h1>LW 변동성 돌파 V1.0</h1><small>빗썸 KRW · 독립 연구 · 자동매매 없음</small><section><h2>1. 비교 연구</h2><label>고정 종목 (최대 10개)</label><input id="coins" value="BTC,ETH,SOL,XRP,DOGE,ADA,LINK,AVAX,SUI,PEPE"><p><label>기간 <select id="days"><option>30</option><option>60</option></select>일</label> <button id="run">연구 실행</button></p><p id="state">대기</p><small>전일 거래대금 5억 이상 · 09시 기준 · 5분봉 완전 수집일만 · 편도 0.25% · 비교군별 하루 최대 4건. 조회량이 많아 최초 수집이 길어질 수 있습니다.</small></section><section><h2>2. 비교 결과 (18개)</h2><p id="coverage"></p><div class="scroll" id="summary"></div><p><a href="/api/lw/csv">거래 CSV</a> · <a href="/api/lw/audit">진단 CSV</a> · <a href="/api/lw/summary">18개 요약 CSV</a></p><details><summary>하루 4건 제한 없는 비교</summary><div class="scroll" id="uncapped"></div></details></section><section><h2>3. 비교 기준</h2><p>A: 돌파가 접촉 시 진입(갭 상승 시 시가). B: 돌파 후 첫 종가 확인, 다음 시가. C: 돌파 뒤 최대 6봉 내 지지 반등 확인, 다음 시가.</p><p>DAY: 다음 09시 시가 청산. SCALP: 순익 +0.5%, 가격 -1%, 최대 60분, 장 종료 전 청산. 동일 봉 손절 우선. A는 봉 안 순서 불명으로 보수 처리. 수수료 외 슬리피지 0 가정. 고정 종목의 과거 표본으로 전체 시장 대표성 및 실수익 보장 없음.</p></section><script>const $=x=>document.getElementById(x);let timer;function table(el,rows){el.replaceChildren();if(!rows.length){el.textContent='결과 없음';return}const t=document.createElement('table'),keys=Object.keys(rows[0]);let h=t.insertRow();for(const k of keys){let c=document.createElement('th');c.textContent=k;h.append(c)}for(const r of rows){let tr=t.insertRow();for(const k of keys){let c=tr.insertCell();c.textContent=r[k]??'—'}}el.append(t)}async function poll(){try{const x=await(await fetch('/api/lw/status',{cache:'no-store'})).json();$('state').textContent=x.progress||x.error||x.state;$('run').disabled=x.state==='running';if(x.error)$('state').textContent=x.error;if(x.result){let r=x.result;$('coverage').textContent=r.from+' ~ '+r.until+' / '+JSON.stringify(r.coverage)+' / 오류: '+r.errors.join(' / ');table($('summary'),r.summary);table($('uncapped'),r.uncapped_summary)}if(x.state==='running')timer=setTimeout(poll,1800)}catch(e){$('state').textContent='연결 오류: 새로고침으로 상태 재확인';$('run').disabled=false}}$('run').onclick=async()=>{clearTimeout(timer);$('run').disabled=true;try{let r=await fetch('/api/lw/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({coins:$('coins').value,days:Number($('days').value)})});if(!r.ok)throw Error(await r.text());poll()}catch(e){$('state').textContent=e.message;$('run').disabled=false}};poll();</script></html>'''
+HTML='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LW 변동성 돌파 연구 V1.1</title><style>body{font:15px system-ui;background:#101a2b;color:#eaf1fc;max-width:1000px;margin:auto;padding:16px}section{background:#192a40;border:1px solid #354b65;border-radius:12px;padding:16px;margin:12px 0}input,select,button{font:inherit;background:#0e1c30;color:white;border:1px solid #56708f;padding:10px;border-radius:8px;box-sizing:border-box}input{width:100%}button{background:#286cb1}button:disabled{opacity:.5}a{color:#a0d6ff}small{color:#b5c6dc}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #354b65;padding:8px;white-space:nowrap;text-align:right}.scroll{overflow:auto}h1{font-size:24px}h2{font-size:18px}</style><h1>LW 변동성 돌파 V1.1</h1><small>빗썸 KRW · 독립 연구 · 자동매매 없음</small><section><h2>1. 비교 연구</h2><label>고정 종목 (최대 10개)</label><input id="coins" value="BTC,ETH,SOL,XRP,DOGE,ADA,LINK,AVAX,SUI,PEPE"><p><label>기간 <select id="days"><option>30</option><option>60</option></select>일</label> <button id="run">연구 실행</button></p><p id="state">대기</p><small>전일 거래대금 5억 이상 · 09시 기준 · 전일·당일 288봉 완전 수집일만 · 편도 0.25% · 비교군별 하루 최대 4건. 조회량이 많아 최초 수집이 길어질 수 있습니다.</small></section><section><h2>2. 비교 결과 (18개)</h2><p id="coverage"></p><div class="scroll" id="summary"></div><p id="downloads" hidden><a href="/api/lw/csv">거래 CSV</a> · <a href="/api/lw/audit">진단 CSV</a> · <a href="/api/lw/summary">18개 요약 CSV</a></p><details><summary>하루 4건 제한 없는 비교</summary><div class="scroll" id="uncapped"></div></details></section><section><h2>3. 비교 기준</h2><p>A: 돌파가 접촉 시 진입(갭 상승 시 시가). B: 돌파 후 첫 종가 확인, 다음 시가. C: 돌파 뒤 최대 6봉 내 지지 반등 확인, 다음 시가.</p><p>DAY: 다음 09시 시가 청산. SCALP: 순익 +0.5%, 가격 -1%, 최대 60분, 장 종료 전 청산. 동일 봉 손절 우선. A는 봉 안 순서 불명으로 보수 처리. 수수료 외 슬리피지 0 가정. 고정 종목의 과거 표본으로 전체 시장 대표성 및 실수익 보장 없음.</p></section><script>const $=x=>document.getElementById(x);let timer;function table(el,rows){el.replaceChildren();if(!rows.length){el.textContent='결과 없음';return}const t=document.createElement('table'),keys=Object.keys(rows[0]);let h=t.insertRow();for(const k of keys){let c=document.createElement('th');c.textContent=k;h.append(c)}for(const r of rows){let tr=t.insertRow();for(const k of keys){let c=tr.insertCell();c.textContent=r[k]??'—'}}el.append(t)}async function poll(){try{const x=await(await fetch('/api/lw/status',{cache:'no-store'})).json();$('state').textContent=x.progress||x.error||x.state;$('run').disabled=x.state==='running';$('downloads').hidden=!x.result;if(x.error)$('state').textContent=x.error;if(x.result){let r=x.result;$('coverage').textContent=(r.summary[0].valid_coin_days===0?'정상 분석일 0: 수익성 판단 불가 / ':'')+r.from+' ~ '+r.until+' / '+JSON.stringify(r.coverage)+' / 오류: '+r.errors.join(' / ');table($('summary'),r.summary);table($('uncapped'),r.uncapped_summary)}if(x.state==='running')timer=setTimeout(poll,1800)}catch(e){$('state').textContent='연결 오류: 새로고침으로 상태 재확인';$('run').disabled=false}}$('run').onclick=async()=>{clearTimeout(timer);$('run').disabled=true;$('downloads').hidden=true;try{let r=await fetch('/api/lw/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({coins:$('coins').value,days:Number($('days').value)})});if(!r.ok)throw Error(await r.text());poll()}catch(e){$('state').textContent=e.message;$('run').disabled=false}};poll();</script></html>'''
 
 def handle_get(h,p):
     if p=='/lw':return h.respond(HTML,ctype='text/html; charset=utf-8')
@@ -178,7 +181,7 @@ def handle_get(h,p):
     choices={'/api/lw/csv':(r['rows'],FIELDS,'TRADES'),'/api/lw/audit':(r['audit'],AUDIT,'DIAGNOSTICS'),'/api/lw/summary':(r['summary'],list(r['summary'][0]),'SUMMARY')}
     if p not in choices:return h.respond('{}',404)
     data,fields,suffix=choices[p]
-    return h.respond(csv_text(data,fields),ctype='text/csv; charset=utf-8',extra={'Content-Disposition':f'attachment; filename="BITHUMB_LW_V1_0_{suffix}.csv"'})
+    return h.respond(csv_text(data,fields),ctype='text/csv; charset=utf-8',extra={'Content-Disposition':f'attachment; filename="BITHUMB_LW_V1_1_{suffix}.csv"'})
 
 def handle_post(h,p):
     try:
@@ -201,4 +204,4 @@ class Handler(BaseHTTPRequestHandler):
         else:self.respond('{}',404)
 
 if __name__=='__main__':
-    a=argparse.ArgumentParser();a.add_argument('--host',default='127.0.0.1');a.add_argument('--port',type=int,default=int(os.environ.get('PORT',8080)));x=a.parse_args();print('LW V1.0 web',x.host,x.port,flush=True);ThreadingHTTPServer((x.host,x.port),Handler).serve_forever()
+    a=argparse.ArgumentParser();a.add_argument('--host',default='127.0.0.1');a.add_argument('--port',type=int,default=int(os.environ.get('PORT',8080)));x=a.parse_args();print('LW V1.1 web',x.host,x.port,flush=True);ThreadingHTTPServer((x.host,x.port),Handler).serve_forever()
