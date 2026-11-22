@@ -2169,7 +2169,9 @@ TP_COMPARE_JS = "<script>\n(()=>{const keys=['0.5','1','2','3'], stables=new Set
 
 def tp_compare_page():
     page=CORE_PAGE.replace('<title>V2 CORE.17 · 분할 익절 + 초기 -1% 손절 비교 연구</title>', '<title>CORE.17 TP V1.0 · 첫 익절 비교</title>',1)
+    page=page.replace('<h1>🧪 V2 CORE.17 · 벡스 10분봉 SMA3 초기 손절 추가 비교 연구</h1>','<h1>🧪 CORE.17 TP V1.0 · 첫 익절 목표 비교</h1>',1)
     page=page.replace('value="0.25" id="fee"','value="0.04" id="fee"',1)
+    page=page.replace('id="csv" disabled>CSV 받기','id="csv" disabled>기존 CORE.17 CSV',1)
     page=page.replace('<section class="panel"><h2>전략별 결과</h2>', TP_COMPARE_PANEL+'<section class="panel"><h2>전략별 결과</h2>',1)
     page=page.replace('</body></html>',TP_COMPARE_JS+'</body></html>',1)
     return page
