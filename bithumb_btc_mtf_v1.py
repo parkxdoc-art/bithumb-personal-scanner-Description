@@ -1,4 +1,4 @@
-"""BITHUMB BTC MTF V1.0 | Read-only LIVE + historical snapshot research.
+"""BITHUMB BTC MTF V1.1 | Read-only LIVE + historical snapshot research.
 
 BTC: month/week/day/4h/1h/30m/15m/5m/3m/1m trends, all closed candles.
 Coin scan: 5m/15m/1h/4h/day, BUY/WATCH with audit reasons.
@@ -20,11 +20,12 @@ from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, jsonify, request, Response
 
-VERSION = "BTC MTF V1.0"
+VERSION = "BTC MTF V1.1"
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com"
 TIMEFRAMES = ("month", "week", "day", "4h", "1h", "30m", "15m", "5m", "3m", "1m")
 SCAN_TF = ("5m", "15m", "1h", "4h", "day")
+STRATEGIES = ("scalp", "swing")
 STABLES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USD1", "PYUSD", "USDE", "USDD", "RLUSD", "EURC", "EURI"}
 MARKET_RE = re.compile(r"^KRW-[A-Z0-9]+$")
 MIN_TURNOVER = 500_000_000  # live only: 24h ticker value
@@ -161,6 +162,9 @@ def request_cfg(raw, need_market=False):
     if not isinstance(raw, dict):
         raise ValueError("요청 형식 오류")
     mode = raw.get("mode", "live")
+    strategy = raw.get("strategy", "scalp")
+    if strategy not in STRATEGIES:
+        raise ValueError("단타/스윙 모드 오류")
     tf = raw.get("tf", "5m")
     if mode not in ("live", "backtest") or tf not in SCAN_TF:
         raise ValueError("모드 또는 시간봉 오류")
@@ -179,9 +183,11 @@ def request_cfg(raw, need_market=False):
     else:
         at = now_kst()
     market = raw.get("market") if need_market else None
+    if mode == "backtest" and strategy == "swing" and at > now_kst() - timedelta(hours=121):
+        raise ValueError("스윙은 과거 기준 시각 이후 120시간이 지나야 검증할 수 있어")
     if need_market and (not isinstance(market, str) or not MARKET_RE.fullmatch(market) or market.split("-", 1)[1] in STABLES):
         raise ValueError("KRW 코인 마켓만 조회 가능")
-    return mode, tf, fee, at, market
+    return mode, tf, fee, at, market, strategy
 
 
 def market_list():
@@ -219,13 +225,14 @@ def universe():
 
 
 def btc_context(cfg):
-    mode, selected, fee, at, _ = cfg
+    mode, selected, fee, at, _, strategy = cfg
     key = ("btc", mode, selected, at.strftime("%Y-%m-%d %H:%M"))
     cached = ttl_get(key)
     if cached is not None:
         return cached
     states = {}
     last4 = None
+    rows4 = []
     def run_tf(tf):
         try:
             # at is the snapshot clock; 1m candles are not *currently forming*.
@@ -238,6 +245,8 @@ def btc_context(cfg):
             states[tf] = state
             if tf == selected:
                 last4 = rows
+            if tf == "4h":
+                rows4 = rows
     lng = aggregate([states[tf]["state"] for tf in ("month", "week", "day", "4h")])
     sht = aggregate([states[tf]["state"] for tf in ("1h", "30m", "15m", "5m", "3m", "1m")])
     selected_return = round((last4[-1]["c"]/last4[-5]["c"]-1)*100, 4) if last4 and is_contiguous(last4, selected, 5) else None
@@ -245,6 +254,7 @@ def btc_context(cfg):
                "selected_return": selected_return, "selected_tf": selected,
                "asof_kst": at.strftime("%Y-%m-%d %H:%M:%S")}
     ttl_put(key, context, 3600 if mode == "backtest" else 900)
+    ttl_put(("btc-h4",mode,at.strftime("%Y-%m-%d %H:%M")), rows4, 3600 if mode == "backtest" else 900)
     return context
 
 
@@ -321,7 +331,7 @@ def backtest_exit(market, at, fee, getter=candles):
     out = {"status": "UNKNOWN", "net_pct": None, "reason": "", "tp1": False, "tp2": False,
            "stop": False, "minutes": None, "ambiguous": False}
     try:
-        rows = getter(market, "5m", at+timedelta(minutes=240), count=100)
+        rows = getter(market, "5m", at+timedelta(minutes=241), count=100)
     except Exception as ex:
         return {**out, "reason": "청산 경로 조회 실패: " + str(ex)[:80]}
     indexed = {r["t"]:r for r in rows}
@@ -362,6 +372,135 @@ def backtest_exit(market, at, fee, getter=candles):
     return {**out, "reason": "결과 확인 불가"}
 
 
+def _avg(values):
+    return sum(values)/len(values)
+
+
+def swing_metrics(day, h4, h1, btc4, at):
+    """Only completed candles at the snapshot and synchronized BTC 4h series."""
+    if not (is_contiguous(day, "day", 24) and is_contiguous(h4, "4h", 34)
+            and is_contiguous(h1, "1h", 16)):
+        return None, "스윙 판정용 연속 마감봉 부족(일 24, 4시간 34, 1시간 16)"
+    if at-tf_end(h4[-1]["t"],"4h") > timedelta(hours=8) or at-tf_end(h1[-1]["t"],"1h") > timedelta(hours=3):
+        return None, "4시간/1시간 최신 완료봉이 오래됨"
+    btcmap={b["t"]:b["c"] for b in btc4}
+    if h4[-1]["t"] not in btcmap or h4[-5]["t"] not in btcmap:
+        return None, "BTC와 코인의 동일 시각 4시간봉 부족"
+    d=[x["c"] for x in day]; f=[x["c"] for x in h4]; hour=[x["c"] for x in h1]
+    day_ma20=_avg(d[-20:]); day_prev20=_avg(d[-24:-4])
+    ma7=_avg(f[-7:]); ma14=_avg(f[-14:]); ma30=_avg(f[-30:]); prev7=_avg(f[-10:-3])
+    h1ma7=_avg(hour[-7:]); h1ma14=_avg(hour[-14:])
+    ret16=(f[-1]/f[-5]-1)*100; btc16=(btcmap[h4[-1]["t"]]/btcmap[h4[-5]["t"]]-1)*100
+    prev12high=max(x["h"] for x in h4[-13:-1]); high6=max(x["h"] for x in h4[-7:-1])
+    lo_recent=min(x["l"] for x in h4[-7:-1]); lo_prior=min(x["l"] for x in h4[-13:-7])
+    volbase=_avg([x["turnover"] for x in h4[-21:-1]]); ratio=h4[-1]["turnover"]/volbase if volbase else 0
+    tr=[max(x["h"]-x["l"],abs(x["h"]-y["c"]),abs(x["l"]-y["c"])) for x,y in zip(h4[-14:],h4[-15:-1])]
+    atr=_avg(tr)/f[-1]*100
+    dayrise=(d[-1]/d[-2]-1)*100; ret24=(f[-1]/f[-7]-1)*100
+    ext=(f[-1]/ma7-1)*100; support=lo_recent*.998
+    risk=(f[-1]/support-1)*100
+    breakout=(f[-1]/prev12high-1)*100
+    return {
+      "close":f[-1],"ma5":ma7,"ma20":ma14,"day_ma20":round(day_ma20,6),"h4_ma30":round(ma30,6),
+      "coin_return_pct":round(ret16,4),"btc_return_pct":round(btc16,4),"relative_pct":round(ret16-btc16,4),
+      "breakout_pct":round(breakout,4),"volume_ratio":round(ratio,3),"atr_pct":round(atr,3),
+      "h4_distance_ma7_pct":round(ext,3),"structure_risk_pct":round(risk,3),"support":round(support,8),
+      "day_rise_pct":round(dayrise,3),"rise24_pct":round(ret24,3),
+      "h4_higher_low":lo_recent>lo_prior,"h4_higher_high":high6>max(x["h"] for x in h4[-13:-7]),
+      "day_up":d[-1]>day_ma20 and day_ma20>day_prev20,
+      "h4_up":f[-1]>ma7>ma14 and ma7>prev7,
+      "h1_up":hour[-1]>h1ma7>h1ma14,
+      "recovery":min(x["l"] for x in h4[-3:-1])<=ma7*1.016 and f[-1]>f[-2],
+      "closed_kst":tf_end(h4[-1]["t"],"4h").strftime("%Y-%m-%d %H:%M"),
+      "body_ratio":round((h4[-1]["c"]-h4[-1]["o"])/max(h4[-1]["h"]-h4[-1]["l"],1e-14),3),
+    },None
+
+
+def swing_signal(m,ctx,fee):
+    rel=m["relative_pct"];bear=ctx["long"]=="down" or ctx["short"]=="down"
+    strong_rel=rel>=(2.0 if bear else 1.0)
+    excessive=m["h4_distance_ma7_pct"]>7.5 or m["rise24_pct"]>22.0 or m["structure_risk_pct"]>12
+    setup=m["breakout_pct"]>0 or m["recovery"]
+    good=(m["day_up"] and m["h4_up"] and m["h1_up"] and strong_rel
+          and m["h4_higher_low"] and setup and m["volume_ratio"]>=.7
+          and m["structure_risk_pct"]<=8.0 and m.get("timing_ok",True) and not excessive)
+    watch=((m["day_up"] or m["h4_up"]) and rel>=.3 and
+           (m["h4_up"] or m["h4_higher_high"] or m["breakout_pct"]>0))
+    if not good and not watch:return None
+    kind="BUY" if good else "WATCH"
+    checks={
+      "일봉 MA20 상회·우상향":m["day_up"],
+      "4시간봉 MA7·MA14 상승":m["h4_up"],
+      "4시간봉 저점 상승":m["h4_higher_low"],
+      "1시간봉 재상승":m["h1_up"],
+      "BTC 대비 강도 충족":strong_rel,
+      "4시간봉 돌파·눌림 회복":setup,
+      "4시간봉 거래대금 0.7배 이상":m["volume_ratio"]>=.7,
+      "구조적 손절 거리 8% 이내":m["structure_risk_pct"]<=8.0,
+      "선택한 검색봉 상승 확인":m.get("timing_ok",True),
+      "급등 추격 위험 낮음":not excessive,
+    }
+    causes=[
+      f"스윙: 일봉 {'상승' if m['day_up'] else '미확정'} · 4시간봉 {'상승' if m['h4_up'] else '미확정'} · 1시간봉 {'상승' if m['h1_up'] else '미확정'}",
+      f"동일한 16시간 동안 코인 {m['coin_return_pct']:+.2f}%, BTC {m['btc_return_pct']:+.2f}% → 상대강도 {rel:+.2f}%p",
+      f"4시간봉 고점 돌파폭 {m['breakout_pct']:+.2f}% · 최근 고점/저점 상승 {m['h4_higher_high']}/{m['h4_higher_low']}",
+      f"4시간봉 MA7 이격 {m['h4_distance_ma7_pct']:+.2f}% · 최근 24시간 {m['rise24_pct']:+.2f}% · 구조적 지지까지 {m['structure_risk_pct']:.2f}%",
+      f"4시간봉 거래대금 배수 {m['volume_ratio']:.2f}배 · BTC 장기 {state_ko(ctx['long'])}, 단기 {state_ko(ctx['short'])}",
+      f"선택 검색봉 {m.get('selected_tf','4h')} 추세 {'상승' if m.get('timing_ok',True) else '미확정'}",
+    ]
+    if kind=="WATCH":
+        missing=[k for k,v in checks.items() if not v]
+        causes.append("BUY 보류: "+(", ".join(missing) if missing else "상승 확인 대기"))
+    else:
+        causes.append("스윙 구조 조건 충족 · 체결 전 호가/집중보유/공시 위험 별도 확인")
+    if excessive:causes.append("⚠ 급등 추격 위험: 이미 많이 오른 시점이므로 신규 진입은 WATCH")
+    cost=fee/100
+    tp1=((1.05)*(1+cost)/(1-cost)-1)*100
+    tp2=((1.12)*(1+cost)/(1-cost)-1)*100
+    return {"signal":kind,"metrics":m,"explanation":causes,"plan":{
+      "tp1_net":5.0,"tp1_fraction":.5,"tp2_net":12.0,"tp2_fraction":.5,
+      "stop_gross":-5.0,"max_minutes":7200,
+      "tp1_gross_pct":round(tp1,3),"tp2_gross_pct":round(tp2,3),
+      "support":m["support"],"support_risk_pct":m["structure_risk_pct"]}}
+
+
+def swing_backtest_exit(market,at,fee,getter=candles):
+    """120 observed hourly candles; pessimistic stop priority, gaps at open."""
+    out={"status":"UNKNOWN","net_pct":None,"reason":"","tp1":False,"tp2":False,
+         "stop":False,"minutes":None,"ambiguous":False}
+    entry_at=at.replace(minute=0,second=0,microsecond=0)
+    if entry_at<at:entry_at+=timedelta(hours=1)
+    end=entry_at+timedelta(hours=120)
+    try:
+        rows=getter(market,"1h",end+timedelta(minutes=1),count=140)
+    except Exception as ex:
+        return {**out,"reason":"스윙 120시간 청산 경로 조회 실패: "+str(ex)[:80]}
+    indexed={r["t"]:r for r in rows}
+    if any(entry_at+timedelta(hours=i) not in indexed for i in range(120)):
+        return {**out,"reason":"120시간 중 1시간봉 누락: 신뢰할 수 있는 청산 판정 불가"}
+    entry=indexed[entry_at]["o"]
+    if entry<=0:return {**out,"reason":"진입가 자료 없음"}
+    cost=fee/100
+    p1=entry*1.05*(1+cost)/(1-cost);p2=entry*1.12*(1+cost)/(1-cost);sl=entry*.95
+    rest=1.0;realized=0.0;tp1=False
+    def net(px):return (px*(1-cost)/(entry*(1+cost))-1)*100
+    for i in range(120):
+        r=indexed[entry_at+timedelta(hours=i)]
+        if r["l"]<=sl:
+            amb=r["h"]>=(p2 if tp1 else p1)
+            return {**out,"status":"RESOLVED","net_pct":round(realized+rest*net(min(r["o"],sl)),6),
+                    "tp1":tp1,"stop":True,"minutes":(i+1)*60,"ambiguous":amb}
+        if not tp1 and r["h"]>=p1:
+            tp1=True;realized+=.5*net(p1);rest=.5
+        if tp1 and r["h"]>=p2:
+            return {**out,"status":"RESOLVED","net_pct":round(realized+rest*net(p2),6),
+                    "tp1":True,"tp2":True,"minutes":(i+1)*60}
+        if i==119:
+            return {**out,"status":"RESOLVED","net_pct":round(realized+rest*net(r["c"]),6),
+                    "tp1":tp1,"minutes":120*60}
+    return {**out,"reason":"스윙 경로 판정 불가"}
+
+
 @app.get("/")
 def page():
     return Response(HTML, content_type="text/html; charset=utf-8")
@@ -394,21 +533,40 @@ def coin_api():
     try:
         raw = request.get_json(silent=True)
         cfg = request_cfg(raw, True)
-        mode, tf, fee, at, market = cfg
+        mode, tf, fee, at, market, strategy = cfg
         if market not in market_list():
             raise ValueError("현재 KRW 마켓 목록에 없음")
         ctx = btc_context(cfg)
-        # For historical mode all inputs below are fetched <= the snapshot timestamp.
-        rows = candles(market, tf, at, count=50)
-        m, issue = coin_metrics(rows, tf, ctx.get("selected_return"))
-        if m is None:
-            return jsonify(ok=True, market=market, signal=None, issue=issue)
-        signal = coin_signal(m, ctx, fee)
+        if strategy == "swing":
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                fday=pool.submit(candles,market,"day",at,80)
+                fh4=pool.submit(candles,market,"4h",at,80)
+                fh1=pool.submit(candles,market,"1h",at,50)
+                day,h4,h1=fday.result(),fh4.result(),fh1.result()
+            btc4=ttl_get(("btc-h4",mode,at.strftime("%Y-%m-%d %H:%M")))
+            if btc4 is None:
+                btc4=candles("KRW-BTC","4h",at,50)
+            m,issue=swing_metrics(day,h4,h1,btc4,at)
+            if m is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            if tf in ("5m","15m"):
+                timing_rows=candles(market,tf,at,count=18)
+                m["timing_ok"]=trend(timing_rows,tf).get("state")=="up"
+            else:
+                m["timing_ok"]={"1h":m["h1_up"],"4h":m["h4_up"],"day":m["day_up"]}[tf]
+            m["selected_tf"]=tf
+            signal=swing_signal(m,ctx,fee)
+        else:
+            rows=candles(market,tf,at,count=50)
+            m,issue=coin_metrics(rows,tf,ctx.get("selected_return"))
+            if m is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            signal=coin_signal(m,ctx,fee)
         if signal is None:
             return jsonify(ok=True, market=market, signal=None)
         if mode == "backtest":
-            signal["backtest"] = backtest_exit(market, at, fee)
-        return jsonify(ok=True, market=market, signal=signal)
+            signal["backtest"] = swing_backtest_exit(market,at,fee) if strategy == "swing" else backtest_exit(market,at,fee)
+        return jsonify(ok=True, market=market, signal=signal, strategy=strategy)
     except Exception as ex:
         return jsonify(ok=False, error=str(ex)[:170]), 400
 
