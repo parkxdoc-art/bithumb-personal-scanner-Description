@@ -86,7 +86,10 @@ def _h4_bearish(h4, at):
     r = [x for x in h4 if x["t"] + timedelta(hours=4) <= at]
     if len(r) < 12:
         return None
-    a,b=r[-12:-6],r[-6:]
+    r=r[-12:]
+    if any(r[k+1]['t']-r[k]['t']!=timedelta(hours=4) for k in range(11)):
+        return None
+    a,b=r[:6],r[6:]
     return (max(x["h"] for x in b) < max(x["h"] for x in a),
             min(x["l"] for x in b) < min(x["l"] for x in a))
 
@@ -98,6 +101,9 @@ def _m15_chochs(m15):
         bar=m15[i]
         prior=m15[i-8:i]
         older=m15[i-16:i-8]
+        window=m15[i-16:i+1]
+        if any(window[j+1]["t"]-window[j]["t"]!=timedelta(minutes=15) for j in range(16)):
+            continue
         if (bar["c"] > max(x["h"] for x in prior)
                 and min(x["l"] for x in prior) < min(x["l"] for x in older)
                 and bar["c"] > bar["o"]):
@@ -141,7 +147,7 @@ def _simulate(minute, entry_index, entry_price, stop_price, fee_each, max_hold=6
             "hold_minutes":max(0,len(minute)-entry_index)}
 
 
-def replay(market, minute, m15, h4, fee_each=.04, max_trades=8):
+def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None):
     """All indicators and references use data strictly available at signal."""
     if fee_each not in (.04,.25):
         raise ValueError("fee_each must be 0.04 or 0.25")
@@ -160,6 +166,8 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8):
     for i in range(25,len(minute)-1):
         r=minute[i]
         at=r["t"] + timedelta(minutes=1)
+        if scan_begin is not None and at < scan_begin:
+            continue  # indicator warm-up bars are not eligible entry times
         if cooldown_until and at < cooldown_until:
             continue
         ev=next((v for v in reversed(events)
@@ -263,7 +271,7 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
                  if r["t"]+timedelta(minutes=15)<=end]
             h4=[r for r in getter(market,240,end+timedelta(minutes=1),100)
                 if r["t"]+timedelta(hours=4)<=end]
-            result=replay(market,one,m15,h4,fee_each)
+            result=replay(market,one,m15,h4,fee_each,scan_begin=end-timedelta(hours=hours))
             result["data_audit"]={**audit,"m15_bars":len(m15),"h4_bars":len(h4),
                                   "first_1m_kst":one[0]["t"].strftime("%Y-%m-%d %H:%M") if one else None,
                                   "last_1m_kst":one[-1]["t"].strftime("%Y-%m-%d %H:%M") if one else None}
@@ -276,6 +284,7 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
     return {
         "version":VERSION,"mode":"historical_public_candles_only",
         "asof_kst":end.strftime("%Y-%m-%d %H:%M"),"lookback_hours":hours,
+        "scan_begin_kst":(end-timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M"),
         "fee_each_pct":fee_each,"markets":output,
         "total":{"signals":len(alltrades),"resolved":len(known),
                  "unknown":len(alltrades)-len(known),
