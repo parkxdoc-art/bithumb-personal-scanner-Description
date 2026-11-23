@@ -707,7 +707,7 @@ function classifyIssue(reason){
 function visibleResults(){
  const filter=$('watch-filter').value;
  return results.filter(x=>{
-  if(x.signal.legacy_signal==='BUY')return true; // older BUY remains in screen comparison
+  // Original BUY results remain in the comparison panel and full CSV, not as strict WATCH
   if(x.signal.signal!=='WATCH'||strategy!=='swing'||filter==='all')return true;
   const m=x.signal.metrics||{},score=Number(m.score);
   if(score<(filter==='ten'?10:9)||m.data_gap_recent===true)return false;
@@ -811,7 +811,7 @@ $('start').onclick=async()=>{
   items=scope==='all'?items:items.slice(0,Number(scope));
   const daysCount=mode==='backtest'?Number($('days').value):1;
   if(daysCount>1)items=items.slice(0,daysCount===7?10:20);
-  const pinned=$('focus').value.trim().toUpperCase().replace(/^KRW-/, '');if(pinned){const found=list.items.find(x=>x.market==='KRW-'+pinned||x.name===$('focus').value.trim());if(found&&!items.some(x=>x.market===found.market))items=[found,...items];else if(!found)throw Error('관찰 코인을 찾지 못했어: '+pinned);}if(!items.length)throw Error('검색 가능한 종목이 없어');
+  const pinned=$('focus').value.trim().toUpperCase().replace(/^KRW-/, '');let focusedMarket='';if(pinned){const found=list.items.find(x=>x.market==='KRW-'+pinned||x.name===$('focus').value.trim());if(found){focusedMarket=found.market;if(!items.some(x=>x.market===found.market))items=[found,...items];}else throw Error('관찰 코인을 찾지 못했어: '+pinned);}if(!items.length)throw Error('검색 가능한 종목이 없어');
   const dates=[];
   for(let day=0;day<daysCount;day++){
    const c={...cfg};
@@ -831,7 +831,7 @@ $('start').onclick=async()=>{
    const work=async()=>{while(cursor<items.length){
     const coin=items[cursor++];
     try{
-     const focused=!!pinned&&coin.market==='KRW-'+pinned;
+     const focused=!!focusedMarket&&coin.market===focusedMarket;
      const j=await post('/api/coin',{...c,market:coin.market,want_diagnostic:focused});
      if(focused&&j.diagnostic)focusDiagnostics.push({market:coin.market,name:coin.name,at:c.at||c.snapshot_at||'LIVE',diagnostic:j.diagnostic});
      if(j.signal)results.push({market:coin.market,name:coin.name,at:c.at||c.snapshot_at||'LIVE',turnover24h:coin.turnover,signal:j.signal});
