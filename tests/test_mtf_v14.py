@@ -883,24 +883,28 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
             self.assertRaises(RuntimeError,_minute_data,"KRW-XRP",1,self.at,10)
 
     def test_real_bithumb_public_data_probe_report_not_a_profit_claim(self):
-        """One-time integration evidence; data errors are reported explicitly.
+        """Temporary read-only network probe printed into Render build logs.
 
-        This test prints a real Bithumb 1-minute 6-hour replay summary in
-        Render's build logs. It never asserts a win or requires network.
+        Report network failure rather than pretending historical P&L exists.
         """
         import json
         from chart360_mini_lab import run_backtest
         try:
-            result=run_backtest(markets=["KRW-XRP"],hours=6,fee_each=.04)
-            item=result["markets"][0]
-            audit=item.get("data_audit") or {}
-            print("CHART360_REAL_REPLAY "+json.dumps({
-                "asof":result["asof_kst"],"market":item["market"],
-                "error":item.get("error"),"bars_1m":audit.get("minutes_observed"),
-                "bars_15m":audit.get("m15_bars"),"bars_4h":audit.get("h4_bars"),
-                "stats":item.get("stats"),"total":result["total"],
-                "sample_trades":item.get("trades",[])[:3],
-            },ensure_ascii=False,default=str),flush=True)
+            result=run_backtest(markets=["KRW-XRP","KRW-ETH","KRW-NEAR"],hours=12,fee_each=.04)
+            for item in result["markets"]:
+                audit=item.get("data_audit") or {}
+                print("CHART360_REAL_REPLAY "+json.dumps({
+                    "asof":result["asof_kst"],"window":result["scan_begin_kst"],
+                    "market":item["market"],"error":item.get("error"),
+                    "bars_1m":audit.get("minutes_observed"),
+                    "bars_15m":audit.get("m15_bars"),
+                    "bars_4h":audit.get("h4_bars"),
+                    "stats":item.get("stats"),
+                    "summary":item.get("summary"),
+                    "sample_trades":item.get("trades",[])[:3],
+                },ensure_ascii=False,default=str),flush=True)
+            print("CHART360_TOTAL_REAL_REPLAY "+json.dumps(result["total"],
+                  ensure_ascii=False,default=str),flush=True)
         except Exception as exc:
             print("CHART360_REAL_REPLAY_UNAVAILABLE "+str(exc)[:200],flush=True)
 
