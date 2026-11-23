@@ -87,6 +87,9 @@ def build_explanation(m, ctx, day, h4, h1, fee_each_pct):
     scores = {k: _score([ok for _, ok in checks]) for k, checks in factors.items()}
     # A red candle's turnover is NOT a direct measure of taker sell orders.
     last4 = h4[-4:]
+    h4_24h_contiguous = all(
+        (y["t"] - x["t"]).total_seconds() == 4*60*60
+        for x,y in zip(h4[-6:-1],h4[-5:]))
     total_turnover = sum(max(0, float(x.get("turnover", 0))) for x in last4)
     down_turnover = sum(max(0, float(x.get("turnover", 0)))
                         for x in last4 if x["c"] < x["o"])
@@ -155,10 +158,11 @@ def build_explanation(m, ctx, day, h4, h1, fee_each_pct):
             "h4_ma7_distance_pct": round(float(m.get("h4_distance_ma7_pct",0)),3),
             "h4_ma20_ref": _round_price(ma20),
             "day_ma20_ref": _round_price(day_ma20),
-            "last_24h_closed_turnover_krw": round(
-                sum(max(0,float(x.get("turnover",0))) for x in h4[-6:]),0),
+            "last_24h_closed_turnover_krw": (
+                round(sum(max(0,float(x.get("turnover",0)))
+                          for x in h4[-6:]),0) if h4_24h_contiguous else None),
             "btc_relative_pct": round(float(m.get("relative_pct",0)),3),
         },
         "summary": summary, "warnings": warnings, "plan": plan,
-        "snapshot_notice": "모든 수치는 스캔 시각까지 완료된 OHLC에서 계산. 점수는 성공 확률이 아닌 4개 근거씩의 체크리스트. 실시간 호가·체결강도는 미수집.",
+        "snapshot_notice": "모든 수치는 스캔 시각까지 완료된 OHLC에서 계산. 24시간 거래대금은 4시간 연속봉 6개의 합계(연속성이 없으면 미산정). 점수는 성공 확률이 아닌 4개 근거씩의 체크리스트. 실시간 호가·체결강도는 미수집.",
     }
