@@ -888,7 +888,7 @@ function renderStudy(){
  if(!studyResult)return;
  const z=studyResult,t=z.summary||{},uniqueDays=(z.by_day||[]).length;
  $('study-status').textContent='비교 완료 · 후보 '+t.candidates+'건 · '+uniqueDays+'개 기준일 · 실재 고유 종목 '+t.unique_markets+'개 · 확정 '+t.resolved+'건 · 미확정 '+t.unknown+'건';
- $('study-results').innerHTML='<p class="notice"><b>전체 검색 '+z.scanned+'건 · 검색 자료 오류 '+z.issues+'건 · 후보 '+t.candidates+'건</b> · 동일 코인이 다른 날짜에 있으면 개별 스냅샷으로 집계되며 독립 표본은 아냐.</p>'
+ $('study-results').innerHTML='<p class="notice"><b>전체 검색 '+z.scanned+'건 · 검색 자료 오류 '+z.issues+'건 · 후보 '+t.candidates+'건 · 편도 수수료 '+Number(z.fee_each_pct).toFixed(2)+'%</b> · 동일 코인이 다른 날짜에 있으면 개별 스냅샷으로 집계되며 독립 표본은 아냐. 7일 검사 범위는 현재 거래대금 상위 최대 10개, 3일은 최대 20개 코인으로 제한돼.</p>'
   +'<h3>신호별 비교 · 모두 관찰용 가상 경로</h3>'+studyTable(z.by_kind||[])
   +'<h3>신호 시점 이전 유동성 4개 기준</h3>'+studyTable(z.by_quality||[])
   +'<h3>과거 24시간 1시간봉 자료 완전도</h3>'+studyTable(z.by_coverage||[])
@@ -931,13 +931,13 @@ $('study-summary-csv').onclick=()=>{
  for(const [type,items] of [['TOTAL',[z.summary]],['LEGACY_BUY',[z.original_buy]],['KIND',z.by_kind],['QUALITY',z.by_quality],['COVERAGE',z.by_coverage],['KIND_QUALITY',z.by_kind_quality],['DAY',z.by_day]]){
   for(const x of items||[])if(x)rows.push({group_type:type,...x});
  }
- const fields=['group_type','label','candidates','unique_markets','unique_snapshots','resolved','unknown','positive','nonpositive','resolution_rate_pct','positive_fraction_resolved_pct','mean_hypothetical_net_pct','median_hypothetical_net_pct','min_hypothetical_net_pct','max_hypothetical_net_pct','small_sample'];
- exportStudyCsv(rows,'COHORT_SUMMARY',fields,fields);
+ const fields=['version','fee_each_pct','group_type','label','candidates','unique_markets','unique_snapshots','resolved','unknown','positive','nonpositive','resolution_rate_pct','positive_fraction_resolved_pct','mean_hypothetical_net_pct','median_hypothetical_net_pct','min_hypothetical_net_pct','max_hypothetical_net_pct','small_sample'];
+ exportStudyCsv(rows.map(x=>({version:'BTC-MTF-V1.4.7',fee_each_pct:z.fee_each_pct,...x})),'COHORT_SUMMARY',fields,fields);
 };
 $('study-rows-csv').onclick=()=>{
  if(!studyResult)return;
- const fields=['at','market','kind','legacy_signal','quality','coverage','quality_checks_passed','hourly_bars_observed','historical_turnover_krw','status','net_pct','backtest_reason'];
- exportStudyCsv(studyResult.rows||[],'COHORT_DETAILS',fields,fields);
+ const fields=['version','fee_each_pct','at','market','kind','legacy_signal','quality','coverage','quality_checks_passed','hourly_bars_observed','historical_turnover_krw','status','net_pct','backtest_reason'];
+ exportStudyCsv((studyResult.rows||[]).map(x=>({version:'BTC-MTF-V1.4.7',fee_each_pct:studyResult.fee_each_pct,...x})),'COHORT_DETAILS',fields,fields);
 };
 
 function btcDraw(ctx){$('long').textContent=ST[ctx.long]||'미확인';$('long').className=ctx.long;$('short').textContent=ST[ctx.short]||'미확인';$('short').className=ctx.short;$('btcts').textContent='· '+ctx.asof_kst+' KST';$('tf-grid').innerHTML=order.map(k=>{const x=ctx.tf[k]||{state:'unknown'},why=x.reason?' · '+x.reason:'';return `<div class="tf" title="${esc(why)}"><div class="name">BTC ${TF[k]}</div><div class="status ${x.state}">${ST[x.state]||'자료 부족'}</div></div>`}).join('')}
