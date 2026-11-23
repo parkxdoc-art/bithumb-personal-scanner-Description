@@ -809,9 +809,9 @@ function renderFocus(){
  if(strategy!=='swing')return;
  if(!focusDiagnostics.length){$('focus-results').textContent='신호와 관계없이 관심 코인을 지정하면 MACD 진단을 보여줘.';return;}
  $('focus-results').innerHTML=focusDiagnostics.map(x=>{
-  const d=x.diagnostic||{},v=d.macd||{},g=d.strict_gate||{};
+  const d=x.diagnostic||{},v=d.macd||{},g=d.strict_gate||{},combined=d.combined_gate||{};
   return '<div><h3>'+esc(x.name||x.market)+' · '+esc(x.at)+'</h3>'
-    +'<p class="notice">기존 신호 '+esc(d.legacy_signal||'NONE')+' · 점수 '+(d.score??'—')+'/10 · RSI '+(d.rsi14??'—')+' · 강화 BUY 조건 '+(g.passed?'충족':'미충족')+'</p>'
+    +'<p class="notice">원본 '+esc(d.legacy_signal||'NONE')+' · 점수 '+(d.score??'—')+'/10 · RSI '+(d.rsi14??'—')+' · 이전 강화 '+(g.passed?'충족':'미충족')+' · 종합 '+esc(combined.signal||'RESEARCH')+'</p>'+'<p class="notice">종합 WATCH 미충족: '+esc((combined.missing_watch||[]).join(' / ')||'없음')+'</p>'
     +explainCard(d.explain)+macdCard(v.h4,'4시간봉 MACD(12,26,9)')
     +macdCard(v.day,'일봉 MACD(12,26,9)')
     +macdCard(v.day_chart,'일봉 MACD(3,10,16) · 차트 비교')
@@ -826,27 +826,27 @@ function renderComparison(){
   const out=mode!=='backtest'?'LIVE · 사후 결과 미측정':
      bt.status==='RESOLVED'?'120시간 가상 결과 '+Number(bt.net_pct).toFixed(3)+'% (확정)':
      '미확정 · '+String(bt.reason||'봉 자료 부족');
-  return '<div class="result"><strong>'+esc(x.name||x.market)+' ('+esc(x.market)+')</strong> · <span class="badge buy">기존 BUY</span> → <span class="badge '+(si.signal==='BUY'?'buy':'watch')+'">'+(si.signal==='BUY'?'강화 BUY':'강화 보류')+'</span>'
+  return '<div class="result"><strong>'+esc(x.name||x.market)+' ('+esc(x.market)+')</strong> · <span class="badge buy">기존 BUY</span> → <span class="badge '+si.signal.toLowerCase()+'">'+(si.signal==='BUY'?'종합 BUY':si.signal==='WATCH'?'종합 WATCH':'연구 보류')+'</span>'
   +'<p class="notice">반등 '+Number(si.metrics.score)+'/10 · '+esc(x.at||'')+' · '+esc(out)+'</p>'
-  +(g.missing?.length?'<p class="reason">추가 확인 미충족: '+esc(g.missing.join(' / '))+'</p>':'<p class="reason">강화 필수 확인조건 모두 충족</p>')
+  +(si.combined_gate?.missing_watch?.length?'<p class="reason">종합 미충족: '+esc(si.combined_gate.missing_watch.join(' / '))+'</p>':'<p class="reason">종합 관찰조건 통과</p>')+(si.signal!=='BUY'?'<p class="reason">종합 BUY 미충족: '+esc((si.combined_gate?.missing_buy||[]).join(' / '))+'</p>':'')
   +'</div>';
  }).join('');
 }
 function renderResults(){
  if(strategy==='swing'){renderComparison();renderFocus();}
  const sorted=visibleResults().sort((a,b)=>(a.signal.signal==='BUY'?0:1)-(b.signal.signal==='BUY'?0:1)||b.signal.metrics.relative_pct-a.signal.metrics.relative_pct);
- if(!sorted.length){$('results').textContent=results.length?'화면 조건에 맞는 WATCH가 없어. 아래 기존 BUY 비교표 또는 전체 CSV를 확인해 줘.':'정상 판정 후보 없음. 자료 부족은 문제 내역 CSV를 확인해 줘.';return;}
+ if(!sorted.length){$('results').textContent=results.length?'종합 BUY/WATCH가 없어. 연구 보류는 원본 전체 표시 또는 후보 전체 CSV를 확인해 줘.':'원본 후보가 없어. 자료 부족은 문제 내역 CSV를 확인해 줘.';return;}
  const num=x=>Number.isFinite(Number(x))?Number(x).toLocaleString('ko-KR',{maximumFractionDigits:8}):'—';
  $('results').classList.remove('empty');
  $('results').innerHTML=sorted.map(x=>{
   const si=x.signal,m=si.metrics,p=si.plan,bt=si.backtest,fee=Number(lastCfg.fee),base=Number(m.close);
   const bttext=mode!=='backtest'?'':bt&&bt.status==='RESOLVED'
-   ?'<p class="pnl '+(bt.net_pct>=0?'up':'down')+'">'+(si.signal==='BUY'?'BUY 가상거래':'WATCH 가상 경로(거래 미가정)')+' · '+(strategy==='swing'?'120시간':'240분')+' 순익 '+(bt.net_pct>=0?'+':'')+Number(bt.net_pct).toFixed(3)+'% · '+(bt.stop?'손절':bt.tp2?'2차 익절':bt.tp1?'1차 익절 후 청산':'만료')+(bt.ambiguous?' · 동일 봉 순서 불명':'')+'</p>'
+   ?'<p class="pnl '+(bt.net_pct>=0?'up':'down')+'">'+(si.signal==='BUY'?'BUY 가상거래':'진입 없는 참고 가격 경로')+' · '+(strategy==='swing'?'120시간':'240분')+' 순익 '+(bt.net_pct>=0?'+':'')+Number(bt.net_pct).toFixed(3)+'% · '+(bt.stop?'손절':bt.tp2?'2차 익절':bt.tp1?'1차 익절 후 청산':'만료')+(bt.ambiguous?' · 동일 봉 순서 불명':'')+'</p>'
    :'<p class="pnl side">미확정: '+esc(bt&&bt.reason||'봉 누락')+'</p>';
-  return '<details class="result"><summary><span class="badge '+si.signal.toLowerCase()+'">'+si.signal+'</span><small>'+esc(si.stage||'')+'</small><span class="score-chip">'+(m.score_total===10?m.score+'/10점':'')+'</span><b>'+esc(x.name||x.market)+' <small>'+esc(x.market)+'</small></b><span class="entry-price '+(si.signal==='WATCH'?'watch-entry':'')+'">'+(si.signal==='BUY'?'진입 참고가 ':'WATCH 관찰가 ')+num(base)+'원</span><span class="push">'+esc(x.at||'')+' · 상대강도 '+(m.relative_pct>=0?'+':'')+Number(m.relative_pct).toFixed(2)+'%p · 상세 ▾</span></summary><div class="reason">'
-   +'<div class="entry-note"><strong>'+(si.signal==='BUY'?'BUY 진입 참고가: ':'WATCH 관찰 기준가: ')+num(base)+'원</strong> · '+(si.signal==='BUY'?'신호가 확인된 마지막 마감봉 종가. 실제 주문가는 다를 수 있어.':'아직 BUY 조건 미충족. 표시된 금액은 참고 가격이며 매수를 뜻하지 않아.')+'</div>'
+  return '<details class="result"><summary><span class="badge '+si.signal.toLowerCase()+'">'+si.signal+'</span><small>'+esc(si.stage||'')+'</small><span class="score-chip">'+(m.score_total===10?m.score+'/10점':'')+'</span><b>'+esc(x.name||x.market)+' <small>'+esc(x.market)+'</small></b><span class="entry-price '+(si.signal==='WATCH'?'watch-entry':'')+'">'+(si.signal==='BUY'?'진입 참고가 ':si.signal==='WATCH'?'WATCH 관찰가 ':'연구 참고가 ')+num(base)+'원</span><span class="push">'+esc(x.at||'')+' · 상대강도 '+(m.relative_pct>=0?'+':'')+Number(m.relative_pct).toFixed(2)+'%p · 상세 ▾</span></summary><div class="reason">'
+   +'<div class="entry-note"><strong>'+(si.signal==='BUY'?'BUY 진입 참고가: ':si.signal==='WATCH'?'WATCH 관찰 기준가: ':'연구용 참고가: ')+num(base)+'원</strong> · '+(si.signal==='BUY'?'신호가 확인된 마지막 마감봉 종가. 실제 주문가는 다를 수 있어.':si.signal==='WATCH'?'BUY 조건 미충족. 관찰 참고 가격이며 매수를 뜻하지 않아.':'연구 기록만 보관. 종합 기준 불합격이며 실제 진입 추천이 아님.')+'</div>'
    +'<div class="entry-metrics"><span>1차 익절 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원</span><span>2차 익절 예상 '+num(base*(1+p.tp2_gross_pct/100))+'원</span><span>가상 손절 '+num(base*(1+p.stop_gross/100))+'원</span></div>'
-   +(si.legacy_signal==='BUY'&&si.signal!=='BUY'?'<p class="entry-note">기존 V1.3.3 BUY였지만 V1.4.3 강화 기준 불합격 · 신규 BUY 아님</p>':'')+(strategy==='swing'?explainCard(si.explain):'')+(strategy==='swing'&&m.macd_h4?macdCard(m.macd_h4,'4시간봉 MACD(12,26,9)'):'')+si.explanation.map(z=>'<p>• '+esc(z)+'</p>').join('')
+   +(si.legacy_signal==='BUY'&&si.signal!=='BUY'?'<p class="entry-note">기존 V1.3.3 BUY였지만 V1.4.3 종합 기준 미달 · 신규 BUY 아님</p>':'')+(si.signal==='RESEARCH'?'<p class="entry-note">연구 보류: 실제 BUY/WATCH가 아니며 원본 기록과 탈락 이유만 보존.</p>':'')+(strategy==='swing'?explainCard(si.explain):'')+(strategy==='swing'&&m.macd_h4?macdCard(m.macd_h4,'4시간봉 MACD(12,26,9)'):'')+si.explanation.map(z=>'<p>• '+esc(z)+'</p>').join('')
    +'<p>가상 청산: 순익 +'+p.tp1_net+'% '+Math.round(p.tp1_fraction*100)+'%, +'+p.tp2_net+'% '+Math.round(p.tp2_fraction*100)+'% · 손절 '+p.stop_gross+'% · '+p.max_minutes/60+'시간</p>'
    +'<p>완료봉 참고가 '+num(base)+'원 · 1차 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원 · 2차 '+num(base*(1+p.tp2_gross_pct/100))+'원 · 가상 손절 '+num(base*(1+p.stop_gross/100))+'원'+(m.support?' · 구조 지지 '+num(m.support)+'원':'')+' (실제 체결가 아님)</p>'
    +'<p>수수료 편도 '+fee.toFixed(2)+'% · 완료봉 '+esc(m.closed_kst)+' KST</p>'+bttext+'</div></details>';
