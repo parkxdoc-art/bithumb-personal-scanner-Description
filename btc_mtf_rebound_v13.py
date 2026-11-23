@@ -63,9 +63,12 @@ def rebound_signal(m, ctx, fee):
         and from_low <= 9.0 and risk <= 9.0
         and m["bb_position"] <= 0.95
         and m.get("timing_ok", True)
+        and not m.get("data_gap_recent", False)  # avoid BUY on interrupted 1h/4h history
     )
     kind = "BUY" if buy else "WATCH"
-    stage = "반등 확인 BUY" if buy else ("반등 직전 WATCH" if m["score"] >= 8 else "반등 준비 WATCH")
+    stage = ("반등 확인 BUY" if buy else
+             "점검 공백 · BUY 보류" if m.get("data_gap_recent", False) else
+             "반등 직전 WATCH" if m["score"] >= 8 else "반등 준비 WATCH")
     legacy = dict(m)
     legacy["score"] = m["technical_score"]  # preserve legacy /7 explanation and plan
     raw = _legacy_signal(legacy, ctx, fee)
@@ -90,6 +93,8 @@ def rebound_signal(m, ctx, fee):
         f"판정 {stage} · 10점이어도 반등 확정이 아니며 BUY 필수 확인 조건 적용",
         "기술 지표: " + tech_details,
         "진입 품질: " + qual_details,
+        ("⚠ 최근 1시간·4시간 마감봉에 공백이 있어 BUY를 자동 보류함. 실거래 캔들만 이용하며 누락봉 보간 없음."
+         if m.get("data_gap_recent") else "최근 1시간·4시간 마감봉 연속성 확인"),
         *raw["explanation"][1:7],
         f"저점 대비 +{from_low:.2f}% · 저점 기준 위험 거리 {risk:.2f}% · 24시간 등락 {m['rise24_pct']:+.2f}%",
     ]
@@ -105,6 +110,8 @@ def rebound_signal(m, ctx, fee):
             missing.append("BUY 진입 위치 안전 기준")
         if not m.get("timing_ok", True):
             missing.append("선택한 검색 시간봉 확인")
+        if m.get("data_gap_recent"):
+            missing.append("점검 후 최근 마감봉 공백(연속봉 회복까지 BUY 보류)")
         why.append("BUY 보류 이유: " + (", ".join(missing) if missing else "반등 확인 추가 대기"))
     else:
         why.append("완료봉 기준 반등 확인. 실제 주문 신호나 수익 보장은 아님")
