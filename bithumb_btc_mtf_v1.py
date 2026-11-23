@@ -803,6 +803,7 @@ HTML = r'''<!doctype html>
 .insight-plan b{display:block;font-size:16px}.insight-plan small{font-size:11px}
 .insight-proof{font-size:12px;margin:8px 0;color:var(--muted)}
 .insight-proof span{display:block;margin:3px 0}
+.study-scroll{overflow-x:auto;margin:9px 0 14px}.study-scroll table{border-collapse:collapse;width:100%;min-width:625px;font-size:12px}.study-scroll th,.study-scroll td{padding:8px 7px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.study-scroll th{color:var(--muted)}#study-panel h3{font-size:13px;margin:14px 0 6px}#study-panel details{border-top:1px solid var(--line);padding-top:10px}
 .hidden{display:none!important}
 @media(max-width:760px){main{padding:14px 11px 30px}header{align-items:flex-start}.toolbar{grid-template-columns:1fr 1fr}.tf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.surface{padding:13px}.btc-agg{grid-template-columns:1fr 1fr}}
 @media(max-width:355px){.toolbar{grid-template-columns:1fr 1fr}.row{gap:6px}.action button{flex:1}}
@@ -877,6 +878,68 @@ $('spotcheck-csv').onclick=()=>{
  a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_7_SPOTCHECK_202610311500.csv';
  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
+const studyLabels={BUY:'종합 BUY',EARLY_WATCH:'초기 WATCH',TREND_WATCH:'추세 WATCH',RESEARCH:'연구 보류',ORIGINAL_BUY:'기존 원본 BUY',Q4:'유동성 4/4',Q23:'유동성 2~3/4',Q01:'유동성 0~1/4',Q_UNKNOWN:'유동성 자료 없음',COMPLETE_24H:'과거 24시간봉 완전',INCOMPLETE_24H:'과거 24시간봉 불완전',UNKNOWN_24H:'관측 이력 미확인'};
+function studyFmt(n,suffix=''){return n===null||n===undefined||!Number.isFinite(Number(n))?'—':Number(n).toLocaleString('ko-KR',{maximumFractionDigits:2})+suffix}
+function studyTable(rows){
+ const body=rows.map(g=>'<tr><td>'+esc(studyLabels[g.label]||g.label)+'</td><td>'+g.candidates+' / '+g.unique_markets+'</td><td>'+g.resolved+' / '+g.unknown+'</td><td>'+g.positive+' / '+g.nonpositive+'</td><td>'+studyFmt(g.resolution_rate_pct,'%')+'</td><td>'+studyFmt(g.mean_hypothetical_net_pct,'%')+(g.small_sample&&g.resolved?' ⚠':'')+'</td></tr>').join('');
+ return '<div class="study-scroll"><table><thead><tr><th>분류</th><th>후보 / 고유코인</th><th>확정 / 미확정</th><th>양수 / 비양수</th><th>확정률</th><th>확정분 평균</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+}
+function renderStudy(){
+ if(!studyResult)return;
+ const z=studyResult,t=z.summary||{},uniqueDays=(z.by_day||[]).length;
+ $('study-status').textContent='비교 완료 · 후보 '+t.candidates+'건 · '+uniqueDays+'개 기준일 · 실재 고유 종목 '+t.unique_markets+'개 · 확정 '+t.resolved+'건 · 미확정 '+t.unknown+'건';
+ $('study-results').innerHTML='<p class="notice"><b>전체 검색 '+z.scanned+'건 · 검색 자료 오류 '+z.issues+'건 · 후보 '+t.candidates+'건</b> · 동일 코인이 다른 날짜에 있으면 개별 스냅샷으로 집계되며 독립 표본은 아냐.</p>'
+  +'<h3>신호별 비교 · 모두 관찰용 가상 경로</h3>'+studyTable(z.by_kind||[])
+  +'<h3>신호 시점 이전 유동성 4개 기준</h3>'+studyTable(z.by_quality||[])
+  +'<h3>과거 24시간 1시간봉 자료 완전도</h3>'+studyTable(z.by_coverage||[])
+  +'<details><summary>추가 비교: 기존 BUY / 날짜별 / 신호×유동성</summary>'
+  +'<h3>기존 원본 BUY</h3>'+studyTable(z.original_buy?[z.original_buy]:[])
+  +'<h3>날짜별</h3>'+studyTable(z.by_day||[])
+  +'<h3>신호×유동성 (후보가 있는 그룹만)</h3>'+studyTable((z.by_kind_quality||[]).filter(x=>x.candidates))
+  +'</details>'
+  +'<p class="notice"><b>해석 주의:</b> '+esc((z.warnings||[]).join(' · '))+'</p>';
+ $('study-summary-csv').disabled=false;$('study-rows-csv').disabled=false;
+}
+async function refreshStudy(){
+ if(mode!=='backtest'||strategy!=='swing')return;
+ $('study-status').textContent='후보 유형·선행 유동성·가상 경로 비교 계산 중…';
+ const payload=results.map(x=>({
+  market:x.market,at:x.at,kind:x.signal.watch_kind||'RESEARCH',
+  legacy_signal:x.signal.legacy_signal||'NONE',
+  liquidity_audit:x.signal.liquidity_audit||{},
+  backtest:x.signal.backtest||{}
+ }));
+ const response=await post('/api/study-v147',{
+  mode:'backtest',strategy:'swing',fee:Number(lastCfg?.fee||.04),
+  scanned:completed,issues:problems,items:payload
+ });
+ studyResult=response.study;renderStudy();
+}
+function exportStudyCsv(rows,name,headers,fields){
+ if(!studyResult)return;
+ const q=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
+ const lines=[headers.map(q).join(',')];
+ for(const row of rows)lines.push(fields.map(k=>q(row[k]??'')).join(','));
+ const url=URL.createObjectURL(new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;
+ a.download='BITHUMB_BTC_MTF_V1_4_7_'+name+'_'+String(lastCfg?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';
+ document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+}
+$('study-summary-csv').onclick=()=>{
+ if(!studyResult)return;
+ const z=studyResult,rows=[];
+ for(const [type,items] of [['TOTAL',[z.summary]],['LEGACY_BUY',[z.original_buy]],['KIND',z.by_kind],['QUALITY',z.by_quality],['COVERAGE',z.by_coverage],['KIND_QUALITY',z.by_kind_quality],['DAY',z.by_day]]){
+  for(const x of items||[])if(x)rows.push({group_type:type,...x});
+ }
+ const fields=['group_type','label','candidates','unique_markets','unique_snapshots','resolved','unknown','positive','nonpositive','resolution_rate_pct','positive_fraction_resolved_pct','mean_hypothetical_net_pct','median_hypothetical_net_pct','min_hypothetical_net_pct','max_hypothetical_net_pct','small_sample'];
+ exportStudyCsv(rows,'COHORT_SUMMARY',fields,fields);
+};
+$('study-rows-csv').onclick=()=>{
+ if(!studyResult)return;
+ const fields=['at','market','kind','legacy_signal','quality','coverage','quality_checks_passed','hourly_bars_observed','historical_turnover_krw','status','net_pct','backtest_reason'];
+ exportStudyCsv(studyResult.rows||[],'COHORT_DETAILS',fields,fields);
+};
+
 function btcDraw(ctx){$('long').textContent=ST[ctx.long]||'미확인';$('long').className=ctx.long;$('short').textContent=ST[ctx.short]||'미확인';$('short').className=ctx.short;$('btcts').textContent='· '+ctx.asof_kst+' KST';$('tf-grid').innerHTML=order.map(k=>{const x=ctx.tf[k]||{state:'unknown'},why=x.reason?' · '+x.reason:'';return `<div class="tf" title="${esc(why)}"><div class="name">BTC ${TF[k]}</div><div class="status ${x.state}">${ST[x.state]||'자료 부족'}</div></div>`}).join('')}
 function classifyIssue(reason){
  const msg=String(reason||'알 수 없는 문제');
@@ -1070,7 +1133,10 @@ $('start').onclick=async()=>{
    await Promise.all(Array.from({length:Math.min(4,items.length)},work));
   }
  }catch(ex){$('error').textContent='검사를 완료하지 못했어: '+ex.message;}
- finally{busy=false;btn.disabled=false;btn.textContent='검색 시작';summary();renderResults();$('csv').disabled=!completed;$('issuecsv').disabled=!issueCases.length;$('focuscsv').disabled=!focusDiagnostics.length;}
+ finally{summary();renderResults();$('csv').disabled=!completed;$('issuecsv').disabled=!issueCases.length;$('focuscsv').disabled=!focusDiagnostics.length;
+  if(mode==='backtest'&&strategy==='swing'){try{await refreshStudy();}catch(err){$('study-status').textContent='비교 실패: '+String(err?.message||err);$('study-results').textContent='전체 후보 CSV는 정상 저장 가능. 연구 비교 요청만 실패했어.';}}
+  busy=false;btn.disabled=false;btn.textContent='검색 시작';
+ }
 };
 $('focuscsv').onclick=()=>{
  if(!focusDiagnostics.length)return;
