@@ -1,4 +1,4 @@
-"""BITHUMB BTC MTF V1.4.0 | Read-only LIVE + historical snapshot research.
+"""BITHUMB BTC MTF V1.4.1 | Read-only LIVE + historical snapshot research.
 
 BTC: month/week/day/4h/1h/30m/15m/5m/3m/1m trends, all closed candles.
 Coin scan: 5m/15m/1h/4h/day, BUY/WATCH with audit reasons.
@@ -20,8 +20,9 @@ from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, jsonify, request, Response
 import btc_mtf_rebound_v13 as rebound
+from btc_mtf_macd_v141 import all_macd_views
 
-VERSION = "BTC MTF V1.4.0"
+VERSION = "BTC MTF V1.4.1"
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com"
 TIMEFRAMES = ("month", "week", "day", "4h", "1h", "30m", "15m", "5m", "3m", "1m")
@@ -435,6 +436,7 @@ def strict_swing_gate(m, ctx, day, h4):
         "1시간봉 반등 확인": m["checks"]["h1_confirm"],
         "RSI(14) 50 이상": m["rsi14"] >= 50,
         "MACD 히스토그램 양수": m["macd_hist"] > 0,
+        "4시간 MACD 골든 상태 (실제 교차와 구분)": m["macd_h4"]["state"] == "GOLDEN",
         "4시간 거래대금 1.1배 이상": m["volume_ratio"] >= 1.1,
         "BTC 장·단기 비하락": (
             ctx["long"] in ("up", "side") and ctx["short"] in ("up", "side")),
@@ -605,6 +607,10 @@ def coin_api():
             else:
                 m["timing_ok"]={"1h":m["checks"]["h1_confirm"],"4h":m["checks"]["ma_recover"],"day":m["day_ma20_distance_pct"]>=-6}[tf]
             m["selected_tf"]=tf
+            macd_views=all_macd_views(day,h4,tf_end,is_contiguous)
+            m["macd_h4"]=macd_views["h4"]
+            m["macd_day"]=macd_views["day"]
+            m["macd_day_chart"]=macd_views["day_chart"]
             signal=rebound.rebound_signal(m,ctx,fee)
             if signal is not None:
                 previous = signal["signal"]
@@ -617,9 +623,15 @@ def coin_api():
                                    "기존 BUY / 강화 보류" if previous == "BUY" else
                                    signal.get("stage", "WATCH"))
                 signal["explanation"].append(
-                    "기존 V1.3.3 " + previous + " → V1.4 " + signal["signal"]
+                    "기존 V1.3.3 " + previous + " → V1.4.1 " + signal["signal"]
                     + " · 강화 조건: " +
                     ("전체 통과" if gate["passed"] else ", ".join(gate["missing"]))
+                )
+                signal["explanation"].append(
+                    "MACD 4시간(12,26,9): " + macd_views["h4"]["state"]
+                    + ", 이번 봉 교차 " + macd_views["h4"]["event"]
+                    + " | 일봉(12,26,9): " + macd_views["day"]["state"]
+                    + " | 일봉(3,10,16): " + macd_views["day_chart"]["state"]
                 )
         else:
             rows=candles(market,tf,at,count=50)
@@ -627,25 +639,35 @@ def coin_api():
             if m is None:
                 return jsonify(ok=True,market=market,signal=None,issue=issue)
             signal=coin_signal(m,ctx,fee)
+        diagnostic = None
+        if strategy == "swing" and raw.get("want_diagnostic") is True:
+            diagnostic = {
+                "closed_kst": m["closed_kst"], "close": m["close"],
+                "score": m["score"], "rsi14": m["rsi14"],
+                "day_up": m["day_up"], "h4_up": m["h4_up"],
+                "macd": macd_views,
+                "strict_gate": strict_swing_gate(m,ctx,day,h4),
+                "legacy_signal": signal["legacy_signal"] if signal else "NONE",
+            }
         if signal is None:
-            return jsonify(ok=True, market=market, signal=None)
+            return jsonify(ok=True, market=market, signal=None, diagnostic=diagnostic)
         if mode == "backtest":
             signal["backtest"] = swing_backtest_exit(market,at,fee) if strategy == "swing" else backtest_exit(market,at,fee)
-        return jsonify(ok=True, market=market, signal=signal, strategy=strategy)
+        return jsonify(ok=True, market=market, signal=signal, strategy=strategy, diagnostic=diagnostic)
     except Exception as ex:
         return jsonify(ok=False, error=str(ex)[:170]), 400
 
 
 HTML = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BITHUMB · BTC MTF V1.4.0 · 추세확인 비교 연구</title>
+<title>BITHUMB · BTC MTF V1.4.1 · 추세확인 비교 연구</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1120;--panel:#161f33;--panel2:#202c46;--ink:#edf4ff;--muted:#93a4bd;--line:#34445f;--cyan:#45cfce;--green:#39d7a1;--yellow:#ffc56d;--red:#ff7d85}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,'Noto Sans KR',sans-serif;color:var(--ink);line-height:1.5}main{max-width:1100px;margin:auto;padding:18px 16px 48px}h1{font-size:1.4rem;line-height:1.3;margin:0}h2{font-size:1.08rem;margin:0 0 11px}small,.muted{color:var(--muted)}header{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:5px 0 19px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:1px}.tag{border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);white-space:nowrap;font-size:11px}.surface{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;margin-bottom:14px}.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:15px}.tabs button{font-size:15px;font-weight:750;padding:13px}.tabs button.on{background:#145c64;border-color:var(--cyan);color:white}button,select,input{border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--ink);font:inherit;padding:10px;min-width:0}button{cursor:pointer}button:disabled{opacity:.42;cursor:default}button.primary{background:var(--cyan);border-color:var(--cyan);color:#09252a;font-weight:800}button.secondary{background:transparent}.toolbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px}.field label{color:var(--muted);font-size:12px;font-weight:650}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.timebox{display:flex;gap:8px}.timebox input{flex:1;min-width:0}.action{margin-top:14px}.action button{padding:11px 20px}.help{font-size:12px;color:var(--muted);margin-top:9px}.btc-agg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.agg{background:#101d32;border:1px solid var(--line);padding:12px;border-radius:12px}.agg strong{display:block;font-size:1.16rem;margin-top:4px}.tf-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.tf{background:#101b2e;border:1px solid var(--line);border-radius:12px;padding:10px}.tf .name{font-size:12px;color:var(--muted)}.tf .status{font-size:16px;font-weight:750;margin-top:2px}.up{color:var(--green)}.down{color:var(--red)}.side{color:var(--yellow)}.unknown{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{padding:13px;background:#101b2e;border:1px solid var(--line);border-radius:12px}.metric strong{font-size:22px;display:block}.metric span{font-size:12px;color:var(--muted)}.bar{height:6px;background:#27354a;overflow:hidden;border-radius:8px;margin-top:12px}.bar i{display:block;background:var(--cyan);height:100%;width:0%;transition:width .2s}.result{border:1px solid var(--line);background:#101c30;border-radius:13px;margin-top:9px;padding:12px}.result summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.score-chip{border:1px solid #4c7087;background:#17374a;color:#c4f5f0;border-radius:7px;padding:3px 6px;font-weight:850;font-size:12px;white-space:nowrap}.entry-price{border:1px solid #466380;background:#243553;border-radius:8px;padding:4px 9px;font-size:13px;font-weight:750;color:#ebf6ff;white-space:nowrap}.entry-price.watch-entry{background:#352f24;color:#ffe8b3;border-color:#7b623c}.entry-note{border:1px solid #364b67;background:#172943;padding:10px;border-radius:9px;margin:8px 0}.entry-metrics{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.entry-metrics span{border:1px solid #364b67;padding:6px 9px;border-radius:8px;font-size:12px}.result summary::-webkit-details-marker{display:none}.result summary b{font-size:16px}.badge{font-size:11px;font-weight:900;padding:4px 8px;border-radius:7px}.badge.buy{background:#115e4c;color:#9ff9d5}.badge.watch{background:#59421e;color:#ffdca5}.push{margin-left:auto;color:var(--muted);font-size:12px}.reason{font-size:13px;color:#cfdaeb;margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}.reason p{margin:5px 0}.pnl{font-size:13px;margin-top:7px}.empty{font-size:13px;color:var(--muted);padding:15px 0}.notice{font-size:12px;color:#b6c7df;margin-top:12px}.foot{margin-top:26px;color:var(--muted);font-size:12px}#error{color:var(--red);font-size:13px;margin-top:9px;white-space:pre-wrap}#scanstatus{color:var(--muted);font-size:13px}.hidden{display:none!important}
 @media(max-width:760px){main{padding:14px 11px 30px}header{align-items:flex-start}.toolbar{grid-template-columns:1fr 1fr}.tf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.surface{padding:13px}.btc-agg{grid-template-columns:1fr 1fr}}
 @media(max-width:355px){.toolbar{grid-template-columns:1fr 1fr}.row{gap:6px}.action button{flex:1}}
 </style></head><body><main>
-<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.4.0 · 기존 BUY vs 강화 BUY 별도 연구판</small></div><span class="tag">KRW ONLY</span></header>
+<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.4.1 · 기존 BUY vs 강화 BUY 별도 연구판</small></div><span class="tag">KRW ONLY</span></header>
 <div class="tabs"><button id="live-tab" class="on" type="button">● 실시간 검색</button><button id="backtest-tab" type="button">◷ 과거 백테스트</button></div>
 <section class="surface"><h2>검색 설정</h2><div class="tabs"><button id="scalp-tab" type="button">⚡ 단타</button><button id="swing-tab" class="on" type="button">🌱 스윙 · 점수제</button></div><div class="toolbar">
 <div class="field"><label for="tf">코인 검색 시간봉</label><select id="tf"><option value="5m">5분봉</option><option value="15m">15분봉</option><option value="1h">1시간봉</option><option value="4h" selected>4시간봉</option><option value="day">일봉</option></select></div>
@@ -800,11 +822,11 @@ $('issuecsv').onclick=()=>{
  const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
  const rows=[['version','strategy','mode','snapshot_kst','tf','fee_each_pct','min_turnover_24h_krw','market_turnover_24h_krw','market','name','issue_type','issue_reason']];
  for(const x of issueCases){
-  rows.push(['BTC-MTF-V1.4.0',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,classifyIssue(x.reason),x.reason]);
+  rows.push(['BTC-MTF-V1.4.1',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,classifyIssue(x.reason),x.reason]);
  }
  const csv=rows.map(row=>row.map(quote).join(',')).join('\n');
  const url=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));
- const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_0_ISSUES_'+String(issueCases[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+ const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_1_ISSUES_'+String(issueCases[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 $('csv').onclick=()=>{
  if(!lastCfg)return;
@@ -813,10 +835,10 @@ $('csv').onclick=()=>{
  const shown=new Set(visibleResults());
  for(const x of results){
   const si=x.signal,m=si.metrics,t=si.backtest||{},p=si.plan;
-  lines.push(['BTC-MTF-V1.4.0',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':'WATCH 관찰 기준가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.data_gap_recent??'',m.data_status??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??'',$('watch-filter').value,shown.has(x),si.legacy_signal??'',si.signal,si.strict_gate?.passed??'',(si.strict_gate?.missing||[]).join(' / '),JSON.stringify(si.strict_gate?.checks||{}),si.strict_gate?.h4_ma20??'',si.strict_gate?.h4_ma20_prev??''].map(quote).join(','));
+  lines.push(['BTC-MTF-V1.4.1',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':'WATCH 관찰 기준가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.data_gap_recent??'',m.data_status??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??'',$('watch-filter').value,shown.has(x),si.legacy_signal??'',si.signal,si.strict_gate?.passed??'',(si.strict_gate?.missing||[]).join(' / '),JSON.stringify(si.strict_gate?.checks||{}),si.strict_gate?.h4_ma20??'',si.strict_gate?.h4_ma20_prev??''].map(quote).join(','));
  }
  const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
- a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_0_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'_'+String(results[0]?.at||lastCfg.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_1_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'_'+String(results[0]?.at||lastCfg.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 
 })();
