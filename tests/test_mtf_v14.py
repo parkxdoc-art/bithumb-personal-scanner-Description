@@ -7,6 +7,7 @@ from btc_mtf_explain_v142 import build_explanation
 from btc_mtf_combo_v143 import evaluate_combined, REQUIRED_TREND_CHECKS
 from btc_mtf_watch_v144 import classify_watch_tracks
 from btc_mtf_replay_v145 import HourlyReplayPath
+from btc_mtf_quality_v146 import snapshot_liquidity, investigate_missing_hour
 from unittest.mock import patch
 import bithumb_btc_mtf_v1 as main
 from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
@@ -427,6 +428,125 @@ class TargetedReplayRecoveryTest(unittest.TestCase):
         response=main.app.test_client().get("/api/replay-spotcheck?fee=1.0")
         self.assertEqual(response.status_code,400)
         self.assertFalse(response.get_json()["ok"])
+
+
+class HistoricalLiquidityV146Test(unittest.TestCase):
+    def setUp(self):
+        self.at=datetime(2026,10,31,15,tzinfo=KST)
+        self.start=self.at-timedelta(hours=24)
+        self.h1=[{"t":self.start+timedelta(hours=i),"o":100,"c":100,
+                  "turnover":6_000_000} for i in range(24)]
+
+    def test_full_precisely_prior_day_is_four_of_four(self):
+        result=snapshot_liquidity(self.h1,self.at)
+        self.assertEqual(result["hourly_bars_observed"],24)
+        self.assertEqual(result["checks_passed"],4)
+        self.assertEqual(result["kind"],"OBSERVED_OK")
+        self.assertEqual(result["observed_turnover_24h_krw"],144_000_000)
+        self.assertFalse(result["changes_buy_watch_gate"])
+
+    def test_future_bar_excluded_even_if_present_in_argument(self):
+        h=self.h1+[{"t":self.at,"turnover":900_000_000},
+                    {"t":self.at+timedelta(hours=1),"turnover":800_000_000}]
+        original=list(h)
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["hourly_bars_observed"],24)
+        self.assertEqual(result["observed_turnover_24h_krw"],144_000_000)
+        self.assertEqual(original,h)
+
+    def test_missing_hour_reports_incomplete_observation_not_false_zero_volume(self):
+        h=[x for x in self.h1 if x["t"]!=self.start+timedelta(hours=8)]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["hourly_bars_observed"],23)
+        self.assertFalse(result["observed_turnover_is_complete"])
+        self.assertEqual(result["longest_missing_hours"],1)
+        self.assertIn("2026-10-30 23:00",result["missing_hour_samples_kst"])
+        self.assertTrue(any("불완전" in text for text in result["warnings"]))
+
+    def test_recent_hourly_outage_raises_data_gap_risk(self):
+        h=self.h1[:-5]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["recent_6h_bars_observed"],1)
+        self.assertEqual(result["kind"],"DATA_GAP")
+
+    def test_low_turnover_with_complete_history_is_only_warning(self):
+        h=[dict(x,turnover=1000) for x in self.h1]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["kind"],"THIN_OBSERVED")
+        self.assertTrue(result["observed_turnover_is_complete"])
+        self.assertFalse(result["changes_buy_watch_gate"])
+
+    def test_invalid_turnover_rejected_without_synthetic_zero(self):
+        h=[dict(x) for x in self.h1]
+        h[-1]["turnover"]=float("nan")
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["hourly_bars_observed"],23)
+        self.assertFalse(result["checks"]["직전 완료 1시간봉 확인"])
+
+    def test_sparse_snapshot_with_nonzero_minute_not_used_for_buy(self):
+        h=[dict(x) for x in self.h1[:12]]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["kind"],"DATA_GAP")
+        self.assertFalse(result["changes_buy_watch_gate"])
+
+
+class MicroGapV146Test(unittest.TestCase):
+    def setUp(self):
+        self.at=datetime(2026,10,31,16,tzinfo=KST)
+        self.calls=[]
+
+    def test_true_1m_and_5m_with_exact_hour_boundary(self):
+        def getter(market,tf,to,count):
+            self.calls.append((tf,to,count))
+            points = [self.at-timedelta(minutes=1),
+                      self.at+timedelta(minutes=15),
+                      self.at+timedelta(hours=1)]
+            return [{"t":t} for t in points]
+        r=investigate_missing_hour("KRW-TEST",self.at,getter)
+        self.assertEqual(r["status_code"],"LOWER_TIMEFRAME_BARS_EXIST")
+        self.assertEqual(r["five_min_bars_observed"],1)
+        self.assertEqual(r["one_min_bars_observed"],1)
+        self.assertEqual(len(self.calls),2)
+        self.assertEqual(self.calls[0][0],"5m")
+        self.assertEqual(self.calls[1][0],"1m")
+        self.assertFalse(r["changes_exit_result"])
+        self.assertEqual(self.calls[0][1],self.at+timedelta(hours=1,minutes=1))
+
+    def test_no_lower_intervals_does_not_prove_no_trades(self):
+        r=investigate_missing_hour("KRW-TEST",self.at,
+                                   lambda market,tf,to,count: [])
+        self.assertEqual(r["status_code"],"NO_LOWER_TF_BARS_RETURNED")
+        self.assertIn("미확정",r["status_text"])
+
+    def test_api_error_remains_explicit(self):
+        def one_error(market,tf,to,count):
+            if tf=="1m":raise RuntimeError("API timeout")
+            return []
+        r=investigate_missing_hour("KRW-TEST",self.at,one_error)
+        self.assertEqual(r["status_code"],"LOWER_TIMEFRAME_API_ERROR")
+        self.assertIn("timeout",r["errors"]["1m"])
+
+    def test_spotcheck_api_adds_micro_evidence_but_preserves_unknown(self):
+        fake_bt={"status":"UNKNOWN","net_pct":None,"reason_code":"MISSING_HOURLY_BAR",
+                 "audit":{"status_code":"SOURCE_1H_30M_NOT_RETURNED",
+                          "first_unresolved_or_recovered_hour_kst":"2026-10-31 16:00"}}
+        micro={"status_code":"LOWER_TIMEFRAME_BARS_EXIST",
+               "five_min_bars_observed":1,"one_min_bars_observed":1,
+               "changes_exit_result":False}
+        with patch.object(main,"swing_backtest_exit",return_value=fake_bt),\
+             patch.object(main,"investigate_missing_hour",return_value=micro) as diag,\
+             patch.object(main,"ttl_get",return_value=None),\
+             patch.object(main,"ttl_put"):
+            resp=main.app.test_client().get("/api/replay-spotcheck?fee=0.04")
+            self.assertEqual(resp.status_code,200,resp.get_json())
+            data=resp.get_json()
+            self.assertEqual(len(data["items"]),5)
+            self.assertEqual(diag.call_count,5)
+            self.assertTrue(all(x["gap_micro"]["five_min_bars_observed"]==1
+                                for x in data["items"]))
+            self.assertTrue(all(x["backtest"]["status"]=="UNKNOWN"
+                                and x["backtest"]["net_pct"] is None
+                                for x in data["items"]))
 
 if __name__=="__main__":
     unittest.main()
