@@ -12,7 +12,7 @@ class FocusDiagnosticTest(unittest.TestCase):
         self.h4=[{"t":h+timedelta(hours=4*i),"c":100+i*.18} for i in range(90)]
         self.h1=[{"t":h+timedelta(hours=i),"c":100+i*.06} for i in range(50)]
         self.m={
-            "score":9,"day_up":True,"h4_up":True,"rsi14":56,
+            "score":9,"day_up":True,"h4_up":True,"day_ma20_distance_pct":2,"rsi14":56,
             "macd_hist":0.13,"volume_ratio":1.3,
             "close":self.h4[-1]["c"],"rebound_from_low_pct":3.4,
             "structure_risk_pct":4.2,"data_gap_recent":False,
