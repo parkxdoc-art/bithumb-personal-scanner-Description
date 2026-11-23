@@ -712,7 +712,9 @@ class ExactHistoricalCandleBoundaryV148Test(unittest.TestCase):
         now=self.snapshot+timedelta(seconds=3)
         with patch.object(main,"now_kst",return_value=now),\
              patch.object(main,"api_get",return_value=raw):
-            rows=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+            # The LIVE snapshot itself must be +3 seconds. An older pinned
+            # clock exactly at 15:00 must NOT bypass its 2-second guard.
+            rows=main.candles("KRW-XRP","1h",now,count=50)
         self.assertEqual(len(rows),1)
         self.assertEqual(rows[0]["t"],self.snapshot-timedelta(hours=1))
 
