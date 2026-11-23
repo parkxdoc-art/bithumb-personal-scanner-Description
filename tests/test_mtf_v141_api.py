@@ -8,15 +8,25 @@ class FocusDiagnosticTest(unittest.TestCase):
     def setUp(self):
         d=datetime(2026,8,1,tzinfo=main.KST)
         h=datetime(2026,10,1,tzinfo=main.KST)
-        self.day=[{"t":d+timedelta(days=i),"c":100+i*.3} for i in range(80)]
-        self.h4=[{"t":h+timedelta(hours=4*i),"c":100+i*.18} for i in range(90)]
-        self.h1=[{"t":h+timedelta(hours=i),"c":100+i*.06} for i in range(50)]
+        def rows(start, step, n, slope):
+            return [
+                {"t":start+step*i, "c":100+i*slope,
+                 "o":99.8+i*slope, "h":100.7+i*slope,
+                 "l":99.3+i*slope, "turnover":10000000.0}
+                for i in range(n)
+            ]
+        self.day=rows(d,timedelta(days=1),80,.3)
+        self.h4=rows(h,timedelta(hours=4),90,.18)
+        self.h1=rows(h,timedelta(hours=1),50,.06)
         self.m={
             "score":9,"day_up":True,"h4_up":True,"day_ma20_distance_pct":2,"rsi14":56,
-            "macd_hist":0.13,"volume_ratio":1.3,
+            "macd_hist":0.13,"volume_ratio":1.3,"atr_pct":1.4,"bb_position":0.65,
+            "body_ratio":0.65,"h4_distance_ma7_pct":1.4,
+            "h4_higher_low":True,"h4_higher_high":True,"relative_pct":1.1,
             "close":self.h4[-1]["c"],"rebound_from_low_pct":3.4,
             "structure_risk_pct":4.2,"data_gap_recent":False,
-            "checks":{"h1_confirm":True,"ma_recover":True},
+            "checks":{"h1_confirm":True,"ma_recover":True,
+                      "rsi_recover":True,"macd_recover":True},
             "closed_kst":"2026-10-10 00:00",
         }
     def fetch(self,market,tf,at=None,count=70):
@@ -44,6 +54,9 @@ class FocusDiagnosticTest(unittest.TestCase):
             self.assertEqual(data["diagnostic"]["score"],9)
             self.assertEqual(data["diagnostic"]["macd"]["day_chart"]["params"],"3,10,16")
             self.assertEqual(data["diagnostic"]["macd"]["h4"]["params"],"12,26,9")
+            self.assertIn("scores",data["diagnostic"]["explain"])
+            self.assertEqual(data["diagnostic"]["explain"]["status"],"RESEARCH_ONLY")
+            self.assertIsNone(data["diagnostic"]["explain"]["sell_pressure_proxy"]["orderbook_sell_wall"])
 
 if __name__=="__main__":
     unittest.main()
