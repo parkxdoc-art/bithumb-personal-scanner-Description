@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta
 from bithumb_btc_mtf_v1 import KST, strict_swing_gate, swing_backtest_exit, tf_end, is_contiguous
 from btc_mtf_macd_v141 import analyze_macd, all_macd_views
+from btc_mtf_explain_v142 import build_explanation
 from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
 
 def make_bars(start,n,delta):
@@ -116,6 +117,66 @@ class MacdCrossTest(unittest.TestCase):
         test.setUp()
         test.m["macd_h4"]={"state":"DEAD"}
         self.assertFalse(strict_swing_gate(test.m,test.ctx,test.day,test.h4)["passed"])
+
+
+class ExplainableSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.day=make_bars(datetime(2026,8,1,tzinfo=KST),40,timedelta(days=1))
+        self.h4=make_bars(datetime(2026,10,1,tzinfo=KST),40,timedelta(hours=4))
+        self.h1=make_bars(datetime(2026,10,1,tzinfo=KST),30,timedelta(hours=1))
+        self.m={
+            "score":9,"close":self.h4[-1]["c"],"day_up":True,"h4_up":True,
+            "h4_higher_low":True,"h4_higher_high":True,
+            "checks":{"h1_confirm":True,"ma_recover":True,
+                      "rsi_recover":True,"macd_recover":True},
+            "rsi14":56,"macd_h4":{"state":"GOLDEN"},
+            "volume_ratio":1.4,"rebound_from_low_pct":4.0,
+            "structure_risk_pct":3.6,"data_gap_recent":False,
+            "timing_ok":True,"bb_position":0.7,"body_ratio":0.7,
+            "atr_pct":1.2,"h4_distance_ma7_pct":1.2,
+            "relative_pct":0.9,"closed_kst":"2026-10-10 00:00",
+        }
+        self.ctx={"long":"up","short":"side"}
+
+    def explain(self):
+        return build_explanation(self.m,self.ctx,self.day,self.h4,self.h1,.25)
+
+    def test_scorecards_are_four_checklists_not_profit_probabilities(self):
+        d=self.explain()
+        self.assertEqual(d["status"],"RESEARCH_ONLY")
+        self.assertEqual(len(d["scores"]),6)
+        self.assertTrue(all(0<=v<=100 for v in d["scores"].values()))
+        self.assertEqual(len(d["factors"]["structure"]),4)
+        self.assertEqual(len(d["factors"]["entry"]),4)
+        self.assertEqual(d["sell_pressure_proxy"]["orderbook_sell_wall"],None)
+        self.assertEqual(d["sell_pressure_proxy"]["taker_sell_strength"],None)
+        self.assertIsNotNone(d["context"]["last_24h_closed_turnover_krw"])
+
+    def test_future_breakout_is_only_a_conditional_reference(self):
+        d=self.explain()
+        p=d["plan"]
+        self.assertEqual(d["status"],"RESEARCH_ONLY")
+        self.assertTrue(p["requires_next_completed_4h_body_close_above_trigger"])
+        self.assertEqual(p["requires_future_4h_turnover_ratio"],2.0)
+        self.assertGreater(p["trigger_ref"],d["context"]["close_ref"])
+        self.assertGreater(p["trigger_ref"],p["stop_ref"])
+        self.assertGreater(p["breakeven_ref"],p["trigger_ref"])
+
+    def test_unsafe_stop_distance_hides_targets(self):
+        for x in self.h4[-6:]:
+            x["l"]=50.
+        d=self.explain()
+        self.assertFalse(d["plan"]["plan_valid"])
+        self.assertIsNone(d["plan"]["target1_ref"])
+        self.assertIsNone(d["plan"]["target2_ref"])
+        self.assertTrue(any("구조적 손절 거리" in w for w in d["warnings"]))
+
+    def test_dead_macd_not_equivalent_to_trend_confirmation(self):
+        self.m["macd_h4"]={"state":"DEAD"}
+        self.m["rsi14"]=43
+        d=self.explain()
+        self.assertFalse(d["factors"]["trend"][-1]["passed"])
+        self.assertTrue(any("MACD" in w for w in d["warnings"]))
 
 if __name__=="__main__":
     unittest.main()
