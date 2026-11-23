@@ -6,6 +6,9 @@ from btc_mtf_macd_v141 import analyze_macd, all_macd_views
 from btc_mtf_explain_v142 import build_explanation
 from btc_mtf_combo_v143 import evaluate_combined, REQUIRED_TREND_CHECKS
 from btc_mtf_watch_v144 import classify_watch_tracks
+from btc_mtf_replay_v145 import HourlyReplayPath
+from unittest.mock import patch
+import bithumb_btc_mtf_v1 as main
 from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
 
 def make_bars(start,n,delta):
@@ -308,6 +311,112 @@ class SeparateWatchTracksTest(unittest.TestCase):
 
     def test_no_original_candidate_cannot_become_early_watch(self):
         self.assertEqual(self.classify(None)["kind"],"RESEARCH")
+
+
+class TargetedReplayRecoveryTest(unittest.TestCase):
+    """Use only real returned 1h source bars; no 30m price substitution."""
+
+    def setUp(self):
+        self.at=datetime(2026,10,31,15,tzinfo=KST)
+        self.base=[{"t":self.at+timedelta(hours=i),"o":100.0,"h":100.1,
+                    "l":99.9,"c":100.0,"turnover":1000} for i in range(120)]
+        self.gap=self.at+timedelta(hours=1)
+        self.calls=[]
+
+    def get(self,market,tf,to,count=100):
+        self.calls.append((market,tf,to,count))
+        if tf=="1h" and count==160:
+            return [r for r in self.base if r["t"]!=self.gap]
+        if tf=="1h":
+            return [r for r in self.base if r["t"]==self.gap]
+        raise AssertionError("Unexpected timeframe")
+
+    def test_exact_hour_recovered_and_fee_unchanged(self):
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=self.get)
+        self.assertEqual(got["status"],"RESOLVED")
+        self.assertEqual(got["minutes"],7200)
+        self.assertEqual(got["audit"]["recovered_one_hour_candles"],1)
+        self.assertEqual(got["audit"]["status_code"],"RECOVERED_1H")
+        self.assertEqual(got["audit"]["hourly_recheck_calls"],1)
+        self.assertEqual(self.calls[1][2],self.gap+timedelta(hours=1,minutes=1))
+        self.assertAlmostEqual(got["net_pct"],-0.079968,places=4)
+
+    def test_persistent_hourly_gap_keeps_unknown(self):
+        def no_gap_return(market,tf,to,count=100):
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=no_gap_return)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertIsNone(got["net_pct"])
+        self.assertEqual(got["audit"]["status_code"],"SOURCE_1H_NOT_RETURNED")
+        self.assertEqual(got["audit"]["first_unresolved_or_recovered_hour_kst"],"2026-10-31 16:00")
+
+    def test_30m_bars_diagnose_but_never_create_1h_execution_price(self):
+        def half(market,tf,to,count=100):
+            if tf=="30m":return [{"t":self.gap+timedelta(minutes=30),"o":99,"h":100,"l":99,"c":99}]
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=half,detailed=True)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertIsNone(got["net_pct"])
+        self.assertEqual(got["audit"]["status_code"],"SOURCE_1H_MISSING_BUT_30M_EXISTS")
+        self.assertEqual(got["audit"]["lower_timeframe_bars_in_missing_hour"],1)
+
+    def test_no_1h_or_30m_cannot_claim_zero_trades(self):
+        def no_gap(market,tf,to,count=100):
+            if tf=="30m":return []
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=no_gap,detailed=True)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertEqual(got["audit"]["status_code"],"SOURCE_1H_30M_NOT_RETURNED")
+
+    def test_recheck_api_error_is_not_converted_to_profit(self):
+        def broken(market,tf,to,count=100):
+            if tf=="1h" and count!=160:raise RuntimeError("temporary HTTP 503")
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=broken)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertEqual(got["audit"]["status_code"],"HOURLY_RECHECK_API_ERROR")
+        self.assertIn("503",got["audit"]["detail_error"])
+
+    def test_gap_after_stop_skips_unnecessary_recheck(self):
+        late=self.at+timedelta(hours=65)
+        def stops(market,tf,to,count=100):
+            self.calls.append((tf,count))
+            rows=[dict(r) for r in self.base if r["t"]!=late]
+            for r in rows:
+                if r["t"]==self.at+timedelta(hours=2):r["l"]=90
+            return rows
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=stops,detailed=True)
+        self.assertEqual(got["status"],"RESOLVED")
+        self.assertTrue(got["stop"])
+        self.assertEqual(got["audit"]["hourly_recheck_calls"],0)
+        self.assertEqual(got["audit"]["total_candle_api_calls"],1)
+
+    def test_missing_entry_may_be_recovered_only_by_true_hourly_bar(self):
+        def missing_first(market,tf,to,count=100):
+            if tf=="1h" and count==160:return [r for r in self.base if r["t"]!=self.at]
+            if tf=="1h":return [r for r in self.base if r["t"]==self.at]
+            return []
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=missing_first)
+        self.assertEqual(got["status"],"RESOLVED")
+        self.assertEqual(got["audit"]["recovered_one_hour_candles"],1)
+
+    def test_missing_entry_unreturned_remains_unknown(self):
+        def no_entry(market,tf,to,count=100):
+            return [r for r in self.base if r["t"]!=self.at]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=no_entry)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertEqual(got["reason_code"],"ENTRY_HOUR_MISSING")
+
+    def test_spotcheck_route_returns_five_without_account_keys(self):
+        fake={"status":"UNKNOWN","net_pct":None,"audit":{"status_code":"SOURCE_1H_NOT_RETURNED"}}
+        with patch.object(main,"swing_backtest_exit",return_value=fake) as b:
+            r=main.app.test_client().post("/api/replay-spotcheck",json={"fee":0.04})
+            self.assertEqual(r.status_code,200,r.get_json())
+            got=r.get_json()
+            self.assertEqual(len(got["items"]),5)
+            self.assertEqual(got["fee_each_pct"],.04)
+            self.assertEqual(b.call_count,5)
+            self.assertTrue(all(i["backtest"]["status"]=="UNKNOWN" for i in got["items"]))
 
 if __name__=="__main__":
     unittest.main()
