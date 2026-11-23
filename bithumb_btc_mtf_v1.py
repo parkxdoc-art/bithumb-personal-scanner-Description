@@ -1,4 +1,4 @@
-"""BITHUMB BTC MTF V1.4.5 | Read-only LIVE + historical snapshot research.
+"""BITHUMB BTC MTF V1.4.6 | Read-only LIVE + historical snapshot research.
 
 BTC: month/week/day/4h/1h/30m/15m/5m/3m/1m trends, all closed candles.
 Coin scan: 5m/15m/1h/4h/day, BUY/WATCH with audit reasons.
@@ -25,8 +25,9 @@ from btc_mtf_explain_v142 import build_explanation
 from btc_mtf_combo_v143 import evaluate_combined
 from btc_mtf_watch_v144 import classify_watch_tracks
 from btc_mtf_replay_v145 import HourlyReplayPath
+from btc_mtf_quality_v146 import snapshot_liquidity, investigate_missing_hour
 
-VERSION = "BTC MTF V1.4.5"
+VERSION = "BTC MTF V1.4.6"
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com"
 TIMEFRAMES = ("month", "week", "day", "4h", "1h", "30m", "15m", "5m", "3m", "1m")
@@ -509,7 +510,7 @@ def swing_signal(m,ctx,fee):
 def swing_backtest_exit(market, at, fee, getter=candles, detailed=False):
     """Simulate 120h only on verified Bithumb 1h candles.
 
-    V1.4.5 targeted recheck is triggered only when the replay actually
+    V1.4.6 targeted recheck is triggered only when the replay actually
     encounters a missing hour. Do NOT fill missing hours with prices from
     30m or carry-forward data. Existing exit-order and fee logic unchanged.
     """
@@ -577,7 +578,7 @@ def replay_spotcheck_api():
         if fee not in FEE_CHOICES:
             raise ValueError("편도 수수료는 0.04 또는 0.25만 지원")
         at = historical_time("2026-10-31 15:00:00")
-        cached = ttl_get(("replay-spotcheck-v145",fee))
+        cached = ttl_get(("replay-spotcheck-v146",fee))
         if cached is not None:
             return jsonify(cached)
         targets = (
@@ -587,15 +588,27 @@ def replay_spotcheck_api():
         )
         def one_target(pair):
             market, name = pair
-            return {"market": market, "name": name,
-                    "backtest": swing_backtest_exit(market,at,fee,detailed=True)}
+            bt = swing_backtest_exit(market,at,fee,detailed=True)
+            micro = None
+            stamp = bt.get("audit",{}).get("first_unresolved_or_recovered_hour_kst")
+            if bt.get("status") == "UNKNOWN" and bt.get("reason_code") in (
+                    "MISSING_HOURLY_BAR","ENTRY_HOUR_MISSING") and stamp:
+                try:
+                    gap = datetime.strptime(stamp,"%Y-%m-%d %H:%M").replace(tzinfo=KST)
+                    if at <= gap < at + timedelta(hours=121):
+                        # Only forensic investigation AFTER a past snapshot.
+                        # Never feed these 1m/5m prices into the exit engine.
+                        micro = investigate_missing_hour(market,gap,candles)
+                except (ValueError,TypeError):
+                    pass
+            return {"market":market,"name":name,"backtest":bt,"gap_micro":micro}
         with ThreadPoolExecutor(max_workers=2) as executor:
             items = list(executor.map(one_target, targets))
         payload = dict(ok=True,version=VERSION,
                        snapshot_kst=at.strftime("%Y-%m-%d %H:%M"),
                        fee_each_pct=fee,items=items,
                        note="과거 초기 WATCH 5종목의 가상 가격경로만 재조회. 실제 매매 아님, UNKNOWN은 손실/수익으로 변환하지 않음.")
-        ttl_put(("replay-spotcheck-v145",fee),payload,120)
+        ttl_put(("replay-spotcheck-v146",fee),payload,120)
         return jsonify(payload)
     except Exception as ex:
         return jsonify(ok=False,error=str(ex)[:200]), 400
@@ -663,9 +676,13 @@ def coin_api():
             m["macd_day"]=macd_views["day"]
             m["macd_day_chart"]=macd_views["day_chart"]
             explain=build_explanation(m,ctx,day,h4,h1,fee)
+            # Observation only. Uses the 24 hours of COMPLETED 1h bars
+            # before the snapshot, never the future 120h exit path.
+            liquidity=snapshot_liquidity(h1,at)
             signal=rebound.rebound_signal(m,ctx,fee)
             if signal is not None:
                 signal["explain"]=explain
+                signal["liquidity_audit"]=liquidity
             if signal is not None:
                 previous = signal["signal"]
                 gate = strict_swing_gate(m,ctx,day,h4)
@@ -684,7 +701,7 @@ def coin_api():
                 signal["explanation"].append(
                     "V1.3.3 원본 "+previous+" → V1.4.1 추세 "+signal["strict_signal"]
                     +" → V1.4.3 종합 "+combined["signal"]
-                    +" → V1.4.5 분리관찰 "+tracks["kind"]
+                    +" → V1.4.6 분리관찰 "+tracks["kind"]
                 )
                 signal["explanation"].append(
                     "초기관찰 기준 미충족: "+(
@@ -702,6 +719,13 @@ def coin_api():
                     signal["explanation"].append(
                         "종합 BUY 보류: "+", ".join(combined["missing_buy"])
                     )
+                signal["explanation"].append(
+                    "선행 유동성 관측 "+str(liquidity["checks_passed"])+"/4: "
+                    +liquidity["label"]+" · 24시간 완료 1시간봉 "
+                    +str(liquidity["hourly_bars_observed"])+"/24 · 관측 거래대금 "
+                    +str(round(liquidity["observed_turnover_24h_krw"]/100_000_000,2))
+                    +"억원 (매매 신호/기존 BUY 조건 영향 없음)"
+                )
                 signal["explanation"].append(
                     "MACD 4시간(12,26,9): " + macd_views["h4"]["state"]
                     + ", 이번 봉 교차 " + macd_views["h4"]["event"]
@@ -730,6 +754,7 @@ def coin_api():
                     evaluate_combined(None,strict_swing_gate(m,ctx,day,h4),explain,m,h4,is_contiguous),
                     explain,m,ctx),
                 "legacy_signal": signal["legacy_signal"] if signal else "NONE",
+                "liquidity_audit": liquidity,
             }
         if signal is None:
             return jsonify(ok=True, market=market, signal=None, diagnostic=diagnostic)
@@ -742,7 +767,7 @@ def coin_api():
 
 HTML = r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BITHUMB · BTC MTF V1.4.5 · 과거 캔들 재조회 연구</title>
+<title>BITHUMB · BTC MTF V1.4.6 · 과거 캔들 재조회 연구</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1120;--panel:#161f33;--panel2:#202c46;--ink:#edf4ff;--muted:#93a4bd;--line:#34445f;--cyan:#45cfce;--green:#39d7a1;--yellow:#ffc56d;--red:#ff7d85}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,'Noto Sans KR',sans-serif;color:var(--ink);line-height:1.5}main{max-width:1100px;margin:auto;padding:18px 16px 48px}h1{font-size:1.4rem;line-height:1.3;margin:0}h2{font-size:1.08rem;margin:0 0 11px}small,.muted{color:var(--muted)}header{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:5px 0 19px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:1px}.tag{border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);white-space:nowrap;font-size:11px}.surface{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;margin-bottom:14px}.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:15px}.tabs button{font-size:15px;font-weight:750;padding:13px}.tabs button.on{background:#145c64;border-color:var(--cyan);color:white}button,select,input{border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--ink);font:inherit;padding:10px;min-width:0}button{cursor:pointer}button:disabled{opacity:.42;cursor:default}button.primary{background:var(--cyan);border-color:var(--cyan);color:#09252a;font-weight:800}button.secondary{background:transparent}.toolbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px}.field label{color:var(--muted);font-size:12px;font-weight:650}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.timebox{display:flex;gap:8px}.timebox input{flex:1;min-width:0}.action{margin-top:14px}.action button{padding:11px 20px}.help{font-size:12px;color:var(--muted);margin-top:9px}.btc-agg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.agg{background:#101d32;border:1px solid var(--line);padding:12px;border-radius:12px}.agg strong{display:block;font-size:1.16rem;margin-top:4px}.tf-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.tf{background:#101b2e;border:1px solid var(--line);border-radius:12px;padding:10px}.tf .name{font-size:12px;color:var(--muted)}.tf .status{font-size:16px;font-weight:750;margin-top:2px}.up{color:var(--green)}.down{color:var(--red)}.side{color:var(--yellow)}.unknown{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{padding:13px;background:#101b2e;border:1px solid var(--line);border-radius:12px}.metric strong{font-size:22px;display:block}.metric span{font-size:12px;color:var(--muted)}.bar{height:6px;background:#27354a;overflow:hidden;border-radius:8px;margin-top:12px}.bar i{display:block;background:var(--cyan);height:100%;width:0%;transition:width .2s}.result{border:1px solid var(--line);background:#101c30;border-radius:13px;margin-top:9px;padding:12px}.result summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.score-chip{border:1px solid #4c7087;background:#17374a;color:#c4f5f0;border-radius:7px;padding:3px 6px;font-weight:850;font-size:12px;white-space:nowrap}.entry-price{border:1px solid #466380;background:#243553;border-radius:8px;padding:4px 9px;font-size:13px;font-weight:750;color:#ebf6ff;white-space:nowrap}.entry-price.watch-entry{background:#352f24;color:#ffe8b3;border-color:#7b623c}.entry-note{border:1px solid #364b67;background:#172943;padding:10px;border-radius:9px;margin:8px 0}.entry-metrics{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.entry-metrics span{border:1px solid #364b67;padding:6px 9px;border-radius:8px;font-size:12px}.result summary::-webkit-details-marker{display:none}.result summary b{font-size:16px}.badge{font-size:11px;font-weight:900;padding:4px 8px;border-radius:7px}.badge.buy{background:#115e4c;color:#9ff9d5}.badge.watch{background:#59421e;color:#ffdca5}.badge.research{background:#303d53;color:#bdd0e8}.push{margin-left:auto;color:var(--muted);font-size:12px}.reason{font-size:13px;color:#cfdaeb;margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}.reason p{margin:5px 0}.pnl{font-size:13px;margin-top:7px}.empty{font-size:13px;color:var(--muted);padding:15px 0}.notice{font-size:12px;color:#b6c7df;margin-top:12px}.foot{margin-top:26px;color:var(--muted);font-size:12px}#error{color:var(--red);font-size:13px;margin-top:9px;white-space:pre-wrap}#scanstatus{color:var(--muted);font-size:13px}.insight-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}
@@ -759,7 +784,7 @@ HTML = r'''<!doctype html>
 @media(max-width:760px){main{padding:14px 11px 30px}header{align-items:flex-start}.toolbar{grid-template-columns:1fr 1fr}.tf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.surface{padding:13px}.btc-agg{grid-template-columns:1fr 1fr}}
 @media(max-width:355px){.toolbar{grid-template-columns:1fr 1fr}.row{gap:6px}.action button{flex:1}}
 </style></head><body><main>
-<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.4.5 · 초기/추세 WATCH + 과거 캔들 재검증</small></div><span class="tag">KRW ONLY</span></header>
+<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.4.6 · 초기/추세 WATCH + 과거 캔들 재검증</small></div><span class="tag">KRW ONLY</span></header>
 <div class="tabs"><button id="live-tab" class="on" type="button">● 실시간 검색</button><button id="backtest-tab" type="button">◷ 과거 백테스트</button></div>
 <section class="surface"><h2>검색 설정</h2><div class="tabs"><button id="scalp-tab" type="button">⚡ 단타</button><button id="swing-tab" class="on" type="button">🌱 스윙 · 점수제</button></div><div class="toolbar">
 <div class="field"><label for="tf">코인 검색 시간봉</label><select id="tf"><option value="5m">5분봉</option><option value="15m">15분봉</option><option value="1h">1시간봉</option><option value="4h" selected>4시간봉</option><option value="day">일봉</option></select></div>
@@ -768,7 +793,7 @@ HTML = r'''<!doctype html>
 <div class="field"><label for="scope">검색 범위</label><select id="scope"><option value="20">거래대금 상위 20</option><option value="40" selected>거래대금 상위 40</option><option value="80">거래대금 상위 80</option><option value="all">전체 KRW</option></select></div>
 <div class="field" id="watch-filter-field"><label for="watch-filter">WATCH 표시 기준 (스윙)</label><select id="watch-filter"><option value="strict" selected>BUY + 초기/추세 WATCH (기본)</option><option value="early">초기 반등 WATCH만</option><option value="trend">추세 확인 WATCH만</option><option value="nine">연구 비교 · 원본 9점+</option><option value="ten">연구 비교 · 원본 10점</option><option value="all">모든 원본 후보(연구 보류 포함)</option></select></div><div class="field"><label for="focus">관찰 코인 지정 (선택)</label><input id="focus" placeholder="예: PIEVERSE" maxlength="18"></div><div class="field" id="backtest-date-field" style="display:none"><label for="at">과거 검사 시각 (한국시간)</label><input type="datetime-local" id="at" step="300"></div><div class="field" id="backtest-days-field" style="display:none"><label for="days">자체 백테스트</label><select id="days"><option value="1">1일 · 1회</option><option value="3">3일 · 매일 같은 시각</option><option value="7">7일 · 매일 같은 시각</option></select></div>
 </div><div class="action row"><button class="primary" id="start" type="button">검색 시작</button><button class="secondary" id="csv" disabled type="button">후보 전체 CSV</button><button class="secondary" id="issuecsv" disabled type="button">문제 내역 CSV</button><button class="secondary" id="focuscsv" disabled type="button">관찰 코인 MACD CSV</button><small id="scanstatus">검사 전</small></div><div id="error"></div>
-<div class="help" id="strategy-help">V1.4.5: 초기/추세 WATCH 구분 및 기존 엄격 BUY 조건 그대로. 과거 120시간 청산 경로에서 1시간봉 누락 시 해당 시각 재조회, 30분봉은 진단용(체결가격 대체 금지). 10월 31일 WATCH 5종목은 상단 재검증 버튼으로 전체 스캔 없이 확인 가능. 편도 0.04% 권장. UNKNOWN은 데이터 없으면 유지.</div><div class="help" id="live-help">설정한 24시간 거래대금 하한을 넘는 KRW 코인만 검색해. 제한 없음을 선택하면 거래가 거의 없는 코인까지 포함되어 자료 부족이 늘 수 있어. 마감봉만 사용하며 자동 주문은 없어.</div>
+<div class="help" id="strategy-help">V1.4.6: 초기/추세 WATCH 구분 및 기존 엄격 BUY 조건 그대로. 과거 120시간 청산 경로에서 1시간봉 누락 시 해당 시각 재조회, 30분봉은 진단용(체결가격 대체 금지). 10월 31일 WATCH 5종목은 상단 재검증 버튼으로 전체 스캔 없이 확인 가능. 편도 0.04% 권장. UNKNOWN은 데이터 없으면 유지.</div><div class="help" id="live-help">설정한 24시간 거래대금 하한을 넘는 KRW 코인만 검색해. 제한 없음을 선택하면 거래가 거의 없는 코인까지 포함되어 자료 부족이 늘 수 있어. 마감봉만 사용하며 자동 주문은 없어.</div>
 <div class="help hidden" id="backtest-help">선택 시각의 과거 <b>완료봉만 사용</b>해 신호를 판정하고 단타는 240분/스윙은 120시간을 가상 청산해. 3·7일은 지정한 시각에 하루 1번씩 반복. 현재 상장 목록과 현재 24시간 거래대금 순위·하한을 쓰므로 생존·미래정보 편향이 있어. 미확정 봉은 따로 표시해.</div>
 </section>
 <section class="surface" id="spotcheck-panel"><h2>10월 31일 초기 WATCH 5종목 · 데이터 재검증 <small>전체 스캔 불필요</small></h2><div class="notice">2026-10-31 15:00 KST의 블루핀·더블제로·무비블록·넥스페이스·저트라를 다시 조회해. 기존 진입 조건은 변경하지 않고, 최초 누락된 1시간봉만 재요청해. 30분봉은 원인 진단만 하며 손익 계산에 사용하지 않아.</div><div class="action row"><button id="spotcheck-btn" class="secondary" type="button">5종목 청산 경로 재검증</button><button id="spotcheck-csv" class="secondary" disabled type="button">5종목 진단 CSV</button><small id="spotcheck-status">검증 전</small></div><div id="spotcheck-results" class="empty">버튼을 누르면 편도 수수료 설정(기본 0.04%)으로 5종목의 누락 시각을 확인해.</div></section>
@@ -783,7 +808,7 @@ let mode='live',strategy='swing',busy=false,results=[],issueCases=[],focusDiagno
 const dt=(d)=>{const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':00'};
 let d=new Date();d.setDate(d.getDate()-1);d.setHours(15,0,0,0);$('at').value=dt(d);
 function modeSet(next){if(busy||spotcheckBusy)return;mode=next;$('live-tab').classList.toggle('on',mode==='live');$('backtest-tab').classList.toggle('on',mode==='backtest');$('backtest-date-field').style.display=mode==='backtest'?'flex':'none';$('backtest-days-field').style.display=mode==='backtest'?'flex':'none';$('live-help').classList.toggle('hidden',mode!=='live');$('backtest-help').classList.toggle('hidden',mode!=='backtest');reset()}
-function strategySet(next){if(busy||spotcheckBusy)return;strategy=next;$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙 V1.4.5: 초기/추세 WATCH 별도 표시. 기존 BUY 기준 불변. 120시간 가상 경로 1시간봉 누락 시 정확한 재조회·추적. 화면 상단 5종목 재검증 버튼 및 진단 CSV 제공.':'단타: 빠른 돌파·BTC 상대강도 · +1% 70% / +10% 30% · -2% 손절 / 240분.';$('watch-filter-field').style.display=next==='swing'?'flex':'none';$('comparison-panel').classList.toggle('hidden',next!=='swing');$('focus-panel').classList.toggle('hidden',next!=='swing');$('spotcheck-panel').classList.toggle('hidden',next!=='swing');if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
+function strategySet(next){if(busy||spotcheckBusy)return;strategy=next;$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙 V1.4.6: 초기/추세 WATCH 별도 표시. 기존 BUY 기준 불변. 120시간 가상 경로 1시간봉 누락 시 정확한 재조회·추적. 화면 상단 5종목 재검증 버튼 및 진단 CSV 제공.':'단타: 빠른 돌파·BTC 상대강도 · +1% 70% / +10% 30% · -2% 손절 / 240분.';$('watch-filter-field').style.display=next==='swing'?'flex':'none';$('comparison-panel').classList.toggle('hidden',next!=='swing');$('focus-panel').classList.toggle('hidden',next!=='swing');$('spotcheck-panel').classList.toggle('hidden',next!=='swing');if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
 $('scalp-tab').onclick=()=>strategySet('scalp');$('swing-tab').onclick=()=>strategySet('swing');
 $('live-tab').onclick=()=>modeSet('live');$('backtest-tab').onclick=()=>modeSet('backtest');
 function reset(){results=[];issueCases=[];focusDiagnostics=[];spotcheckRows=[];$('spotcheck-csv').disabled=true;$('spotcheck-status').textContent='검증 전';$('spotcheck-results').textContent='10월 31일 WATCH 5종목을 전용 버튼으로 재검증할 수 있어.';completed=problems=0;$('focuscsv').disabled=true;$('focus-results').textContent='관찰 코인을 지정하고 검사해 줘.';$('results').innerHTML='검사 시작을 누르면 BUY·WATCH 후보만 나타나.';$('csv').disabled=true;$('issuecsv').disabled=true;$('issue-summary').textContent='';$('watch-summary').textContent='';$('comparison-results').textContent='검사 전';['done','noldbuy','nbuy','nwatch','nearly','ntrend','nerr'].forEach(k=>$(k).textContent='0');$('long').textContent='검사 전';$('short').textContent='검사 전';$('tf-grid').innerHTML='';$('progress').style.width='0%';$('scanstatus').textContent='검사 전';$('btinfo').textContent='';$('bt-summary').textContent='';$('watch-bt-summary').textContent='';$('error').textContent='';$('btcts').textContent=''}
@@ -820,11 +845,11 @@ $('spotcheck-csv').onclick=()=>{
  const head=['version','snapshot_kst','fee_each_pct','market','name','status','net_pct','reason','reason_code','tp1','tp2','stop','minutes','audit_status','initial_missing_hours','sample_missing_kst','first_examined_missing_kst','hourly_recheck_calls','half_hour_diagnostic_calls','total_candle_api_calls','recovered_one_hour_candles','lower_tf_actual_bars_in_missing_hour','initial_api_error','detail_error','source_limitations'];
  const records=[head.map(q).join(',')];
  for(const x of spotcheckRows){const b=x.backtest||{},a=b.audit||{};
-  records.push(['BTC-MTF-V1.4.5','2026-10-31 15:00',spotcheckFee,x.market,x.name,b.status,b.net_pct??'',b.reason||'',b.reason_code||'',b.tp1,b.tp2,b.stop,b.minutes??'',a.status_code||'',a.initial_missing_hours??'',(a.initial_missing_samples_kst||[]).join(' / '),a.first_unresolved_or_recovered_hour_kst||'',a.hourly_recheck_calls??'',a.half_hour_diagnostic_calls??'',a.total_candle_api_calls??'',a.recovered_one_hour_candles??'',a.lower_timeframe_bars_in_missing_hour??'',a.initial_api_error||'',a.detail_error||'',a.source_limitations||''].map(q).join(','));
+  records.push(['BTC-MTF-V1.4.6','2026-10-31 15:00',spotcheckFee,x.market,x.name,b.status,b.net_pct??'',b.reason||'',b.reason_code||'',b.tp1,b.tp2,b.stop,b.minutes??'',a.status_code||'',a.initial_missing_hours??'',(a.initial_missing_samples_kst||[]).join(' / '),a.first_unresolved_or_recovered_hour_kst||'',a.hourly_recheck_calls??'',a.half_hour_diagnostic_calls??'',a.total_candle_api_calls??'',a.recovered_one_hour_candles??'',a.lower_timeframe_bars_in_missing_hour??'',a.initial_api_error||'',a.detail_error||'',a.source_limitations||''].map(q).join(','));
  }
  const blob=new Blob(['\ufeff'+records.join('\n')],{type:'text/csv;charset=utf-8'});
  const url=URL.createObjectURL(blob),a=document.createElement('a');
- a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_5_SPOTCHECK_202610311500.csv';
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_6_SPOTCHECK_202610311500.csv';
  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 function btcDraw(ctx){$('long').textContent=ST[ctx.long]||'미확인';$('long').className=ctx.long;$('short').textContent=ST[ctx.short]||'미확인';$('short').className=ctx.short;$('btcts').textContent='· '+ctx.asof_kst+' KST';$('tf-grid').innerHTML=order.map(k=>{const x=ctx.tf[k]||{state:'unknown'},why=x.reason?' · '+x.reason:'';return `<div class="tf" title="${esc(why)}"><div class="name">BTC ${TF[k]}</div><div class="status ${x.state}">${ST[x.state]||'자료 부족'}</div></div>`}).join('')}
@@ -961,7 +986,7 @@ function renderResults(){
   return '<details class="result"><summary><span class="badge '+si.signal.toLowerCase()+'">'+si.signal+'</span><small>'+esc(si.stage||'')+'</small><span class="score-chip">'+(m.score_total===10?m.score+'/10점':'')+'</span><b>'+esc(x.name||x.market)+' <small>'+esc(x.market)+'</small></b><span class="entry-price '+(si.signal==='WATCH'?'watch-entry':'')+'">'+(si.signal==='BUY'?'진입 참고가 ':si.signal==='WATCH'?'WATCH 관찰가 ':'연구 참고가 ')+num(base)+'원</span><span class="push">'+esc(x.at||'')+' · 상대강도 '+(m.relative_pct>=0?'+':'')+Number(m.relative_pct).toFixed(2)+'%p · 상세 ▾</span></summary><div class="reason">'
    +'<div class="entry-note"><strong>'+(si.signal==='BUY'?'BUY 진입 참고가: ':si.signal==='WATCH'?'WATCH 관찰 기준가: ':'연구용 참고가: ')+num(base)+'원</strong> · '+(si.signal==='BUY'?'신호가 확인된 마지막 마감봉 종가. 실제 주문가는 다를 수 있어.':si.signal==='WATCH'?'BUY 조건 미충족. 관찰 참고 가격이며 매수를 뜻하지 않아.':'연구 기록만 보관. 종합 기준 불합격이며 실제 진입 추천이 아님.')+'</div>'
    +'<div class="entry-metrics"><span>1차 익절 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원</span><span>2차 익절 예상 '+num(base*(1+p.tp2_gross_pct/100))+'원</span><span>가상 손절 '+num(base*(1+p.stop_gross/100))+'원</span></div>'
-   +(si.legacy_signal==='BUY'&&si.signal!=='BUY'?'<p class="entry-note">기존 V1.3.3 BUY였지만 V1.4.5 종합 기준 미달 · 신규 BUY 아님</p>':'')+(si.signal==='RESEARCH'?'<p class="entry-note">연구 보류: BUY/WATCH 신호 아님, 원본 기록·탈락 사유만 보존.</p>':'')+(si.watch_kind==='EARLY_WATCH'?'<p class="entry-note">초기 반등 관찰용. 상위 추세 미확정 가능 · BUY 및 진입 신호 아님.</p>':'')+(si.watch_kind==='TREND_WATCH'?'<p class="entry-note">추세 확인 WATCH. BUY 진입 신호 아님.</p>':'')+(strategy==='swing'?explainCard(si.explain):'')+(strategy==='swing'&&m.macd_h4?macdCard(m.macd_h4,'4시간봉 MACD(12,26,9)'):'')+si.explanation.map(z=>'<p>• '+esc(z)+'</p>').join('')
+   +(si.legacy_signal==='BUY'&&si.signal!=='BUY'?'<p class="entry-note">기존 V1.3.3 BUY였지만 V1.4.6 종합 기준 미달 · 신규 BUY 아님</p>':'')+(si.signal==='RESEARCH'?'<p class="entry-note">연구 보류: BUY/WATCH 신호 아님, 원본 기록·탈락 사유만 보존.</p>':'')+(si.watch_kind==='EARLY_WATCH'?'<p class="entry-note">초기 반등 관찰용. 상위 추세 미확정 가능 · BUY 및 진입 신호 아님.</p>':'')+(si.watch_kind==='TREND_WATCH'?'<p class="entry-note">추세 확인 WATCH. BUY 진입 신호 아님.</p>':'')+(strategy==='swing'?explainCard(si.explain):'')+(strategy==='swing'&&m.macd_h4?macdCard(m.macd_h4,'4시간봉 MACD(12,26,9)'):'')+si.explanation.map(z=>'<p>• '+esc(z)+'</p>').join('')
    +'<p>가상 청산: 순익 +'+p.tp1_net+'% '+Math.round(p.tp1_fraction*100)+'%, +'+p.tp2_net+'% '+Math.round(p.tp2_fraction*100)+'% · 손절 '+p.stop_gross+'% · '+p.max_minutes/60+'시간</p>'
    +'<p>완료봉 참고가 '+num(base)+'원 · 1차 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원 · 2차 '+num(base*(1+p.tp2_gross_pct/100))+'원 · 가상 손절 '+num(base*(1+p.stop_gross/100))+'원'+(m.support?' · 구조 지지 '+num(m.support)+'원':'')+' (실제 체결가 아님)</p>'
    +'<p>수수료 편도 '+fee.toFixed(2)+'% · 완료봉 '+esc(m.closed_kst)+' KST</p>'+bttext+audittext+'</div></details>';
@@ -1019,22 +1044,22 @@ $('focuscsv').onclick=()=>{
  const lines=[cols.map(q).join(',')];
  for(const x of focusDiagnostics){const d=x.diagnostic||{};
   for(const key of ['h4','day','day_chart']){const v=d.macd?.[key]||{};
-   lines.push(['BTC-MTF-V1.4.5',x.market,x.name,x.at,d.closed_kst,d.close,d.score,d.rsi14,d.legacy_signal,d.strict_gate?.passed,key,v.params,v.state,v.event,v.last_event,v.last_event_kst,v.bars_since_cross,v.continuous,v.macd,v.signal,v.hist,v.prev_hist,d.explain?.scores?.structure??'',d.explain?.scores?.timing??'',d.explain?.scores?.trend??'',d.explain?.scores?.setup??'',d.explain?.scores?.entry??'',d.explain?.scores?.safety??'',d.explain?.sell_pressure_proxy?.red_candle_turnover_pct??'',d.explain?.plan?.trigger_ref??'',d.explain?.plan?.stop_ref??'',d.explain?.plan?.breakeven_ref??'',d.explain?.plan?.target1_ref??'',d.explain?.plan?.target2_ref??'',d.explain?.plan?.risk_pct??'',d.explain?.summary??'',(d.explain?.warnings||[]).join(' / '),JSON.stringify(d.explain?.factors||{}),d.explain?.sell_pressure_proxy?.note??'',d.combined_gate?.signal??'',d.combined_gate?.watch_ready??'',d.combined_gate?.buy_ready??'',(d.combined_gate?.missing_watch||[]).join(' / '),(d.combined_gate?.missing_buy||[]).join(' / '),JSON.stringify(d.combined_gate?.watch_checks||{}),d.combined_gate?.prior_3bar_breakout_level??'',d.combined_gate?.latest_completed_4h_breakout??'',d.watch_tracks?.kind??'',d.watch_tracks?.early_ready??'',d.watch_tracks?.trend_ready??'',(d.watch_tracks?.early_missing||[]).join(' / '),(d.watch_tracks?.trend_missing||[]).join(' / '),JSON.stringify(d.watch_tracks?.early_checks||{}),JSON.stringify(d.watch_tracks?.trend_checks||{}),(d.watch_tracks?.warnings||[]).join(' / '),d.watch_tracks?.old_combined_signal??''].map(q).join(','));
+   lines.push(['BTC-MTF-V1.4.6',x.market,x.name,x.at,d.closed_kst,d.close,d.score,d.rsi14,d.legacy_signal,d.strict_gate?.passed,key,v.params,v.state,v.event,v.last_event,v.last_event_kst,v.bars_since_cross,v.continuous,v.macd,v.signal,v.hist,v.prev_hist,d.explain?.scores?.structure??'',d.explain?.scores?.timing??'',d.explain?.scores?.trend??'',d.explain?.scores?.setup??'',d.explain?.scores?.entry??'',d.explain?.scores?.safety??'',d.explain?.sell_pressure_proxy?.red_candle_turnover_pct??'',d.explain?.plan?.trigger_ref??'',d.explain?.plan?.stop_ref??'',d.explain?.plan?.breakeven_ref??'',d.explain?.plan?.target1_ref??'',d.explain?.plan?.target2_ref??'',d.explain?.plan?.risk_pct??'',d.explain?.summary??'',(d.explain?.warnings||[]).join(' / '),JSON.stringify(d.explain?.factors||{}),d.explain?.sell_pressure_proxy?.note??'',d.combined_gate?.signal??'',d.combined_gate?.watch_ready??'',d.combined_gate?.buy_ready??'',(d.combined_gate?.missing_watch||[]).join(' / '),(d.combined_gate?.missing_buy||[]).join(' / '),JSON.stringify(d.combined_gate?.watch_checks||{}),d.combined_gate?.prior_3bar_breakout_level??'',d.combined_gate?.latest_completed_4h_breakout??'',d.watch_tracks?.kind??'',d.watch_tracks?.early_ready??'',d.watch_tracks?.trend_ready??'',(d.watch_tracks?.early_missing||[]).join(' / '),(d.watch_tracks?.trend_missing||[]).join(' / '),JSON.stringify(d.watch_tracks?.early_checks||{}),JSON.stringify(d.watch_tracks?.trend_checks||{}),(d.watch_tracks?.warnings||[]).join(' / '),d.watch_tracks?.old_combined_signal??''].map(q).join(','));
   }
  }
  const url=URL.createObjectURL(new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}));
- const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_5_FOCUS_MACD_'+String(focusDiagnostics[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+ const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_6_FOCUS_MACD_'+String(focusDiagnostics[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 $('issuecsv').onclick=()=>{
  if(!issueCases.length||!lastCfg)return;
  const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
  const rows=[['version','strategy','mode','snapshot_kst','tf','fee_each_pct','min_turnover_24h_krw','market_turnover_24h_krw','market','name','issue_type','issue_reason']];
  for(const x of issueCases){
-  rows.push(['BTC-MTF-V1.4.5',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,classifyIssue(x.reason),x.reason]);
+  rows.push(['BTC-MTF-V1.4.6',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,classifyIssue(x.reason),x.reason]);
  }
  const csv=rows.map(row=>row.map(quote).join(',')).join('\n');
  const url=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));
- const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_5_ISSUES_'+String(issueCases[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+ const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_6_ISSUES_'+String(issueCases[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 $('csv').onclick=()=>{
  if(!lastCfg)return;
@@ -1043,10 +1068,10 @@ $('csv').onclick=()=>{
  const shown=new Set(visibleResults());
  for(const x of results){
   const si=x.signal,m=si.metrics,t=si.backtest||{},p=si.plan;
-  lines.push(['BTC-MTF-V1.4.5',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':si.signal==='WATCH'?'WATCH 관찰 기준가':'연구 참고가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.data_gap_recent??'',m.data_status??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??'',$('watch-filter').value,shown.has(x),si.legacy_signal??'',si.strict_signal??'',si.strict_gate?.passed??'',(si.strict_gate?.missing||[]).join(' / '),JSON.stringify(si.strict_gate?.checks||{}),si.strict_gate?.h4_ma20??'',si.strict_gate?.h4_ma20_prev??'',m.macd_h4?.state??'',m.macd_h4?.event??'',m.macd_h4?.last_event??'',m.macd_h4?.last_event_kst??'',m.macd_h4?.macd??'',m.macd_h4?.signal??'',m.macd_h4?.prev_hist??'',m.macd_day?.state??'',m.macd_day?.event??'',m.macd_day?.macd??'',m.macd_day?.signal??'',m.macd_day_chart?.state??'',m.macd_day_chart?.event??'',m.macd_day_chart?.macd??'',m.macd_day_chart?.signal??'',si.explain?.version??'',si.explain?.scores?.structure??'',si.explain?.scores?.timing??'',si.explain?.scores?.trend??'',si.explain?.scores?.setup??'',si.explain?.scores?.entry??'',si.explain?.scores?.safety??'',si.explain?.sell_pressure_proxy?.red_candle_turnover_pct??'',si.explain?.context?.last_24h_closed_turnover_krw??'',si.explain?.context?.h4_rvol_turnover??'',si.explain?.context?.h4_atr_pct??'',si.explain?.context?.h4_ma7_distance_pct??'',si.explain?.summary??'',(si.explain?.warnings||[]).join(' / '),si.explain?.plan?.trigger_ref??'',si.explain?.plan?.stop_ref??'',si.explain?.plan?.breakeven_ref??'',si.explain?.plan?.target1_ref??'',si.explain?.plan?.target2_ref??'',si.explain?.plan?.target1_rr??'',si.explain?.plan?.target2_rr??'',si.explain?.plan?.risk_pct??'',si.explain?.plan?.requires_future_4h_turnover_ratio??'',si.explain?.plan?.requires_next_completed_4h_body_close_above_trigger??'',si.explain?.plan?.plan_valid??'',JSON.stringify(si.explain?.factors||{}),si.explain?.snapshot_notice??'',si.explain?.sell_pressure_proxy?.note??'',si.combined_gate?.rule??'',si.signal,si.combined_gate?.watch_ready??'',si.combined_gate?.buy_ready??'',(si.combined_gate?.missing_watch||[]).join(' / '),(si.combined_gate?.missing_buy||[]).join(' / '),JSON.stringify(si.combined_gate?.watch_checks||{}),JSON.stringify(si.combined_gate?.buy_checks||{}),si.combined_gate?.prior_3bar_breakout_level??'',si.combined_gate?.latest_completed_4h_breakout??'',si.combined_gate?.red_candle_turnover_pct??'',si.v143_signal??'',si.watch_kind??'',si.watch_tracks?.early_ready??'',si.watch_tracks?.trend_ready??'',(si.watch_tracks?.early_missing||[]).join(' / '),(si.watch_tracks?.trend_missing||[]).join(' / '),JSON.stringify(si.watch_tracks?.early_checks||{}),JSON.stringify(si.watch_tracks?.trend_checks||{}),(si.watch_tracks?.warnings||[]).join(' / '),t.audit?.status_code??'',t.audit?.initial_missing_hours??'',(t.audit?.initial_missing_samples_kst||[]).join(' / '),t.audit?.first_unresolved_or_recovered_hour_kst??'',t.audit?.hourly_recheck_calls??'',t.audit?.half_hour_diagnostic_calls??'',t.audit?.recovered_one_hour_candles??'',t.audit?.lower_timeframe_bars_in_missing_hour??'',t.audit?.total_candle_api_calls??'',t.audit?.initial_api_error??'',t.audit?.detail_error??'',t.reason_code??''].map(quote).join(','));
+  lines.push(['BTC-MTF-V1.4.6',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':si.signal==='WATCH'?'WATCH 관찰 기준가':'연구 참고가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.data_gap_recent??'',m.data_status??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??'',$('watch-filter').value,shown.has(x),si.legacy_signal??'',si.strict_signal??'',si.strict_gate?.passed??'',(si.strict_gate?.missing||[]).join(' / '),JSON.stringify(si.strict_gate?.checks||{}),si.strict_gate?.h4_ma20??'',si.strict_gate?.h4_ma20_prev??'',m.macd_h4?.state??'',m.macd_h4?.event??'',m.macd_h4?.last_event??'',m.macd_h4?.last_event_kst??'',m.macd_h4?.macd??'',m.macd_h4?.signal??'',m.macd_h4?.prev_hist??'',m.macd_day?.state??'',m.macd_day?.event??'',m.macd_day?.macd??'',m.macd_day?.signal??'',m.macd_day_chart?.state??'',m.macd_day_chart?.event??'',m.macd_day_chart?.macd??'',m.macd_day_chart?.signal??'',si.explain?.version??'',si.explain?.scores?.structure??'',si.explain?.scores?.timing??'',si.explain?.scores?.trend??'',si.explain?.scores?.setup??'',si.explain?.scores?.entry??'',si.explain?.scores?.safety??'',si.explain?.sell_pressure_proxy?.red_candle_turnover_pct??'',si.explain?.context?.last_24h_closed_turnover_krw??'',si.explain?.context?.h4_rvol_turnover??'',si.explain?.context?.h4_atr_pct??'',si.explain?.context?.h4_ma7_distance_pct??'',si.explain?.summary??'',(si.explain?.warnings||[]).join(' / '),si.explain?.plan?.trigger_ref??'',si.explain?.plan?.stop_ref??'',si.explain?.plan?.breakeven_ref??'',si.explain?.plan?.target1_ref??'',si.explain?.plan?.target2_ref??'',si.explain?.plan?.target1_rr??'',si.explain?.plan?.target2_rr??'',si.explain?.plan?.risk_pct??'',si.explain?.plan?.requires_future_4h_turnover_ratio??'',si.explain?.plan?.requires_next_completed_4h_body_close_above_trigger??'',si.explain?.plan?.plan_valid??'',JSON.stringify(si.explain?.factors||{}),si.explain?.snapshot_notice??'',si.explain?.sell_pressure_proxy?.note??'',si.combined_gate?.rule??'',si.signal,si.combined_gate?.watch_ready??'',si.combined_gate?.buy_ready??'',(si.combined_gate?.missing_watch||[]).join(' / '),(si.combined_gate?.missing_buy||[]).join(' / '),JSON.stringify(si.combined_gate?.watch_checks||{}),JSON.stringify(si.combined_gate?.buy_checks||{}),si.combined_gate?.prior_3bar_breakout_level??'',si.combined_gate?.latest_completed_4h_breakout??'',si.combined_gate?.red_candle_turnover_pct??'',si.v143_signal??'',si.watch_kind??'',si.watch_tracks?.early_ready??'',si.watch_tracks?.trend_ready??'',(si.watch_tracks?.early_missing||[]).join(' / '),(si.watch_tracks?.trend_missing||[]).join(' / '),JSON.stringify(si.watch_tracks?.early_checks||{}),JSON.stringify(si.watch_tracks?.trend_checks||{}),(si.watch_tracks?.warnings||[]).join(' / '),t.audit?.status_code??'',t.audit?.initial_missing_hours??'',(t.audit?.initial_missing_samples_kst||[]).join(' / '),t.audit?.first_unresolved_or_recovered_hour_kst??'',t.audit?.hourly_recheck_calls??'',t.audit?.half_hour_diagnostic_calls??'',t.audit?.recovered_one_hour_candles??'',t.audit?.lower_timeframe_bars_in_missing_hour??'',t.audit?.total_candle_api_calls??'',t.audit?.initial_api_error??'',t.audit?.detail_error??'',t.reason_code??''].map(quote).join(','));
  }
  const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
- a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_5_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'_'+String(results[0]?.at||lastCfg.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_6_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'_'+String(results[0]?.at||lastCfg.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 };
 
 })();
