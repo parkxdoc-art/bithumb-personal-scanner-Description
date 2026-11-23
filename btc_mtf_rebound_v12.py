@@ -53,8 +53,18 @@ def ichimoku(rows):
     return tenkan,kijun,prev_tenkan,max(span_a,span_b)
 
 def bottom_rebound_metrics(day,h4,h1,btc4,at,baseline,contiguous,bar_end):
-    if not (contiguous(day,'day',24) and contiguous(h4,'4h',80) and contiguous(h1,'1h',24)):
-        return None,'반등 지표 연속 마감봉 부족: 일24 / 4시간80 / 1시간24 필요'
+    # Maintenance or temporary no-trade intervals must not invalidate weeks of
+    # otherwise real candles. Keep minimum sample sizes and bounded coverage.
+    # Never invent missing OHLC values or call an irregular bar "continuous".
+    if not (len(day)>=24 and len(h4)>=80 and len(h1)>=24):
+        return None,'반등 지표 실제 캔들 수 부족: 일24 / 4시간80 / 1시간24 필요'
+    if (day[-1]['t']-day[-24]['t']>timedelta(days=28)
+            or h4[-1]['t']-h4[-80]['t']>timedelta(hours=4*89)
+            or h1[-1]['t']-h1[-24]['t']>timedelta(hours=34)):
+        return None,'반등 지표 관측 간격 과다: 일/4시간/1시간 실거래 캔들 밀도 부족'
+    gap_h1 = not contiguous(h1,'1h',6)
+    gap_h4 = not contiguous(h4,'4h',3)
+    recent_gap = gap_h1 or gap_h4
     if at-bar_end(h4[-1]['t'],'4h')>timedelta(hours=8):
         return None,'4시간 최신 마감봉이 오래됨'
     if at-bar_end(h1[-1]['t'],'1h')>timedelta(hours=3):
@@ -106,6 +116,10 @@ def bottom_rebound_metrics(day,h4,h1,btc4,at,baseline,contiguous,bar_end):
         'rise24_pct':round((f[-1]/f[-7]-1)*100,3),
         'structure_risk_pct':round((cur/support-1)*100,3),'support':round(support,8),
         'checks':checks,'score':sum(checks.values()),
+        'data_gap_recent':recent_gap,
+        'data_gap_1h':gap_h1,
+        'data_gap_4h':gap_h4,
+        'data_status':'점검 후 최근 마감봉 불연속: BUY 보류' if recent_gap else '정상',
         'closed_kst':bar_end(h4[-1]['t'],'4h').strftime('%Y-%m-%d %H:%M'),
         'day_rise_pct':round((d[-1]/d[-2]-1)*100,3),
     })
