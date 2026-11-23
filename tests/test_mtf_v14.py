@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta
 from bithumb_btc_mtf_v1 import KST, strict_swing_gate, swing_backtest_exit, tf_end, is_contiguous
 from btc_mtf_macd_v141 import analyze_macd, all_macd_views
+from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
 
 def make_bars(start,n,delta):
     return [{"t":start+i*delta,"o":100+i,"h":101+i,"l":99+i,
