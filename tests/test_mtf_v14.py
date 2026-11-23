@@ -803,5 +803,106 @@ class ExpandedHistoricalUniverseV149Test(unittest.TestCase):
         self.assertNotIn("historicalLimit",source)
         self.assertNotIn("history-breadth",source)
 
+
+class Chart360MiniIsolatedResearchTest(unittest.TestCase):
+    def setUp(self):
+        from chart360_mini_lab import KST as C_KST
+        self.C_KST=C_KST
+        self.at=datetime(2026,11,23,20,0,tzinfo=C_KST)
+
+    def minute(self,t,o=100,h=101,l=99,c=100,v=2_000_000):
+        return {"t":t,"o":o,"h":h,"l":l,"c":c,"v":v}
+
+    def test_hourly_structure_requires_lower_high_and_lower_low(self):
+        from chart360_mini_lab import _h4_bearish
+        h4=[]
+        for i in range(12):
+            t=self.at-timedelta(hours=4*(12-i))
+            high=115 if i<6 else 105
+            low=95 if i<6 else 90
+            h4.append(self.minute(t,h=high,l=low))
+        self.assertEqual(_h4_bearish(h4,self.at),(True,True))
+        self.assertEqual(_h4_bearish(h4[:4],self.at),None)
+
+    def test_m15_choch_requires_closed_bullish_break_and_prior_lower_low(self):
+        from chart360_mini_lab import _m15_chochs
+        start=self.at-timedelta(minutes=17*15)
+        rows=[]
+        for i in range(17):
+            t=start+timedelta(minutes=15*i)
+            if i<8:r=self.minute(t,h=120,l=95,c=100)
+            elif i<16:r=self.minute(t,h=102,l=85,c=98)
+            else:r=self.minute(t,o=100,h=105,l=99,c=104)
+            rows.append(r)
+        event=_m15_chochs(rows)
+        self.assertEqual(len(event),1)
+        self.assertEqual(event[0]["level"],102)
+        self.assertEqual(event[0]["end"],self.at)
+
+    def test_stop_first_conservative_replay(self):
+        from chart360_mini_lab import _simulate
+        rows=[self.minute(self.at,h=104,l=96,c=103)]
+        out=_simulate(rows,0,100,98,.04)
+        self.assertEqual(out["status"],"RESOLVED")
+        self.assertEqual(out["exit_reason"],"STOP")
+        self.assertLess(out["net_pct"],0)
+
+    def test_next_minute_gap_must_stay_unknown(self):
+        from chart360_mini_lab import _simulate
+        rows=[self.minute(self.at,h=100,l=99,c=100),
+              self.minute(self.at+timedelta(minutes=2),h=105,l=99,c=104)]
+        out=_simulate(rows,0,100,98,.04,max_hold=2)
+        self.assertEqual(out["status"],"UNKNOWN")
+        self.assertEqual(out["exit_reason"],"MISSING_1M_BAR")
+        self.assertIsNone(out["net_pct"])
+
+    def test_open_replay_without_m15_structure_must_not_invent_trades(self):
+        from chart360_mini_lab import replay
+        bars=[self.minute(self.at+timedelta(minutes=i)) for i in range(80)]
+        out=replay("KRW-XRP",bars,[],[],fee_each=.04)
+        self.assertEqual(out["summary"]["signals"],0)
+        self.assertIsNone(out["summary"]["mean_net_pct"])
+
+    def test_lab_route_mounted_and_original_v149_health_unchanged(self):
+        client=main.app.test_client()
+        page=client.get("/chart360")
+        self.assertEqual(page.status_code,200)
+        self.assertIn("CHART360 MINI V0.1",page.get_data(as_text=True))
+        self.assertEqual(client.get("/health").get_json()["version"],"BTC MTF V1.4.9")
+        invalid=client.post("/api/chart360",json={"markets":["KRW-XRP"],"hours":100})
+        self.assertEqual(invalid.status_code,400)
+        self.assertFalse(invalid.get_json()["ok"])
+
+    def test_unexpected_api_payload_rejected_and_not_fabricated(self):
+        from chart360_mini_lab import _minute_data
+        response=type("FakeResponse",(),{
+          "raise_for_status":lambda self:None,
+          "json":lambda self:{"bad":1},
+        })
+        with patch("chart360_mini_lab.requests.get",return_value=response()):
+            self.assertRaises(RuntimeError,_minute_data,"KRW-XRP",1,self.at,10)
+
+    def test_real_bithumb_public_data_probe_report_not_a_profit_claim(self):
+        """One-time integration evidence; data errors are reported explicitly.
+
+        This test prints a real Bithumb 1-minute 6-hour replay summary in
+        Render's build logs. It never asserts a win or requires network.
+        """
+        import json
+        from chart360_mini_lab import run_backtest
+        try:
+            result=run_backtest(markets=["KRW-XRP"],hours=6,fee_each=.04)
+            item=result["markets"][0]
+            audit=item.get("data_audit") or {}
+            print("CHART360_REAL_REPLAY "+json.dumps({
+                "asof":result["asof_kst"],"market":item["market"],
+                "error":item.get("error"),"bars_1m":audit.get("minutes_observed"),
+                "bars_15m":audit.get("m15_bars"),"bars_4h":audit.get("h4_bars"),
+                "stats":item.get("stats"),"total":result["total"],
+                "sample_trades":item.get("trades",[])[:3],
+            },ensure_ascii=False,default=str),flush=True)
+        except Exception as exc:
+            print("CHART360_REAL_REPLAY_UNAVAILABLE "+str(exc)[:200],flush=True)
+
 if __name__=="__main__":
     unittest.main()
