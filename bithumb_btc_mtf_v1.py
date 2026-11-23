@@ -767,7 +767,7 @@ function explainCard(d){
  if(d.status==='INSUFFICIENT')return '<div class="insight-wrap">근거 점수: 완료봉 이력 부족</div>';
  const names=[['structure','Structure · 구조'],['timing','Timing · 타이밍'],
  ['trend','Trend · 추세'],['setup','Setup · 셋업'],
- ['entry','Entry · 진입 준비'],['safety','Safety · 안전']];
+ ['entry','Entry · 진입 준비'],['safety','Safety · 안전(높을수록 안전)']];
  const fmt=x=>x===null||x===undefined||!Number.isFinite(Number(x))?'—':Number(x).toLocaleString('ko-KR',{maximumFractionDigits:8});
  const scores=names.map(([k,t])=>'<div class="insight-score"><strong>'+fmt(d.scores?.[k])+'</strong><span>'+esc(t)+'/100</span></div>').join('');
  const down=d.sell_pressure_proxy?.red_candle_turnover_pct;
@@ -780,19 +780,20 @@ function explainCard(d){
   ['2차 가상 목표 (3.0R)',p.target2_ref],['손절 거리',p.risk_pct==null?null:fmt(p.risk_pct)+'%']];
  const levelsHtml=levels.map(([label,v])=>'<div><b>'+esc(v==null?'미산정':fmt(v)==='—'?v:fmt(v))+(typeof v==='string'&&v.includes('%')?'':'')+'</b><small>'+esc(label)+'</small></div>').join('');
  const warnings=(d.warnings||[]).map(t=>'⚠ '+esc(t)).join(' · ');
- const ctx='완료봉 24시간 거래대금 합계 '+fmt(Number(c.last_24h_closed_turnover_krw||0)/100000000)+'억 원 · 4H 거래대금 배수 '+fmt(c.h4_rvol_turnover)+'배 · 4H RSI '+fmt(c.h4_rsi)+' · ATR '+fmt(c.h4_atr_pct)+'% · MA7 이격 '+fmt(c.h4_ma7_distance_pct)+'%';
+ const dayTurnover=c.last_24h_closed_turnover_krw==null?'연속봉 부족으로 미산정':fmt(c.last_24h_closed_turnover_krw/100000000)+'억 원';
+ const ctx='완료봉 24시간 거래대금 합계 '+dayTurnover+' · 4H 거래대금 배수 '+fmt(c.h4_rvol_turnover)+'배 · 4H RSI '+fmt(c.h4_rsi)+' · ATR '+fmt(c.h4_atr_pct)+'% · MA7 이격 '+fmt(c.h4_ma7_distance_pct)+'%';
  return '<section class="insight-wrap"><b>설명형 점수 · 4조건씩 / 100점 (연구용)</b>'
   +'<div class="insight-grid">'+scores+red+'</div>'
   +'<p class="entry-note">'+esc(d.summary||'진입 확정 전')+'</p>'
   +'<p class="notice">'+esc(ctx)+'</p>'
   +(warnings?'<p class="notice">'+warnings+'</p>':'')
-  +'<b>미래 완료봉 진입 검토 조건 · 확정 신호 아님</b>'
+  +'<b>별도 연구용 관찰 계획 (기존 120시간 백테스트 손절·목표와 다름)</b>'
   +'<p class="notice">다음 4시간봉 몸통이 돌파 관찰선 위에서 마감 + 같은 봉 거래대금 2.0배 이상이 확인돼야 재판정해. 현재 봉에서는 충족 여부를 알 수 없어.</p>'
   +'<div class="insight-plan">'+levelsHtml+'</div>'
   +'<p class="notice">'+esc(p.note||'')+'</p>'
   +(p.plan_valid?'':'<p class="notice">⚠ 손절 거리/봉 연속성 때문에 이 참고 계획은 부적합. 목표가는 표시하지 않아.</p>')
   +'<details><summary>점수별 통과/미통과 근거 펼치기</summary>'+reasons+'</details>'
-  +'<p class="notice">음봉 거래대금 비율은 실제 매도 체결강도가 아니야. 호가벽·체결강도 미수집. 실거래 체결·호가단위·슬리피지 미검증.</p></section>';
+  +'<p class="notice">음봉 거래대금 비율은 실제 매도 체결강도가 아니야. 호가벽·체결강도 미수집. 실거래 체결·호가단위·슬리피지 미검증. 점수는 확률 아님.</p></section>';
 }
 function macdCard(x,title){
  if(!x)return '<div class="result">'+esc(title)+' · 데이터 없음</div>';
