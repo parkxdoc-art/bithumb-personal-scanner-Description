@@ -417,6 +417,16 @@ class TargetedReplayRecoveryTest(unittest.TestCase):
             self.assertEqual(got["fee_each_pct"],.04)
             self.assertEqual(b.call_count,5)
             self.assertTrue(all(i["backtest"]["status"]=="UNKNOWN" for i in got["items"]))
+            get_result=main.app.test_client().get("/api/replay-spotcheck?fee=0.04")
+            self.assertEqual(get_result.status_code,200,get_result.get_json())
+            self.assertEqual(len(get_result.get_json()["items"]),5)
+            self.assertEqual(b.call_count,5)  # GET uses 2-minute cache
+
+
+    def test_spotcheck_rejects_unsupported_fee(self):
+        response=main.app.test_client().get("/api/replay-spotcheck?fee=1.0")
+        self.assertEqual(response.status_code,400)
+        self.assertFalse(response.get_json()["ok"])
 
 if __name__=="__main__":
     unittest.main()
