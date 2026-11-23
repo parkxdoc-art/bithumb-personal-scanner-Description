@@ -564,7 +564,7 @@ def swing_backtest_exit(market, at, fee, getter=candles, detailed=False):
     return done(reason="미확정 경로", reason_code="UNKNOWN_PATH")
 
 
-@app.post("/api/replay-spotcheck")
+@app.route("/api/replay-spotcheck",methods=["GET","POST"])
 def replay_spotcheck_api():
     """Read-only V1.4.4 five early-WATCH candles, 2026-10-31 15:00 KST.
 
@@ -572,11 +572,14 @@ def replay_spotcheck_api():
     reinterpret any missing candles as profit/loss.
     """
     try:
-        raw = request.get_json(silent=True) or {}
+        raw = (request.get_json(silent=True) or {}) if request.method=="POST" else request.args
         fee = float(raw.get("fee", 0.04))
         if fee not in FEE_CHOICES:
             raise ValueError("편도 수수료는 0.04 또는 0.25만 지원")
         at = historical_time("2026-10-31 15:00:00")
+        cached = ttl_get(("replay-spotcheck-v145",fee))
+        if cached is not None:
+            return jsonify(cached)
         targets = (
             ("KRW-BLUE","블루핀"), ("KRW-2Z","더블제로"),
             ("KRW-MBL","무비블록"), ("KRW-NXPC","넥스페이스"),
@@ -588,10 +591,12 @@ def replay_spotcheck_api():
                     "backtest": swing_backtest_exit(market,at,fee,detailed=True)}
         with ThreadPoolExecutor(max_workers=2) as executor:
             items = list(executor.map(one_target, targets))
-        return jsonify(ok=True,version=VERSION,
+        payload = dict(ok=True,version=VERSION,
                        snapshot_kst=at.strftime("%Y-%m-%d %H:%M"),
                        fee_each_pct=fee,items=items,
                        note="과거 초기 WATCH 5종목의 가상 가격경로만 재조회. 실제 매매 아님, UNKNOWN은 손실/수익으로 변환하지 않음.")
+        ttl_put(("replay-spotcheck-v145",fee),payload,120)
+        return jsonify(payload)
     except Exception as ex:
         return jsonify(ok=False,error=str(ex)[:200]), 400
 
