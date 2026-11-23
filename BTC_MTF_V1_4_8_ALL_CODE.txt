@@ -1,0 +1,3274 @@
+BTC MTF V1.4.8 COMPLETE BACKUP - SOURCE & 67 REGRESSION TESTS
+Main source: bithumb_btc_mtf_v1.py | GitHub branch: btc-mtf-v1-4
+Read-only research, no auto-trading. TXT is archival. Keep each file at its marked original path.
+
+
+========================================================================
+FILE: bithumb_btc_mtf_v1.py
+========================================================================
+"""BITHUMB BTC MTF V1.4.8 | Read-only LIVE + historical snapshot research.
+
+BTC: month/week/day/4h/1h/30m/15m/5m/3m/1m trends, all closed candles.
+Coin scan: 5m/15m/1h/4h/day, BUY/WATCH with audit reasons.
+Fees: 0.04% or 0.25% each side. No private endpoints or automatic orders.
+Backtest: one dated KST snapshot, next 240m of observed 5m OHLC; no lookahead.
+"""
+from __future__ import annotations
+
+import calendar
+import math
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import requests
+from flask import Flask, jsonify, request, Response
+import btc_mtf_rebound_v13 as rebound
+from btc_mtf_macd_v141 import all_macd_views
+from btc_mtf_explain_v142 import build_explanation
+from btc_mtf_combo_v143 import evaluate_combined
+from btc_mtf_watch_v144 import classify_watch_tracks
+from btc_mtf_replay_v145 import HourlyReplayPath
+from btc_mtf_quality_v146 import snapshot_liquidity, investigate_missing_hour
+from btc_mtf_study_v147 import compare_watch_cohorts
+
+VERSION = "BTC MTF V1.4.8"
+KST = ZoneInfo("Asia/Seoul")
+API = "https://api.bithumb.com"
+TIMEFRAMES = ("month", "week", "day", "4h", "1h", "30m", "15m", "5m", "3m", "1m")
+SCAN_TF = ("5m", "15m", "1h", "4h", "day")
+STRATEGIES = ("scalp", "swing")
+STABLES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USD1", "PYUSD", "USDE", "USDD", "RLUSD", "EURC", "EURI"}
+MARKET_RE = re.compile(r"^KRW-[A-Z0-9]+$")
+MIN_TURNOVER = 100_000_000  # UI default, selectable 50M/100M/500M/unlimited
+FEE_CHOICES = (0.04, 0.25)
+_CACHE = {}
+_LOCK = threading.Lock()
+app = Flask(__name__)
+
+
+def now_kst():
+    return datetime.now(KST)
+
+
+def ttl_get(key):
+    with _LOCK:
+        value = _CACHE.get(key)
+        return value[1] if value and value[0] > time.monotonic() else None
+
+
+def ttl_put(key, value, seconds):
+    with _LOCK:
+        if len(_CACHE) > 1600:
+            _CACHE.clear()
+        _CACHE[key] = (time.monotonic() + seconds, value)
+
+
+def api_get(path, params=None):
+    err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(API + path, params=params, timeout=(4, 13), headers={
+                "Accept": "application/json", "User-Agent": "bithumb-btc-mtf-personal-v1/1.0"
+            })
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"temporary HTTP {r.status_code}")
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list):
+                raise RuntimeError("API array expected")
+            return data
+        except Exception as ex:
+            err = ex
+            if attempt < 2:
+                time.sleep(.35 * (attempt + 1))
+    raise RuntimeError(f"Bithumb {path}: {str(err)[:95]}")
+
+
+def endpoint(tf):
+    if tf not in TIMEFRAMES:
+        raise ValueError("Unsupported timeframe")
+    return "/v1/candles/" + ({"month": "months", "week": "weeks", "day": "days"}.get(tf, "minutes/" + str({"4h": 240, "1h": 60, "30m": 30, "15m": 15, "5m": 5, "3m": 3, "1m": 1}.get(tf, 5))))
+
+
+def tf_end(start, tf):
+    if tf == "month":
+        m = start.month + 1
+        y = start.year + (m > 12)
+        m = (m - 1) % 12 + 1
+        return start.replace(year=y, month=m, day=min(start.day, calendar.monthrange(y, m)[1]))
+    if tf == "week":
+        return start + timedelta(days=7)
+    if tf == "day":
+        return start + timedelta(days=1)
+    return start + timedelta(minutes={"4h": 240, "1h": 60, "30m": 30, "15m": 15, "5m": 5, "3m": 3, "1m": 1}[tf])
+
+
+def candle_close_cutoff(clock):
+    """Treat a historical exact close as closed; keep 2s caution for LIVE.
+
+    A live snapshot is at most 15 minutes old (see request_cfg).
+    Older snapshots are completed historical observations, so a candle
+    that closes EXACTLY at clock must be retained, not discarded by
+    the 2-second live safety margin.
+    """
+    if clock >= now_kst() - timedelta(minutes=15):
+        return clock - timedelta(seconds=2)
+    return clock
+
+
+def candles(market, tf, at=None, count=70):
+    params = {"market": market, "count": min(200, count)}
+    if at is not None:
+        params["to"] = at.strftime("%Y-%m-%d %H:%M:%S")
+    raw = api_get(endpoint(tf), params)
+    clock = at or now_kst()
+    cutoff = candle_close_cutoff(clock)
+    result = {}
+    for x in raw:
+        try:
+            start = datetime.fromisoformat(x["candle_date_time_kst"]).replace(tzinfo=KST)
+            if tf_end(start, tf) > cutoff:
+                continue  # historical exact close INCLUDED; live 2-second guard
+            op, hi, lo, cl = [float(x[k]) for k in ("opening_price", "high_price", "low_price", "trade_price")]
+            vol = float(x.get("candle_acc_trade_price") or 0)
+            if not (math.isfinite(op) and math.isfinite(hi) and math.isfinite(lo) and math.isfinite(cl) and min(op, hi, lo, cl) > 0):
+                continue
+            result[start] = {"t": start, "o": op, "h": hi, "l": lo, "c": cl, "turnover": vol}
+        except (KeyError, ValueError, TypeError, OverflowError):
+            continue
+    return sorted(result.values(), key=lambda r: r["t"])
+
+
+def is_contiguous(rows, tf, n=10):
+    if len(rows) < n:
+        return False
+    tail = rows[-n:]
+    return all(tf_end(x["t"], tf) == y["t"] for x, y in zip(tail, tail[1:]))
+
+
+def trend(rows, tf):
+    if not is_contiguous(rows, tf, 10):
+        return {"state": "unknown", "reason": "연속 마감봉 10개 부족", "bars": len(rows)}
+    prices = [x["c"] for x in rows[-10:]]
+    m5 = sum(prices[-5:]) / 5
+    m10 = sum(prices) / 10
+    c = prices[-1]
+    state = "up" if c > m5 > m10 else "down" if c < m5 < m10 else "side"
+    return {"state": state, "close": c, "ma5": m5, "ma10": m10,
+            "closed_kst": tf_end(rows[-1]["t"], tf).isoformat(), "bars": len(rows)}
+
+
+def aggregate(trends):
+    states = [s for s in trends if s in ("up", "down", "side")]
+    if len(states) < max(2, len(trends)//2):
+        return "unknown"
+    up, down = states.count("up"), states.count("down")
+    return "up" if up > down and up >= (len(states)+1)//2 else "down" if down > up and down >= (len(states)+1)//2 else "side"
+
+
+def historical_time(s):
+    try:
+        d = datetime.fromisoformat(str(s))
+        if d.tzinfo is not None:
+            raise ValueError("KST local date/time expected")
+        d = d.replace(tzinfo=KST)
+        if d.minute % 5 or d.second:
+            raise ValueError("5분 단위 시각만 지원")
+        if d > now_kst() - timedelta(minutes=245):
+            raise ValueError("청산 240분이 지난 과거 시각만 검증 가능")
+        if d < now_kst() - timedelta(days=360):
+            raise ValueError("최근 360일 이내 시각 선택")
+        return d
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"검증 시각 오류: {ex}")
+
+
+def request_cfg(raw, need_market=False):
+    if not isinstance(raw, dict):
+        raise ValueError("요청 형식 오류")
+    mode = raw.get("mode", "live")
+    strategy = raw.get("strategy", "scalp")
+    if strategy not in STRATEGIES:
+        raise ValueError("단타/스윙 모드 오류")
+    tf = raw.get("tf", "5m")
+    if mode not in ("live", "backtest") or tf not in SCAN_TF:
+        raise ValueError("모드 또는 시간봉 오류")
+    fee = float(raw.get("fee", .04))
+    if fee not in FEE_CHOICES:
+        raise ValueError("편도 수수료는 0.04 또는 0.25만 선택")
+    if mode == "backtest":
+        at = historical_time(raw.get("at"))
+    elif raw.get("snapshot_at"):
+        try:
+            at = datetime.fromisoformat(str(raw["snapshot_at"]).replace(" ", "T")).replace(tzinfo=KST)
+            if abs((now_kst()-at).total_seconds()) > 900:
+                raise ValueError("실시간 스캔 시각이 15분 이상 오래됨")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"실시간 기준 시각 오류: {exc}")
+    else:
+        at = now_kst()
+    market = raw.get("market") if need_market else None
+    if mode == "backtest" and strategy == "swing" and at > now_kst() - timedelta(hours=121):
+        raise ValueError("스윙은 과거 기준 시각 이후 120시간이 지나야 검증할 수 있어")
+    if need_market and (not isinstance(market, str) or not MARKET_RE.fullmatch(market) or market.split("-", 1)[1] in STABLES):
+        raise ValueError("KRW 코인 마켓만 조회 가능")
+    return mode, tf, fee, at, market, strategy
+
+
+def market_list():
+    cached = ttl_get("markets-v1")
+    if cached is not None:
+        return cached
+    data = api_get("/v1/market/all", {"isDetails": "true"})
+    names = {x["market"]: x.get("korean_name", x["market"]) for x in data if isinstance(x, dict) and MARKET_RE.fullmatch(str(x.get("market", ""))) and x["market"].split("-", 1)[1] not in STABLES}
+    ttl_put("markets-v1", names, 600)
+    return names
+
+
+def universe():
+    cached = ttl_get("ranked-markets-v1")
+    if cached is not None:
+        return cached
+    names = market_list()
+    ticker = {}
+    ms = list(names)
+    for i in range(0, len(ms), 50):
+        try:
+            arr = api_get("/v1/ticker", {"markets": ",".join(ms[i:i+50])})
+            ticker.update({x["market"]: x for x in arr if isinstance(x, dict) and x.get("market")})
+        except Exception:
+            pass
+    rows = []
+    for market, name in names.items():
+        if market == "KRW-BTC":
+            continue  # BTC only on market trend board
+        t = ticker.get(market) or {}
+        turnover = float(t.get("acc_trade_price_24h") or 0)
+        rows.append({"market": market, "name": name, "turnover": turnover,
+                     "change24": round(float(t.get("signed_change_rate") or 0)*100, 3)})
+    rows.sort(key=lambda x: (-x["turnover"], x["market"]))
+    ttl_put("ranked-markets-v1", rows, 300)
+    return rows
+
+
+def btc_context(cfg):
+    mode, selected, fee, at, _, strategy = cfg
+    key = ("btc", mode, selected, at.strftime("%Y-%m-%d %H:%M"))
+    cached = ttl_get(key)
+    if cached is not None:
+        return cached
+    states = {}
+    last4 = None
+    rows4 = []
+    def run_tf(tf):
+        try:
+            # at is the snapshot clock; 1m candles are not *currently forming*.
+            rs = candles("KRW-BTC", tf, at, count=48)
+            return tf, trend(rs, tf), rs
+        except Exception as exc:
+            return tf, {"state": "unknown", "reason": str(exc)[:100]}, []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for tf, state, rows in pool.map(run_tf, TIMEFRAMES):
+            states[tf] = state
+            if tf == selected:
+                last4 = rows
+            if tf == "4h":
+                rows4 = rows
+    lng = aggregate([states[tf]["state"] for tf in ("month", "week", "day", "4h")])
+    sht = aggregate([states[tf]["state"] for tf in ("1h", "30m", "15m", "5m", "3m", "1m")])
+    selected_return = round((last4[-1]["c"]/last4[-5]["c"]-1)*100, 4) if last4 and is_contiguous(last4, selected, 5) else None
+    context = {"tf": states, "long": lng, "short": sht,
+               "selected_return": selected_return, "selected_tf": selected,
+               "asof_kst": at.strftime("%Y-%m-%d %H:%M:%S")}
+    ttl_put(key, context, 3600 if mode == "backtest" else 900)
+    ttl_put(("btc-h4",mode,at.strftime("%Y-%m-%d %H:%M")), rows4, 3600 if mode == "backtest" else 900)
+    return context
+
+
+def coin_metrics(rows, tf, btc_ret):
+    if not is_contiguous(rows, tf, 23) or btc_ret is None:
+        return None, "종목 23봉 연속 이력 또는 같은 봉 BTC 수익률 부족"
+    closes = [x["c"] for x in rows]
+    last, prev = rows[-1], rows[-2]
+    m5 = sum(closes[-5:]) / 5
+    m20 = sum(closes[-20:]) / 20
+    prev6high = max(r["h"] for r in rows[-7:-1])
+    breakout = (last["c"] / prev6high - 1) * 100
+    change4 = (closes[-1]/closes[-5]-1)*100
+    relative = change4-btc_ret
+    volprev = sum(x["turnover"] for x in rows[-21:-1])/20
+    volratio = last["turnover"]/volprev if volprev>0 else 0
+    body = (last["c"]-last["o"])/max(last["h"]-last["l"], 1e-14)
+    tr = [max(x["h"]-x["l"], abs(x["h"]-y["c"]), abs(x["l"]-y["c"])) for x,y in zip(rows[-14:], rows[-15:-1])]
+    atr = sum(tr)/len(tr)/last["c"]*100 if tr else None
+    return {"close": last["c"], "ma5": m5, "ma20": m20,
+            "breakout_pct": round(breakout, 4), "coin_return_pct": round(change4, 4),
+            "btc_return_pct": btc_ret, "relative_pct": round(relative, 4),
+            "volume_ratio": round(volratio, 3), "body_ratio": round(body, 3),
+            "atr_pct": round(atr, 3) if atr is not None else None,
+            "closed_kst": tf_end(last["t"], tf).strftime("%Y-%m-%d %H:%M")}, None
+
+
+def coin_signal(metrics, ctx, fee):
+    m = metrics
+    conditions = {
+        "trend": m["close"] > m["ma5"] > m["ma20"],
+        "breakout": m["breakout_pct"] > 0,
+        "relative": m["relative_pct"] >= .5,
+        "volume": m["volume_ratio"] >= .7,
+        "candle": m["body_ratio"] >= .5,
+    }
+    bear = ctx["long"] == "down" and ctx["short"] == "down"
+    independent = m["relative_pct"] >= 1.5 and m["breakout_pct"] >= .25
+    buy = all(conditions.values()) and (not bear or independent)
+    watch = (conditions["trend"] or conditions["breakout"]) and m["relative_pct"] > 0 and m["body_ratio"] > 0
+    if not buy and not watch:
+        return None
+    kind = "BUY" if buy else "WATCH"
+    causes = []
+    causes.append(f"같은 {ctx['selected_tf']} 기준 BTC 대비 상대강도 {m['relative_pct']:+.2f}%p (코인 {m['coin_return_pct']:+.2f}% / BTC {m['btc_return_pct']:+.2f}%)")
+    causes.append(f"직전 6봉 고점 대비 마감 돌파폭 {m['breakout_pct']:+.2f}% · 거래대금 배수 {m['volume_ratio']:.2f}배")
+    causes.append(f"종가 > MA5 > MA20 {'충족' if conditions['trend'] else '미충족'} · 양봉 몸통 비중 {m['body_ratio']*100:.0f}%")
+    causes.append(f"BTC 장기 {state_ko(ctx['long'])}, 단기 {state_ko(ctx['short'])}" + (" · 약세장 상대강도 강화 충족" if bear and independent else ""))
+    if kind == "WATCH":
+        missing = [k for k, ok in conditions.items() if not ok]
+        names = {"trend": "상승 배열", "breakout": "직전 고점 돌파", "relative": "BTC 대비 0.5%p 우위", "volume": "거래대금 0.7배", "candle": "양봉 몸통 50%"}
+        causes.append("BUY 보류: " + (", ".join(names[k] for k in missing) if missing else "BTC 동시 강한 하락 중 독립 상승 강도 부족"))
+    else:
+        causes.append("모든 진입 품질 조건 충족 · 실제 주문이 아닌 연구용 BUY 후보")
+    # Exchange fee applies per leg; backtest uses the same target levels.
+    gross_tp1 = ((1+.01)*(1+fee/100)/(1-fee/100)-1)*100
+    gross_tp2 = ((1+.10)*(1+fee/100)/(1-fee/100)-1)*100
+    return {"signal": kind, "metrics": m, "explanation": causes,
+            "plan": {"tp1_net": 1.0, "tp1_fraction": .7, "tp2_net": 10.0,
+                     "tp2_fraction": .3, "stop_gross": -2.0, "max_minutes": 240,
+                     "tp1_gross_pct": round(gross_tp1, 3), "tp2_gross_pct": round(gross_tp2, 3)}}
+
+
+def state_ko(s):
+    return {"up": "상승", "side": "횡보", "down": "하락", "unknown": "자료 부족"}.get(s, "자료 부족")
+
+
+def backtest_exit(market, at, fee, getter=candles):
+    """Simulate one snapshot entry at the 5m open and 240m observed path.
+
+    Both stop and TP within a 5-minute candle: conservatively stop first.
+    Prior 5-minute candles are not traded, and no synthetic candles are made.
+    """
+    out = {"status": "UNKNOWN", "net_pct": None, "reason": "", "tp1": False, "tp2": False,
+           "stop": False, "minutes": None, "ambiguous": False}
+    try:
+        rows = getter(market, "5m", at+timedelta(minutes=241), count=100)
+    except Exception as ex:
+        return {**out, "reason": "청산 경로 조회 실패: " + str(ex)[:80]}
+    indexed = {r["t"]:r for r in rows}
+    if any(at+timedelta(minutes=5*k) not in indexed for k in range(48)):
+        return {**out, "reason": "240분 중 5분봉 누락: 미래 가격 경로 확인 불가"}
+    entry = indexed[at]["o"]
+    if entry <= 0:
+        return {**out, "reason": "진입 시가 없음"}
+    cost = fee / 100
+    p1 = entry*(1.01)*(1+cost)/(1-cost)
+    p2 = entry*(1.10)*(1+cost)/(1-cost)
+    stop = entry*.98
+    fraction, realized = 1.0, 0.0
+    tp1 = tp2 = False
+    def net(px):
+        return (px*(1-cost)/(entry*(1+cost))-1)*100
+    for k in range(48):
+        b = indexed[at+timedelta(minutes=5*k)]
+        op, hi, lo, cl = b["o"], b["h"], b["l"], b["c"]
+        if lo <= stop:
+            ambiguous = (hi >= p1 if not tp1 else hi >= p2)
+            return {**out, "status": "RESOLVED", "net_pct": round(realized + fraction*net(min(op,stop)), 6),
+                    "reason": "", "tp1": tp1, "tp2": tp2, "stop": True,
+                    "minutes": (k+1)*5, "ambiguous": ambiguous}
+        if not tp1 and hi >= p1:
+            realized += .7*net(p1)
+            fraction = .3
+            tp1 = True
+        if tp1 and hi >= p2:
+            realized += fraction*net(p2)
+            return {**out, "status": "RESOLVED", "net_pct": round(realized, 6),
+                    "reason": "", "tp1": True, "tp2": True, "stop": False,
+                    "minutes": (k+1)*5, "ambiguous": False}
+        if k == 47:
+            return {**out, "status": "RESOLVED", "net_pct": round(realized + fraction*net(cl), 6),
+                    "reason": "", "tp1": tp1, "tp2": False, "stop": False,
+                    "minutes": 240, "ambiguous": False}
+    return {**out, "reason": "결과 확인 불가"}
+
+
+def _avg(values):
+    return sum(values)/len(values)
+
+
+def swing_metrics(day, h4, h1, btc4, at):
+    """Only completed candles at the snapshot and synchronized BTC 4h series."""
+    # Historical outage gaps should not wipe out the entire market. Do not
+    # fabricate missing candles: the indicator module validates real-bar
+    # density and blocks BUY while recent hourly data is discontinuous.
+    if not (len(day)>=24 and len(h4)>=34 and len(h1)>=16):
+        return None, "스윙 판정용 실제 캔들 수 부족(일 24, 4시간 34, 1시간 16)"
+    if at-tf_end(h4[-1]["t"],"4h") > timedelta(hours=8) or at-tf_end(h1[-1]["t"],"1h") > timedelta(hours=3):
+        return None, "4시간/1시간 최신 완료봉이 오래됨"
+    btcmap={b["t"]:b["c"] for b in btc4}
+    if h4[-1]["t"] not in btcmap or h4[-5]["t"] not in btcmap:
+        return None, "BTC와 코인의 동일 시각 4시간봉 부족"
+    d=[x["c"] for x in day]; f=[x["c"] for x in h4]; hour=[x["c"] for x in h1]
+    day_ma20=_avg(d[-20:]); day_prev20=_avg(d[-24:-4])
+    ma7=_avg(f[-7:]); ma14=_avg(f[-14:]); ma30=_avg(f[-30:]); prev7=_avg(f[-10:-3])
+    h1ma7=_avg(hour[-7:]); h1ma14=_avg(hour[-14:])
+    ret16=(f[-1]/f[-5]-1)*100; btc16=(btcmap[h4[-1]["t"]]/btcmap[h4[-5]["t"]]-1)*100
+    prev12high=max(x["h"] for x in h4[-13:-1]); high6=max(x["h"] for x in h4[-7:-1])
+    lo_recent=min(x["l"] for x in h4[-7:-1]); lo_prior=min(x["l"] for x in h4[-13:-7])
+    volbase=_avg([x["turnover"] for x in h4[-21:-1]]); ratio=h4[-1]["turnover"]/volbase if volbase else 0
+    tr=[max(x["h"]-x["l"],abs(x["h"]-y["c"]),abs(x["l"]-y["c"])) for x,y in zip(h4[-14:],h4[-15:-1])]
+    atr=_avg(tr)/f[-1]*100
+    dayrise=(d[-1]/d[-2]-1)*100; ret24=(f[-1]/f[-7]-1)*100
+    ext=(f[-1]/ma7-1)*100; support=lo_recent*.998
+    risk=(f[-1]/support-1)*100
+    breakout=(f[-1]/prev12high-1)*100
+    return {
+      "close":f[-1],"ma5":ma7,"ma20":ma14,"day_ma20":round(day_ma20,6),"h4_ma30":round(ma30,6),
+      "coin_return_pct":round(ret16,4),"btc_return_pct":round(btc16,4),"relative_pct":round(ret16-btc16,4),
+      "breakout_pct":round(breakout,4),"volume_ratio":round(ratio,3),"atr_pct":round(atr,3),
+      "h4_distance_ma7_pct":round(ext,3),"structure_risk_pct":round(risk,3),"support":round(support,8),
+      "day_rise_pct":round(dayrise,3),"rise24_pct":round(ret24,3),
+      "h4_higher_low":lo_recent>lo_prior,"h4_higher_high":high6>max(x["h"] for x in h4[-13:-7]),
+      "day_up":d[-1]>day_ma20 and day_ma20>day_prev20,
+      "h4_up":f[-1]>ma7>ma14 and ma7>prev7,
+      "h1_up":hour[-1]>h1ma7>h1ma14,
+      "recovery":min(x["l"] for x in h4[-3:-1])<=ma7*1.016 and f[-1]>f[-2],
+      "closed_kst":tf_end(h4[-1]["t"],"4h").strftime("%Y-%m-%d %H:%M"),
+      "body_ratio":round((h4[-1]["c"]-h4[-1]["o"])/max(h4[-1]["h"]-h4[-1]["l"],1e-14),3),
+    },None
+
+
+
+def strict_swing_gate(m, ctx, day, h4):
+    """V1.4 research gate; never uses candles after the snapshot."""
+    h4_ma20 = sum(x["c"] for x in h4[-20:]) / 20
+    h4_ma20_prev = sum(x["c"] for x in h4[-21:-1]) / 20
+    checks = {
+        "점수 9/10 이상": m["score"] >= 9,
+        "일봉 MA20 상향 + 22봉 연속": m["day_up"] and is_contiguous(day, "day", 22),
+        "4시간봉 MA20 상회·상향 + 21봉 연속": (
+            is_contiguous(h4, "4h", 21) and m["close"] > h4_ma20 > h4_ma20_prev),
+        "4시간봉 MA7/14 상승 배열": m["h4_up"],
+        "1시간봉 반등 확인": m["checks"]["h1_confirm"],
+        "RSI(14) 50 이상": m["rsi14"] >= 50,
+        "MACD 히스토그램 양수": m["macd_hist"] > 0,
+        "4시간 MACD 골든 상태 (실제 교차와 구분)": m["macd_h4"]["state"] == "GOLDEN",
+        "4시간 거래대금 1.1배 이상": m["volume_ratio"] >= 1.1,
+        "BTC 장·단기 비하락": (
+            ctx["long"] in ("up", "side") and ctx["short"] in ("up", "side")),
+        "최근 봉 공백 없음": not m.get("data_gap_recent", True),
+        "저점·지지 9% 내 / 선택 시간봉 확인": (
+            1.2 <= m["rebound_from_low_pct"] <= 9
+            and 0 <= m["structure_risk_pct"] <= 9
+            and m.get("timing_ok", False)),
+    }
+    return {
+        "passed": all(checks.values()), "checks": checks,
+        "missing": [k for k, v in checks.items() if not v],
+        "h4_ma20": round(h4_ma20, 8),
+        "h4_ma20_prev": round(h4_ma20_prev, 8)
+    }
+
+
+def swing_signal(m,ctx,fee):
+    rel=m["relative_pct"];bear=ctx["long"]=="down" or ctx["short"]=="down"
+    strong_rel=rel>=(2.0 if bear else 1.0)
+    excessive=m["h4_distance_ma7_pct"]>7.5 or m["rise24_pct"]>22.0 or m["structure_risk_pct"]>12
+    setup=m["breakout_pct"]>0 or m["recovery"]
+    good=(m["day_up"] and m["h4_up"] and m["h1_up"] and strong_rel
+          and m["h4_higher_low"] and setup and m["volume_ratio"]>=.7
+          and m["structure_risk_pct"]<=8.0 and m.get("timing_ok",True) and not excessive)
+    watch=((m["day_up"] or m["h4_up"]) and rel>=.3 and
+           (m["h4_up"] or m["h4_higher_high"] or m["breakout_pct"]>0))
+    if not good and not watch:return None
+    kind="BUY" if good else "WATCH"
+    checks={
+      "일봉 MA20 상회·우상향":m["day_up"],
+      "4시간봉 MA7·MA14 상승":m["h4_up"],
+      "4시간봉 저점 상승":m["h4_higher_low"],
+      "1시간봉 재상승":m["h1_up"],
+      "BTC 대비 강도 충족":strong_rel,
+      "4시간봉 돌파·눌림 회복":setup,
+      "4시간봉 거래대금 0.7배 이상":m["volume_ratio"]>=.7,
+      "구조적 손절 거리 8% 이내":m["structure_risk_pct"]<=8.0,
+      "선택한 검색봉 상승 확인":m.get("timing_ok",True),
+      "급등 추격 위험 낮음":not excessive,
+    }
+    causes=[
+      f"스윙: 일봉 {'상승' if m['day_up'] else '미확정'} · 4시간봉 {'상승' if m['h4_up'] else '미확정'} · 1시간봉 {'상승' if m['h1_up'] else '미확정'}",
+      f"동일한 16시간 동안 코인 {m['coin_return_pct']:+.2f}%, BTC {m['btc_return_pct']:+.2f}% → 상대강도 {rel:+.2f}%p",
+      f"4시간봉 고점 돌파폭 {m['breakout_pct']:+.2f}% · 최근 고점/저점 상승 {m['h4_higher_high']}/{m['h4_higher_low']}",
+      f"4시간봉 MA7 이격 {m['h4_distance_ma7_pct']:+.2f}% · 최근 24시간 {m['rise24_pct']:+.2f}% · 구조적 지지까지 {m['structure_risk_pct']:.2f}%",
+      f"4시간봉 거래대금 배수 {m['volume_ratio']:.2f}배 · BTC 장기 {state_ko(ctx['long'])}, 단기 {state_ko(ctx['short'])}",
+      f"선택 검색봉 {m.get('selected_tf','4h')} 추세 {'상승' if m.get('timing_ok',True) else '미확정'}",
+    ]
+    if kind=="WATCH":
+        missing=[k for k,v in checks.items() if not v]
+        causes.append("BUY 보류: "+(", ".join(missing) if missing else "상승 확인 대기"))
+    else:
+        causes.append("스윙 구조 조건 충족 · 체결 전 호가/집중보유/공시 위험 별도 확인")
+    if excessive:causes.append("⚠ 급등 추격 위험: 이미 많이 오른 시점이므로 신규 진입은 WATCH")
+    cost=fee/100
+    tp1=((1.05)*(1+cost)/(1-cost)-1)*100
+    tp2=((1.12)*(1+cost)/(1-cost)-1)*100
+    return {"signal":kind,"metrics":m,"explanation":causes,"plan":{
+      "tp1_net":5.0,"tp1_fraction":.5,"tp2_net":12.0,"tp2_fraction":.5,
+      "stop_gross":-5.0,"max_minutes":7200,
+      "tp1_gross_pct":round(tp1,3),"tp2_gross_pct":round(tp2,3),
+      "support":m["support"],"support_risk_pct":m["structure_risk_pct"]}}
+
+
+def swing_backtest_exit(market, at, fee, getter=candles, detailed=False):
+    """Simulate 120h only on verified Bithumb 1h candles.
+
+    V1.4.8 targeted recheck is triggered only when the replay actually
+    encounters a missing hour. Do NOT fill missing hours with prices from
+    30m or carry-forward data. Existing exit-order and fee logic unchanged.
+    """
+    out = {"status": "UNKNOWN", "net_pct": None, "reason": "", "tp1": False,
+           "tp2": False, "stop": False, "minutes": None, "ambiguous": False}
+    entry_at = at.replace(minute=0, second=0, microsecond=0)
+    if entry_at < at:
+        entry_at += timedelta(hours=1)
+    path = HourlyReplayPath(market, entry_at, getter, detailed=detailed)
+    def done(**fields):
+        return {**out, **fields, "audit": path.audit()}
+
+    first = path.hour(entry_at)
+    if first is None or first.get("o", 0) <= 0:
+        return done(reason="진입 시각 "+entry_at.strftime("%Y-%m-%d %H:%M")
+                    +" 1시간봉 미확인 (재조회: "+path.audit()["status_code"]+")",
+                    reason_code="ENTRY_HOUR_MISSING")
+    entry = first["o"]
+    cost = fee / 100
+    p1 = entry * 1.05 * (1+cost)/(1-cost)
+    p2 = entry * 1.12 * (1+cost)/(1-cost)
+    stop = entry * .95
+    rest, realized, tp1 = 1.0, 0.0, False
+    def net(px):
+        return (px*(1-cost)/(entry*(1+cost))-1)*100
+    for i in range(120):
+        r = path.hour(entry_at + timedelta(hours=i))
+        if r is None:
+            clock = (entry_at + timedelta(hours=i)).strftime("%Y-%m-%d %H:%M")
+            code = path.audit()["status_code"]
+            return done(reason=(f"진입 후 {i}시간째 {clock} KST 1시간봉 미확인"
+                                +f" (재조회 {code}); 이후 청산 미확정"),
+                        reason_code="MISSING_HOURLY_BAR",
+                        tp1=tp1, minutes=i*60)
+        if r["l"] <= stop:
+            return done(status="RESOLVED",
+                        net_pct=round(realized + rest*net(min(r["o"], stop)), 6),
+                        tp1=tp1, stop=True, minutes=(i+1)*60,
+                        ambiguous=r["h"] >= (p2 if tp1 else p1))
+        if not tp1 and r["h"] >= p1:
+            tp1 = True
+            realized += .5 * net(p1)
+            rest = .5
+        if tp1 and r["h"] >= p2:
+            return done(status="RESOLVED",
+                        net_pct=round(realized + rest*net(p2), 6),
+                        tp1=True, tp2=True, minutes=(i+1)*60)
+        if i == 119:
+            return done(status="RESOLVED",
+                        net_pct=round(realized + rest*net(r["c"]), 6),
+                        tp1=tp1, minutes=7200)
+    return done(reason="미확정 경로", reason_code="UNKNOWN_PATH")
+
+
+@app.route("/api/replay-spotcheck",methods=["GET","POST"])
+def replay_spotcheck_api():
+    """Read-only V1.4.4 five early-WATCH candles, 2026-10-31 15:00 KST.
+
+    This route does NOT retest the selection strategy, place orders, or
+    reinterpret any missing candles as profit/loss.
+    """
+    try:
+        raw = (request.get_json(silent=True) or {}) if request.method=="POST" else request.args
+        fee = float(raw.get("fee", 0.04))
+        if fee not in FEE_CHOICES:
+            raise ValueError("편도 수수료는 0.04 또는 0.25만 지원")
+        at = historical_time("2026-10-31 15:00:00")
+        cached = ttl_get(("replay-spotcheck-v146",fee))
+        if cached is not None:
+            return jsonify(cached)
+        targets = (
+            ("KRW-BLUE","블루핀"), ("KRW-2Z","더블제로"),
+            ("KRW-MBL","무비블록"), ("KRW-NXPC","넥스페이스"),
+            ("KRW-STRAX","저트라"),
+        )
+        def one_target(pair):
+            market, name = pair
+            bt = swing_backtest_exit(market,at,fee,detailed=True)
+            micro = None
+            stamp = bt.get("audit",{}).get("first_unresolved_or_recovered_hour_kst")
+            if bt.get("status") == "UNKNOWN" and bt.get("reason_code") in (
+                    "MISSING_HOURLY_BAR","ENTRY_HOUR_MISSING") and stamp:
+                try:
+                    gap = datetime.strptime(stamp,"%Y-%m-%d %H:%M").replace(tzinfo=KST)
+                    if at <= gap < at + timedelta(hours=121):
+                        # Only forensic investigation AFTER a past snapshot.
+                        # Never feed these 1m/5m prices into the exit engine.
+                        micro = investigate_missing_hour(market,gap,candles)
+                except (ValueError,TypeError):
+                    pass
+            return {"market":market,"name":name,"backtest":bt,"gap_micro":micro}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            items = list(executor.map(one_target, targets))
+        payload = dict(ok=True,version=VERSION,
+                       snapshot_kst=at.strftime("%Y-%m-%d %H:%M"),
+                       fee_each_pct=fee,items=items,
+                       note="과거 초기 WATCH 5종목의 가상 가격경로만 재조회. 실제 매매 아님, UNKNOWN은 손실/수익으로 변환하지 않음.")
+        ttl_put(("replay-spotcheck-v146",fee),payload,120)
+        return jsonify(payload)
+    except Exception as ex:
+        return jsonify(ok=False,error=str(ex)[:200]), 400
+
+
+@app.post("/api/study-v147")
+def study_v147_api():
+    """Retrospective comparison of already-computed historical candidates.
+
+    WATCH remains a research observation, not a real trade. The endpoint
+    reads no exchange data, makes no orders and performs no lookahead scans.
+    """
+    try:
+        if request.content_length and request.content_length > 2_000_000:
+            raise ValueError("연구 비교 요청 용량 초과")
+        raw = request.get_json(silent=True)
+        if not isinstance(raw,dict) or raw.get("mode")!="backtest" or raw.get("strategy")!="swing":
+            raise ValueError("스윙 과거 백테스트 결과만 비교 가능")
+        fee = float(raw.get("fee",0.04))
+        report = compare_watch_cohorts(
+            raw.get("items"),scanned=raw.get("scanned",0),
+            issues=raw.get("issues",0),fee_each=fee)
+        return jsonify(ok=True,version=VERSION,study=report)
+    except (TypeError,ValueError) as ex:
+        return jsonify(ok=False,error=str(ex)[:180]),400
+
+
+@app.get("/")
+def page():
+    return Response(HTML, content_type="text/html; charset=utf-8")
+
+
+@app.get("/health")
+def health():
+    return jsonify(ok=True, version=VERSION, mode="read-only")
+
+
+@app.get("/api/universe")
+def universe_api():
+    try:
+        return jsonify(ok=True, items=universe(), version=VERSION, min_turnover_live=MIN_TURNOVER)
+    except Exception as ex:
+        return jsonify(ok=False, error=str(ex)[:150]), 502
+
+
+@app.post("/api/btc")
+def btc_api():
+    try:
+        cfg = request_cfg(request.get_json(silent=True))
+        return jsonify(ok=True, context=btc_context(cfg), version=VERSION)
+    except Exception as ex:
+        return jsonify(ok=False, error=str(ex)[:160]), 400
+
+
+@app.post("/api/coin")
+def coin_api():
+    try:
+        raw = request.get_json(silent=True)
+        cfg = request_cfg(raw, True)
+        mode, tf, fee, at, market, strategy = cfg
+        if market not in market_list():
+            raise ValueError("현재 KRW 마켓 목록에 없음")
+        ctx = btc_context(cfg)
+        if strategy == "swing":
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                fday=pool.submit(candles,market,"day",at,80)
+                fh4=pool.submit(candles,market,"4h",at,90)
+                fh1=pool.submit(candles,market,"1h",at,50)
+                day,h4,h1=fday.result(),fh4.result(),fh1.result()
+            btc4=ttl_get(("btc-h4",mode,at.strftime("%Y-%m-%d %H:%M")))
+            if btc4 is None:
+                btc4=candles("KRW-BTC","4h",at,50)
+            baseline,issue=swing_metrics(day,h4,h1,btc4,at)
+            if baseline is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            m,issue=rebound.bottom_rebound_metrics(day,h4,h1,btc4,at,baseline,is_contiguous,tf_end)
+            if m is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            if tf in ("5m","15m"):
+                timing_rows=candles(market,tf,at,count=18)
+                m["timing_ok"]=trend(timing_rows,tf).get("state")=="up"
+            else:
+                m["timing_ok"]={"1h":m["checks"]["h1_confirm"],"4h":m["checks"]["ma_recover"],"day":m["day_ma20_distance_pct"]>=-6}[tf]
+            m["selected_tf"]=tf
+            macd_views=all_macd_views(day,h4,tf_end,is_contiguous)
+            m["macd_h4"]=macd_views["h4"]
+            m["macd_day"]=macd_views["day"]
+            m["macd_day_chart"]=macd_views["day_chart"]
+            explain=build_explanation(m,ctx,day,h4,h1,fee)
+            # Observation only. Uses the 24 hours of COMPLETED 1h bars
+            # before the snapshot, never the future 120h exit path.
+            liquidity=snapshot_liquidity(h1,at)
+            signal=rebound.rebound_signal(m,ctx,fee)
+            if signal is not None:
+                signal["explain"]=explain
+                signal["liquidity_audit"]=liquidity
+            if signal is not None:
+                previous = signal["signal"]
+                gate = strict_swing_gate(m,ctx,day,h4)
+                combined = evaluate_combined(previous,gate,explain,m,h4,is_contiguous)
+                signal["legacy_signal"] = previous
+                signal["strict_gate"] = gate
+                signal["strict_signal"] = ("BUY" if previous=="BUY" and gate["passed"] else "WATCH")
+                signal["combined_gate"] = combined
+                tracks = classify_watch_tracks(previous,gate,combined,explain,m,ctx)
+                signal["watch_tracks"] = tracks
+                signal["v143_signal"] = combined["signal"]
+                signal["watch_kind"] = tracks["kind"]
+                signal["signal"] = "BUY" if tracks["kind"] == "BUY" else (
+                    "WATCH" if tracks["kind"] in ("EARLY_WATCH","TREND_WATCH") else "RESEARCH")
+                signal["stage"] = tracks["label"]
+                signal["explanation"].append(
+                    "V1.3.3 원본 "+previous+" → V1.4.1 추세 "+signal["strict_signal"]
+                    +" → V1.4.3 종합 "+combined["signal"]
+                    +" → V1.4.8 분리관찰 "+tracks["kind"]
+                )
+                signal["explanation"].append(
+                    "초기관찰 기준 미충족: "+(
+                        ", ".join(tracks["early_missing"]) if tracks["early_missing"] else "없음")
+                )
+                signal["explanation"].append(
+                    "추세확인 기준 미충족: "+(
+                        ", ".join(tracks["trend_missing"]) if tracks["trend_missing"] else "없음")
+                )
+                signal["explanation"].append(
+                    "종합 WATCH 보류: "+(
+                        ", ".join(combined["missing_watch"]) if combined["missing_watch"] else "모든 관찰 조건 충족")
+                )
+                if signal["signal"] != "BUY":
+                    signal["explanation"].append(
+                        "종합 BUY 보류: "+", ".join(combined["missing_buy"])
+                    )
+                signal["explanation"].append(
+                    "선행 유동성 관측 "+str(liquidity["checks_passed"])+"/4: "
+                    +liquidity["label"]+" · 24시간 완료 1시간봉 "
+                    +str(liquidity["hourly_bars_observed"])+"/24 · 관측 거래대금 "
+                    +str(round(liquidity["observed_turnover_24h_krw"]/100_000_000,2))
+                    +"억원 (매매 신호/기존 BUY 조건 영향 없음)"
+                )
+                signal["explanation"].append(
+                    "MACD 4시간(12,26,9): " + macd_views["h4"]["state"]
+                    + ", 이번 봉 교차 " + macd_views["h4"]["event"]
+                    + " | 일봉(12,26,9): " + macd_views["day"]["state"]
+                    + " | 일봉(3,10,16): " + macd_views["day_chart"]["state"]
+                )
+        else:
+            rows=candles(market,tf,at,count=50)
+            m,issue=coin_metrics(rows,tf,ctx.get("selected_return"))
+            if m is None:
+                return jsonify(ok=True,market=market,signal=None,issue=issue)
+            signal=coin_signal(m,ctx,fee)
+        diagnostic = None
+        if strategy == "swing" and raw.get("want_diagnostic") is True:
+            diagnostic = {
+                "closed_kst": m["closed_kst"], "close": m["close"],
+                "score": m["score"], "rsi14": m["rsi14"],
+                "day_up": m["day_up"], "h4_up": m["h4_up"],
+                "macd": macd_views,
+                "explain": explain,
+                "strict_gate": strict_swing_gate(m,ctx,day,h4),
+                "combined_gate": signal["combined_gate"] if signal else evaluate_combined(
+                    None,strict_swing_gate(m,ctx,day,h4),explain,m,h4,is_contiguous),
+                "watch_tracks": signal["watch_tracks"] if signal else classify_watch_tracks(
+                    None,strict_swing_gate(m,ctx,day,h4),
+                    evaluate_combined(None,strict_swing_gate(m,ctx,day,h4),explain,m,h4,is_contiguous),
+                    explain,m,ctx),
+                "legacy_signal": signal["legacy_signal"] if signal else "NONE",
+                "liquidity_audit": liquidity,
+            }
+        if signal is None:
+            return jsonify(ok=True, market=market, signal=None, diagnostic=diagnostic)
+        if mode == "backtest":
+            signal["backtest"] = swing_backtest_exit(market,at,fee, detailed=signal.get("watch_kind") in ("EARLY_WATCH","TREND_WATCH","BUY")) if strategy == "swing" else backtest_exit(market,at,fee)
+        return jsonify(ok=True, market=market, signal=signal, strategy=strategy, diagnostic=diagnostic)
+    except Exception as ex:
+        return jsonify(ok=False, error=str(ex)[:170]), 400
+
+
+HTML = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BITHUMB · BTC MTF V1.4.8 · 유동성·과거 WATCH 비교</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1120;--panel:#161f33;--panel2:#202c46;--ink:#edf4ff;--muted:#93a4bd;--line:#34445f;--cyan:#45cfce;--green:#39d7a1;--yellow:#ffc56d;--red:#ff7d85}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,'Noto Sans KR',sans-serif;color:var(--ink);line-height:1.5}main{max-width:1100px;margin:auto;padding:18px 16px 48px}h1{font-size:1.4rem;line-height:1.3;margin:0}h2{font-size:1.08rem;margin:0 0 11px}small,.muted{color:var(--muted)}header{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:5px 0 19px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:1px}.tag{border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);white-space:nowrap;font-size:11px}.surface{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;margin-bottom:14px}.tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:15px}.tabs button{font-size:15px;font-weight:750;padding:13px}.tabs button.on{background:#145c64;border-color:var(--cyan);color:white}button,select,input{border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--ink);font:inherit;padding:10px;min-width:0}button{cursor:pointer}button:disabled{opacity:.42;cursor:default}button.primary{background:var(--cyan);border-color:var(--cyan);color:#09252a;font-weight:800}button.secondary{background:transparent}.toolbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px}.field label{color:var(--muted);font-size:12px;font-weight:650}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.timebox{display:flex;gap:8px}.timebox input{flex:1;min-width:0}.action{margin-top:14px}.action button{padding:11px 20px}.help{font-size:12px;color:var(--muted);margin-top:9px}.btc-agg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}.agg{background:#101d32;border:1px solid var(--line);padding:12px;border-radius:12px}.agg strong{display:block;font-size:1.16rem;margin-top:4px}.tf-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.tf{background:#101b2e;border:1px solid var(--line);border-radius:12px;padding:10px}.tf .name{font-size:12px;color:var(--muted)}.tf .status{font-size:16px;font-weight:750;margin-top:2px}.up{color:var(--green)}.down{color:var(--red)}.side{color:var(--yellow)}.unknown{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{padding:13px;background:#101b2e;border:1px solid var(--line);border-radius:12px}.metric strong{font-size:22px;display:block}.metric span{font-size:12px;color:var(--muted)}.bar{height:6px;background:#27354a;overflow:hidden;border-radius:8px;margin-top:12px}.bar i{display:block;background:var(--cyan);height:100%;width:0%;transition:width .2s}.result{border:1px solid var(--line);background:#101c30;border-radius:13px;margin-top:9px;padding:12px}.result summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.score-chip{border:1px solid #4c7087;background:#17374a;color:#c4f5f0;border-radius:7px;padding:3px 6px;font-weight:850;font-size:12px;white-space:nowrap}.entry-price{border:1px solid #466380;background:#243553;border-radius:8px;padding:4px 9px;font-size:13px;font-weight:750;color:#ebf6ff;white-space:nowrap}.entry-price.watch-entry{background:#352f24;color:#ffe8b3;border-color:#7b623c}.entry-note{border:1px solid #364b67;background:#172943;padding:10px;border-radius:9px;margin:8px 0}.entry-metrics{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.entry-metrics span{border:1px solid #364b67;padding:6px 9px;border-radius:8px;font-size:12px}.result summary::-webkit-details-marker{display:none}.result summary b{font-size:16px}.badge{font-size:11px;font-weight:900;padding:4px 8px;border-radius:7px}.badge.buy{background:#115e4c;color:#9ff9d5}.badge.watch{background:#59421e;color:#ffdca5}.badge.research{background:#303d53;color:#bdd0e8}.push{margin-left:auto;color:var(--muted);font-size:12px}.reason{font-size:13px;color:#cfdaeb;margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}.reason p{margin:5px 0}.pnl{font-size:13px;margin-top:7px}.empty{font-size:13px;color:var(--muted);padding:15px 0}.notice{font-size:12px;color:#b6c7df;margin-top:12px}.foot{margin-top:26px;color:var(--muted);font-size:12px}#error{color:var(--red);font-size:13px;margin-top:9px;white-space:pre-wrap}#scanstatus{color:var(--muted);font-size:13px}.insight-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}
+.insight-score{border:1px solid var(--line);background:#15253c;border-radius:12px;padding:11px 10px;text-align:center}
+.insight-score strong{display:block;font-size:22px;color:var(--cyan)}
+.insight-score span{font-size:11px;color:var(--muted)}
+.insight-wrap{margin:14px 0;border:1px solid var(--line);border-radius:12px;padding:11px}
+.insight-plan{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.insight-plan div{border:1px solid var(--line);border-radius:9px;padding:8px}
+.insight-plan b{display:block;font-size:16px}.insight-plan small{font-size:11px}
+.insight-proof{font-size:12px;margin:8px 0;color:var(--muted)}
+.insight-proof span{display:block;margin:3px 0}
+.study-scroll{overflow-x:auto;margin:9px 0 14px}.study-scroll table{border-collapse:collapse;width:100%;min-width:625px;font-size:12px}.study-scroll th,.study-scroll td{padding:8px 7px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.study-scroll th{color:var(--muted)}#study-panel h3{font-size:13px;margin:14px 0 6px}#study-panel details{border-top:1px solid var(--line);padding-top:10px}
+.hidden{display:none!important}
+@media(max-width:760px){main{padding:14px 11px 30px}header{align-items:flex-start}.toolbar{grid-template-columns:1fr 1fr}.tf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.surface{padding:13px}.btc-agg{grid-template-columns:1fr 1fr}}
+@media(max-width:355px){.toolbar{grid-template-columns:1fr 1fr}.row{gap:6px}.action button{flex:1}}
+</style></head><body><main>
+<header><div><div class="eyebrow">PERSONAL RESEARCH · BITHUMB KRW</div><h1>BTC 추세 · 코인 검색기</h1><small>BTC MTF V1.4.8 · 선행 유동성 4/4 + 과거 캔들 진단</small></div><span class="tag">KRW ONLY</span></header>
+<div class="tabs"><button id="live-tab" class="on" type="button">● 실시간 검색</button><button id="backtest-tab" type="button">◷ 과거 백테스트</button></div>
+<section class="surface"><h2>검색 설정</h2><div class="tabs"><button id="scalp-tab" type="button">⚡ 단타</button><button id="swing-tab" class="on" type="button">🌱 스윙 · 점수제</button></div><div class="toolbar">
+<div class="field"><label for="tf">코인 검색 시간봉</label><select id="tf"><option value="5m">5분봉</option><option value="15m">15분봉</option><option value="1h">1시간봉</option><option value="4h" selected>4시간봉</option><option value="day">일봉</option></select></div>
+<div class="field"><label for="fee">편도 수수료</label><select id="fee"><option value="0.04">0.04%</option><option value="0.25">0.25%</option></select></div>
+<div class="field"><label for="turnover">24시간 거래대금 하한</label><select id="turnover"><option value="50000000">5천만 원 이상</option><option value="100000000" selected>1억 원 이상</option><option value="500000000">5억 원 이상</option><option value="0">제한 없음</option></select></div>
+<div class="field"><label for="scope">검색 범위</label><select id="scope"><option value="20">거래대금 상위 20</option><option value="40" selected>거래대금 상위 40</option><option value="80">거래대금 상위 80</option><option value="all">전체 KRW</option></select></div>
+<div class="field" id="watch-filter-field"><label for="watch-filter">WATCH 표시 기준 (스윙)</label><select id="watch-filter"><option value="strict" selected>BUY + 초기/추세 WATCH (기본)</option><option value="early">초기 반등 WATCH만</option><option value="trend">추세 확인 WATCH만</option><option value="nine">연구 비교 · 원본 9점+</option><option value="ten">연구 비교 · 원본 10점</option><option value="all">모든 원본 후보(연구 보류 포함)</option></select></div><div class="field"><label for="focus">관찰 코인 지정 (선택)</label><input id="focus" placeholder="예: PIEVERSE" maxlength="18"></div><div class="field" id="backtest-date-field" style="display:none"><label for="at">과거 검사 시각 (한국시간)</label><input type="datetime-local" id="at" step="300"></div><div class="field" id="backtest-days-field" style="display:none"><label for="days">자체 백테스트</label><select id="days"><option value="1">1일 · 1회</option><option value="3">3일 · 매일 같은 시각</option><option value="7">7일 · 매일 같은 시각</option></select></div>
+</div><div class="action row"><button class="primary" id="start" type="button">검색 시작</button><button class="secondary" id="csv" disabled type="button">후보 전체 CSV</button><button class="secondary" id="issuecsv" disabled type="button">문제 내역 CSV</button><button class="secondary" id="focuscsv" disabled type="button">관찰 코인 MACD CSV</button><small id="scanstatus">검사 전</small></div><div id="error"></div>
+<div class="help" id="strategy-help">V1.4.8: 과거 검색 시각에 정확히 마감한 봉(예: 15시 정각의 14~15시 1시간봉)을 포함하도록 시간 경계 수정. 실시간은 마감 뒤 2초 안전장치 유지. 기존 BUY/WATCH 조건 그대로. 선행 유동성 4개 기준도 유지. 이는 경고·설명용으로 BUY를 바꾸지 않아. 10월 31일 WATCH 5종목은 상단에서 1시간·30분·5분·1분봉 누락 원인을 조사할 수 있어. 미래 캔들은 신호에 사용하지 않고 자료 없으면 UNKNOWN 유지. 편도 수수료 0.04%.</div><div class="help" id="live-help">설정한 24시간 거래대금 하한을 넘는 KRW 코인만 검색해. 제한 없음을 선택하면 거래가 거의 없는 코인까지 포함되어 자료 부족이 늘 수 있어. 마감봉만 사용하며 자동 주문은 없어.</div>
+<div class="help hidden" id="backtest-help">선택 시각의 과거 <b>완료봉만 사용</b>해 신호를 판정하고 단타는 240분/스윙은 120시간을 가상 청산해. 3·7일은 지정한 시각에 하루 1번씩 반복. 현재 상장 목록과 현재 24시간 거래대금 순위·하한을 쓰므로 생존·미래정보 편향이 있어. 미확정 봉은 따로 표시해.</div>
+</section>
+<section class="surface" id="spotcheck-panel"><h2>10월 31일 초기 WATCH 5종목 · 데이터 재검증 <small>전체 스캔 불필요</small></h2><div class="notice">2026-10-31 15:00 KST 초기 WATCH 5종목의 1시간봉 누락을 재확인하고, 미확정 시 같은 시간대 30분·5분·1분봉까지 조사해. 하위 분봉은 원인 진단만 하며 가상 수익률에 반영하지 않아. 7일을 초과한 체결 내역은 공식 공개 API의 과거 조회 범위 밖이야.</div><div class="action row"><button id="spotcheck-btn" class="secondary" type="button">5종목 청산 경로 재검증</button><button id="spotcheck-csv" class="secondary" disabled type="button">5종목 진단 CSV</button><small id="spotcheck-status">검증 전</small></div><div id="spotcheck-results" class="empty">버튼을 누르면 편도 수수료 설정(기본 0.04%)으로 5종목의 누락 시각을 확인해.</div></section>
+<section class="surface"><h2>BTC 장기·단기 추세 <small id="btcts"></small></h2><div class="btc-agg"><div class="agg"><small>장기 · 월/주/일/4시간</small><strong id="long" class="unknown">검사 전</strong></div><div class="agg"><small>단기 · 1시간~1분</small><strong id="short" class="unknown">검사 전</strong></div></div><div id="tf-grid" class="tf-grid"></div><div class="notice">판정: 완료봉 종가와 MA5·MA10 배열. 종가 &gt; MA5 &gt; MA10은 상승, 반대는 하락, 그 외 횡보. 10봉 연속 자료 부족이면 미확인.</div></section>
+<section class="surface" id="focus-panel"><h2>관찰 코인 MACD 분석 <small>신호 0건도 확인</small></h2><div class="notice">검색 설정에서 관찰 코인을 지정해. 4시간봉·일봉 MACD(12·26·9)와 빗썸 차트 비교용 일봉(3·10·16)의 골든/데드 상태와 실제 교차가 구분돼.</div><div id="focus-results" class="empty">관찰 코인(예: NEAR)을 지정한 뒤 검색해 줘.</div></section><section class="surface"><h2>코인 후보 <small>BUY / WATCH</small></h2><div class="metrics"><div class="metric"><span>검사 완료</span><strong id="done">0</strong></div><div class="metric"><span>기존 BUY</span><strong id="noldbuy" class="side">0</strong></div><div class="metric"><span>종합 BUY</span><strong id="nbuy" class="up">0</strong></div><div class="metric"><span>전체 WATCH</span><strong id="nwatch" class="side">0</strong></div><div class="metric"><span>초기 WATCH</span><strong id="nearly" class="side">0</strong></div><div class="metric"><span>추세 WATCH</span><strong id="ntrend" class="up">0</strong></div><div class="metric"><span>오류 / 자료 부족</span><strong id="nerr">0</strong></div></div><div class="bar"><i id="progress"></i></div><div class="notice" id="btinfo"></div><div id="watch-summary" class="notice"></div><div id="issue-summary" class="notice"></div><div id="bt-summary" class="notice"></div><div id="watch-bt-summary" class="notice"></div><div id="results" class="empty">검사 시작을 누르면 BUY·WATCH 후보만 나타나.</div></section>
+<section class="surface hidden" id="study-panel"><h2>V1.4.8 · 과거 후보별 관찰 성과 비교</h2><div class="notice">초기 WATCH / 추세 WATCH / 기존 BUY / 연구 보류를 유동성 관측 품질과 함께 비교해. UNKNOWN은 수익·손실 평균에서 제외하고 데이터 완전도는 별도로 표시. 이 자료는 과거 WATCH 가격경로 가정이며 실제 체결 승률이 아냐.</div><div class="action row"><button id="study-summary-csv" type="button" class="secondary" disabled>그룹 비교 CSV</button><button id="study-rows-csv" type="button" class="secondary" disabled>후보별 비교 CSV</button><small id="study-status">백테스트 검색 완료 후 자동 비교</small></div><div id="study-results" class="notice">같은 시각·같은 검색 범위에서 나온 원본 후보 모두 비교. 화면 WATCH 필터와 관계없이 연구 보류까지 포함.</div></section><section class="surface" id="comparison-panel"><h2>기존 BUY ↔ 종합 BUY 비교</h2><div class="notice">원본 BUY·이전 강화 판정·새 종합 판정을 함께 비교해. 종합 보류도 저장되며 거래 신호가 아니야. 신호 품질 연구용 기준이야.</div><div id="comparison-results" class="empty">검사 전</div></section><div class="foot">모든 신호는 연구용 가상 판정이며 투자 권유나 주문 지시가 아니야. 실제 체결과 손익은 슬리피지·호가·갭으로 달라질 수 있어. 빗썸 공개 API만 사용하고 계정·주문 API는 호출하지 않아.</div>
+</main><script>
+(()=>{
+const $=id=>document.getElementById(id), ST={up:'상승',down:'하락',side:'횡보',unknown:'자료 부족'},TF={'month':'월','week':'주','day':'일','4h':'4시간','1h':'1시간','30m':'30분','15m':'15분','5m':'5분','3m':'3분','1m':'1분'},order=['month','week','day','4h','1h','30m','15m','5m','3m','1m'];
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let mode='live',strategy='swing',busy=false,results=[],issueCases=[],focusDiagnostics=[],spotcheckRows=[],spotcheckFee=.04,spotcheckBusy=false,studyResult=null,problems=0,completed=0,universe=[],runId=0,lastCfg=null;
+const dt=(d)=>{const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':00'};
+let d=new Date();d.setDate(d.getDate()-1);d.setHours(15,0,0,0);$('at').value=dt(d);
+function modeSet(next){if(busy||spotcheckBusy)return;mode=next;$('study-panel').classList.toggle('hidden',!(strategy==='swing'&&mode==='backtest'));$('live-tab').classList.toggle('on',mode==='live');$('backtest-tab').classList.toggle('on',mode==='backtest');$('backtest-date-field').style.display=mode==='backtest'?'flex':'none';$('backtest-days-field').style.display=mode==='backtest'?'flex':'none';$('live-help').classList.toggle('hidden',mode!=='live');$('backtest-help').classList.toggle('hidden',mode!=='backtest');reset()}
+function strategySet(next){if(busy||spotcheckBusy)return;strategy=next;$('study-panel').classList.toggle('hidden',!(strategy==='swing'&&mode==='backtest'));$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙 V1.4.8: 과거 정각 완료봉 누락 수정(15:00에 14:00~15:00 봉 포함), 실시간 2초 보호 유지. 기존 BUY/WATCH 기준 변경 없음. 시점 이전 24시간 유동성도 다시 정확하게 집계. 상단에서 10월 31일 WATCH 5개 종목의 5분/1분봉 공백 조사, CSV 제공.':'단타: 빠른 돌파·BTC 상대강도 · +1% 70% / +10% 30% · -2% 손절 / 240분.';$('watch-filter-field').style.display=next==='swing'?'flex':'none';$('comparison-panel').classList.toggle('hidden',next!=='swing');$('focus-panel').classList.toggle('hidden',next!=='swing');$('spotcheck-panel').classList.toggle('hidden',next!=='swing');if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
+$('scalp-tab').onclick=()=>strategySet('scalp');$('swing-tab').onclick=()=>strategySet('swing');
+$('live-tab').onclick=()=>modeSet('live');$('backtest-tab').onclick=()=>modeSet('backtest');
+function reset(){results=[];issueCases=[];focusDiagnostics=[];spotcheckRows=[];studyResult=null;$('study-summary-csv').disabled=true;$('study-rows-csv').disabled=true;$('study-status').textContent='백테스트 검색 완료 후 자동 비교';$('study-results').textContent='검색 전에 비교할 데이터가 없어.';$('spotcheck-csv').disabled=true;$('spotcheck-status').textContent='검증 전';$('spotcheck-results').textContent='10월 31일 WATCH 5종목을 전용 버튼으로 재검증할 수 있어.';completed=problems=0;$('focuscsv').disabled=true;$('focus-results').textContent='관찰 코인을 지정하고 검사해 줘.';$('results').innerHTML='검사 시작을 누르면 BUY·WATCH 후보만 나타나.';$('csv').disabled=true;$('issuecsv').disabled=true;$('issue-summary').textContent='';$('watch-summary').textContent='';$('comparison-results').textContent='검사 전';['done','noldbuy','nbuy','nwatch','nearly','ntrend','nerr'].forEach(k=>$(k).textContent='0');$('long').textContent='검사 전';$('short').textContent='검사 전';$('tf-grid').innerHTML='';$('progress').style.width='0%';$('scanstatus').textContent='검사 전';$('btinfo').textContent='';$('bt-summary').textContent='';$('watch-bt-summary').textContent='';$('error').textContent='';$('btcts').textContent=''}
+async function post(url,body){const rsp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await rsp.json();if(!rsp.ok||!j.ok)throw Error(j.error||'데이터 요청 실패');return j}
+async function get(url){const rsp=await fetch(url);const j=await rsp.json();if(!rsp.ok||!j.ok)throw Error(j.error||'목록 조회 실패');return j}
+$('spotcheck-btn').onclick=async()=>{
+ if(busy||spotcheckBusy)return;
+ spotcheckBusy=true;
+ const btn=$('spotcheck-btn');btn.disabled=true;btn.textContent='검증 중…';
+ $('spotcheck-csv').disabled=true;$('spotcheck-results').textContent='1시간봉 재조회 후 30분·5분·1분봉이 실제로 존재하는지 확인 중…';
+ $('spotcheck-status').textContent='요청 중';spotcheckRows=[];
+ try{
+  spotcheckFee=Number($('fee').value);
+  const result=await post('/api/replay-spotcheck',{fee:spotcheckFee});
+  spotcheckRows=result.items||[];
+  const fmt=x=>x==null||!Number.isFinite(Number(x))?'—':Number(x).toFixed(3);
+  const solved=spotcheckRows.filter(x=>x.backtest?.status==='RESOLVED').length;
+  const recovered=spotcheckRows.reduce((z,x)=>z+(Number(x.backtest?.audit?.recovered_one_hour_candles)||0),0);
+  $('spotcheck-status').textContent='완료 '+spotcheckRows.length+'건 / 확정 '+solved+' / 미확정 '+(spotcheckRows.length-solved)+' / 재조회 복구 '+recovered+'봉';
+  $('spotcheck-results').innerHTML=spotcheckRows.map(x=>{
+   const bt=x.backtest||{},a=bt.audit||{},micro=x.gap_micro||{};
+   return '<div class="result"><b>'+esc(x.name)+' ('+esc(x.market)+')</b>'
+     +'<p class="notice">가상 결과 '+(bt.status==='RESOLVED'?'확정 '+fmt(bt.net_pct)+'%':'UNKNOWN')+' · 상태 '+esc(a.status_code||'기록 없음')+'</p>'
+     +'<p class="notice">최초 누락 시간 '+esc(a.first_unresolved_or_recovered_hour_kst||'없음')+' KST · 최초 누락 '+esc(a.initial_missing_hours??'—')+'시간봉 · 실제 복구 '+esc(a.recovered_one_hour_candles??0)+'개</p>'
+     +'<p class="notice">1시간봉 재조회 '+esc(a.hourly_recheck_calls??0)+'회 · 30분봉 진단 '+esc(a.half_hour_diagnostic_calls??0)+'회 · 원인: '+esc(bt.reason||'추가 누락 전에 가상 청산 확인')+'</p>'
+     +'<p class="notice">V1.4.8: 5분봉 '+esc(micro.five_min_bars_observed??'미확인')+'개 · 1분봉 '+esc(micro.one_min_bars_observed??'미확인')+'개 · 판정 '+esc(micro.status_text||'추가 검사 대상 아님')+'</p>'
+     +'<p class="notice">하위 분봉이 있더라도 1시간봉을 합성해 매매 결과로 계산하지 않아.</p></div>';
+  }).join('');
+  $('spotcheck-csv').disabled=!spotcheckRows.length;
+ }catch(e){$('spotcheck-status').textContent='검증 실패';$('spotcheck-results').textContent='재조회 요청 오류: '+String(e?.message||e);}
+ finally{spotcheckBusy=false;btn.disabled=busy;btn.textContent='5종목 청산 경로 재검증';}
+};
+$('spotcheck-csv').onclick=()=>{
+ if(!spotcheckRows.length)return;
+ const q=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
+ const head=['version','snapshot_kst','fee_each_pct','market','name','status','net_pct','reason','reason_code','tp1','tp2','stop','minutes','audit_status','initial_missing_hours','sample_missing_kst','first_examined_missing_kst','hourly_recheck_calls','half_hour_diagnostic_calls','total_candle_api_calls','recovered_one_hour_candles','lower_tf_actual_bars_in_missing_hour','initial_api_error','detail_error','source_limitations','v146_micro_status','v146_5m_bars','v146_1m_bars','v146_5m_samples_kst','v146_1m_samples_kst','v146_micro_errors_json','v146_micro_explanation'];
+ const records=[head.map(q).join(',')];
+ for(const x of spotcheckRows){const b=x.backtest||{},a=b.audit||{},micro=x.gap_micro||{};
+  records.push(['BTC-MTF-V1.4.8','2026-10-31 15:00',spotcheckFee,x.market,x.name,b.status,b.net_pct??'',b.reason||'',b.reason_code||'',b.tp1,b.tp2,b.stop,b.minutes??'',a.status_code||'',a.initial_missing_hours??'',(a.initial_missing_samples_kst||[]).join(' / '),a.first_unresolved_or_recovered_hour_kst||'',a.hourly_recheck_calls??'',a.half_hour_diagnostic_calls??'',a.total_candle_api_calls??'',a.recovered_one_hour_candles??'',a.lower_timeframe_bars_in_missing_hour??'',a.initial_api_error||'',a.detail_error||'',a.source_limitations||'',micro.status_code||'',micro.five_min_bars_observed??'',micro.one_min_bars_observed??'',(micro.five_min_samples_kst||[]).join(' / '),(micro.one_min_samples_kst||[]).join(' / '),JSON.stringify(micro.errors||{}),micro.status_text||''].map(q).join(','));
+ }
+ const blob=new Blob(['\ufeff'+records.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_8_SPOTCHECK_202610311500.csv';
+ document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+const studyLabels={BUY:'종합 BUY',EARLY_WATCH:'초기 WATCH',TREND_WATCH:'추세 WATCH',RESEARCH:'연구 보류',ORIGINAL_BUY:'기존 원본 BUY',Q4:'유동성 4/4',Q23:'유동성 2~3/4',Q01:'유동성 0~1/4',Q_UNKNOWN:'유동성 자료 없음',COMPLETE_24H:'과거 24시간봉 완전',INCOMPLETE_24H:'과거 24시간봉 불완전',UNKNOWN_24H:'관측 이력 미확인'};
+function studyFmt(n,suffix=''){return n===null||n===undefined||!Number.isFinite(Number(n))?'—':Number(n).toLocaleString('ko-KR',{maximumFractionDigits:2})+suffix}
+function studyTable(rows){
+ const body=rows.map(g=>'<tr><td>'+esc(studyLabels[g.label]||g.label)+'</td><td>'+g.candidates+' / '+g.unique_markets+'</td><td>'+g.resolved+' / '+g.unknown+'</td><td>'+g.positive+' / '+g.nonpositive+'</td><td>'+studyFmt(g.resolution_rate_pct,'%')+'</td><td>'+studyFmt(g.mean_hypothetical_net_pct,'%')+(g.small_sample&&g.resolved?' ⚠':'')+'</td></tr>').join('');
+ return '<div class="study-scroll"><table><thead><tr><th>분류</th><th>후보 / 고유코인</th><th>확정 / 미확정</th><th>양수 / 비양수</th><th>확정률</th><th>확정분 평균</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+}
+function renderStudy(){
+ if(!studyResult)return;
+ const z=studyResult,t=z.summary||{},uniqueDays=(z.by_day||[]).length;
+ $('study-status').textContent='비교 완료 · 후보 '+t.candidates+'건 · '+uniqueDays+'개 기준일 · 실재 고유 종목 '+t.unique_markets+'개 · 확정 '+t.resolved+'건 · 미확정 '+t.unknown+'건';
+ $('study-results').innerHTML='<p class="notice"><b>전체 검색 '+z.scanned+'건 · 검색 자료 오류 '+z.issues+'건 · 후보 '+t.candidates+'건 · 편도 수수료 '+Number(z.fee_each_pct).toFixed(2)+'%</b> · 동일 코인이 다른 날짜에 있으면 개별 스냅샷으로 집계되며 독립 표본은 아냐. 7일 검사 범위는 현재 거래대금 상위 최대 10개, 3일은 최대 20개 코인으로 제한돼.</p>'
+  +'<h3>신호별 비교 · 모두 관찰용 가상 경로</h3>'+studyTable(z.by_kind||[])
+  +'<h3>신호 시점 이전 유동성 4개 기준</h3>'+studyTable(z.by_quality||[])
+  +'<h3>과거 24시간 1시간봉 자료 완전도</h3>'+studyTable(z.by_coverage||[])
+  +'<details><summary>추가 비교: 기존 BUY / 날짜별 / 신호×유동성</summary>'
+  +'<h3>기존 원본 BUY</h3>'+studyTable(z.original_buy?[z.original_buy]:[])
+  +'<h3>날짜별</h3>'+studyTable(z.by_day||[])
+  +'<h3>신호×유동성 (후보가 있는 그룹만)</h3>'+studyTable((z.by_kind_quality||[]).filter(x=>x.candidates))
+  +'</details>'
+  +'<p class="notice"><b>해석 주의:</b> '+esc((z.warnings||[]).join(' · '))+'</p>';
+ $('study-summary-csv').disabled=false;$('study-rows-csv').disabled=false;
+}
+async function refreshStudy(){
+ if(mode!=='backtest'||strategy!=='swing')return;
+ $('study-status').textContent='후보 유형·선행 유동성·가상 경로 비교 계산 중…';
+ const payload=results.map(x=>({
+  market:x.market,at:x.at,kind:x.signal.watch_kind||'RESEARCH',
+  legacy_signal:x.signal.legacy_signal||'NONE',
+  liquidity_audit:x.signal.liquidity_audit||{},
+  backtest:x.signal.backtest||{}
+ }));
+ const response=await post('/api/study-v147',{
+  mode:'backtest',strategy:'swing',fee:Number(lastCfg?.fee||.04),
+  scanned:completed,issues:problems,items:payload
+ });
+ studyResult=response.study;renderStudy();
+}
+function exportStudyCsv(rows,name,headers,fields){
+ if(!studyResult)return;
+ const q=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
+ const lines=[headers.map(q).join(',')];
+ for(const row of rows)lines.push(fields.map(k=>q(row[k]??'')).join(','));
+ const url=URL.createObjectURL(new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;
+ a.download='BITHUMB_BTC_MTF_V1_4_8_'+name+'_'+String(lastCfg?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';
+ document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+}
+$('study-summary-csv').onclick=()=>{
+ if(!studyResult)return;
+ const z=studyResult,rows=[];
+ for(const [type,items] of [['TOTAL',[z.summary]],['LEGACY_BUY',[z.original_buy]],['KIND',z.by_kind],['QUALITY',z.by_quality],['COVERAGE',z.by_coverage],['KIND_QUALITY',z.by_kind_quality],['DAY',z.by_day]]){
+  for(const x of items||[])if(x)rows.push({group_type:type,...x});
+ }
+ const fields=['version','fee_each_pct','group_type','label','candidates','unique_markets','unique_snapshots','resolved','unknown','positive','nonpositive','resolution_rate_pct','positive_fraction_resolved_pct','mean_hypothetical_net_pct','median_hypothetical_net_pct','min_hypothetical_net_pct','max_hypothetical_net_pct','small_sample'];
+ exportStudyCsv(rows.map(x=>({version:'BTC-MTF-V1.4.8',fee_each_pct:z.fee_each_pct,...x})),'COHORT_SUMMARY',fields,fields);
+};
+$('study-rows-csv').onclick=()=>{
+ if(!studyResult)return;
+ const fields=['version','fee_each_pct','at','market','kind','legacy_signal','quality','coverage','quality_checks_passed','hourly_bars_observed','historical_turnover_krw','status','net_pct','backtest_reason'];
+ exportStudyCsv((studyResult.rows||[]).map(x=>({version:'BTC-MTF-V1.4.8',fee_each_pct:studyResult.fee_each_pct,...x})),'COHORT_DETAILS',fields,fields);
+};
+
+function btcDraw(ctx){$('long').textContent=ST[ctx.long]||'미확인';$('long').className=ctx.long;$('short').textContent=ST[ctx.short]||'미확인';$('short').className=ctx.short;$('btcts').textContent='· '+ctx.asof_kst+' KST';$('tf-grid').innerHTML=order.map(k=>{const x=ctx.tf[k]||{state:'unknown'},why=x.reason?' · '+x.reason:'';return `<div class="tf" title="${esc(why)}"><div class="name">BTC ${TF[k]}</div><div class="status ${x.state}">${ST[x.state]||'자료 부족'}</div></div>`}).join('')}
+function classifyIssue(reason){
+ const msg=String(reason||'알 수 없는 문제');
+ if(/이력|실제 캔들 수|연속 마감봉|밀도 부족|관측 간격/.test(msg))return '이력/캔들 공백';
+ if(/최신|오래됨|동일 시각|신선도/.test(msg))return '시각/최신봉';
+ if(/HTTP|API|fetch|timeout|요청|조회 실패|제한/.test(msg))return 'API/통신';
+ return '기타';
+}
+function visibleResults(){
+ const filter=$('watch-filter').value;
+ return results.filter(x=>{
+  if(strategy!=='swing')return true;
+  const sig=x.signal,kind=sig.watch_kind||'',score=Number(sig.metrics?.score||0);
+  if(filter==='all')return true;
+  if(filter==='nine')return score>=9;
+  if(filter==='ten')return score>=10;
+  if(filter==='early')return kind==='EARLY_WATCH';
+  if(filter==='trend')return kind==='TREND_WATCH';
+  return kind==='BUY'||kind==='EARLY_WATCH'||kind==='TREND_WATCH';
+ });
+}
+$('watch-filter').onchange=()=>{if(!busy){summary();renderResults();}};
+function issueSummary(){
+ if(!issueCases.length){$('issue-summary').textContent='';return}
+ const counts={};for(const x of issueCases){const k=classifyIssue(x.reason);counts[k]=(counts[k]||0)+1;}
+ const kinds=Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([k,v])=>k+' '+v+'건').join(' · ');
+ const ex=issueCases[0];
+ $('issue-summary').textContent='자료 확인 필요 '+issueCases.length+'건 ('+kinds+'). 예: '+ex.market+' — '+ex.reason+'. 정확한 종목별 이유는 문제 내역 CSV로 저장 가능.';
+}
+function trackBacktest(kind,label){
+ const a=results.filter(x=>x.signal.watch_kind===kind),d=a.filter(x=>x.signal.backtest?.status==='RESOLVED'),w=d.filter(x=>Number(x.signal.backtest.net_pct)>0).length;
+ const avg=d.length?(d.reduce((z,x)=>z+Number(x.signal.backtest.net_pct),0)/d.length).toFixed(2)+'%':'—';
+ return label+' '+a.length+'건 / 경로 확인 '+d.length+'건(수익 '+w+'·손실 '+(d.length-w)+') / 미확정 '+(a.length-d.length)+' / 확인분 가상 평균 '+avg;
+}
+function summary(){
+ issueSummary();
+ const buy=results.filter(x=>x.signal.signal==='BUY').length,oldbuy=results.filter(x=>x.signal.legacy_signal==='BUY').length,watchAll=results.filter(x=>x.signal.signal==='WATCH').length,early=results.filter(x=>x.signal.watch_kind==='EARLY_WATCH').length,trendCount=results.filter(x=>x.signal.watch_kind==='TREND_WATCH').length,research=results.filter(x=>x.signal.signal==='RESEARCH').length;
+ const watch=visibleResults().filter(x=>x.signal.signal==='WATCH').length;
+ $('done').textContent=completed;$('noldbuy').textContent=strategy==='swing'?oldbuy:buy;$('nbuy').textContent=buy;$('nwatch').textContent=watch;$('nearly').textContent=early;$('ntrend').textContent=trendCount;$('nerr').textContent=problems;
+ $('watch-summary').textContent=strategy==='swing'?'원본 BUY '+oldbuy+'건 → 엄격 BUY '+buy+'건 / 초기 WATCH '+early+'건 / 추세 WATCH '+trendCount+'건 · 화면 WATCH '+watch+'건 · 연구 보류 '+research+'건 · 원본과 각 판정 CSV 보존':'단타는 기존 판정 유지';
+ $('progress').style.width=universe.length?Math.round(completed/universe.length*100)+'%':'0%';
+ $('scanstatus').textContent=(busy?'검사 중 ':'검사 완료 ')+completed+'/'+universe.length;
+ const ok=results.filter(x=>x.signal.signal==='BUY'&&x.signal.backtest&&x.signal.backtest.status==='RESOLVED'),unk=buy-ok.length,wins=ok.filter(x=>x.signal.backtest.net_pct>0).length;
+ const oldResolved=results.filter(x=>x.signal.legacy_signal==='BUY'&&x.signal.backtest?.status==='RESOLVED');
+ const oldWins=oldResolved.filter(x=>x.signal.backtest.net_pct>0).length;
+ $('watch-bt-summary').textContent=mode==='backtest'&&strategy==='swing'?trackBacktest('EARLY_WATCH','초기 WATCH')+' · '+trackBacktest('TREND_WATCH','추세 WATCH')+' · WATCH는 진입 거래가 아니라 참고 가격 경로':'';
+ $('bt-summary').textContent=mode!=='backtest'?'':strategy==='swing'
+   ?'기존 BUY '+oldbuy+'건 (청산 확정 '+oldResolved.length+', 확정 승률 '+(oldResolved.length?(oldWins/oldResolved.length*100).toFixed(1)+'%':'—')+') / 종합 BUY '+buy+'건 (청산 확정 '+ok.length+', 확정 승률 '+(ok.length?(wins/ok.length*100).toFixed(1)+'%':'—')+'). 미확정 제외 · 현재 거래대금 선택 편향 존재.'
+   :'BUY '+buy+'건 · 청산 확정 '+ok.length+' · 미확정 '+unk+' · 확정 승률 '+(ok.length?(wins/ok.length*100).toFixed(1)+'%':'—')+' · 확정 평균 순익 '+(ok.length?(ok.reduce((v,x)=>v+Number(x.signal.backtest.net_pct),0)/ok.length).toFixed(3)+'%':'—');
+}
+const macdStateText=s=>({GOLDEN:'골든 상태 (MACD선이 시그널선 위)',DEAD:'데드 상태 (MACD선이 시그널선 아래)',FLAT:'두 선 동일',UNKNOWN:'자료/최근 연속봉 부족'})[s]||'알 수 없음';
+const macdEventText=s=>({GOLDEN_CROSS:'골든크로스 발생',DEAD_CROSS:'데드크로스 발생',NONE:'이번 봉 교차 없음'})[s]||'불명';
+function explainCard(d){
+ if(!d)return '';
+ if(d.status==='INSUFFICIENT')return '<div class="insight-wrap">근거 점수: 완료봉 이력 부족</div>';
+ const names=[['structure','Structure · 구조'],['timing','Timing · 타이밍'],
+ ['trend','Trend · 추세'],['setup','Setup · 셋업'],
+ ['entry','Entry · 진입 준비'],['safety','Safety · 안전(높을수록 안전)']];
+ const fmt=x=>x===null||x===undefined||!Number.isFinite(Number(x))?'—':Number(x).toLocaleString('ko-KR',{maximumFractionDigits:8});
+ const scores=names.map(([k,t])=>'<div class="insight-score"><strong>'+fmt(d.scores?.[k])+'</strong><span>'+esc(t)+'/100</span></div>').join('');
+ const down=d.sell_pressure_proxy?.red_candle_turnover_pct;
+ const red='<div class="insight-score"><strong>'+(down==null?'—':fmt(down)+'%')+'</strong><span>음봉 거래대금 비중 · 매도 압력 참고</span></div>';
+ const reasons=names.map(([k,t])=>'<div class="insight-proof"><b>'+esc(t)+'</b>'+
+  (d.factors?.[k]||[]).map(v=>'<span>'+(v.passed?'✓ ':'× ')+esc(v.label)+'</span>').join('')+'</div>').join('');
+ const p=d.plan||{},c=d.context||{};
+ const levels=[['돌파 관찰선',p.trigger_ref],['가상 손절선',p.stop_ref],
+  ['수수료 포함 본전 참고',p.breakeven_ref],['1차 가상 목표 (1.5R)',p.target1_ref],
+  ['2차 가상 목표 (3.0R)',p.target2_ref],['손절 거리',p.risk_pct==null?null:fmt(p.risk_pct)+'%']];
+ const levelsHtml=levels.map(([label,v])=>'<div><b>'+esc(v==null?'미산정':fmt(v)==='—'?v:fmt(v))+(typeof v==='string'&&v.includes('%')?'':'')+'</b><small>'+esc(label)+'</small></div>').join('');
+ const warnings=(d.warnings||[]).map(t=>'⚠ '+esc(t)).join(' · ');
+ const dayTurnover=c.last_24h_closed_turnover_krw==null?'연속봉 부족으로 미산정':fmt(c.last_24h_closed_turnover_krw/100000000)+'억 원';
+ const ctx='완료봉 24시간 거래대금 합계 '+dayTurnover+' · 4H 거래대금 배수 '+fmt(c.h4_rvol_turnover)+'배 · 4H RSI '+fmt(c.h4_rsi)+' · ATR '+fmt(c.h4_atr_pct)+'% · MA7 이격 '+fmt(c.h4_ma7_distance_pct)+'%';
+ return '<section class="insight-wrap"><b>설명형 점수 · 4조건씩 / 100점 (연구용)</b>'
+  +'<div class="insight-grid">'+scores+red+'</div>'
+  +'<p class="entry-note">'+esc(d.summary||'진입 확정 전')+'</p>'
+  +'<p class="notice">'+esc(ctx)+'</p>'
+  +(warnings?'<p class="notice">'+warnings+'</p>':'')
+  +'<b>별도 연구용 관찰 계획 (기존 120시간 백테스트 손절·목표와 다름)</b>'
+  +'<p class="notice">다음 4시간봉 몸통이 돌파 관찰선 위에서 마감 + 같은 봉 거래대금 2.0배 이상이 확인돼야 재판정해. 현재 봉에서는 충족 여부를 알 수 없어.</p>'
+  +'<div class="insight-plan">'+levelsHtml+'</div>'
+  +'<p class="notice">'+esc(p.note||'')+'</p>'
+  +(p.plan_valid?'':'<p class="notice">⚠ 손절 거리/봉 연속성 때문에 이 참고 계획은 부적합. 목표가는 표시하지 않아.</p>')
+  +'<details><summary>점수별 통과/미통과 근거 펼치기</summary>'+reasons+'</details>'
+  +'<p class="notice">음봉 거래대금 비율은 실제 매도 체결강도가 아니야. 호가벽·체결강도 미수집. 실거래 체결·호가단위·슬리피지 미검증. 점수는 확률 아님.</p></section>';
+}
+function liquidityCard(x){
+ if(!x)return '';
+ const amt=(Number(x.observed_turnover_24h_krw||0)/100000000).toFixed(2);
+ const caveat=x.observed_turnover_is_complete?'24시간 완전 관측':'캔들 누락으로 거래대금 합계 불완전';
+ return '<div class="insight-wrap"><b>선행 유동성 관측 '+esc(x.checks_passed??0)+'/4 · '+esc(x.label||'자료 없음')+'</b>'
+  +'<p class="notice">스냅샷 이전 실제 1시간봉 '+esc(x.hourly_bars_observed??'—')+'/24 · 최근 6시간 '+esc(x.recent_6h_bars_observed??'—')+'/6 · 관측 거래대금 '+esc(amt)+'억원</p>'
+  +'<p class="notice">'+esc(caveat)+' · 최장 연속 누락 '+esc(x.longest_missing_hours??'—')+'시간</p>'
+  +'<p class="notice">주의: '+esc((x.warnings||[]).join(' / ')||'추가 경고 없음')+'</p>'
+  +'<p class="notice">이 점수는 관측 품질 설명이며 성공 확률·BUY 조건이 아니야. 미래 청산 데이터 사용 안 함.</p></div>';
+}
+function macdCard(x,title){
+ if(!x)return '<div class="result">'+esc(title)+' · 데이터 없음</div>';
+ const last=x.last_event==='NONE'?'최근 24봉 교차 확인되지 않음':macdEventText(x.last_event)+' · '+esc(x.last_event_kst||'')+' ('+x.bars_since_cross+'봉 전)';
+ return '<div class="result"><b>'+esc(title)+'</b><p class="reason">현재: '+macdStateText(x.state)+' · 완료봉 '+esc(x.closed_kst||'')+'</p>'
+   +'<p class="notice">이번 완료봉: '+macdEventText(x.event)+' · 마지막 교차: '+last+'</p>'
+   +'<p class="notice">MACD '+(x.macd??'—')+' / 시그널 '+(x.signal??'—')+' / 히스토그램 '+(x.hist??'—')+' (이전 '+(x.prev_hist??'—')+')</p></div>';
+}
+function renderFocus(){
+ if(strategy!=='swing')return;
+ if(!focusDiagnostics.length){$('focus-results').textContent='신호와 관계없이 관심 코인을 지정하면 MACD 진단을 보여줘.';return;}
+ $('focus-results').innerHTML=focusDiagnostics.map(x=>{
+  const d=x.diagnostic||{},v=d.macd||{},g=d.strict_gate||{},combined=d.combined_gate||{};
+  return '<div><h3>'+esc(x.name||x.market)+' · '+esc(x.at)+'</h3>'
+    +'<p class="notice">원본 '+esc(d.legacy_signal||'NONE')+' · 점수 '+(d.score??'—')+'/10 · RSI '+(d.rsi14??'—')+' · V1.4.3 '+esc(combined.signal||'RESEARCH')+' · 분리 WATCH '+esc(d.watch_tracks?.label||'연구 보류')+'</p>'+'<p class="notice">초기 WATCH 미충족: '+esc((d.watch_tracks?.early_missing||[]).join(' / ')||'없음')+'</p>'+'<p class="notice">추세 WATCH 미충족: '+esc((d.watch_tracks?.trend_missing||[]).join(' / ')||'없음')+'</p>'
+    +liquidityCard(d.liquidity_audit)+explainCard(d.explain)+macdCard(v.h4,'4시간봉 MACD(12,26,9)')
+    +macdCard(v.day,'일봉 MACD(12,26,9)')
+    +macdCard(v.day_chart,'일봉 MACD(3,10,16) · 차트 비교')
+    +'</div>';
+ }).join('');
+}
+function renderComparison(){
+ const old=results.filter(x=>x.signal.legacy_signal==='BUY');
+ if(!old.length){$('comparison-results').textContent='기존 BUY 0건 · 비교할 신호가 없어.';return;}
+ $('comparison-results').innerHTML=old.map(x=>{
+  const si=x.signal,g=si.strict_gate||{},bt=si.backtest||{};
+  const out=mode!=='backtest'?'LIVE · 사후 결과 미측정':
+     bt.status==='RESOLVED'?'120시간 가상 결과 '+Number(bt.net_pct).toFixed(3)+'% (확정)':
+     '미확정 · '+String(bt.reason||'봉 자료 부족');
+  return '<div class="result"><strong>'+esc(x.name||x.market)+' ('+esc(x.market)+')</strong> · <span class="badge buy">기존 BUY</span> → <span class="badge '+si.signal.toLowerCase()+'">'+(si.signal==='BUY'?'엄격 BUY':si.signal==='WATCH'?esc(si.watch_tracks?.label||'관찰 WATCH'):'연구 보류')+'</span>'
+  +'<p class="notice">반등 '+Number(si.metrics.score)+'/10 · '+esc(x.at||'')+' · '+esc(out)+'</p>'+'<p class="notice">V1.4.3 '+esc(si.v143_signal||'RESEARCH')+' · 초기 WATCH '+(si.watch_tracks?.early_ready?'통과':'보류')+' · 추세 WATCH '+(si.watch_tracks?.trend_ready?'통과':'보류')+'</p>'
+  +(si.combined_gate?.missing_watch?.length?'<p class="reason">종합 미충족: '+esc(si.combined_gate.missing_watch.join(' / '))+'</p>':'<p class="reason">종합 관찰조건 통과</p>')+(si.signal!=='BUY'?'<p class="reason">종합 BUY 미충족: '+esc((si.combined_gate?.missing_buy||[]).join(' / '))+'</p>':'')
+  +'</div>';
+ }).join('');
+}
+function renderResults(){
+ if(strategy==='swing'){renderComparison();renderFocus();}
+ const sorted=visibleResults().sort((a,b)=>(a.signal.signal==='BUY'?0:1)-(b.signal.signal==='BUY'?0:1)||b.signal.metrics.relative_pct-a.signal.metrics.relative_pct);
+ if(!sorted.length){$('results').textContent=results.length?'선택한 WATCH 종류의 후보가 없어. 다른 WATCH 필터 또는 연구 전체를 확인해 줘.':'원본 반등 후보가 없어. 자료 부족은 문제 내역 CSV를 확인해 줘.';return;}
+ const num=x=>Number.isFinite(Number(x))?Number(x).toLocaleString('ko-KR',{maximumFractionDigits:8}):'—';
+ $('results').classList.remove('empty');
+ $('results').innerHTML=sorted.map(x=>{
+  const si=x.signal,m=si.metrics,p=si.plan,bt=si.backtest,fee=Number(lastCfg.fee),base=Number(m.close);
+  const audittext=mode==='backtest'&&strategy==='swing'&&bt?.audit?'<p class="notice">1시간봉 검증: '+esc(bt.audit.status_code||'')+' · 최초 누락 '+esc(bt.audit.first_unresolved_or_recovered_hour_kst||'없음')+' KST · 실제 복구 '+esc(bt.audit.recovered_one_hour_candles??0)+'봉 · 재조회 '+esc(bt.audit.hourly_recheck_calls??0)+'회</p>':'';
+  const bttext=mode!=='backtest'?'':bt&&bt.status==='RESOLVED'
+   ?'<p class="pnl '+(bt.net_pct>=0?'up':'down')+'">'+(si.signal==='BUY'?'BUY 가상거래':'진입 없는 참고 가격 경로')+' · '+(strategy==='swing'?'120시간':'240분')+' 순익 '+(bt.net_pct>=0?'+':'')+Number(bt.net_pct).toFixed(3)+'% · '+(bt.stop?'손절':bt.tp2?'2차 익절':bt.tp1?'1차 익절 후 청산':'만료')+(bt.ambiguous?' · 동일 봉 순서 불명':'')+'</p>'
+   :'<p class="pnl side">미확정: '+esc(bt&&bt.reason||'봉 누락')+'</p>';
+  return '<details class="result"><summary><span class="badge '+si.signal.toLowerCase()+'">'+si.signal+'</span><small>'+esc(si.stage||'')+'</small><span class="score-chip">'+(m.score_total===10?m.score+'/10점':'')+'</span><b>'+esc(x.name||x.market)+' <small>'+esc(x.market)+'</small></b><span class="entry-price '+(si.signal==='WATCH'?'watch-entry':'')+'">'+(si.signal==='BUY'?'진입 참고가 ':si.signal==='WATCH'?'WATCH 관찰가 ':'연구 참고가 ')+num(base)+'원</span><span class="push">'+esc(x.at||'')+' · 상대강도 '+(m.relative_pct>=0?'+':'')+Number(m.relative_pct).toFixed(2)+'%p · 상세 ▾</span></summary><div class="reason">'
+   +'<div class="entry-note"><strong>'+(si.signal==='BUY'?'BUY 진입 참고가: ':si.signal==='WATCH'?'WATCH 관찰 기준가: ':'연구용 참고가: ')+num(base)+'원</strong> · '+(si.signal==='BUY'?'신호가 확인된 마지막 마감봉 종가. 실제 주문가는 다를 수 있어.':si.signal==='WATCH'?'BUY 조건 미충족. 관찰 참고 가격이며 매수를 뜻하지 않아.':'연구 기록만 보관. 종합 기준 불합격이며 실제 진입 추천이 아님.')+'</div>'
+   +'<div class="entry-metrics"><span>1차 익절 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원</span><span>2차 익절 예상 '+num(base*(1+p.tp2_gross_pct/100))+'원</span><span>가상 손절 '+num(base*(1+p.stop_gross/100))+'원</span></div>'
+   +(si.legacy_signal==='BUY'&&si.signal!=='BUY'?'<p class="entry-note">기존 V1.3.3 BUY였지만 V1.4.8 종합 기준 미달 · 신규 BUY 아님</p>':'')+(si.signal==='RESEARCH'?'<p class="entry-note">연구 보류: BUY/WATCH 신호 아님, 원본 기록·탈락 사유만 보존.</p>':'')+(si.watch_kind==='EARLY_WATCH'?'<p class="entry-note">초기 반등 관찰용. 상위 추세 미확정 가능 · BUY 및 진입 신호 아님.</p>':'')+(si.watch_kind==='TREND_WATCH'?'<p class="entry-note">추세 확인 WATCH. BUY 진입 신호 아님.</p>':'')+(strategy==='swing'?liquidityCard(si.liquidity_audit)+explainCard(si.explain):'')+(strategy==='swing'&&m.macd_h4?macdCard(m.macd_h4,'4시간봉 MACD(12,26,9)'):'')+si.explanation.map(z=>'<p>• '+esc(z)+'</p>').join('')
+   +'<p>가상 청산: 순익 +'+p.tp1_net+'% '+Math.round(p.tp1_fraction*100)+'%, +'+p.tp2_net+'% '+Math.round(p.tp2_fraction*100)+'% · 손절 '+p.stop_gross+'% · '+p.max_minutes/60+'시간</p>'
+   +'<p>완료봉 참고가 '+num(base)+'원 · 1차 예상 '+num(base*(1+p.tp1_gross_pct/100))+'원 · 2차 '+num(base*(1+p.tp2_gross_pct/100))+'원 · 가상 손절 '+num(base*(1+p.stop_gross/100))+'원'+(m.support?' · 구조 지지 '+num(m.support)+'원':'')+' (실제 체결가 아님)</p>'
+   +'<p>수수료 편도 '+fee.toFixed(2)+'% · 완료봉 '+esc(m.closed_kst)+' KST</p>'+bttext+audittext+'</div></details>';
+ }).join('');
+}
+$('start').onclick=async()=>{
+ if(busy||spotcheckBusy)return;reset();busy=true;runId++;const id=runId,btn=$('start');btn.disabled=true;btn.textContent='검색 중…';
+ const cfg={mode,strategy,tf:$('tf').value,fee:Number($('fee').value),min_turnover_24h_krw:Number($('turnover').value)};
+ if(mode==='backtest')cfg.at=$('at').value.replace('T',' ')+':00';lastCfg={...cfg};
+ try{
+  const list=await get('/api/universe');const scope=$('scope').value;
+  let items=list.items.filter(x=>Number(x.turnover)>=cfg.min_turnover_24h_krw);
+  items=scope==='all'?items:items.slice(0,Number(scope));
+  const daysCount=mode==='backtest'?Number($('days').value):1;
+  if(daysCount>1)items=items.slice(0,daysCount===7?10:20);
+  const pinned=$('focus').value.trim().toUpperCase().replace(/^KRW-/, '');let focusedMarket='';if(pinned){const found=list.items.find(x=>x.market==='KRW-'+pinned||x.name===$('focus').value.trim());if(found){focusedMarket=found.market;if(!items.some(x=>x.market===found.market))items=[found,...items];}else throw Error('관찰 코인을 찾지 못했어: '+pinned);}if(!items.length)throw Error('검색 가능한 종목이 없어');
+  const dates=[];
+  for(let day=0;day<daysCount;day++){
+   const c={...cfg};
+   if(mode==='backtest'){const d=new Date(cfg.at.replace(' ','T'));d.setDate(d.getDate()-day);c.at=dt(d).replace('T',' ')+':00';}
+   dates.push(c);
+  }
+  universe=dates.flatMap(c=>items.map(x=>({...x,at:c.at||'LIVE'})));
+  $('btinfo').textContent=mode==='backtest'
+    ?daysCount+'일 × 하루 같은 시각 1회 · '+items.length+'개 현재 상장 종목. 거래대금 하한 '+($('turnover').selectedOptions[0]?.textContent||'')+' · 현재 거래대금 기준: 과거 시점 정보가 아니므로 생존·미래정보 편향 주의!'
+    :'24시간 거래대금 '+($('turnover').selectedOptions[0]?.textContent||'')+' · BTC 후보 제외 · 반등 점수 및 진입 위치 필터';
+  for(const c of dates){
+   const b=await post('/api/btc',c);
+   if(runId!==id)break;
+   btcDraw(b.context);
+   if(mode==='live')c.snapshot_at=b.context.asof_kst;
+   let cursor=0;
+   const work=async()=>{while(cursor<items.length){
+    const coin=items[cursor++];
+    try{
+     const focused=!!focusedMarket&&coin.market===focusedMarket;
+     const j=await post('/api/coin',{...c,market:coin.market,want_diagnostic:focused});
+     if(focused&&j.diagnostic)focusDiagnostics.push({market:coin.market,name:coin.name,at:c.at||c.snapshot_at||'LIVE',diagnostic:j.diagnostic});
+     if(j.signal)results.push({market:coin.market,name:coin.name,at:c.at||c.snapshot_at||'LIVE',turnover24h:coin.turnover,signal:j.signal});
+     if(j.issue){problems++;issueCases.push({market:coin.market,name:coin.name,at:c.at||c.snapshot_at||'LIVE',turnover24h:coin.turnover,reason:j.issue});}
+    }catch(e){problems++;issueCases.push({market:coin.market,name:coin.name,at:c.at||c.snapshot_at||'LIVE',turnover24h:coin.turnover,reason:'요청/API 오류: '+String(e?.message||e)});}
+    completed++;
+    if(completed%4===0||completed===universe.length){summary();renderResults();}
+    await Promise.resolve();
+   }};
+   await Promise.all(Array.from({length:Math.min(4,items.length)},work));
+  }
+ }catch(ex){$('error').textContent='검사를 완료하지 못했어: '+ex.message;}
+ finally{summary();renderResults();$('csv').disabled=!completed;$('issuecsv').disabled=!issueCases.length;$('focuscsv').disabled=!focusDiagnostics.length;
+  if(mode==='backtest'&&strategy==='swing'){try{await refreshStudy();}catch(err){$('study-status').textContent='비교 실패: '+String(err?.message||err);$('study-results').textContent='전체 후보 CSV는 정상 저장 가능. 연구 비교 요청만 실패했어.';}}
+  busy=false;btn.disabled=false;btn.textContent='검색 시작';
+ }
+};
+$('focuscsv').onclick=()=>{
+ if(!focusDiagnostics.length)return;
+ const cols=['version','market','name','snapshot_kst','closed_kst','reference_price_krw','rebound_score','rsi14','legacy_signal','strict_gate_passed','macd_view','macd_params','macd_state','macd_current_bar_event','macd_last_event','macd_last_event_kst','bars_since_cross','continuous','macd_value','macd_signal','macd_hist','macd_hist_previous','structure_score','timing_score','trend_score','setup_score','entry_score','safety_score','red_candle_turnover_pct','breakout_watch_ref','hypothetical_stop_ref','fee_breakeven_ref','hypothetical_target1_ref','hypothetical_target2_ref','hypothetical_stop_distance_pct','explain_summary','explain_warnings','explain_factors_json','orderbook_status','combined_signal','combined_watch_ready','combined_buy_ready','combined_watch_failed','combined_buy_failed','combined_checks_json','completed_4h_breakout_ref','completed_4h_breakout_ok','v144_watch_kind','v144_early_ready','v144_trend_ready','v144_early_failed','v144_trend_failed','v144_early_checks_json','v144_trend_checks_json','v144_warnings','v144_prior_v143_signal','v146_quality_label','v146_quality_kind','v146_quality_passed','v146_hourly_bars_24','v146_recent6h_bars','v146_max_missing_streak_hours','v146_observed_turnover_24h_krw','v146_observed_turnover_complete','v146_missing_hours_kst','v146_quality_warnings'];
+ const q=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
+ const lines=[cols.map(q).join(',')];
+ for(const x of focusDiagnostics){const d=x.diagnostic||{};
+  for(const key of ['h4','day','day_chart']){const v=d.macd?.[key]||{};
+   lines.push(['BTC-MTF-V1.4.8',x.market,x.name,x.at,d.closed_kst,d.close,d.score,d.rsi14,d.legacy_signal,d.strict_gate?.passed,key,v.params,v.state,v.event,v.last_event,v.last_event_kst,v.bars_since_cross,v.continuous,v.macd,v.signal,v.hist,v.prev_hist,d.explain?.scores?.structure??'',d.explain?.scores?.timing??'',d.explain?.scores?.trend??'',d.explain?.scores?.setup??'',d.explain?.scores?.entry??'',d.explain?.scores?.safety??'',d.explain?.sell_pressure_proxy?.red_candle_turnover_pct??'',d.explain?.plan?.trigger_ref??'',d.explain?.plan?.stop_ref??'',d.explain?.plan?.breakeven_ref??'',d.explain?.plan?.target1_ref??'',d.explain?.plan?.target2_ref??'',d.explain?.plan?.risk_pct??'',d.explain?.summary??'',(d.explain?.warnings||[]).join(' / '),JSON.stringify(d.explain?.factors||{}),d.explain?.sell_pressure_proxy?.note??'',d.combined_gate?.signal??'',d.combined_gate?.watch_ready??'',d.combined_gate?.buy_ready??'',(d.combined_gate?.missing_watch||[]).join(' / '),(d.combined_gate?.missing_buy||[]).join(' / '),JSON.stringify(d.combined_gate?.watch_checks||{}),d.combined_gate?.prior_3bar_breakout_level??'',d.combined_gate?.latest_completed_4h_breakout??'',d.watch_tracks?.kind??'',d.watch_tracks?.early_ready??'',d.watch_tracks?.trend_ready??'',(d.watch_tracks?.early_missing||[]).join(' / '),(d.watch_tracks?.trend_missing||[]).join(' / '),JSON.stringify(d.watch_tracks?.early_checks||{}),JSON.stringify(d.watch_tracks?.trend_checks||{}),(d.watch_tracks?.warnings||[]).join(' / '),d.watch_tracks?.old_combined_signal??'',d.liquidity_audit?.label??'',d.liquidity_audit?.kind??'',d.liquidity_audit?.checks_passed??'',d.liquidity_audit?.hourly_bars_observed??'',d.liquidity_audit?.recent_6h_bars_observed??'',d.liquidity_audit?.longest_missing_hours??'',d.liquidity_audit?.observed_turnover_24h_krw??'',d.liquidity_audit?.observed_turnover_is_complete??'',(d.liquidity_audit?.missing_hour_samples_kst||[]).join(' / '),(d.liquidity_audit?.warnings||[]).join(' / ')].map(q).join(','));
+  }
+ }
+ const url=URL.createObjectURL(new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_8_FOCUS_MACD_'+String(focusDiagnostics[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+$('issuecsv').onclick=()=>{
+ if(!issueCases.length||!lastCfg)return;
+ const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
+ const rows=[['version','strategy','mode','snapshot_kst','tf','fee_each_pct','min_turnover_24h_krw','market_turnover_24h_krw','market','name','issue_type','issue_reason']];
+ for(const x of issueCases){
+  rows.push(['BTC-MTF-V1.4.8',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,classifyIssue(x.reason),x.reason]);
+ }
+ const csv=rows.map(row=>row.map(quote).join(',')).join('\n');
+ const url=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_8_ISSUES_'+String(issueCases[0]?.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+$('csv').onclick=()=>{
+ if(!lastCfg)return;
+ const fields=['version','strategy','mode','snapshot_kst','tf','fee_each_pct','min_turnover_24h_krw','market_turnover_24h_krw','market','name','signal','closed_kst','entry_ref_price_krw','entry_ref_type','tp1_ref_price_krw','tp2_ref_price_krw','stop_ref_price_krw','relative_pct','btc_change_pct','coin_change_pct','breakout_pct','volume_ratio','atr_pct','rise24_pct','structure_risk_pct','rebound_from_low_pct','data_gap_recent','data_status','technical_score','quality_score','score_total','quality_btc_strength','quality_entry_zone','quality_risk_control','bb_position','rsi14','macd_hist','ichimoku_tenkan','ichimoku_kijun','score','stage','reason','tp1_net','tp1_fraction','tp2_net','tp2_fraction','stop_gross','max_minutes','bt_status','bt_net_pct','bt_stop','bt_tp1','bt_tp2','bt_minutes','bt_ambiguous','bt_reason','watch_filter','shown_on_screen','legacy_signal','strict_signal','strict_gate_passed','strict_failed_checks','strict_gate_checks','h4_ma20','h4_ma20_prev','macd_4h_state','macd_4h_event','macd_4h_last_cross','macd_4h_last_cross_kst','macd_4h_macd','macd_4h_signal','macd_4h_prev_hist','macd_day_state','macd_day_event','macd_day_macd','macd_day_signal','macd_day_chart_state','macd_day_chart_event','macd_day_chart_macd','macd_day_chart_signal','explain_version','structure_score','timing_score','trend_score','setup_score','entry_score','safety_score','red_candle_turnover_pct','24h_closed_turnover_krw','rvol_4h','atr_4h_pct','ma7_distance_pct','explain_summary','explain_warnings','breakout_watch_ref','hypothetical_stop_ref','fee_breakeven_ref','hypothetical_target1_ref','hypothetical_target2_ref','target1_rr','target2_rr','hypothetical_stop_distance_pct','future_bar_turnover_ratio_required','future_bar_confirmation_required','explain_plan_valid','explain_factors_json','explain_notice','orderbook_status','combined_rule','combined_signal','combined_watch_ready','combined_buy_ready','combined_watch_failed','combined_buy_failed','combined_watch_checks_json','combined_buy_checks_json','completed_h4_prior_high_breakout_ref','completed_h4_breakout_ok','combined_red_candle_turnover_pct','v143_signal','v144_watch_kind','v144_early_ready','v144_trend_ready','v144_early_failed','v144_trend_failed','v144_early_checks_json','v144_trend_checks_json','v144_warnings','bt_gap_audit_code','bt_initial_missing_hours','bt_initial_missing_samples_kst','bt_first_missing_hour_kst','bt_hourly_recheck_calls','bt_half_hour_diagnostic_calls','bt_recovered_one_hour_candles','bt_lower_tf_bars_in_gap','bt_total_candle_api_calls','bt_audit_initial_error','bt_audit_detail_error','bt_reason_code','v146_quality_label','v146_quality_kind','v146_quality_passed','v146_hourly_bars_24','v146_recent6h_bars','v146_max_missing_streak_hours','v146_observed_turnover_24h_krw','v146_observed_turnover_complete','v146_missing_hours_kst','v146_quality_warnings'];
+ const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"',lines=[fields.join(',')];
+ const shown=new Set(visibleResults());
+ for(const x of results){
+  const si=x.signal,m=si.metrics,t=si.backtest||{},p=si.plan;
+  lines.push(['BTC-MTF-V1.4.8',lastCfg.strategy,lastCfg.mode,x.at,lastCfg.tf,lastCfg.fee,lastCfg.min_turnover_24h_krw,x.turnover24h,x.market,x.name,si.signal,m.closed_kst,m.close,si.signal==='BUY'?'BUY 마감봉 참고가':si.signal==='WATCH'?'WATCH 관찰 기준가':'연구 참고가',Number(m.close)*(1+p.tp1_gross_pct/100),Number(m.close)*(1+p.tp2_gross_pct/100),Number(m.close)*(1+p.stop_gross/100),m.relative_pct,m.btc_return_pct,m.coin_return_pct,m.breakout_pct,m.volume_ratio,m.atr_pct,m.rise24_pct??'',m.structure_risk_pct??'',m.rebound_from_low_pct??'',m.data_gap_recent??'',m.data_status??'',m.technical_score??'',m.quality_score??'',m.score_total??'',m.quality_checks?.btc_strength??'',m.quality_checks?.entry_zone??'',m.quality_checks?.risk_control??'',m.bb_position??'',m.rsi14??'',m.macd_hist??'',m.ichimoku_tenkan??'',m.ichimoku_kijun??'',m.score??'',si.stage||'',si.explanation.join(' / '),p.tp1_net,p.tp1_fraction,p.tp2_net,p.tp2_fraction,p.stop_gross,p.max_minutes,t.status||'',t.net_pct??'',t.stop??'',t.tp1??'',t.tp2??'',t.minutes??'',t.ambiguous??'',t.reason??'',$('watch-filter').value,shown.has(x),si.legacy_signal??'',si.strict_signal??'',si.strict_gate?.passed??'',(si.strict_gate?.missing||[]).join(' / '),JSON.stringify(si.strict_gate?.checks||{}),si.strict_gate?.h4_ma20??'',si.strict_gate?.h4_ma20_prev??'',m.macd_h4?.state??'',m.macd_h4?.event??'',m.macd_h4?.last_event??'',m.macd_h4?.last_event_kst??'',m.macd_h4?.macd??'',m.macd_h4?.signal??'',m.macd_h4?.prev_hist??'',m.macd_day?.state??'',m.macd_day?.event??'',m.macd_day?.macd??'',m.macd_day?.signal??'',m.macd_day_chart?.state??'',m.macd_day_chart?.event??'',m.macd_day_chart?.macd??'',m.macd_day_chart?.signal??'',si.explain?.version??'',si.explain?.scores?.structure??'',si.explain?.scores?.timing??'',si.explain?.scores?.trend??'',si.explain?.scores?.setup??'',si.explain?.scores?.entry??'',si.explain?.scores?.safety??'',si.explain?.sell_pressure_proxy?.red_candle_turnover_pct??'',si.explain?.context?.last_24h_closed_turnover_krw??'',si.explain?.context?.h4_rvol_turnover??'',si.explain?.context?.h4_atr_pct??'',si.explain?.context?.h4_ma7_distance_pct??'',si.explain?.summary??'',(si.explain?.warnings||[]).join(' / '),si.explain?.plan?.trigger_ref??'',si.explain?.plan?.stop_ref??'',si.explain?.plan?.breakeven_ref??'',si.explain?.plan?.target1_ref??'',si.explain?.plan?.target2_ref??'',si.explain?.plan?.target1_rr??'',si.explain?.plan?.target2_rr??'',si.explain?.plan?.risk_pct??'',si.explain?.plan?.requires_future_4h_turnover_ratio??'',si.explain?.plan?.requires_next_completed_4h_body_close_above_trigger??'',si.explain?.plan?.plan_valid??'',JSON.stringify(si.explain?.factors||{}),si.explain?.snapshot_notice??'',si.explain?.sell_pressure_proxy?.note??'',si.combined_gate?.rule??'',si.signal,si.combined_gate?.watch_ready??'',si.combined_gate?.buy_ready??'',(si.combined_gate?.missing_watch||[]).join(' / '),(si.combined_gate?.missing_buy||[]).join(' / '),JSON.stringify(si.combined_gate?.watch_checks||{}),JSON.stringify(si.combined_gate?.buy_checks||{}),si.combined_gate?.prior_3bar_breakout_level??'',si.combined_gate?.latest_completed_4h_breakout??'',si.combined_gate?.red_candle_turnover_pct??'',si.v143_signal??'',si.watch_kind??'',si.watch_tracks?.early_ready??'',si.watch_tracks?.trend_ready??'',(si.watch_tracks?.early_missing||[]).join(' / '),(si.watch_tracks?.trend_missing||[]).join(' / '),JSON.stringify(si.watch_tracks?.early_checks||{}),JSON.stringify(si.watch_tracks?.trend_checks||{}),(si.watch_tracks?.warnings||[]).join(' / '),t.audit?.status_code??'',t.audit?.initial_missing_hours??'',(t.audit?.initial_missing_samples_kst||[]).join(' / '),t.audit?.first_unresolved_or_recovered_hour_kst??'',t.audit?.hourly_recheck_calls??'',t.audit?.half_hour_diagnostic_calls??'',t.audit?.recovered_one_hour_candles??'',t.audit?.lower_timeframe_bars_in_missing_hour??'',t.audit?.total_candle_api_calls??'',t.audit?.initial_api_error??'',t.audit?.detail_error??'',t.reason_code??'',si.liquidity_audit?.label??'',si.liquidity_audit?.kind??'',si.liquidity_audit?.checks_passed??'',si.liquidity_audit?.hourly_bars_observed??'',si.liquidity_audit?.recent_6h_bars_observed??'',si.liquidity_audit?.longest_missing_hours??'',si.liquidity_audit?.observed_turnover_24h_krw??'',si.liquidity_audit?.observed_turnover_is_complete??'',(si.liquidity_audit?.missing_hour_samples_kst||[]).join(' / '),(si.liquidity_audit?.warnings||[]).join(' / ')].map(quote).join(','));
+ }
+ const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_8_'+lastCfg.strategy.toUpperCase()+'_'+lastCfg.mode.toUpperCase()+'_'+String(results[0]?.at||lastCfg.at||dt(new Date())).replace(/[^0-9]/g,'').slice(0,12)+'.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+
+})();
+</script></body></html>'''
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
+
+
+========================================================================
+FILE: btc_mtf_study_v147.py
+========================================================================
+"""V1.4.7 — retrospective cohort table for existing BTC-MTF scan results.
+
+The input is the already-computed historical snapshot candidates. No new
+market-data lookups are made and no candidate BUY/WATCH rules are changed.
+A WATCH is an observation, NOT an executed trade. UNKNOWN is never profit.
+"""
+from collections import defaultdict
+from math import isfinite
+from statistics import mean, median
+
+VERSION = "RESEARCH_COHORT_V147"
+KINDS = ("BUY", "EARLY_WATCH", "TREND_WATCH", "RESEARCH")
+QUALITY = ("Q4", "Q23", "Q01", "Q_UNKNOWN")
+COVERAGE = ("COMPLETE_24H", "INCOMPLETE_24H", "UNKNOWN_24H")
+
+
+def _float(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        n = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return n if isfinite(n) else None
+
+
+def _quality(q):
+    score = q.get("checks_passed")
+    n = _float(score)
+    if n is None or n < 0 or n > 4 or int(n) != n:
+        return "Q_UNKNOWN"
+    if n == 4:
+        return "Q4"
+    return "Q23" if n >= 2 else "Q01"
+
+
+def _coverage(q):
+    if q.get("observed_turnover_is_complete") is True and q.get("hourly_bars_observed") == 24:
+        return "COMPLETE_24H"
+    if q.get("hourly_bars_observed") is not None:
+        return "INCOMPLETE_24H"
+    return "UNKNOWN_24H"
+
+
+def _group(rows, label):
+    done = [x["net_pct"] for x in rows if x["status"] == "RESOLVED"]
+    pos = sum(x > 0 for x in done)
+    size = len(rows)
+    return {
+        "label": label,
+        "candidates": size,
+        "unique_markets": len({x["market"] for x in rows}),
+        "unique_snapshots": len({x["at"] for x in rows}),
+        "resolved": len(done),
+        "unknown": size-len(done),
+        "positive": pos,
+        "nonpositive": len(done)-pos,
+        "resolution_rate_pct": round(100*len(done)/size, 2) if size else None,
+        "positive_fraction_resolved_pct": round(100*pos/len(done), 2) if done else None,
+        "mean_hypothetical_net_pct": round(mean(done), 4) if done else None,
+        "median_hypothetical_net_pct": round(median(done), 4) if done else None,
+        "min_hypothetical_net_pct": round(min(done), 4) if done else None,
+        "max_hypothetical_net_pct": round(max(done), 4) if done else None,
+        "small_sample": len(done) < 5,
+        "watch_is_not_trade": True,
+    }
+
+
+def compare_watch_cohorts(items, scanned=0, issues=0, fee_each=0.04):
+    """Compare already stored per-snapshot rows without backtest lookahead.
+
+    Never infer a virtual gain from missing hourly candles. A non-finite or
+    missing P&L stays UNKNOWN even if the caller marks status RESOLVED.
+    """
+    if not isinstance(items, list) or len(items) > 1500:
+        raise ValueError("연구 비교는 후보 1500건 이하만 지원")
+    if fee_each not in (0.04, 0.25):
+        raise ValueError("편도 수수료 0.04 또는 0.25만 지원")
+    clean = []
+    used = set()
+    duplicate_count = 0
+    invalid_count = 0
+    for item in items:
+        if not isinstance(item, dict):
+            invalid_count += 1
+            continue
+        market = str(item.get("market") or "").strip().upper()
+        at = str(item.get("at") or "").strip()
+        kind = str(item.get("kind") or "")
+        if not (market.startswith("KRW-") and market[4:].isalnum()
+                and 4 <= len(market) <= 22 and len(at) >= 10
+                and kind in KINDS):
+            invalid_count += 1
+            continue
+        key = market, at
+        if key in used:
+            duplicate_count += 1
+            continue
+        used.add(key)
+        q = item.get("liquidity_audit") or {}
+        if not isinstance(q, dict):
+            q = {}
+        bt = item.get("backtest") or {}
+        if not isinstance(bt, dict):
+            bt = {}
+        net = _float(bt.get("net_pct"))
+        status = "RESOLVED" if bt.get("status") == "RESOLVED" and net is not None else "UNKNOWN"
+        clean.append({
+            "market": market, "at": at, "kind": kind,
+            "quality": _quality(q), "coverage": _coverage(q),
+            "quality_checks_passed": q.get("checks_passed"),
+            "hourly_bars_observed": q.get("hourly_bars_observed"),
+            "status": status,
+            "net_pct": net if status == "RESOLVED" else None,
+            "backtest_reason": str(bt.get("reason") or "")[:160],
+            "historical_turnover_krw": _float(q.get("observed_turnover_24h_krw")),
+            "legacy_signal": str(item.get("legacy_signal") or ""),
+        })
+    by_kind = [_group([x for x in clean if x["kind"] == k], k) for k in KINDS]
+    by_quality = [_group([x for x in clean if x["quality"] == k], k) for k in QUALITY]
+    by_coverage = [_group([x for x in clean if x["coverage"] == k], k) for k in COVERAGE]
+    cross = [
+        {**_group([x for x in clean if x["kind"] == k and x["quality"] == q],
+                  k+" × "+q), "kind": k, "quality": q}
+        for k in KINDS for q in QUALITY
+    ]
+    by_day = [_group([x for x in clean if x["at"][:10] == day], day)
+              for day in sorted({x["at"][:10] for x in clean})]
+    original_buy = _group([x for x in clean if x["legacy_signal"] == "BUY"], "ORIGINAL_BUY")
+    total = _group(clean, "ALL")
+    warnings = [
+        "WATCH와 RESEARCH의 120시간 가격 경로는 실제 진입 거래가 아닌 사후 가정",
+        "UNKNOWN은 미확정으로 별도 집계, 승률/평균 분모에서 제외",
+        "확정 사례만으로 집계한 수익 비율은 누락 편향을 포함할 수 있음",
+        "여러 날 같은 종목은 서로 독립된 표본이 아님 (고유 종목 수 병기)",
+        "종목 목록·거래대금 검색 범위는 현재 티커 기반이라 과거 시점 생존/미래정보 편향 있음",
+        "유동성 4/4는 후보의 선행 관측 조건일 뿐 수익확률이나 BUY 조건 아님",
+        "특히 확정 5건 미만 그룹의 평균 및 양수 비율은 실전 성능 판단 근거 부족",
+    ]
+    return {
+        "version": VERSION,
+        "fee_each_pct": fee_each,
+        "scanned": int(scanned) if isinstance(scanned, int) and 0 <= scanned <= 100000 else 0,
+        "issues": int(issues) if isinstance(issues, int) and 0 <= issues <= 100000 else 0,
+        "duplicates_skipped": duplicate_count,
+        "invalid_skipped": invalid_count,
+        "summary": total,
+        "original_buy": original_buy,
+        "by_kind": by_kind,
+        "by_quality": by_quality,
+        "by_coverage": by_coverage,
+        "by_kind_quality": cross,
+        "by_day": by_day,
+        "rows": clean,
+        "warnings": warnings,
+    }
+
+
+
+========================================================================
+FILE: btc_mtf_quality_v146.py
+========================================================================
+"""BTC MTF V1.4.6 — historical liquidity observations and source-gap evidence.
+
+Historical liquidity uses ONLY completed 1h candles no later than the selected
+snapshot. No current 24h ticker is used for historical quality estimates.
+Historical 1m/5m checks AFTER the snapshot diagnose an UNKNOWN replay gap only;
+they never change trade signals, OHLC, stop/take-profit or exit status.
+"""
+from datetime import timedelta
+import math
+
+RULE = "HISTORICAL_LIQUIDITY_V146"
+
+
+def _ts(t):
+    return t.strftime("%Y-%m-%d %H:%M") if t is not None else ""
+
+
+def _valid_turnover(row):
+    try:
+        v = float(row["turnover"])
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return None
+    return v if math.isfinite(v) and v >= 0 else None
+
+
+def snapshot_liquidity(h1, snapshot):
+    """Read-only 24h historical turnover / hourly completeness from real bars.
+
+    Note: missing hourly candles are NOT treated as zero-turnover evidence.
+    A present hourly candle can still represent a thin market.
+    """
+    floor = snapshot.replace(minute=0, second=0, microsecond=0)
+    start = floor - timedelta(hours=24)
+    expected = [start + timedelta(hours=i) for i in range(24)]
+    index = {}
+    for r in h1:
+        try:
+            stamp = r["t"]
+        except (KeyError, TypeError):
+            continue
+        if stamp not in expected or stamp in index:
+            continue
+        if stamp + timedelta(hours=1) > snapshot:
+            continue
+        amount = _valid_turnover(r)
+        if amount is None:
+            continue
+        index[stamp] = amount
+
+    present = len(index)
+    recent6 = sum(t in index for t in expected[-6:])
+    missing = [t for t in expected if t not in index]
+    longest = stretch = 0
+    for t in expected:
+        stretch = 0 if t in index else stretch + 1
+        longest = max(longest, stretch)
+
+    observed_krw = sum(index.values())
+    checks = {
+        "과거 24시간 1시간봉 22개 이상 확인": present >= 22,
+        "가장 최근 6시간에 1시간봉 5개 이상": recent6 >= 5,
+        "완료된 24시간 관측 거래대금 1억원 이상": observed_krw >= 100_000_000,
+        "직전 완료 1시간봉 확인": expected[-1] in index,
+    }
+    score = sum(checks.values())
+    if present < 18 or recent6 < 4:
+        kind = "DATA_GAP"; label = "과거 이력 공백 주의"
+    elif present >= 22 and observed_krw < 100_000_000:
+        kind = "THIN_OBSERVED"; label = "과거 거래대금 낮음"
+    elif score == 4:
+        kind = "OBSERVED_OK"; label = "과거 거래활동 관측 양호"
+    else:
+        kind = "CAUTION"; label = "과거 유동성 추가 확인"
+    warnings = []
+    if present < 24:
+        warnings.append("24시간 중 확인되지 않은 1시간봉이 있어 거래대금 합계는 불완전한 관측값")
+    if observed_krw < 100_000_000:
+        warnings.append("관측 거래대금 1억원 미만: 자료가 완전하지 않다면 실제 거래대금 부족으로 단정 금지")
+    if recent6 < 5:
+        warnings.append("최근 6시간 1시간봉 연속성 부족")
+    if expected[-1] not in index:
+        warnings.append("직전 완료 1시간봉 없음")
+    return {
+        "rule": RULE,
+        "kind": kind,
+        "label": label,
+        "checks": checks,
+        "checks_passed": score,
+        "checks_total": 4,
+        "snapshot_kst": _ts(snapshot),
+        "window_from_kst": _ts(start),
+        "window_to_exclusive_kst": _ts(floor),
+        "hourly_bars_observed": present,
+        "hourly_bars_expected": 24,
+        "recent_6h_bars_observed": recent6,
+        "longest_missing_hours": longest,
+        "missing_hour_samples_kst": [_ts(x) for x in missing[:8]],
+        "observed_turnover_24h_krw": round(observed_krw, 2),
+        "observed_turnover_is_complete": present == 24,
+        "warnings": warnings,
+        "changes_buy_watch_gate": False,
+        "note": ("스냅샷 이전 실제 완료된 1시간봉만 사용. "
+                 "현재 24시간 티커나 미래 청산 캔들을 반영하지 않음. "
+                 "4개 점수는 경험적 자료 품질 지표이며 수익 확률이 아님."),
+    }
+
+
+def investigate_missing_hour(market, missing_hour, getter):
+    """Diagnose only one future-replay missing hour with actual 5m/1m bars.
+
+    No trade/tick query: the public historical tick endpoint documents only
+    the recent 1–7 day window. A missing bar is NOT proof of no trading.
+    """
+    end = missing_hour + timedelta(hours=1)
+    cursor = end + timedelta(minutes=1)
+    observations = {}
+    errors = {}
+    samples = {}
+    for tf, count in (("5m", 15), ("1m", 70)):
+        try:
+            items = getter(market, tf, cursor, count=count)
+            interval = timedelta(minutes=5 if tf == "5m" else 1)
+            # Exact time filter: no bars from the previous or following hour.
+            verified = sorted({
+                row["t"] for row in items
+                if isinstance(row, dict)
+                and "t" in row
+                and missing_hour <= row["t"] < end
+                and (row["t"] + interval) <= cursor
+            })
+            observations[tf] = len(verified)
+            samples[tf] = [_ts(x) for x in verified[:6]]
+        except Exception as ex:
+            observations[tf] = None
+            samples[tf] = []
+            errors[tf] = str(ex)[:120]
+
+    if errors:
+        state = "LOWER_TIMEFRAME_API_ERROR"
+        description = "1분/5분봉 중 일부 또는 전부 조회에 실패함"
+    elif observations["1m"] or observations["5m"]:
+        state = "LOWER_TIMEFRAME_BARS_EXIST"
+        description = "누락된 1시간에 실제 1분/5분봉 일부 확인. 1시간봉 복구된 것은 아님"
+    else:
+        state = "NO_LOWER_TF_BARS_RETURNED"
+        description = "조회된 1분/5분봉 없음. 실제 무거래인지 API 보존 한계인지 미확정"
+    return {
+        "rule": "LOWER_INTERVAL_GAP_V146",
+        "missing_hour_kst": _ts(missing_hour),
+        "status_code": state,
+        "status_text": description,
+        "five_min_bars_observed": observations["5m"],
+        "one_min_bars_observed": observations["1m"],
+        "five_min_samples_kst": samples["5m"],
+        "one_min_samples_kst": samples["1m"],
+        "errors": errors,
+        "tick_history_limit_note": "공식 체결 조회 API daysAgo 범위 1–7일: 오래된 2026-10-31 시간대 체결 조회 대체 불가",
+        "changes_exit_result": False,
+        "note": "1분·5분봉은 원인 확인용. 1시간봉을 합성하거나 미래 정보를 매수 조건으로 사용하지 않음.",
+    }
+
+
+
+========================================================================
+FILE: btc_mtf_replay_v145.py
+========================================================================
+"""BTC MTF V1.4.5: bounded, auditable candle recovery for 120h replay.
+
+No synthetic prices are created. The replay is based only on real Bithumb
+1h OHLC candles, with exact KST timestamps. A 30m query is a diagnostic
+only and NEVER supplies a missing 1h price for virtual exit execution.
+"""
+from datetime import timedelta
+
+AUDIT_RULE = "REPLAY_V145"
+LIMIT_HOURS = 120
+
+
+def _clock(dt):
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
+
+
+class HourlyReplayPath:
+    def __init__(self, market, first_hour, getter, detailed=False, limit=LIMIT_HOURS):
+        self.market = market
+        self.first_hour = first_hour
+        self.end_hour = first_hour + timedelta(hours=limit)
+        self.getter = getter
+        self.detailed = bool(detailed)
+        self.index = {}
+        self.api_calls = 0
+        self.hourly_rechecks = 0
+        self.half_hour_diagnostics = 0
+        self.recovered = 0
+        self.initial_error = ""
+        self.initial_missing_count = None
+        self.initial_missing_samples = []
+        self.last_gap_at = None
+        self.last_gap_status = "NONE"
+        self.last_lower_tf_count = None
+        self.tried_times = set()
+        self.max_hourly_rechecks = 2
+        self._initial_load()
+
+    def _call(self, tf, cursor, count):
+        self.api_calls += 1
+        return self.getter(self.market, tf, cursor, count=count)
+
+    def _merge(self, rows):
+        found = 0
+        for row in rows:
+            if not isinstance(row, dict) or "t" not in row:
+                continue
+            t = row["t"]
+            if not self.first_hour <= t < self.end_hour:
+                continue
+            # Never overwrite a verified first occurrence with a conflicting
+            # response from another request.
+            if t not in self.index:
+                self.index[t] = row
+                found += 1
+        return found
+
+    def _initial_load(self):
+        # Count=160 is preserved from V1.4.4, so the primary baseline is
+        # directly comparable. "to" is KST and exclusive in Bithumb docs.
+        cursor = self.end_hour + timedelta(minutes=1)
+        try:
+            rows = self._call("1h", cursor, 160)
+            self._merge(rows)
+        except Exception as ex:
+            self.initial_error = str(ex)[:120]
+        missing = [
+            self.first_hour + timedelta(hours=i)
+            for i in range(LIMIT_HOURS)
+            if self.first_hour + timedelta(hours=i) not in self.index
+        ]
+        self.initial_missing_count = len(missing)
+        self.initial_missing_samples = [_clock(x) for x in missing[:5]]
+
+    def hour(self, stamp):
+        """Return verified 1h candle, or None if source cannot confirm it."""
+        row = self.index.get(stamp)
+        if row is not None:
+            return row
+        self.last_gap_at = stamp
+        if stamp in self.tried_times:
+            return None
+        self.tried_times.add(stamp)
+        if self.hourly_rechecks >= self.max_hourly_rechecks:
+            self.last_gap_status = "RECHECK_BUDGET_EXHAUSTED"
+            return None
+
+        # A small exact time-bounded request avoids relying on the ranking
+        # of sparse candles from a single large historical batch.
+        self.hourly_rechecks += 1
+        try:
+            fresh = self._call("1h", stamp + timedelta(hours=1, minutes=1), 8)
+            self._merge(fresh)
+        except Exception as ex:
+            self.last_gap_status = "HOURLY_RECHECK_API_ERROR"
+            self.last_error = str(ex)[:120]
+            return None
+        row = self.index.get(stamp)
+        if row is not None:
+            self.recovered += 1
+            self.last_gap_status = "RECOVERED_1H"
+            return row
+
+        self.last_gap_status = "SOURCE_1H_NOT_RETURNED"
+        if not self.detailed:
+            return None
+
+        # A 30m source check can help distinguish a suspicious missing 1h
+        # candle from a likely low-activity period. Never aggregate 30m
+        # into 1h OHLC or assume no trade occurred solely from this response.
+        self.half_hour_diagnostics += 1
+        try:
+            rows30 = self._call("30m", stamp + timedelta(hours=1, minutes=1), 8)
+            self.last_lower_tf_count = sum(
+                1 for r in rows30
+                if isinstance(r, dict) and "t" in r
+                and stamp <= r["t"] < stamp + timedelta(hours=1)
+            )
+            if self.last_lower_tf_count:
+                self.last_gap_status = "SOURCE_1H_MISSING_BUT_30M_EXISTS"
+            else:
+                self.last_gap_status = "SOURCE_1H_30M_NOT_RETURNED"
+        except Exception as ex:
+            self.last_gap_status = "SOURCE_1H_MISSING_30M_API_ERROR"
+            self.last_error = str(ex)[:120]
+        return None
+
+    def audit(self):
+        code = self.last_gap_status
+        if code == "NONE":
+            code = ("INITIAL_API_ERROR" if self.initial_error else
+                    "COMPLETE_1H_PATH" if self.initial_missing_count == 0
+                    else "NO_RECHECK_NEEDED_BEFORE_EXIT")
+        return {
+            "rule": AUDIT_RULE,
+            "status_code": code,
+            "initial_api_error": self.initial_error,
+            "detail_error": getattr(self, "last_error", ""),
+            "initial_missing_hours": self.initial_missing_count,
+            "initial_missing_samples_kst": list(self.initial_missing_samples),
+            "verified_hourly_candles": len(self.index),
+            "first_unresolved_or_recovered_hour_kst": _clock(self.last_gap_at),
+            "hourly_recheck_calls": self.hourly_rechecks,
+            "half_hour_diagnostic_calls": self.half_hour_diagnostics,
+            "total_candle_api_calls": self.api_calls,
+            "recovered_one_hour_candles": self.recovered,
+            "lower_timeframe_bars_in_missing_hour": self.last_lower_tf_count,
+            "source_limitations": (
+                "UNKNOWN remains UNKNOWN unless exact Bithumb 1h candle was returned. "
+                "30m is diagnosis only, not synthetic execution prices."
+            ),
+        }
+
+
+
+========================================================================
+FILE: btc_mtf_watch_v144.py
+========================================================================
+"""V1.4.4: independent early rebound watch and confirmed-trend watch tracks.
+
+- The original 10-point technical + quality candidate is ALWAYS evaluated first.
+- Existing V1.4.3 BUY and strict trend watch rules are preserved exactly.
+- EARLY_WATCH is observational, not a purchase signal or a way to bypass BUY.
+- Do not use 120h hypothetical legacy WATCH exit as traded P&L.
+"""
+RULE_VERSION="WATCH_TRACKS_V144"
+
+def classify_watch_tracks(legacy, strict, combined, evidence, m, ctx):
+    scores=evidence.get("scores") or {}
+    checks=m.get("checks") or {}
+    macd=m.get("macd_h4") or {}
+    rsi=float(m.get("rsi14") or 0)
+    score=int(m.get("score") or 0)
+    safety=float(scores.get("safety") or 0)
+    timing=float(scores.get("timing") or 0)
+    ratio=float(m.get("volume_ratio") or 0)
+    risk=float(m.get("structure_risk_pct") or 1e9)
+    data_gap=bool(m.get("data_gap_recent", True))
+    severe_bear=(macd.get("state")=="DEAD"
+                 and rsi<50
+                 and float(scores.get("trend") or 0)<50)
+    early_conditions={
+        "기존 반등 점수 8/10 이상": score>=8,
+        "기존 기술 5/7·진입품질 2/3 이상": (
+            float(m.get("technical_score") or 0)>=5
+            and float(m.get("quality_score") or 0)>=2),
+        "RSI 45 이상":rsi>=45,
+        "타이밍 점수 75 이상":timing>=75,
+        "안전 점수 75 이상":safety>=75,
+        "4시간 거래대금 0.7배 이상":ratio>=.7,
+        "지지 위험거리 0~9%":0<=risk<=9,
+        "최근 캔들 공백 없음":not data_gap,
+        "MACD 데드·RSI 50미만·추세약세 동시 발생 제외":not severe_bear,
+    }
+    early_ready=legacy in ("BUY","WATCH") and all(early_conditions.values())
+    # The existing V1.4.3 structure + trend + risk logic remains the
+    # non-negotiable basis for the *confirmed* track, with no loosening.
+    trend_conditions={
+        "기존 V1.4.3 종합 WATCH 준비 통과":
+            combined.get("watch_ready") is True,
+        "일봉·4시간봉 상승 추세 필수조건": (
+            strict.get("checks",{}).get("일봉 MA20 상향 + 22봉 연속") is True
+            and strict.get("checks",{}).get("4시간봉 MA20 상회·상향 + 21봉 연속") is True),
+        "4시간 MACD 골든 상태":macd.get("state")=="GOLDEN",
+    }
+    trend_ready=legacy in ("BUY","WATCH") and all(trend_conditions.values())
+    # Never raise an early observer to BUY; BUY is precisely V1.4.3 BUY.
+    if combined.get("signal")=="BUY":
+        kind="BUY"; label="종합 BUY · 기존 엄격 기준 통과"
+    elif trend_ready:
+        kind="TREND_WATCH";label="추세 확인 WATCH · 상위 추세 확인"
+    elif early_ready:
+        kind="EARLY_WATCH";label="초기 반등 WATCH · 추세 확정 전"
+    else:
+        kind="RESEARCH";label="연구 보류 · 최종 관찰 기준 불합격"
+    warnings=[]
+    if kind=="EARLY_WATCH":
+        warnings.append("초기 탐색만 허용: 일봉·4시간 추세는 아직 확정되지 않을 수 있음")
+        warnings.append("BUY 아님: 실제 체결 진입·확정 돌파 신호 아님")
+    if macd.get("state")!="GOLDEN":
+        warnings.append("4시간 MACD 골든 상태 미확인")
+    if ctx.get("long")=="down" or ctx.get("short")=="down":
+        warnings.append("BTC 시장 추세 하락: 관찰 위험 증가")
+    if data_gap:
+        warnings.append("최근 캔들 누락: 신규 신호 보류")
+    return {
+        "rule":RULE_VERSION,
+        "kind":kind,
+        "label":label,
+        "early_ready":early_ready,
+        "trend_ready":trend_ready,
+        "early_checks":early_conditions,
+        "trend_checks":trend_conditions,
+        "early_missing":[k for k,v in early_conditions.items() if not v],
+        "trend_missing":[k for k,v in trend_conditions.items() if not v],
+        "warnings":warnings,
+        "old_combined_signal":combined.get("signal","RESEARCH"),
+        "buy_unchanged":combined.get("signal")=="BUY" if kind=="BUY" else True,
+        "note":"두 WATCH는 관찰용이며 BUY 진입/자동매매로 승격되지 않음. 120시간 가상 가격 경로는 실현 손익 아님.",
+    }
+
+
+
+========================================================================
+FILE: btc_mtf_combo_v143.py
+========================================================================
+"""BTC MTF V1.4.3 — combine original rebound strategy with evidence scores.
+
+The research thresholds are deliberately conservative hypotheses, not a
+validated success model. No orders, no tick/quote reconstruction. Uses only
+candles completed at (or before) the historical scan snapshot.
+"""
+from __future__ import annotations
+
+COMBINED_RULE = "COMBINED_V143"
+
+REQUIRED_TREND_CHECKS = (
+    "일봉 MA20 상향 + 22봉 연속",
+    "4시간봉 MA20 상회·상향 + 21봉 연속",
+    "4시간봉 MA7/14 상승 배열",
+    "RSI(14) 50 이상",
+    "MACD 히스토그램 양수",
+    "4시간 MACD 골든 상태 (실제 교차와 구분)",
+    "4시간 거래대금 1.1배 이상",
+    "BTC 장·단기 비하락",
+    "최근 봉 공백 없음",
+)
+
+
+def evaluate_combined(original, legacy_strict, evidence, m, h4, is_contiguous):
+    """Return old and new evidence side by side, without dropping old rows.
+
+    WATCH: high-score old candidate + 4h/day trend + evidence thresholds and
+    bounded stop/risk/selling-pressure proxies. BUY: additionally requires
+    old BUY, all V1.4 strict conditions and a newly completed 4h candle that
+    actually closes above the *prior* 3 completed highs on >=2x turnover.
+
+    The forward-looking trigger reference in evidence.plan is NOT used to
+    claim that a future candle confirmed at the present snapshot.
+    """
+    scores = evidence.get("scores") or {}
+    checks_old = legacy_strict.get("checks") or {}
+    proxy = evidence.get("sell_pressure_proxy") or {}
+    plan = evidence.get("plan") or {}
+    sell_red = proxy.get("red_candle_turnover_pct")
+    complete_h4 = len(h4) >= 4 and is_contiguous(h4, "4h", 4)
+    if complete_h4:
+        # Excludes the current completed candle from resistance construction.
+        prior_resistance = max(float(x["h"]) for x in h4[-4:-1])
+        breakout_level = prior_resistance * 1.001
+        last = h4[-1]
+        confirmed_breakout = (
+            last["c"] > breakout_level
+            and last["c"] > last["o"]
+            and float(m.get("body_ratio", 0)) >= .5
+            and float(m.get("volume_ratio", 0)) >= 2.0
+        )
+    else:
+        breakout_level = None
+        confirmed_breakout = False
+
+    watch_checks = {
+        "기존 10점 반등 점수 9점 이상": m.get("score", 0) >= 9,
+        "기존 기술 6/7 · 진입 품질 3/3": (
+            m.get("technical_score", 0) >= 6 and m.get("quality_score", 0) >= 3),
+        "일봉/4시간 상승·MACD·BTC 필수조건": all(
+            checks_old.get(key) is True for key in REQUIRED_TREND_CHECKS),
+        "구조 점수 75 이상": scores.get("structure", 0) >= 75,
+        "타이밍 점수 50 이상": scores.get("timing", 0) >= 50,
+        "추세 점수 75 이상": scores.get("trend", 0) >= 75,
+        "셋업 점수 75 이상": scores.get("setup", 0) >= 75,
+        "진입 준비 점수 50 이상": scores.get("entry", 0) >= 50,
+        "안전 점수 75 이상": scores.get("safety", 0) >= 75,
+        "음봉 거래대금 비중 60% 이하(매도호가 아님)": (
+            sell_red is not None and sell_red <= 60),
+        "가상 손절 거리 0.8~5%·최근 봉 정상": plan.get("plan_valid") is True,
+        "4시간봉 4개 연속": complete_h4,
+    }
+    watch_ready = bool(original) and all(watch_checks.values())
+    buy_checks = {
+        "기존 V1.3.3 BUY": original == "BUY",
+        "V1.4.1 강화 BUY 조건": legacy_strict.get("passed") is True,
+        "종합 WATCH 준비 기준 모두 충족": watch_ready,
+        "진입 준비 점수 75 이상": scores.get("entry", 0) >= 75,
+        "완료된 최신 4시간봉이 이전 3봉 고점 돌파": confirmed_breakout,
+        "최신 4시간봉 거래대금 2.0배 이상": m.get("volume_ratio", 0) >= 2.0,
+    }
+    buy_ready = all(buy_checks.values())
+
+    if buy_ready:
+        label = "BUY"
+        stage = "종합 추세·설명 점수 + 완료봉 돌파 확인"
+    elif watch_ready:
+        label = "WATCH"
+        stage = "종합 후보 · 마지막 돌파/거래대금 확인 대기"
+    else:
+        label = "RESEARCH"
+        stage = "원본 반등 기록 · 종합 기준 보류"
+
+    return {
+        "rule": COMBINED_RULE,
+        "signal": label,
+        "stage": stage,
+        "watch_ready": watch_ready,
+        "buy_ready": buy_ready,
+        "watch_checks": watch_checks,
+        "buy_checks": buy_checks,
+        "missing_watch": [k for k, ok in watch_checks.items() if not ok],
+        "missing_buy": [k for k, ok in buy_checks.items() if not ok],
+        "prior_3bar_breakout_level": round(breakout_level, 8) if breakout_level else None,
+        "latest_completed_4h_breakout": confirmed_breakout,
+        "red_candle_turnover_pct": sell_red,
+        "notes": [
+            "10점 반등 + 일봉/4시간/BTC/MACD + 설명 점수/진입 위험 + 이미 완료된 4시간 돌파를 결합",
+            "음봉 거래대금 비중은 매도 호가잔량이나 체결강도가 아닌 가격 봉 기반 추정 지표",
+            "통합 기준은 사용자 연구용 가설이며 실제 승률 검증 전, 기대 수익을 보장하지 않음",
+            "RESEARCH 항목도 CSV에 남고 기본 화면에서는 숨김",
+        ],
+    }
+
+
+
+========================================================================
+FILE: btc_mtf_explain_v142.py
+========================================================================
+"""V1.4.2: explainable OHLC-based swing snapshot, not order-book advice.
+
+All values derive solely from day/4h/1h candles completed by the scan
+snapshot. No later data, public orderbook snapshots, or fictional trade
+executions are used. Scores are documented 0..100 research checklists,
+NOT calibrated success probabilities or broker signals.
+"""
+from __future__ import annotations
+
+from statistics import mean
+
+EXPLAIN_VERSION = "EXPLAIN_V142"
+CHECK_TIMEFRAME = "4시간봉"
+REQUIRE_FUTURE_CANDLE = True
+
+
+def _score(conditions):
+    return int(round(100 * sum(bool(v) for v in conditions) / len(conditions)))
+
+
+def _round_price(x):
+    return round(float(x), 8)
+
+
+def build_explanation(m, ctx, day, h4, h1, fee_each_pct):
+    """Return audit-friendly factors and a conditional future-bar watch plan.
+
+    Caller has already checked minimum OHLC sample size. Required snapshot:
+    day>=24, h4>=80, h1>=24, completed/snapshot-aligned.
+    """
+    if len(day)<24 or len(h4)<30 or len(h1)<16:
+        return {"status": "INSUFFICIENT", "reason": "완료봉 수 부족",
+                "scores": {}, "plan": None, "version": EXPLAIN_VERSION}
+    close = float(m["close"])
+    ma20 = mean(x["c"] for x in h4[-20:])
+    ma20_prev = mean(x["c"] for x in h4[-21:-1])
+    day_ma20 = mean(x["c"] for x in day[-20:])
+    recent_high = max(x["h"] for x in h4[-3:])
+    recent_low = min(x["l"] for x in h4[-6:])
+    atr_abs = max(float(m.get("atr_pct", 0)), 0) * close / 100
+    vratio = max(float(m.get("volume_ratio", 0)), 0)
+    c = m["checks"]
+    macd_state = m.get("macd_h4", {}).get("state", "UNKNOWN")
+    recent_gap = bool(m.get("data_gap_recent", True))
+    btc_nonbear = ctx.get("long") in ("up", "side") and ctx.get("short") in ("up", "side")
+    h4_up = bool(m["h4_up"])
+    day_up = bool(m["day_up"])
+
+    factors = {
+        "structure": [
+            ("4시간 저점 상승", bool(m["h4_higher_low"])),
+            ("4시간 고점 상승", bool(m["h4_higher_high"])),
+            ("4시간 종가 MA20 위", close > ma20),
+            ("4시간 MA20 상향", ma20 > ma20_prev),
+        ],
+        "timing": [
+            ("1시간 반등 확인", bool(c["h1_confirm"])),
+            ("MA5 회복", bool(c["ma_recover"])),
+            ("RSI 상승 전환", bool(c["rsi_recover"])),
+            ("MACD 모멘텀 개선", bool(c["macd_recover"])),
+        ],
+        "trend": [
+            ("일봉 MA20 상승 확인", day_up),
+            ("4시간 MA7·MA14 상승", h4_up),
+            ("RSI 50 이상", float(m["rsi14"]) >= 50),
+            ("4시간 MACD 골든 상태", macd_state == "GOLDEN"),
+        ],
+        "setup": [
+            ("최근 4시간 거래대금 1.1배", vratio >= 1.1),
+            ("저점 대비 +1.2~9%", 1.2 <= float(m["rebound_from_low_pct"]) <= 9),
+            ("구조적 지지 위험거리 9% 내", 0 <= float(m["structure_risk_pct"]) <= 9),
+            ("볼린저밴드 과열·과매도 회피", 0.15 <= float(m["bb_position"]) <= .95),
+        ],
+        "entry": [
+            ("선택한 검색봉 추세 확인", bool(m.get("timing_ok", False))),
+            ("직전 4시간 종가보다 상승", h4[-1]["c"] > h4[-2]["c"]),
+            ("4시간 봉 몸통 비율 50% 이상", float(m.get("body_ratio",0)) >= .5),
+            ("4시간 거래대금 2.0배 이상", vratio >= 2.0),
+        ],
+        "safety": [
+            ("지지 거리 5% 내", 0 <= float(m["structure_risk_pct"]) <= 5),
+            ("RSI 과열 아님(<=70)", float(m["rsi14"]) <= 70),
+            ("최근 1시간·4시간 봉 연속", not recent_gap),
+            ("BTC 장·단기 하락 아님", btc_nonbear),
+        ],
+    }
+    scores = {k: _score([ok for _, ok in checks]) for k, checks in factors.items()}
+    # A red candle's turnover is NOT a direct measure of taker sell orders.
+    last4 = h4[-4:]
+    h4_24h_contiguous = all(
+        (y["t"] - x["t"]).total_seconds() == 4*60*60
+        for x,y in zip(h4[-6:-1],h4[-5:]))
+    total_turnover = sum(max(0, float(x.get("turnover", 0))) for x in last4)
+    down_turnover = sum(max(0, float(x.get("turnover", 0)))
+                        for x in last4 if x["c"] < x["o"])
+    red_turnover_pct = round(100*down_turnover/total_turnover, 1) if total_turnover else None
+
+    # Future-bar reference only. No confirmation can be known at this snapshot.
+    trigger = max(recent_high * 1.001, close * 1.001)
+    stop = min(recent_low - .15*atr_abs, trigger * .999)
+    risk_pct = 100*(trigger-stop)/trigger
+    risk_unit = trigger-stop
+    # Round-trip fee breakeven reference at the hypothetical breakout entry.
+    fee = max(0, float(fee_each_pct))/100
+    breakeven = trigger*(1+fee)/(1-fee) if fee < 1 else None
+    targets_valid = .8 <= risk_pct <= 5
+    plan = {
+        "trigger_ref": _round_price(trigger),
+        "stop_ref": _round_price(stop),
+        "breakeven_ref": _round_price(breakeven) if breakeven is not None else None,
+        "target1_ref": _round_price(trigger+1.5*risk_unit) if targets_valid else None,
+        "target2_ref": _round_price(trigger+3.0*risk_unit) if targets_valid else None,
+        "target1_rr": 1.5 if targets_valid else None,
+        "target2_rr": 3.0 if targets_valid else None,
+        "risk_pct": round(risk_pct, 3),
+        "plan_valid": targets_valid and not recent_gap,
+        "requires_next_completed_4h_body_close_above_trigger": True,
+        "requires_future_4h_turnover_ratio": 2.0,
+        "note": "향후 완료될 4시간봉의 몸통 종가·거래대금 2.0배 확인이 필요. 아직 신호 아님. 가격은 참고치이며 호가 단위·실제 체결/슬리피지 미검증.",
+    }
+    warnings = []
+    if not day_up or not h4_up: warnings.append("상위 추세 미확인(일봉 또는 4시간봉)")
+    if macd_state != "GOLDEN": warnings.append("4시간 MACD 골든 상태 미확인")
+    if float(m["rsi14"]) < 50: warnings.append("RSI 50 미만")
+    if vratio < 1.1: warnings.append("4시간 거래대금 증가 부족")
+    if recent_gap: warnings.append("최근 완료봉 공백")
+    if not btc_nonbear: warnings.append("BTC 추세 하락/불명")
+    if not targets_valid: warnings.append("구조적 손절 거리 과대/과소: 목표가 미산정")
+    if float(m.get("h4_distance_ma7_pct",0)) > 7.5:
+        warnings.append("4시간 MA7 과이격: 추격 금지")
+
+    if day_up and h4_up and macd_state=="GOLDEN" and float(m["rsi14"])>=50:
+        summary = "상위 상승 추세 후보지만 미래 돌파봉은 아직 확인되지 않았어."
+    elif h4_up or bool(c["h1_confirm"]):
+        summary = "단기 반등 징후는 있으나 상위 추세 확정 전이므로 진입을 보류해."
+    else:
+        summary = "상승 전환 근거 부족. 반등 점수만으로는 진입하지 않아."
+
+    return {
+        "version": EXPLAIN_VERSION,
+        "status": "RESEARCH_ONLY",
+        "closed_kst": m.get("closed_kst"),
+        "scores": scores,
+        "factors": {k: [{"label": label, "passed":bool(ok)} for label,ok in checks]
+                    for k,checks in factors.items()},
+        "sell_pressure_proxy": {
+            "red_candle_turnover_pct": red_turnover_pct,
+            "label": "최근 4시간봉 4개 중 음봉의 거래대금 비중(실제 체결 매도량 아님)",
+            "orderbook_sell_wall": None,
+            "taker_sell_strength": None,
+            "note": "호가벽·체결강도 원본을 조회하지 않았으며, 과거 호가를 복원할 수 없음.",
+        },
+        "context": {
+            "close_ref": _round_price(close),
+            "h4_rvol_turnover": round(vratio, 3),
+            "h4_atr_pct": round(float(m.get("atr_pct",0)),3),
+            "h4_rsi": round(float(m["rsi14"]),2),
+            "h4_ma7_distance_pct": round(float(m.get("h4_distance_ma7_pct",0)),3),
+            "h4_ma20_ref": _round_price(ma20),
+            "day_ma20_ref": _round_price(day_ma20),
+            "last_24h_closed_turnover_krw": (
+                round(sum(max(0,float(x.get("turnover",0)))
+                          for x in h4[-6:]),0) if h4_24h_contiguous else None),
+            "btc_relative_pct": round(float(m.get("relative_pct",0)),3),
+        },
+        "summary": summary, "warnings": warnings, "plan": plan,
+        "snapshot_notice": "모든 수치는 스캔 시각까지 완료된 OHLC에서 계산. 24시간 거래대금은 4시간 연속봉 6개의 합계(연속성이 없으면 미산정). 점수는 성공 확률이 아닌 4개 근거씩의 체크리스트. 실시간 호가·체결강도는 미수집.",
+    }
+
+
+
+========================================================================
+FILE: btc_mtf_macd_v141.py
+========================================================================
+"""Compare MACD line/signal position with an actual completed-bar crossover.
+
+Standard 4h/day MACD: 12,26,9. Chart-compatible daily variant: 3,10,16.
+Cross event refers ONLY to the latest completed candle. Bullish status does
+not imply that a new golden cross happened on that candle.
+"""
+from datetime import timedelta
+from btc_mtf_rebound_v12 import ema_series
+
+
+def analyze_macd(rows, fast, slow, signal, tf, bar_end, contiguous):
+    minimum = slow + signal + 10
+    empty = {
+        "state": "UNKNOWN", "event": "NONE", "last_event": "NONE",
+        "last_event_kst": None, "bars_since_cross": None,
+        "macd": None, "signal": None, "hist": None, "prev_hist": None,
+        "continuous": False, "params": f"{fast},{slow},{signal}",
+        "tf": tf, "closed_kst": None,
+    }
+    if not (0 < fast < slow and signal > 0 and len(rows) >= minimum):
+        return empty
+    prices = [r["c"] for r in rows]
+    efast = ema_series(prices, fast)
+    eslow = ema_series(prices, slow)
+    line = [x-y for x, y in zip(efast, eslow)]
+    sig = ema_series(line, signal)
+    hist = [x-y for x, y in zip(line, sig)]
+    recent_ok = contiguous(rows, tf, 3)
+    current = hist[-1]
+    state = "GOLDEN" if current > 0 else "DEAD" if current < 0 else "FLAT"
+    if not recent_ok:
+        state = "UNKNOWN"
+    def cross(previous, latest):
+        if previous <= 0 < latest:
+            return "GOLDEN_CROSS"
+        if previous >= 0 > latest:
+            return "DEAD_CROSS"
+        return "NONE"
+    event = cross(hist[-2], hist[-1]) if recent_ok else "NONE"
+    last_event = "NONE"
+    last_at = None
+    bars_ago = None
+    # Search last 24 completed candles, but never claim a crossover across
+    # an interval for which a real bar is missing.
+    step = timedelta(hours=4) if tf == "4h" else timedelta(days=1)
+    for i in range(len(rows)-1, max(0, len(rows)-25), -1):
+        if rows[i]["t"] - rows[i-1]["t"] != step:
+            continue
+        kind = cross(hist[i-1], hist[i])
+        if kind != "NONE":
+            last_event = kind
+            last_at = bar_end(rows[i]["t"], tf).strftime("%Y-%m-%d %H:%M")
+            bars_ago = len(rows)-1-i
+            break
+    return {
+        "state": state, "event": event,
+        "last_event": last_event, "last_event_kst": last_at,
+        "bars_since_cross": bars_ago, "continuous": recent_ok,
+        "macd": round(line[-1], 10), "signal": round(sig[-1], 10),
+        "hist": round(current, 10), "prev_hist": round(hist[-2], 10),
+        "params": f"{fast},{slow},{signal}", "tf": tf,
+        "closed_kst": bar_end(rows[-1]["t"], tf).strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+def all_macd_views(day, h4, bar_end, contiguous):
+    return {
+        "h4": analyze_macd(h4, 12, 26, 9, "4h", bar_end, contiguous),
+        "day": analyze_macd(day, 12, 26, 9, "day", bar_end, contiguous),
+        "day_chart": analyze_macd(day, 3, 10, 16, "day", bar_end, contiguous),
+    }
+
+
+
+========================================================================
+FILE: btc_mtf_rebound_v13.py
+========================================================================
+"""BTC MTF V1.3 | quality-weighted early rebound classification.
+Keeps V1.2's 7 completed-candle technical checks and adds three independent
+quality checks. A score is a research heuristic, not a probability of profit.
+"""
+from btc_mtf_rebound_v12 import bottom_rebound_metrics as _metrics
+from btc_mtf_rebound_v12 import rebound_signal as _legacy_signal
+
+RULE_VERSION = "REBOUND_V1.3_SCORE10"
+MAX_SCORE = 10
+
+def bottom_rebound_metrics(*args, **kwargs):
+    m, issue = _metrics(*args, **kwargs)
+    if m is None:
+        return m, issue
+    quality = {
+        "btc_strength": m["relative_pct"] >= 0.5,
+        "entry_zone": 1.2 <= m["rebound_from_low_pct"] <= 11.0 and m["rise24_pct"] <= 12,
+        "risk_control": 0 <= m["structure_risk_pct"] <= 11,
+    }
+    m["technical_score"] = m["score"]
+    m["quality_checks"] = quality
+    m["quality_score"] = sum(quality.values())
+    m["score"] = m["technical_score"] + m["quality_score"]
+    m["score_total"] = MAX_SCORE
+    m["score_rule"] = RULE_VERSION
+    return m, None
+
+def rebound_signal(m, ctx, fee):
+    if not m:
+        return None
+    c = m["checks"]
+    q = m["quality_checks"]
+    from_low = m["rebound_from_low_pct"]
+    risk = m["structure_risk_pct"]
+    rel = m["relative_pct"]
+    bearish = ctx["long"] == "down" or ctx["short"] == "down"
+    relative_floor = 0.8 if bearish else 0.5
+
+    # Mandatory prefilters: scores never excuse bad entry location or
+    # relative weakness. Already-exploded coins are excluded, not WATCH.
+    watch_eligible = (
+        m["score"] >= 7
+        and m["technical_score"] >= 4
+        and rel >= relative_floor
+        and 1.2 <= from_low <= 11
+        and 0 <= risk <= 11
+        and m["rise24_pct"] <= 12
+        and 0.15 <= m["bb_position"] <= 1.0
+        and m["volume_ratio"] >= 0.35
+        and m["rsi14"] <= 73
+    )
+    if not watch_eligible:
+        return None
+
+    trigger = (
+        c["h1_confirm"] and c["ma_recover"]
+        and c["rsi_recover"] and c["macd_recover"]
+        and (c["bb_recover"] or c["ichimoku_recover"])
+    )
+    buy = (
+        m["score"] >= 8 and trigger and rel >= relative_floor
+        and m["volume_ratio"] >= 0.7
+        and from_low <= 9.0 and risk <= 9.0
+        and m["bb_position"] <= 0.95
+        and m.get("timing_ok", True)
+        and not m.get("data_gap_recent", False)  # avoid BUY on interrupted 1h/4h history
+    )
+    kind = "BUY" if buy else "WATCH"
+    stage = ("반등 확인 BUY" if buy else
+             "점검 공백 · BUY 보류" if m.get("data_gap_recent", False) else
+             "반등 직전 WATCH" if m["score"] >= 8 else "반등 준비 WATCH")
+    legacy = dict(m)
+    legacy["score"] = m["technical_score"]  # preserve legacy /7 explanation and plan
+    raw = _legacy_signal(legacy, ctx, fee)
+    if raw is None:
+        return None
+
+    names = {
+        "bb_recover": "볼린저밴드 회복", "ma_recover": "MA5 기울기 회복",
+        "ichimoku_recover": "일목 전환선", "rsi_recover": "RSI 상승",
+        "macd_recover": "MACD 모멘텀", "volume_recover": "4시간 거래대금",
+        "h1_confirm": "1시간봉 반등"
+    }
+    quality_names = {
+        "btc_strength": "BTC 대비 +0.5%p 이상",
+        "entry_zone": "저점에서 +1.2~11% 초기 구간",
+        "risk_control": "저점 지지까지 11% 이내"
+    }
+    tech_details = " · ".join(("✓ " if passed else "× ") + names[k] for k, passed in c.items())
+    qual_details = " · ".join(("✓ " if passed else "× ") + quality_names[k] for k, passed in q.items())
+    why = [
+        f"반등 점수 {m['score']}/10 = 지표 {m['technical_score']}/7 + 진입 품질 {m['quality_score']}/3",
+        f"판정 {stage} · 10점이어도 반등 확정이 아니며 BUY 필수 확인 조건 적용",
+        "기술 지표: " + tech_details,
+        "진입 품질: " + qual_details,
+        ("⚠ 최근 1시간·4시간 마감봉에 공백이 있어 BUY를 자동 보류함. 실거래 캔들만 이용하며 누락봉 보간 없음."
+         if m.get("data_gap_recent") else "최근 1시간·4시간 마감봉 연속성 확인"),
+        *raw["explanation"][1:7],
+        f"저점 대비 +{from_low:.2f}% · 저점 기준 위험 거리 {risk:.2f}% · 24시간 등락 {m['rise24_pct']:+.2f}%",
+    ]
+    if not buy:
+        missing = [names[k] for k in ("h1_confirm", "ma_recover", "rsi_recover", "macd_recover") if not c[k]]
+        if not (c["bb_recover"] or c["ichimoku_recover"]):
+            missing.append("볼밴 또는 일목 회복")
+        if m["score"] < 8:
+            missing.append("BUY 점수 8/10")
+        if m["volume_ratio"] < 0.7:
+            missing.append("거래대금 0.7배")
+        if from_low > 9 or risk > 9:
+            missing.append("BUY 진입 위치 안전 기준")
+        if not m.get("timing_ok", True):
+            missing.append("선택한 검색 시간봉 확인")
+        if m.get("data_gap_recent"):
+            missing.append("점검 후 최근 마감봉 공백(연속봉 회복까지 BUY 보류)")
+        why.append("BUY 보류 이유: " + (", ".join(missing) if missing else "반등 확인 추가 대기"))
+    else:
+        why.append("완료봉 기준 반등 확인. 실제 주문 신호나 수익 보장은 아님")
+
+    return {"signal": kind, "stage": stage, "metrics": m, "explanation": why, "plan": raw["plan"]}
+
+
+
+========================================================================
+FILE: btc_mtf_rebound_v12.py
+========================================================================
+"""BTC MTF V1.2 | early swing rebound indicators using completed OHLC only."""
+from __future__ import annotations
+from math import sqrt
+from datetime import timedelta
+
+RULE_VERSION = "REBOUND_V1.2"
+
+def average(xs): return sum(xs)/len(xs)
+
+def ema_series(xs,period):
+    a=2/(period+1);v=None;out=[]
+    for p in xs:
+        v=p if v is None else v+a*(p-v)
+        out.append(v)
+    return out
+
+def rsi_series(closes,length=14):
+    if len(closes)<=length:return []
+    gains=[max(y-x,0) for x,y in zip(closes,closes[1:])]
+    losses=[max(x-y,0) for x,y in zip(closes,closes[1:])]
+    up=average(gains[:length]);dn=average(losses[:length])
+    def rsi(u,d):
+        return 50.0 if u==d==0 else (100.0 if d==0 else 100-100/(1+u/d))
+    out=[rsi(up,dn)]
+    for u,d in zip(gains[length:],losses[length:]):
+        up=(up*(length-1)+u)/length;dn=(dn*(length-1)+d)/length
+        out.append(rsi(up,dn))
+    return out
+
+def macd_hist(closes):
+    e12,e26=ema_series(closes,12),ema_series(closes,26)
+    macd=[a-b for a,b in zip(e12,e26)]
+    sig=ema_series(macd,9)
+    return [m-s for m,s in zip(macd,sig)],macd[-1],sig[-1]
+
+def bollinger(closes,index=None):
+    i=len(closes)-1 if index is None else index
+    xs=closes[i-19:i+1]
+    mid=average(xs);sd=sqrt(average([(v-mid)**2 for v in xs]))
+    width=max(4*sd,mid*1e-8)
+    return mid,mid-2*sd,mid+2*sd,(closes[i]-(mid-2*sd))/width
+
+def midpoint(tail):
+    return (max(x['h'] for x in tail)+min(x['l'] for x in tail))/2
+
+def ichimoku(rows):
+    # Span at current candle = computed 26 completed bars earlier, no future data.
+    tenkan=midpoint(rows[-9:]);kijun=midpoint(rows[-26:])
+    prev_tenkan=midpoint(rows[-10:-1])
+    old=rows[:-26]
+    span_a=(midpoint(old[-9:])+midpoint(old[-26:]))/2
+    span_b=midpoint(old[-52:])
+    return tenkan,kijun,prev_tenkan,max(span_a,span_b)
+
+def bottom_rebound_metrics(day,h4,h1,btc4,at,baseline,contiguous,bar_end):
+    # Maintenance or temporary no-trade intervals must not invalidate weeks of
+    # otherwise real candles. Keep minimum sample sizes and bounded coverage.
+    # Never invent missing OHLC values or call an irregular bar "continuous".
+    if not (len(day)>=24 and len(h4)>=80 and len(h1)>=24):
+        return None,'반등 지표 실제 캔들 수 부족: 일24 / 4시간80 / 1시간24 필요'
+    if (day[-1]['t']-day[-24]['t']>timedelta(days=28)
+            or h4[-1]['t']-h4[-80]['t']>timedelta(hours=4*89)
+            or h1[-1]['t']-h1[-24]['t']>timedelta(hours=34)):
+        return None,'반등 지표 관측 간격 과다: 일/4시간/1시간 실거래 캔들 밀도 부족'
+    gap_h1 = not contiguous(h1,'1h',6)
+    gap_h4 = not contiguous(h4,'4h',3)
+    recent_gap = gap_h1 or gap_h4
+    if at-bar_end(h4[-1]['t'],'4h')>timedelta(hours=8):
+        return None,'4시간 최신 마감봉이 오래됨'
+    if at-bar_end(h1[-1]['t'],'1h')>timedelta(hours=3):
+        return None,'1시간 최신 마감봉이 오래됨'
+    btc={x['t']:x['c'] for x in btc4}
+    if h4[-1]['t'] not in btc or h4[-5]['t'] not in btc:
+        return None,'동일 시각 BTC 4시간봉 부족'
+    m=dict(baseline)
+    f=[x['c'] for x in h4]; hour=[x['c'] for x in h1];d=[x['c'] for x in day]
+    cur=f[-1];rsi=rsi_series(f);h1rsi=rsi_series(hour)
+    hist,macd,sig=macd_hist(f);tenkan,kijun,prev_tenkan,cloud=ichimoku(h4)
+    ma5=average(f[-5:]);prevma5=average(f[-6:-1]);ma20=average(f[-20:])
+    bbmid,bblow,bbup,bbpos=bollinger(f)
+    prevpos=bollinger(f,len(f)-2)[-1]
+    lo=min(x['l'] for x in h4[-25:-1])
+    recent_lo=min(x['l'] for x in h4[-6:]);prior_lo=min(x['l'] for x in h4[-12:-6])
+    from_low=(cur/lo-1)*100
+    h1up=hour[-1]>average(hour[-7:]) and hour[-1]>hour[-2] and h1rsi[-1]>=45
+    volbase=average([x['turnover'] for x in h4[-21:-1]])
+    volratio=h4[-1]['turnover']/volbase if volbase>0 else 0
+    btc16=(btc[h4[-1]['t']]/btc[h4[-5]['t']]-1)*100
+    coin16=(f[-1]/f[-5]-1)*100
+    support=lo*.998
+    checks={
+        'bb_recover':.20<=bbpos<=.95 and bbpos>prevpos+.035,
+        'ma_recover':cur>ma5 and ma5>prevma5,
+        'ichimoku_recover':cur>tenkan and (tenkan>=prev_tenkan or tenkan>=kijun*.995),
+        'rsi_recover':40<=rsi[-1]<=72 and rsi[-1]>rsi[-3]+.4,
+        'macd_recover':hist[-1]>hist[-3] and (hist[-1]>hist[-2] or hist[-1]>0),
+        'volume_recover':volratio>=1.10,
+        'h1_confirm':h1up,
+    }
+    m.update({
+        'setup_name':'바닥 반등 초입','close':cur,'bottom_ref':round(lo,8),
+        'rebound_from_low_pct':round(from_low,3),
+        'recent_low_higher':recent_lo>prior_lo,
+        'day_ma20_distance_pct':round((d[-1]/average(d[-20:])-1)*100,3),
+        'bb_mid':round(bbmid,8),'bb_lower':round(bblow,8),'bb_upper':round(bbup,8),
+        'bb_position':round(bbpos,3),'bb_prev_position':round(prevpos,3),
+        'ma5':round(ma5,8),'ma20':round(ma20,8),
+        'ichimoku_tenkan':round(tenkan,8),'ichimoku_kijun':round(kijun,8),
+        'ichimoku_cloud_top':round(cloud,8),
+        'rsi14':round(rsi[-1],2),'rsi14_prev2':round(rsi[-3],2),
+        'macd_hist':round(hist[-1],8),'macd_hist_prev2':round(hist[-3],8),
+        'macd_value':round(macd,8),'macd_signal':round(sig,8),
+        'volume_ratio':round(volratio,3),
+        'relative_pct':round(coin16-btc16,3),
+        'coin_return_pct':round(coin16,3),'btc_return_pct':round(btc16,3),
+        'rise24_pct':round((f[-1]/f[-7]-1)*100,3),
+        'structure_risk_pct':round((cur/support-1)*100,3),'support':round(support,8),
+        'checks':checks,'score':sum(checks.values()),
+        'data_gap_recent':recent_gap,
+        'data_gap_1h':gap_h1,
+        'data_gap_4h':gap_h4,
+        'data_status':'점검 후 최근 마감봉 불연속: BUY 보류' if recent_gap else '정상',
+        'closed_kst':bar_end(h4[-1]['t'],'4h').strftime('%Y-%m-%d %H:%M'),
+        'day_rise_pct':round((d[-1]/d[-2]-1)*100,3),
+    })
+    return m,None
+
+def rebound_signal(m,ctx,fee):
+    if not m:return None
+    c=m['checks'];relative=m['relative_pct'];from_low=m['rebound_from_low_pct']
+    bearish=ctx['long']=='down' or ctx['short']=='down'
+    strength=relative>=(1.1 if bearish else .5)
+    too_late=from_low>13 or m['rise24_pct']>16 or m['structure_risk_pct']>11 or m['rsi14']>73
+    early=.5<=from_low<=19 and m['score']>=3 and relative>=-.7
+    trigger=c['h1_confirm'] and c['ma_recover'] and (c['bb_recover'] or c['ichimoku_recover'])
+    buy=(early and not too_late and 1.2<=from_low<=11 and m['score']>=5 and trigger and
+         c['rsi_recover'] and c['macd_recover'] and m['volume_ratio']>=.9 and
+         strength and m['structure_risk_pct']<=8 and m.get('timing_ok',True))
+    if not (buy or early):return None
+    kind='BUY' if buy else 'WATCH'
+    stage='반등 시작 확인' if buy else ('급등 추격 대기' if too_late else '바닥 회복 관찰')
+    names={'bb_recover':'볼밴 하단→중심 회복','ma_recover':'4시간 MA5 회복',
+           'ichimoku_recover':'일목 전환선 회복','rsi_recover':'RSI 상승 전환',
+           'macd_recover':'MACD 모멘텀 개선','volume_recover':'거래대금 증가',
+           'h1_confirm':'1시간봉 재상승'}
+    why=[
+        f"단계: {stage} · 최근 저점 {m['bottom_ref']:.6g}원에서 {from_low:+.2f}% (완전 바닥 예측 아님)",
+        f"볼린저밴드 위치 {m['bb_position']:.2f} (0 하단/1 상단) · 중심선 {m['bb_mid']:.6g} · {'회복' if c['bb_recover'] else '대기'}",
+        f"MA5 {m['ma5']:.6g} / MA20 {m['ma20']:.6g} · {'회복' if c['ma_recover'] else '미확인'}",
+        f"일목 전환선 {m['ichimoku_tenkan']:.6g}, 기준선 {m['ichimoku_kijun']:.6g}, 선행 구름 상단 {m['ichimoku_cloud_top']:.6g}",
+        f"RSI(14) {m['rsi14']:.1f} (2봉 전 {m['rsi14_prev2']:.1f}) · MACD 히스토그램 {m['macd_hist']:.6g} (2봉 전 {m['macd_hist_prev2']:.6g})",
+        f"4시간 거래대금 {m['volume_ratio']:.2f}배 · 1시간 반등 {'확인' if c['h1_confirm'] else '대기'}",
+        f"16시간 BTC {m['btc_return_pct']:+.2f}%, 코인 {m['coin_return_pct']:+.2f}% → 상대강도 {relative:+.2f}%p",
+        f"반등 징후 {m['score']}/7 · 저점 지지까지 {m['structure_risk_pct']:.2f}% · 24시간 상승 {m['rise24_pct']:+.2f}%",
+    ]
+    if kind=='WATCH':
+        missing=[names[k] for k,v in c.items() if not v]
+        if not strength:missing.append('BTC 상대강도')
+        if not m.get('timing_ok',True):missing.append('선택 검색봉')
+        if too_late:missing.append('급등 추격 위험')
+        why.append('BUY 보류: '+(', '.join(missing) if missing else '반등 확인 조건·이격 거리'))
+    else:why.append('완료봉으로 반등 시작 확인 · 실제 주문은 하지 않음')
+    cost=fee/100
+    plan={'tp1_net':5.0,'tp1_fraction':.5,'tp2_net':12.0,'tp2_fraction':.5,
+          'stop_gross':-5.0,'max_minutes':7200,
+          'tp1_gross_pct':round((1.05*(1+cost)/(1-cost)-1)*100,3),
+          'tp2_gross_pct':round((1.12*(1+cost)/(1-cost)-1)*100,3),
+          'support':m['support'],'support_risk_pct':m['structure_risk_pct']}
+    return {'signal':kind,'stage':stage,'metrics':m,'explanation':why,'plan':plan}
+
+
+
+========================================================================
+FILE: tests/test_mtf_v14.py
+========================================================================
+"""V1.4 regression tests, run via unittest."""
+import unittest
+from datetime import datetime, timedelta
+from bithumb_btc_mtf_v1 import KST, strict_swing_gate, swing_backtest_exit, tf_end, is_contiguous
+from btc_mtf_macd_v141 import analyze_macd, all_macd_views
+from btc_mtf_explain_v142 import build_explanation
+from btc_mtf_combo_v143 import evaluate_combined, REQUIRED_TREND_CHECKS
+from btc_mtf_watch_v144 import classify_watch_tracks
+from btc_mtf_replay_v145 import HourlyReplayPath
+from btc_mtf_quality_v146 import snapshot_liquidity, investigate_missing_hour
+from btc_mtf_study_v147 import compare_watch_cohorts
+from unittest.mock import patch
+import bithumb_btc_mtf_v1 as main
+from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
+
+def make_bars(start,n,delta):
+    return [{"t":start+i*delta,"o":100+i,"h":101+i,"l":99+i,
+             "c":100+i,"turnover":1000000} for i in range(n)]
+
+class StrictGateTest(unittest.TestCase):
+    def setUp(self):
+        self.day=make_bars(datetime(2026,9,1,tzinfo=KST),40,timedelta(days=1))
+        self.h4=make_bars(datetime(2026,10,1,tzinfo=KST),40,timedelta(hours=4))
+        self.ctx={"long":"up","short":"side"}
+        self.m={"score":10,"day_up":True,"h4_up":True,
+          "close":self.h4[-1]["c"],"checks":{"h1_confirm":True},
+          "rsi14":55,"macd_hist":.3,"volume_ratio":1.3,
+          "data_gap_recent":False,"macd_h4":{"state":"GOLDEN"},"rebound_from_low_pct":3,
+          "structure_risk_pct":4,"timing_ok":True}
+
+    def test_all_conditions_pass(self):
+        result=strict_swing_gate(self.m,self.ctx,self.day,self.h4)
+        self.assertTrue(result["passed"],result["missing"])
+
+    def test_10_point_bounce_with_weak_rsi_macd_is_not_buy(self):
+        self.m["rsi14"]=47
+        self.m["macd_hist"]=-.1
+        result=strict_swing_gate(self.m,self.ctx,self.day,self.h4)
+        self.assertFalse(result["passed"])
+        self.assertIn("RSI(14) 50 이상",result["missing"])
+        self.assertIn("MACD 히스토그램 양수",result["missing"])
+
+    def test_btc_decline_and_gaps_block_buy(self):
+        self.ctx["long"]="down"
+        self.m["data_gap_recent"]=True
+        self.assertFalse(strict_swing_gate(self.m,self.ctx,self.day,self.h4)["passed"])
+
+    def test_eight_points_not_enough(self):
+        self.m["score"]=8
+        self.assertFalse(strict_swing_gate(self.m,self.ctx,self.day,self.h4)["passed"])
+
+class GapTest(unittest.TestCase):
+    def setUp(self):
+        self.at=datetime(2026,10,31,15,tzinfo=KST)
+
+    def candles(self,gap,collision=False):
+        data=[]
+        for i in range(120):
+            if i==gap:continue
+            data.append({"t":self.at+timedelta(hours=i),
+                         "o":100.,"h":120. if (i==2 and collision) else 101.,
+                         "l":94. if i==2 else 99.,"c":100.})
+        return lambda market,tf,at,count:data
+
+    def test_gap_after_stop_keeps_resolved(self):
+        result=swing_backtest_exit("KRW-TEST",self.at,.25,getter=self.candles(60))
+        self.assertEqual(result["status"],"RESOLVED")
+        self.assertTrue(result["stop"])
+
+    def test_gap_before_stop_is_unknown(self):
+        result=swing_backtest_exit("KRW-TEST",self.at,.25,getter=self.candles(1))
+        self.assertEqual(result["status"],"UNKNOWN")
+        self.assertIsNone(result["net_pct"])
+
+    def test_stop_first_when_tp_and_sl_same_hour(self):
+        result=swing_backtest_exit("KRW-TEST",self.at,.25,getter=self.candles(60,True))
+        self.assertEqual(result["status"],"RESOLVED")
+        self.assertTrue(result["ambiguous"])
+        self.assertTrue(result["stop"])
+
+
+class MacdCrossTest(unittest.TestCase):
+    def make(self, prices, hours=4):
+        start=datetime(2026,10,1,tzinfo=KST)
+        return [{"t":start+timedelta(hours=hours*i),"c":float(p),
+                 "o":float(p),"h":float(p)+1,"l":float(p)-1} for i,p in enumerate(prices)]
+
+    def test_current_golden_state_does_not_mean_new_golden_cross(self):
+        rows=self.make([100]*55+[99-j*.75 for j in range(12)]+[90+j*1.2 for j in range(20)])
+        events=[]
+        for i in range(45,len(rows)+1):
+            view=analyze_macd(rows[:i],12,26,9,"4h",tf_end,is_contiguous)
+            if view["event"]=="GOLDEN_CROSS":
+                events.append(i)
+        self.assertTrue(events,"synthetic scenario should contain at least one golden cross")
+        idx=events[-1]
+        cross=analyze_macd(rows[:idx],12,26,9,"4h",tf_end,is_contiguous)
+        after=analyze_macd(rows[:idx+1],12,26,9,"4h",tf_end,is_contiguous)
+        self.assertEqual(cross["state"],"GOLDEN")
+        self.assertEqual(cross["event"],"GOLDEN_CROSS")
+        self.assertEqual(after["state"],"GOLDEN")
+        self.assertEqual(after["event"],"NONE")
+        self.assertEqual(after["last_event"],"GOLDEN_CROSS")
+        self.assertEqual(after["bars_since_cross"],1)
+
+    def test_gapped_latest_data_cannot_claim_a_cross(self):
+        rows=self.make([100]*65+[90+j*.9 for j in range(20)])
+        rows[-2]["t"]+=timedelta(hours=1)
+        view=analyze_macd(rows,12,26,9,"4h",tf_end,is_contiguous)
+        self.assertEqual(view["state"],"UNKNOWN")
+        self.assertEqual(view["event"],"NONE")
+
+    def test_standard_and_daily_chart_settings_are_separate(self):
+        start=datetime(2026,9,1,tzinfo=KST)
+        day=[{"t":start+timedelta(days=i),"c":100+i*.2} for i in range(80)]
+        h4=self.make([100+i*.1 for i in range(90)])
+        views=all_macd_views(day,h4,tf_end,is_contiguous)
+        self.assertEqual(views["h4"]["params"],"12,26,9")
+        self.assertEqual(views["day"]["params"],"12,26,9")
+        self.assertEqual(views["day_chart"]["params"],"3,10,16")
+
+    def test_strict_gate_requires_macd_bullish_state(self):
+        test=StrictGateTest()
+        test.setUp()
+        test.m["macd_h4"]={"state":"DEAD"}
+        self.assertFalse(strict_swing_gate(test.m,test.ctx,test.day,test.h4)["passed"])
+
+
+class ExplainableSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.day=make_bars(datetime(2026,8,1,tzinfo=KST),40,timedelta(days=1))
+        self.h4=make_bars(datetime(2026,10,1,tzinfo=KST),40,timedelta(hours=4))
+        self.h1=make_bars(datetime(2026,10,1,tzinfo=KST),30,timedelta(hours=1))
+        self.m={
+            "score":9,"close":self.h4[-1]["c"],"day_up":True,"h4_up":True,
+            "h4_higher_low":True,"h4_higher_high":True,
+            "checks":{"h1_confirm":True,"ma_recover":True,
+                      "rsi_recover":True,"macd_recover":True},
+            "rsi14":56,"macd_h4":{"state":"GOLDEN"},
+            "volume_ratio":1.4,"rebound_from_low_pct":4.0,
+            "structure_risk_pct":3.6,"data_gap_recent":False,
+            "timing_ok":True,"bb_position":0.7,"body_ratio":0.7,
+            "atr_pct":1.2,"h4_distance_ma7_pct":1.2,
+            "relative_pct":0.9,"closed_kst":"2026-10-10 00:00",
+        }
+        self.ctx={"long":"up","short":"side"}
+
+    def explain(self):
+        return build_explanation(self.m,self.ctx,self.day,self.h4,self.h1,.25)
+
+    def test_scorecards_are_four_checklists_not_profit_probabilities(self):
+        d=self.explain()
+        self.assertEqual(d["status"],"RESEARCH_ONLY")
+        self.assertEqual(len(d["scores"]),6)
+        self.assertTrue(all(0<=v<=100 for v in d["scores"].values()))
+        self.assertEqual(len(d["factors"]["structure"]),4)
+        self.assertEqual(len(d["factors"]["entry"]),4)
+        self.assertEqual(d["sell_pressure_proxy"]["orderbook_sell_wall"],None)
+        self.assertEqual(d["sell_pressure_proxy"]["taker_sell_strength"],None)
+        self.assertIsNotNone(d["context"]["last_24h_closed_turnover_krw"])
+
+    def test_future_breakout_is_only_a_conditional_reference(self):
+        d=self.explain()
+        p=d["plan"]
+        self.assertEqual(d["status"],"RESEARCH_ONLY")
+        self.assertTrue(p["requires_next_completed_4h_body_close_above_trigger"])
+        self.assertEqual(p["requires_future_4h_turnover_ratio"],2.0)
+        self.assertGreater(p["trigger_ref"],d["context"]["close_ref"])
+        self.assertGreater(p["trigger_ref"],p["stop_ref"])
+        self.assertGreater(p["breakeven_ref"],p["trigger_ref"])
+
+    def test_unsafe_stop_distance_hides_targets(self):
+        for x in self.h4[-6:]:
+            x["l"]=50.
+        d=self.explain()
+        self.assertFalse(d["plan"]["plan_valid"])
+        self.assertIsNone(d["plan"]["target1_ref"])
+        self.assertIsNone(d["plan"]["target2_ref"])
+        self.assertTrue(any("구조적 손절 거리" in w for w in d["warnings"]))
+
+    def test_dead_macd_not_equivalent_to_trend_confirmation(self):
+        self.m["macd_h4"]={"state":"DEAD"}
+        self.m["rsi14"]=43
+        d=self.explain()
+        self.assertFalse(d["factors"]["trend"][-1]["passed"])
+        self.assertTrue(any("MACD" in w for w in d["warnings"]))
+
+
+class CombinedSignalTest(unittest.TestCase):
+    """The original signal alone can never bypass structure/entry/risk checks."""
+    def setUp(self):
+        start=datetime(2026,10,1,tzinfo=KST)
+        self.h4=[
+            {"t":start+timedelta(hours=4*i), "o":95+i*.5,
+             "h":99+i*.5, "l":94+i*.5, "c":96+i*.5, "turnover":100}
+            for i in range(6)
+        ]
+        self.h4[-1].update({"o":102.0,"c":106.0,"h":107.0,"l":101.0,"turnover":250})
+        self.m={"score":10,"technical_score":7,"quality_score":3,"body_ratio":.72,"volume_ratio":2.5}
+        self.strict={"passed":True, "checks":{key:True for key in REQUIRED_TREND_CHECKS}}
+        self.evidence={
+            "scores":{"structure":100,"timing":100,"trend":100,
+                      "setup":100,"entry":100,"safety":100},
+            "sell_pressure_proxy":{"red_candle_turnover_pct":20.0},
+            "plan":{"plan_valid":True},
+        }
+
+    def classify(self,original="BUY"):
+        return evaluate_combined(original,self.strict,self.evidence,
+                                 self.m,self.h4,is_contiguous)
+
+    def test_only_old_buy_and_completed_breakout_can_be_combined_buy(self):
+        r=self.classify()
+        self.assertEqual(r["signal"],"BUY")
+        self.assertTrue(r["latest_completed_4h_breakout"])
+        self.assertLess(r["prior_3bar_breakout_level"],self.h4[-1]["c"])
+        self.assertTrue(r["buy_ready"])
+
+    def test_old_watch_remains_watch_even_if_other_gates_pass(self):
+        r=self.classify("WATCH")
+        self.assertEqual(r["signal"],"WATCH")
+        self.assertFalse(r["buy_ready"])
+
+    def test_no_current_bar_breakout_means_watch_not_buy(self):
+        self.h4[-1].update({"o":98,"c":100,"h":103,"l":97})
+        r=self.classify()
+        self.assertFalse(r["latest_completed_4h_breakout"])
+        self.assertEqual(r["signal"],"WATCH")
+
+    def test_sell_turnover_proxy_and_structure_score_are_real_watch_filters(self):
+        self.evidence["sell_pressure_proxy"]["red_candle_turnover_pct"]=75
+        self.evidence["scores"]["structure"]=50
+        r=self.classify()
+        self.assertEqual(r["signal"],"RESEARCH")
+        self.assertFalse(r["watch_ready"])
+        self.assertTrue(any("음봉 거래대금" in t for t in r["missing_watch"]))
+        self.assertTrue(any("구조 점수" in t for t in r["missing_watch"]))
+
+    def test_unavailable_red_candle_ratio_does_not_become_zero(self):
+        self.evidence["sell_pressure_proxy"]["red_candle_turnover_pct"]=None
+        self.assertEqual(self.classify()["signal"],"RESEARCH")
+
+    def test_noncontiguous_four_hour_bars_block_combined_watch(self):
+        self.h4[-2]["t"]+=timedelta(hours=1)
+        r=self.classify()
+        self.assertFalse(r["watch_ready"])
+        self.assertEqual(r["signal"],"RESEARCH")
+
+    def test_existing_strict_gate_is_not_bypassed(self):
+        self.strict["checks"]["일봉 MA20 상향 + 22봉 연속"]=False
+        r=self.classify()
+        self.assertEqual(r["signal"],"RESEARCH")
+
+
+class SeparateWatchTracksTest(unittest.TestCase):
+    def setUp(self):
+        self.m={
+            "score":8,"technical_score":6,"quality_score":2,
+            "rsi14":48,"timing_ok":True,"volume_ratio":.9,
+            "structure_risk_pct":5,"data_gap_recent":False,
+            "macd_h4":{"state":"DEAD"},
+        }
+        self.explain={"scores":{"timing":75,"safety":75,"trend":50}}
+        self.ctx={"long":"side","short":"up"}
+        self.strict={"passed":False,"checks":{
+            "일봉 MA20 상향 + 22봉 연속":False,
+            "4시간봉 MA20 상회·상향 + 21봉 연속":False}}
+        self.combined={"signal":"RESEARCH","watch_ready":False}
+
+    def classify(self,original="WATCH"):
+        return classify_watch_tracks(original,self.strict,self.combined,
+                                     self.explain,self.m,self.ctx)
+
+    def test_early_watch_is_observation_not_buy(self):
+        result=self.classify()
+        self.assertEqual(result["kind"],"EARLY_WATCH")
+        self.assertTrue(result["early_ready"])
+        self.assertFalse(result["trend_ready"])
+        self.assertNotEqual(result["kind"],"BUY")
+
+    def test_old_buy_does_not_promote_early_watch_to_buy(self):
+        result=self.classify("BUY")
+        self.assertEqual(result["kind"],"EARLY_WATCH")
+        self.assertTrue(result["buy_unchanged"])
+
+    def test_weak_macd_and_rsi_and_trend_are_research_not_watch(self):
+        self.explain["scores"]["trend"]=25
+        result=self.classify("BUY")
+        self.assertEqual(result["kind"],"RESEARCH")
+        self.assertIn("MACD 데드·RSI 50미만·추세약세 동시 발생 제외",
+                      result["early_missing"])
+
+    def test_missing_recent_bars_blocks_early_watch(self):
+        self.m["data_gap_recent"]=True
+        self.assertEqual(self.classify()["kind"],"RESEARCH")
+
+    def test_trend_watch_requires_previous_strict_watch_gate(self):
+        self.m["macd_h4"]["state"]="GOLDEN"
+        self.strict["checks"].update({
+            "일봉 MA20 상향 + 22봉 연속":True,
+            "4시간봉 MA20 상회·상향 + 21봉 연속":True})
+        self.combined["watch_ready"]=True
+        self.combined["signal"]="WATCH"
+        result=self.classify()
+        self.assertEqual(result["kind"],"TREND_WATCH")
+        self.assertTrue(result["trend_ready"])
+
+    def test_previous_v143_buy_retains_buy_when_early_conditions_fail(self):
+        self.combined["signal"]="BUY"
+        self.m["data_gap_recent"]=True
+        self.m["score"]=7
+        self.assertEqual(self.classify("BUY")["kind"],"BUY")
+
+    def test_no_original_candidate_cannot_become_early_watch(self):
+        self.assertEqual(self.classify(None)["kind"],"RESEARCH")
+
+
+class TargetedReplayRecoveryTest(unittest.TestCase):
+    """Use only real returned 1h source bars; no 30m price substitution."""
+
+    def setUp(self):
+        self.at=datetime(2026,10,31,15,tzinfo=KST)
+        self.base=[{"t":self.at+timedelta(hours=i),"o":100.0,"h":100.1,
+                    "l":99.9,"c":100.0,"turnover":1000} for i in range(120)]
+        self.gap=self.at+timedelta(hours=1)
+        self.calls=[]
+
+    def get(self,market,tf,to,count=100):
+        self.calls.append((market,tf,to,count))
+        if tf=="1h" and count==160:
+            return [r for r in self.base if r["t"]!=self.gap]
+        if tf=="1h":
+            return [r for r in self.base if r["t"]==self.gap]
+        raise AssertionError("Unexpected timeframe")
+
+    def test_exact_hour_recovered_and_fee_unchanged(self):
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=self.get)
+        self.assertEqual(got["status"],"RESOLVED")
+        self.assertEqual(got["minutes"],7200)
+        self.assertEqual(got["audit"]["recovered_one_hour_candles"],1)
+        self.assertEqual(got["audit"]["status_code"],"RECOVERED_1H")
+        self.assertEqual(got["audit"]["hourly_recheck_calls"],1)
+        self.assertEqual(self.calls[1][2],self.gap+timedelta(hours=1,minutes=1))
+        self.assertAlmostEqual(got["net_pct"],-0.079968,places=4)
+
+    def test_persistent_hourly_gap_keeps_unknown(self):
+        def no_gap_return(market,tf,to,count=100):
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=no_gap_return)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertIsNone(got["net_pct"])
+        self.assertEqual(got["audit"]["status_code"],"SOURCE_1H_NOT_RETURNED")
+        self.assertEqual(got["audit"]["first_unresolved_or_recovered_hour_kst"],"2026-10-31 16:00")
+
+    def test_30m_bars_diagnose_but_never_create_1h_execution_price(self):
+        def half(market,tf,to,count=100):
+            if tf=="30m":return [{"t":self.gap+timedelta(minutes=30),"o":99,"h":100,"l":99,"c":99}]
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=half,detailed=True)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertIsNone(got["net_pct"])
+        self.assertEqual(got["audit"]["status_code"],"SOURCE_1H_MISSING_BUT_30M_EXISTS")
+        self.assertEqual(got["audit"]["lower_timeframe_bars_in_missing_hour"],1)
+
+    def test_no_1h_or_30m_cannot_claim_zero_trades(self):
+        def no_gap(market,tf,to,count=100):
+            if tf=="30m":return []
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=no_gap,detailed=True)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertEqual(got["audit"]["status_code"],"SOURCE_1H_30M_NOT_RETURNED")
+
+    def test_recheck_api_error_is_not_converted_to_profit(self):
+        def broken(market,tf,to,count=100):
+            if tf=="1h" and count!=160:raise RuntimeError("temporary HTTP 503")
+            return [r for r in self.base if r["t"]!=self.gap]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=broken)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertEqual(got["audit"]["status_code"],"HOURLY_RECHECK_API_ERROR")
+        self.assertIn("503",got["audit"]["detail_error"])
+
+    def test_gap_after_stop_skips_unnecessary_recheck(self):
+        late=self.at+timedelta(hours=65)
+        def stops(market,tf,to,count=100):
+            self.calls.append((tf,count))
+            rows=[dict(r) for r in self.base if r["t"]!=late]
+            for r in rows:
+                if r["t"]==self.at+timedelta(hours=2):r["l"]=90
+            return rows
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=stops,detailed=True)
+        self.assertEqual(got["status"],"RESOLVED")
+        self.assertTrue(got["stop"])
+        self.assertEqual(got["audit"]["hourly_recheck_calls"],0)
+        self.assertEqual(got["audit"]["total_candle_api_calls"],1)
+
+    def test_missing_entry_may_be_recovered_only_by_true_hourly_bar(self):
+        def missing_first(market,tf,to,count=100):
+            if tf=="1h" and count==160:return [r for r in self.base if r["t"]!=self.at]
+            if tf=="1h":return [r for r in self.base if r["t"]==self.at]
+            return []
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=missing_first)
+        self.assertEqual(got["status"],"RESOLVED")
+        self.assertEqual(got["audit"]["recovered_one_hour_candles"],1)
+
+    def test_missing_entry_unreturned_remains_unknown(self):
+        def no_entry(market,tf,to,count=100):
+            return [r for r in self.base if r["t"]!=self.at]
+        got=main.swing_backtest_exit("KRW-TEST",self.at,.04,getter=no_entry)
+        self.assertEqual(got["status"],"UNKNOWN")
+        self.assertEqual(got["reason_code"],"ENTRY_HOUR_MISSING")
+
+    def test_spotcheck_route_returns_five_without_account_keys(self):
+        fake={"status":"UNKNOWN","net_pct":None,"audit":{"status_code":"SOURCE_1H_NOT_RETURNED"}}
+        with patch.object(main,"swing_backtest_exit",return_value=fake) as b:
+            r=main.app.test_client().post("/api/replay-spotcheck",json={"fee":0.04})
+            self.assertEqual(r.status_code,200,r.get_json())
+            got=r.get_json()
+            self.assertEqual(len(got["items"]),5)
+            self.assertEqual(got["fee_each_pct"],.04)
+            self.assertEqual(b.call_count,5)
+            self.assertTrue(all(i["backtest"]["status"]=="UNKNOWN" for i in got["items"]))
+            get_result=main.app.test_client().get("/api/replay-spotcheck?fee=0.04")
+            self.assertEqual(get_result.status_code,200,get_result.get_json())
+            self.assertEqual(len(get_result.get_json()["items"]),5)
+            self.assertEqual(b.call_count,5)  # GET uses 2-minute cache
+
+
+    def test_spotcheck_rejects_unsupported_fee(self):
+        response=main.app.test_client().get("/api/replay-spotcheck?fee=1.0")
+        self.assertEqual(response.status_code,400)
+        self.assertFalse(response.get_json()["ok"])
+
+
+class HistoricalLiquidityV146Test(unittest.TestCase):
+    def setUp(self):
+        self.at=datetime(2026,10,31,15,tzinfo=KST)
+        self.start=self.at-timedelta(hours=24)
+        self.h1=[{"t":self.start+timedelta(hours=i),"o":100,"c":100,
+                  "turnover":6_000_000} for i in range(24)]
+
+    def test_full_precisely_prior_day_is_four_of_four(self):
+        result=snapshot_liquidity(self.h1,self.at)
+        self.assertEqual(result["hourly_bars_observed"],24)
+        self.assertEqual(result["checks_passed"],4)
+        self.assertEqual(result["kind"],"OBSERVED_OK")
+        self.assertEqual(result["observed_turnover_24h_krw"],144_000_000)
+        self.assertFalse(result["changes_buy_watch_gate"])
+
+    def test_future_bar_excluded_even_if_present_in_argument(self):
+        h=self.h1+[{"t":self.at,"turnover":900_000_000},
+                    {"t":self.at+timedelta(hours=1),"turnover":800_000_000}]
+        original=list(h)
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["hourly_bars_observed"],24)
+        self.assertEqual(result["observed_turnover_24h_krw"],144_000_000)
+        self.assertEqual(original,h)
+
+    def test_missing_hour_reports_incomplete_observation_not_false_zero_volume(self):
+        h=[x for x in self.h1 if x["t"]!=self.start+timedelta(hours=8)]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["hourly_bars_observed"],23)
+        self.assertFalse(result["observed_turnover_is_complete"])
+        self.assertEqual(result["longest_missing_hours"],1)
+        self.assertIn("2026-10-30 23:00",result["missing_hour_samples_kst"])
+        self.assertTrue(any("불완전" in text for text in result["warnings"]))
+
+    def test_recent_hourly_outage_raises_data_gap_risk(self):
+        h=self.h1[:-5]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["recent_6h_bars_observed"],1)
+        self.assertEqual(result["kind"],"DATA_GAP")
+
+    def test_low_turnover_with_complete_history_is_only_warning(self):
+        h=[dict(x,turnover=1000) for x in self.h1]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["kind"],"THIN_OBSERVED")
+        self.assertTrue(result["observed_turnover_is_complete"])
+        self.assertFalse(result["changes_buy_watch_gate"])
+
+    def test_invalid_turnover_rejected_without_synthetic_zero(self):
+        h=[dict(x) for x in self.h1]
+        h[-1]["turnover"]=float("nan")
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["hourly_bars_observed"],23)
+        self.assertFalse(result["checks"]["직전 완료 1시간봉 확인"])
+
+    def test_sparse_snapshot_with_nonzero_minute_not_used_for_buy(self):
+        h=[dict(x) for x in self.h1[:12]]
+        result=snapshot_liquidity(h,self.at)
+        self.assertEqual(result["kind"],"DATA_GAP")
+        self.assertFalse(result["changes_buy_watch_gate"])
+
+
+class MicroGapV146Test(unittest.TestCase):
+    def setUp(self):
+        self.at=datetime(2026,10,31,16,tzinfo=KST)
+        self.calls=[]
+
+    def test_true_1m_and_5m_with_exact_hour_boundary(self):
+        def getter(market,tf,to,count):
+            self.calls.append((tf,to,count))
+            points = [self.at-timedelta(minutes=1),
+                      self.at+timedelta(minutes=15),
+                      self.at+timedelta(hours=1)]
+            return [{"t":t} for t in points]
+        r=investigate_missing_hour("KRW-TEST",self.at,getter)
+        self.assertEqual(r["status_code"],"LOWER_TIMEFRAME_BARS_EXIST")
+        self.assertEqual(r["five_min_bars_observed"],1)
+        self.assertEqual(r["one_min_bars_observed"],1)
+        self.assertEqual(len(self.calls),2)
+        self.assertEqual(self.calls[0][0],"5m")
+        self.assertEqual(self.calls[1][0],"1m")
+        self.assertFalse(r["changes_exit_result"])
+        self.assertEqual(self.calls[0][1],self.at+timedelta(hours=1,minutes=1))
+
+    def test_no_lower_intervals_does_not_prove_no_trades(self):
+        r=investigate_missing_hour("KRW-TEST",self.at,
+                                   lambda market,tf,to,count: [])
+        self.assertEqual(r["status_code"],"NO_LOWER_TF_BARS_RETURNED")
+        self.assertIn("미확정",r["status_text"])
+
+    def test_api_error_remains_explicit(self):
+        def one_error(market,tf,to,count):
+            if tf=="1m":raise RuntimeError("API timeout")
+            return []
+        r=investigate_missing_hour("KRW-TEST",self.at,one_error)
+        self.assertEqual(r["status_code"],"LOWER_TIMEFRAME_API_ERROR")
+        self.assertIn("timeout",r["errors"]["1m"])
+
+    def test_spotcheck_api_adds_micro_evidence_but_preserves_unknown(self):
+        fake_bt={"status":"UNKNOWN","net_pct":None,"reason_code":"MISSING_HOURLY_BAR",
+                 "audit":{"status_code":"SOURCE_1H_30M_NOT_RETURNED",
+                          "first_unresolved_or_recovered_hour_kst":"2026-10-31 16:00"}}
+        micro={"status_code":"LOWER_TIMEFRAME_BARS_EXIST",
+               "five_min_bars_observed":1,"one_min_bars_observed":1,
+               "changes_exit_result":False}
+        with patch.object(main,"swing_backtest_exit",return_value=fake_bt),\
+             patch.object(main,"investigate_missing_hour",return_value=micro) as diag,\
+             patch.object(main,"ttl_get",return_value=None),\
+             patch.object(main,"ttl_put"):
+            resp=main.app.test_client().get("/api/replay-spotcheck?fee=0.04")
+            self.assertEqual(resp.status_code,200,resp.get_json())
+            data=resp.get_json()
+            self.assertEqual(len(data["items"]),5)
+            self.assertEqual(diag.call_count,5)
+            self.assertTrue(all(x["gap_micro"]["five_min_bars_observed"]==1
+                                for x in data["items"]))
+            self.assertTrue(all(x["backtest"]["status"]=="UNKNOWN"
+                                and x["backtest"]["net_pct"] is None
+                                for x in data["items"]))
+
+
+class CohortStudyV147Test(unittest.TestCase):
+    def row(self, market, at="2026-11-13 15:00:00", kind="EARLY_WATCH",
+            score=4, bars=24, net=None, status="UNKNOWN", legacy="WATCH"):
+        return {
+            "market":market,"at":at,"kind":kind,"legacy_signal":legacy,
+            "liquidity_audit":{
+                "checks_passed":score,
+                "hourly_bars_observed":bars,
+                "observed_turnover_is_complete":bars==24,
+                "observed_turnover_24h_krw":150_000_000,
+            },
+            "backtest":{"status":status,"net_pct":net,
+                        "reason":"missing 1h" if status=="UNKNOWN" else ""},
+        }
+
+    def test_all_unknown_100_percent_missing_not_zero_percent_profit(self):
+        rows=[self.row("KRW-BLUE"),self.row("KRW-MBL")]
+        report=compare_watch_cohorts(rows,scanned=15,issues=3)
+        self.assertEqual(report["summary"]["candidates"],2)
+        self.assertEqual(report["summary"]["unknown"],2)
+        self.assertEqual(report["summary"]["resolved"],0)
+        self.assertIsNone(report["summary"]["positive_fraction_resolved_pct"])
+        self.assertIsNone(report["summary"]["mean_hypothetical_net_pct"])
+        self.assertEqual(report["scanned"],15)
+        self.assertEqual(report["issues"],3)
+
+    def test_resolved_only_average_and_fee_is_already_in_simulated_net(self):
+        rows=[
+            self.row("KRW-BLUE",net=3.0,status="RESOLVED"),
+            self.row("KRW-2Z",net=-1.0,status="RESOLVED"),
+            self.row("KRW-MBL",net=None,status="UNKNOWN")
+        ]
+        report=compare_watch_cohorts(rows,fee_each=.04)
+        self.assertEqual(report["summary"]["positive"],1)
+        self.assertEqual(report["summary"]["nonpositive"],1)
+        self.assertEqual(report["summary"]["unknown"],1)
+        self.assertEqual(report["summary"]["mean_hypothetical_net_pct"],1.0)
+        self.assertEqual(report["summary"]["positive_fraction_resolved_pct"],50.0)
+        self.assertEqual(report["fee_each_pct"],.04)
+
+    def test_watch_buy_and_research_categories_do_not_mix(self):
+        rows=[
+            self.row("KRW-BLUE",kind="EARLY_WATCH",net=1,status="RESOLVED"),
+            self.row("KRW-MBL",kind="TREND_WATCH",net=-2,status="RESOLVED"),
+            self.row("KRW-2Z",kind="BUY",net=5,status="RESOLVED",legacy="BUY"),
+            self.row("KRW-NXPC",kind="RESEARCH",net=None,legacy="BUY")
+        ]
+        r=compare_watch_cohorts(rows)
+        count={x["label"]:x["candidates"] for x in r["by_kind"]}
+        self.assertEqual(count,{"BUY":1,"EARLY_WATCH":1,"TREND_WATCH":1,"RESEARCH":1})
+        self.assertEqual(r["original_buy"]["candidates"],2)
+        self.assertEqual(r["original_buy"]["resolved"],1)
+        self.assertTrue(all(x["watch_is_not_trade"] for x in r["by_kind"]))
+
+    def test_quality_four_not_automatically_complete_24h(self):
+        one=self.row("KRW-MBL",score=4,bars=23)
+        r=compare_watch_cohorts([one])
+        self.assertEqual(r["rows"][0]["quality"],"Q4")
+        self.assertEqual(r["rows"][0]["coverage"],"INCOMPLETE_24H")
+
+    def test_quality_coverage_missing_is_unverified(self):
+        one=self.row("KRW-MBL")
+        one["liquidity_audit"]={}
+        r=compare_watch_cohorts([one])
+        self.assertEqual(r["rows"][0]["quality"],"Q_UNKNOWN")
+        self.assertEqual(r["rows"][0]["coverage"],"UNKNOWN_24H")
+
+    def test_duplicate_coin_time_removed_but_other_dates_kept(self):
+        a=self.row("KRW-BLUE",at="2026-11-12 15:00:00")
+        b=self.row("KRW-BLUE",at="2026-11-13 15:00:00")
+        r=compare_watch_cohorts([a,a,b])
+        self.assertEqual(r["summary"]["candidates"],2)
+        self.assertEqual(r["summary"]["unique_markets"],1)
+        self.assertEqual(r["summary"]["unique_snapshots"],2)
+        self.assertEqual(r["duplicates_skipped"],1)
+        self.assertEqual(len(r["by_day"]),2)
+
+    def test_invalid_resolved_nan_stays_unknown(self):
+        x=self.row("KRW-MBL",net=float("nan"),status="RESOLVED")
+        y=self.row("KRW-2Z",net=None,status="RESOLVED")
+        r=compare_watch_cohorts([x,y])
+        self.assertEqual(r["summary"]["resolved"],0)
+        self.assertEqual(r["summary"]["unknown"],2)
+        self.assertIsNone(r["rows"][0]["net_pct"])
+
+    def test_bad_fields_and_oversized_input_rejected(self):
+        self.assertRaises(ValueError,compare_watch_cohorts,[{}]*1501)
+        self.assertRaises(ValueError,compare_watch_cohorts,[],fee_each=.5)
+        r=compare_watch_cohorts([{"market":"BAD","at":"2026-11-13","kind":"BUY"}])
+        self.assertEqual(r["summary"]["candidates"],0)
+        self.assertEqual(r["invalid_skipped"],1)
+
+    def test_api_is_read_only_and_rejects_live(self):
+        client=main.app.test_client()
+        rows=[self.row("KRW-BLUE",net=-0.2,status="RESOLVED")]
+        resp=client.post("/api/study-v147",json={
+            "mode":"backtest","strategy":"swing","fee":.04,
+            "items":rows,"scanned":10,"issues":2})
+        self.assertEqual(resp.status_code,200,resp.get_json())
+        data=resp.get_json()
+        self.assertEqual(data["study"]["summary"]["candidates"],1)
+        self.assertEqual(data["study"]["by_kind"][1]["label"],"EARLY_WATCH")
+        self.assertEqual(data["study"]["by_kind"][1]["resolved"],1)
+        invalid=client.post("/api/study-v147",json={
+            "mode":"live","strategy":"swing","fee":.04,"items":rows})
+        self.assertEqual(invalid.status_code,400)
+        invalid2=client.post("/api/study-v147",json={
+            "mode":"backtest","strategy":"scalp","fee":.04,"items":rows})
+        self.assertEqual(invalid2.status_code,400)
+
+
+class ExactHistoricalCandleBoundaryV148Test(unittest.TestCase):
+    """Historical exact closes are included; live near-close safety stays."""
+
+    def setUp(self):
+        self.snapshot=datetime(2026,11,18,15,0,0,tzinfo=KST)
+        self.server_time=datetime(2026,11,23,21,54,0,tzinfo=KST)
+
+    def raw(self,stamp,turnover=6_000_000):
+        return {
+            "candle_date_time_kst":stamp.strftime("%Y-%m-%dT%H:%M:%S"),
+            "opening_price":100,"high_price":101,"low_price":99,
+            "trade_price":100,"candle_acc_trade_price":turnover,
+        }
+
+    def test_historical_hour_ending_exactly_at_1500_is_included(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=2)),
+             self.raw(self.snapshot-timedelta(hours=1)),
+             self.raw(self.snapshot)]
+        with patch.object(main,"now_kst",return_value=self.server_time),\
+             patch.object(main,"api_get",return_value=raw) as api:
+            candles=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+        self.assertEqual([x["t"] for x in candles],
+                         [self.snapshot-timedelta(hours=2),
+                          self.snapshot-timedelta(hours=1)])
+        self.assertEqual(api.call_args.args[1]["to"],"2026-11-18 15:00:00")
+
+    def test_historical_hourly_liquidity_has_full_24_verified_hours(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=i)) for i in range(1,25)]
+        with patch.object(main,"now_kst",return_value=self.server_time),\
+             patch.object(main,"api_get",return_value=raw):
+            rows=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+        quality=snapshot_liquidity(rows,self.snapshot)
+        self.assertEqual(quality["hourly_bars_observed"],24)
+        self.assertEqual(quality["recent_6h_bars_observed"],6)
+        self.assertTrue(quality["observed_turnover_is_complete"])
+        self.assertEqual(quality["checks_passed"],4)
+        self.assertNotIn("2026-11-18 14:00",quality["missing_hour_samples_kst"])
+
+    def test_live_at_exact_close_maintains_two_second_guard(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=1))]
+        now=self.snapshot+timedelta(seconds=1)
+        with patch.object(main,"now_kst",return_value=now),\
+             patch.object(main,"api_get",return_value=raw):
+            rows=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+        self.assertEqual(rows,[])
+
+    def test_live_after_two_seconds_can_include_closed_hour(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=1))]
+        now=self.snapshot+timedelta(seconds=3)
+        with patch.object(main,"now_kst",return_value=now),\
+             patch.object(main,"api_get",return_value=raw):
+            # The LIVE snapshot itself must be +3 seconds. An older pinned
+            # clock exactly at 15:00 must NOT bypass its 2-second guard.
+            rows=main.candles("KRW-XRP","1h",now,count=50)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]["t"],self.snapshot-timedelta(hours=1))
+
+    def test_historical_four_hour_and_daily_exact_closes(self):
+        at4=datetime(2026,11,18,16,0,tzinfo=KST)
+        atday=datetime(2026,11,18,0,0,tzinfo=KST)
+        with patch.object(main,"now_kst",return_value=self.server_time):
+            with patch.object(main,"api_get",
+                              return_value=[self.raw(at4-timedelta(hours=4)),
+                                            self.raw(at4)]):
+                h4=main.candles("KRW-XRP","4h",at4,count=40)
+            with patch.object(main,"api_get",
+                              return_value=[self.raw(atday-timedelta(days=1)),
+                                            self.raw(atday)]):
+                day=main.candles("KRW-XRP","day",atday,count=40)
+        self.assertEqual([x["t"] for x in h4],[at4-timedelta(hours=4)])
+        self.assertEqual([x["t"] for x in day],[atday-timedelta(days=1)])
+
+    def test_historical_just_before_exact_close_cannot_look_ahead(self):
+        at=self.snapshot-timedelta(seconds=1)
+        with patch.object(main,"now_kst",return_value=self.server_time),\
+             patch.object(main,"api_get",
+                          return_value=[self.raw(self.snapshot-timedelta(hours=1))]):
+            rows=main.candles("KRW-XRP","1h",at,count=50)
+        self.assertEqual(rows,[])
+
+    def test_candle_logic_does_not_change_buy_watch_rules(self):
+        with patch.object(main,"now_kst",return_value=self.server_time):
+            cutoff=main.candle_close_cutoff(self.snapshot)
+        self.assertEqual(cutoff,self.snapshot)
+        self.assertFalse(cutoff<self.snapshot)
+
+if __name__=="__main__":
+    unittest.main()
+
+
+
+========================================================================
+FILE: tests/test_mtf_v141_api.py
+========================================================================
+"""API regression: pinned swing MACD is available even when no candidate."""
+import unittest
+from unittest.mock import patch
+from datetime import datetime, timedelta
+import bithumb_btc_mtf_v1 as main
+
+class FocusDiagnosticTest(unittest.TestCase):
+    def setUp(self):
+        d=datetime(2026,8,1,tzinfo=main.KST)
+        h=datetime(2026,10,1,tzinfo=main.KST)
+        def rows(start, step, n, slope):
+            return [
+                {"t":start+step*i, "c":100+i*slope,
+                 "o":99.8+i*slope, "h":100.7+i*slope,
+                 "l":99.3+i*slope, "turnover":10000000.0}
+                for i in range(n)
+            ]
+        self.day=rows(d,timedelta(days=1),80,.3)
+        self.h4=rows(h,timedelta(hours=4),90,.18)
+        self.h1=rows(h,timedelta(hours=1),50,.06)
+        self.m={
+            "score":9,"day_up":True,"h4_up":True,"day_ma20_distance_pct":2,"rsi14":56,
+            "macd_hist":0.13,"volume_ratio":1.3,"atr_pct":1.4,"bb_position":0.65,
+            "body_ratio":0.65,"h4_distance_ma7_pct":1.4,
+            "h4_higher_low":True,"h4_higher_high":True,"relative_pct":1.1,
+            "close":self.h4[-1]["c"],"rebound_from_low_pct":3.4,
+            "structure_risk_pct":4.2,"data_gap_recent":False,
+            "checks":{"h1_confirm":True,"ma_recover":True,
+                      "rsi_recover":True,"macd_recover":True},
+            "closed_kst":"2026-10-10 00:00",
+        }
+    def fetch(self,market,tf,at=None,count=70):
+        if tf=="day":return self.day
+        if tf=="4h":return self.h4
+        if tf=="1h":return self.h1
+        raise AssertionError(tf)
+    def test_pinned_symbol_returns_macd_even_without_candidate_signal(self):
+        with patch.object(main,"market_list",return_value={"KRW-NEAR":"니어프로토콜"}),\
+             patch.object(main,"btc_context",return_value={"long":"up","short":"side"}),\
+             patch.object(main,"candles",side_effect=self.fetch),\
+             patch.object(main,"ttl_get",return_value=None),\
+             patch.object(main,"swing_metrics",return_value=({},None)),\
+             patch.object(main.rebound,"bottom_rebound_metrics",return_value=(dict(self.m),None)),\
+             patch.object(main.rebound,"rebound_signal",return_value=None):
+            client=main.app.test_client()
+            resp=client.post("/api/coin",json={
+                "market":"KRW-NEAR","strategy":"swing","mode":"live",
+                "tf":"4h","fee":0.25,"want_diagnostic":True
+            })
+            self.assertEqual(resp.status_code,200,resp.get_json())
+            data=resp.get_json()
+            self.assertTrue(data["ok"])
+            self.assertIsNone(data["signal"])
+            self.assertEqual(data["diagnostic"]["score"],9)
+            self.assertEqual(data["diagnostic"]["macd"]["day_chart"]["params"],"3,10,16")
+            self.assertEqual(data["diagnostic"]["macd"]["h4"]["params"],"12,26,9")
+            self.assertIn("scores",data["diagnostic"]["explain"])
+            self.assertEqual(data["diagnostic"]["explain"]["status"],"RESEARCH_ONLY")
+            self.assertIsNone(data["diagnostic"]["explain"]["sell_pressure_proxy"]["orderbook_sell_wall"])
+
+if __name__=="__main__":
+    unittest.main()
