@@ -768,21 +768,59 @@ HTML = r'''<!doctype html>
 </section>
 <section class="surface"><h2>BTC 장기·단기 추세 <small id="btcts"></small></h2><div class="btc-agg"><div class="agg"><small>장기 · 월/주/일/4시간</small><strong id="long" class="unknown">검사 전</strong></div><div class="agg"><small>단기 · 1시간~1분</small><strong id="short" class="unknown">검사 전</strong></div></div><div id="tf-grid" class="tf-grid"></div><div class="notice">판정: 완료봉 종가와 MA5·MA10 배열. 종가 &gt; MA5 &gt; MA10은 상승, 반대는 하락, 그 외 횡보. 10봉 연속 자료 부족이면 미확인.</div></section>
 <section class="surface" id="focus-panel"><h2>관찰 코인 MACD 분석 <small>신호 0건도 확인</small></h2><div class="notice">검색 설정에서 관찰 코인을 지정해. 4시간봉·일봉 MACD(12·26·9)와 빗썸 차트 비교용 일봉(3·10·16)의 골든/데드 상태와 실제 교차가 구분돼.</div><div id="focus-results" class="empty">관찰 코인(예: NEAR)을 지정한 뒤 검색해 줘.</div></section><section class="surface"><h2>코인 후보 <small>BUY / WATCH</small></h2><div class="metrics"><div class="metric"><span>검사 완료</span><strong id="done">0</strong></div><div class="metric"><span>기존 BUY</span><strong id="noldbuy" class="side">0</strong></div><div class="metric"><span>종합 BUY</span><strong id="nbuy" class="up">0</strong></div><div class="metric"><span>전체 WATCH</span><strong id="nwatch" class="side">0</strong></div><div class="metric"><span>초기 WATCH</span><strong id="nearly" class="side">0</strong></div><div class="metric"><span>추세 WATCH</span><strong id="ntrend" class="up">0</strong></div><div class="metric"><span>오류 / 자료 부족</span><strong id="nerr">0</strong></div></div><div class="bar"><i id="progress"></i></div><div class="notice" id="btinfo"></div><div id="watch-summary" class="notice"></div><div id="issue-summary" class="notice"></div><div id="bt-summary" class="notice"></div><div id="watch-bt-summary" class="notice"></div><div id="results" class="empty">검사 시작을 누르면 BUY·WATCH 후보만 나타나.</div></section>
-<section class="surface" id="comparison-panel"><h2>기존 BUY ↔ 종합 BUY 비교</h2><div class="notice">원본 BUY·이전 강화 판정·새 종합 판정을 함께 비교해. 종합 보류도 저장되며 거래 신호가 아니야. 신호 품질 연구용 기준이야.</div><div id="comparison-results" class="empty">검사 전</div></section><div class="foot">모든 신호는 연구용 가상 판정이며 투자 권유나 주문 지시가 아니야. 실제 체결과 손익은 슬리피지·호가·갭으로 달라질 수 있어. 빗썸 공개 API만 사용하고 계정·주문 API는 호출하지 않아.</div>
+<section class="surface" id="spotcheck-panel"><h2>10월 31일 초기 WATCH 5종목 · 데이터 재검증 <small>전체 스캔 불필요</small></h2><div class="notice">2026-10-31 15:00 KST의 블루핀·더블제로·무비블록·넥스페이스·저트라를 다시 조회해. 기존 진입 조건은 변경하지 않고, 최초 누락된 1시간봉만 재요청해. 30분봉은 원인 진단만 하며 손익 계산에 사용하지 않아.</div><div class="action row"><button id="spotcheck-btn" class="secondary" type="button">5종목 청산 경로 재검증</button><button id="spotcheck-csv" class="secondary" disabled type="button">5종목 진단 CSV</button><small id="spotcheck-status">검증 전</small></div><div id="spotcheck-results" class="empty">버튼을 누르면 편도 수수료 설정(기본 0.04%)으로 5종목의 누락 시각을 확인해.</div></section><section class="surface" id="comparison-panel"><h2>기존 BUY ↔ 종합 BUY 비교</h2><div class="notice">원본 BUY·이전 강화 판정·새 종합 판정을 함께 비교해. 종합 보류도 저장되며 거래 신호가 아니야. 신호 품질 연구용 기준이야.</div><div id="comparison-results" class="empty">검사 전</div></section><div class="foot">모든 신호는 연구용 가상 판정이며 투자 권유나 주문 지시가 아니야. 실제 체결과 손익은 슬리피지·호가·갭으로 달라질 수 있어. 빗썸 공개 API만 사용하고 계정·주문 API는 호출하지 않아.</div>
 </main><script>
 (()=>{
 const $=id=>document.getElementById(id), ST={up:'상승',down:'하락',side:'횡보',unknown:'자료 부족'},TF={'month':'월','week':'주','day':'일','4h':'4시간','1h':'1시간','30m':'30분','15m':'15분','5m':'5분','3m':'3분','1m':'1분'},order=['month','week','day','4h','1h','30m','15m','5m','3m','1m'];
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let mode='live',strategy='swing',busy=false,results=[],issueCases=[],focusDiagnostics=[],problems=0,completed=0,universe=[],runId=0,lastCfg=null;
+let mode='live',strategy='swing',busy=false,results=[],issueCases=[],focusDiagnostics=[],spotcheckRows=[],spotcheckFee=.04,spotcheckBusy=false,problems=0,completed=0,universe=[],runId=0,lastCfg=null;
 const dt=(d)=>{const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':00'};
 let d=new Date();d.setDate(d.getDate()-1);d.setHours(15,0,0,0);$('at').value=dt(d);
 function modeSet(next){if(busy)return;mode=next;$('live-tab').classList.toggle('on',mode==='live');$('backtest-tab').classList.toggle('on',mode==='backtest');$('backtest-date-field').style.display=mode==='backtest'?'flex':'none';$('backtest-days-field').style.display=mode==='backtest'?'flex':'none';$('live-help').classList.toggle('hidden',mode!=='live');$('backtest-help').classList.toggle('hidden',mode!=='backtest');reset()}
-function strategySet(next){if(busy)return;strategy=next;$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙 V1.4.5: 초기 반등 WATCH와 추세 확인 WATCH를 별개로 표시. BUY 기준(V1.4.3)은 그대로. 7개 설명 항목·원본 신호·보류 사유 CSV 보존.':'단타: 빠른 돌파·BTC 상대강도 · +1% 70% / +10% 30% · -2% 손절 / 240분.';$('watch-filter-field').style.display=next==='swing'?'flex':'none';$('comparison-panel').classList.toggle('hidden',next!=='swing');$('focus-panel').classList.toggle('hidden',next!=='swing');if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
+function strategySet(next){if(busy)return;strategy=next;$('scalp-tab').classList.toggle('on',next==='scalp');$('swing-tab').classList.toggle('on',next==='swing');$('tf').value=next==='swing'?'4h':'5m';$('strategy-help').textContent=next==='swing'?'스윙 V1.4.5: 초기 반등 WATCH와 추세 확인 WATCH를 별개로 표시. BUY 기준(V1.4.3)은 그대로. 7개 설명 항목·원본 신호·보류 사유 CSV 보존.':'단타: 빠른 돌파·BTC 상대강도 · +1% 70% / +10% 30% · -2% 손절 / 240분.';$('watch-filter-field').style.display=next==='swing'?'flex':'none';$('comparison-panel').classList.toggle('hidden',next!=='swing');$('focus-panel').classList.toggle('hidden',next!=='swing');$('spotcheck-panel').classList.toggle('hidden',next!=='swing');if(next==='swing'){let d=new Date();d.setDate(d.getDate()-9);d.setHours(15,0,0,0);$('at').value=dt(d)}reset()}
 $('scalp-tab').onclick=()=>strategySet('scalp');$('swing-tab').onclick=()=>strategySet('swing');
 $('live-tab').onclick=()=>modeSet('live');$('backtest-tab').onclick=()=>modeSet('backtest');
-function reset(){results=[];issueCases=[];focusDiagnostics=[];completed=problems=0;$('focuscsv').disabled=true;$('focus-results').textContent='관찰 코인을 지정하고 검사해 줘.';$('results').innerHTML='검사 시작을 누르면 BUY·WATCH 후보만 나타나.';$('csv').disabled=true;$('issuecsv').disabled=true;$('issue-summary').textContent='';$('watch-summary').textContent='';$('comparison-results').textContent='검사 전';['done','noldbuy','nbuy','nwatch','nearly','ntrend','nerr'].forEach(k=>$(k).textContent='0');$('long').textContent='검사 전';$('short').textContent='검사 전';$('tf-grid').innerHTML='';$('progress').style.width='0%';$('scanstatus').textContent='검사 전';$('btinfo').textContent='';$('bt-summary').textContent='';$('watch-bt-summary').textContent='';$('error').textContent='';$('btcts').textContent=''}
+function reset(){results=[];issueCases=[];focusDiagnostics=[];spotcheckRows=[];$('spotcheck-csv').disabled=true;$('spotcheck-status').textContent='검증 전';$('spotcheck-results').textContent='10월 31일 WATCH 5종목을 전용 버튼으로 재검증할 수 있어.';completed=problems=0;$('focuscsv').disabled=true;$('focus-results').textContent='관찰 코인을 지정하고 검사해 줘.';$('results').innerHTML='검사 시작을 누르면 BUY·WATCH 후보만 나타나.';$('csv').disabled=true;$('issuecsv').disabled=true;$('issue-summary').textContent='';$('watch-summary').textContent='';$('comparison-results').textContent='검사 전';['done','noldbuy','nbuy','nwatch','nearly','ntrend','nerr'].forEach(k=>$(k).textContent='0');$('long').textContent='검사 전';$('short').textContent='검사 전';$('tf-grid').innerHTML='';$('progress').style.width='0%';$('scanstatus').textContent='검사 전';$('btinfo').textContent='';$('bt-summary').textContent='';$('watch-bt-summary').textContent='';$('error').textContent='';$('btcts').textContent=''}
 async function post(url,body){const rsp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await rsp.json();if(!rsp.ok||!j.ok)throw Error(j.error||'데이터 요청 실패');return j}
 async function get(url){const rsp=await fetch(url);const j=await rsp.json();if(!rsp.ok||!j.ok)throw Error(j.error||'목록 조회 실패');return j}
+$('spotcheck-btn').onclick=async()=>{
+ if(busy||spotcheckBusy)return;
+ spotcheckBusy=true;
+ const btn=$('spotcheck-btn');btn.disabled=true;btn.textContent='검증 중…';
+ $('spotcheck-csv').disabled=true;$('spotcheck-results').textContent='1시간봉 누락 시각 재조회 및 30분봉 진단 중…';
+ $('spotcheck-status').textContent='요청 중';spotcheckRows=[];
+ try{
+  spotcheckFee=Number($('fee').value);
+  const result=await post('/api/replay-spotcheck',{fee:spotcheckFee});
+  spotcheckRows=result.items||[];
+  const fmt=x=>x==null||!Number.isFinite(Number(x))?'—':Number(x).toFixed(3);
+  const solved=spotcheckRows.filter(x=>x.backtest?.status==='RESOLVED').length;
+  const recovered=spotcheckRows.reduce((z,x)=>z+(Number(x.backtest?.audit?.recovered_one_hour_candles)||0),0);
+  $('spotcheck-status').textContent='완료 '+spotcheckRows.length+'건 / 확정 '+solved+' / 미확정 '+(spotcheckRows.length-solved)+' / 재조회 복구 '+recovered+'봉';
+  $('spotcheck-results').innerHTML=spotcheckRows.map(x=>{
+   const bt=x.backtest||{},a=bt.audit||{};
+   return '<div class="result"><b>'+esc(x.name)+' ('+esc(x.market)+')</b>'
+     +'<p class="notice">가상 결과 '+(bt.status==='RESOLVED'?'확정 '+fmt(bt.net_pct)+'%':'UNKNOWN')+' · 상태 '+esc(a.status_code||'기록 없음')+'</p>'
+     +'<p class="notice">최초 누락 시간 '+esc(a.first_unresolved_or_recovered_hour_kst||'없음')+' KST · 최초 누락 '+esc(a.initial_missing_hours??'—')+'시간봉 · 실제 복구 '+esc(a.recovered_one_hour_candles??0)+'개</p>'
+     +'<p class="notice">1시간봉 재조회 '+esc(a.hourly_recheck_calls??0)+'회 · 30분봉 진단 '+esc(a.half_hour_diagnostic_calls??0)+'회 · 원인: '+esc(bt.reason||'추가 누락 전에 가상 청산 확인')+'</p></div>';
+  }).join('');
+  $('spotcheck-csv').disabled=!spotcheckRows.length;
+ }catch(e){$('spotcheck-status').textContent='검증 실패';$('spotcheck-results').textContent='재조회 요청 오류: '+String(e?.message||e);}
+ finally{spotcheckBusy=false;btn.disabled=busy;btn.textContent='5종목 청산 경로 재검증';}
+};
+$('spotcheck-csv').onclick=()=>{
+ if(!spotcheckRows.length)return;
+ const q=x=>'"'+String(x??'').replace(/"/g,'""')+'"';
+ const head=['version','snapshot_kst','fee_each_pct','market','name','status','net_pct','reason','reason_code','tp1','tp2','stop','minutes','audit_status','initial_missing_hours','sample_missing_kst','first_examined_missing_kst','hourly_recheck_calls','half_hour_diagnostic_calls','total_candle_api_calls','recovered_one_hour_candles','lower_tf_actual_bars_in_missing_hour','initial_api_error','detail_error','source_limitations'];
+ const records=[head.map(q).join(',')];
+ for(const x of spotcheckRows){const b=x.backtest||{},a=b.audit||{};
+  records.push(['BTC-MTF-V1.4.5','2026-10-31 15:00',spotcheckFee,x.market,x.name,b.status,b.net_pct??'',b.reason||'',b.reason_code||'',b.tp1,b.tp2,b.stop,b.minutes??'',a.status_code||'',a.initial_missing_hours??'',(a.initial_missing_samples_kst||[]).join(' / '),a.first_unresolved_or_recovered_hour_kst||'',a.hourly_recheck_calls??'',a.half_hour_diagnostic_calls??'',a.total_candle_api_calls??'',a.recovered_one_hour_candles??'',a.lower_timeframe_bars_in_missing_hour??'',a.initial_api_error||'',a.detail_error||'',a.source_limitations||''].map(q).join(','));
+ }
+ const blob=new Blob(['\ufeff'+records.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download='BITHUMB_BTC_MTF_V1_4_5_SPOTCHECK_202610311500.csv';
+ document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
 function btcDraw(ctx){$('long').textContent=ST[ctx.long]||'미확인';$('long').className=ctx.long;$('short').textContent=ST[ctx.short]||'미확인';$('short').className=ctx.short;$('btcts').textContent='· '+ctx.asof_kst+' KST';$('tf-grid').innerHTML=order.map(k=>{const x=ctx.tf[k]||{state:'unknown'},why=x.reason?' · '+x.reason:'';return `<div class="tf" title="${esc(why)}"><div class="name">BTC ${TF[k]}</div><div class="status ${x.state}">${ST[x.state]||'자료 부족'}</div></div>`}).join('')}
 function classifyIssue(reason){
  const msg=String(reason||'알 수 없는 문제');
