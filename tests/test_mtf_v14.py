@@ -747,5 +747,61 @@ class ExactHistoricalCandleBoundaryV148Test(unittest.TestCase):
         self.assertEqual(cutoff,self.snapshot)
         self.assertFalse(cutoff<self.snapshot)
 
+
+class ExpandedHistoricalUniverseV149Test(unittest.TestCase):
+    """Historical market-coverage switch only; no BUY/WATCH gate changes."""
+
+    def test_historical_swing_10_25_50_dropdown_default_25(self):
+        html=main.HTML
+        self.assertIn('id="history-breadth"',html)
+        self.assertIn('<option value="10">상위 10종목',html)
+        self.assertIn('<option value="25" selected>상위 25종목',html)
+        self.assertIn('<option value="50">상위 50종목',html)
+
+    def test_multiday_swing_uses_coverage_override_not_generic_40(self):
+        html=main.HTML
+        self.assertIn("const expandedSwing=mode==='backtest'&&strategy==='swing'&&daysCount>1;",html)
+        self.assertIn("if(expandedSwing){",html)
+        self.assertIn("items=items.slice(0,historicalLimit);",html)
+        self.assertIn("if(![10,25,50].includes(historicalLimit))",html)
+
+    def test_one_day_live_and_scalp_bounds_stay_intact(self):
+        html=main.HTML
+        self.assertIn("items=scope==='all'?items:items.slice(0,Number(scope));",html)
+        self.assertIn("(daysCount===7?10:20)",html)
+        self.assertIn("if(daysCount>1)items=items.slice(0,historicalLimit);",html)
+        self.assertIn("if(mode==='backtest')cfg.at=",html)
+
+    def test_existing_four_worker_parallelism_is_unchanged(self):
+        html=main.HTML
+        self.assertIn("Array.from({length:Math.min(4,items.length)},work)",html)
+        self.assertIn("for(const c of dates){",html)
+
+    def test_only_historical_multiday_swing_shows_breadth(self):
+        html=main.HTML
+        self.assertIn("mode==='backtest'&&strategy==='swing'&&Number($('days').value)>1",html)
+        self.assertIn("syncHistoricalBreadth();",html)
+        self.assertIn("id=\"backtest-days-field\"",html)
+        self.assertIn("id=\"history-breadth-field\"",html)
+
+    def test_cohort_and_candidates_export_requested_and_actual_scope(self):
+        html=main.HTML
+        self.assertIn("lastCfg.historical_coin_limit=expandedSwing?historicalLimit:null;",html)
+        self.assertIn("lastCfg.actual_selected_markets=items.length;",html)
+        self.assertIn("requested_market_limit",html)
+        self.assertIn("actual_selected_markets",html)
+        self.assertIn("COHORT_SUMMARY",html)
+        self.assertIn("COHORT_DETAILS",html)
+        self.assertIn("BTC-MTF-V1.4.9",html)
+
+    def test_old_signal_gates_still_invoked_without_coverage_argument(self):
+        import inspect
+        source=inspect.getsource(main.coin_api)
+        self.assertIn("strict_swing_gate(m,ctx,day,h4)",source)
+        self.assertIn("evaluate_combined(previous,gate,explain,m,h4,is_contiguous)",source)
+        self.assertIn("classify_watch_tracks(previous,gate,combined,explain,m,ctx)",source)
+        self.assertNotIn("historicalLimit",source)
+        self.assertNotIn("history-breadth",source)
+
 if __name__=="__main__":
     unittest.main()
