@@ -5,6 +5,7 @@ from bithumb_btc_mtf_v1 import KST, strict_swing_gate, swing_backtest_exit, tf_e
 from btc_mtf_macd_v141 import analyze_macd, all_macd_views
 from btc_mtf_explain_v142 import build_explanation
 from btc_mtf_combo_v143 import evaluate_combined, REQUIRED_TREND_CHECKS
+from btc_mtf_watch_v144 import classify_watch_tracks
 from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
 
 def make_bars(start,n,delta):
@@ -244,6 +245,69 @@ class CombinedSignalTest(unittest.TestCase):
         self.strict["checks"]["일봉 MA20 상향 + 22봉 연속"]=False
         r=self.classify()
         self.assertEqual(r["signal"],"RESEARCH")
+
+
+class SeparateWatchTracksTest(unittest.TestCase):
+    def setUp(self):
+        self.m={
+            "score":8,"technical_score":6,"quality_score":2,
+            "rsi14":48,"timing_ok":True,"volume_ratio":.9,
+            "structure_risk_pct":5,"data_gap_recent":False,
+            "macd_h4":{"state":"DEAD"},
+        }
+        self.explain={"scores":{"timing":75,"safety":75,"trend":50}}
+        self.ctx={"long":"side","short":"up"}
+        self.strict={"passed":False,"checks":{
+            "일봉 MA20 상향 + 22봉 연속":False,
+            "4시간봉 MA20 상회·상향 + 21봉 연속":False}}
+        self.combined={"signal":"RESEARCH","watch_ready":False}
+
+    def classify(self,original="WATCH"):
+        return classify_watch_tracks(original,self.strict,self.combined,
+                                     self.explain,self.m,self.ctx)
+
+    def test_early_watch_is_observation_not_buy(self):
+        result=self.classify()
+        self.assertEqual(result["kind"],"EARLY_WATCH")
+        self.assertTrue(result["early_ready"])
+        self.assertFalse(result["trend_ready"])
+        self.assertNotEqual(result["kind"],"BUY")
+
+    def test_old_buy_does_not_promote_early_watch_to_buy(self):
+        result=self.classify("BUY")
+        self.assertEqual(result["kind"],"EARLY_WATCH")
+        self.assertTrue(result["buy_unchanged"])
+
+    def test_weak_macd_and_rsi_and_trend_are_research_not_watch(self):
+        self.explain["scores"]["trend"]=25
+        result=self.classify("BUY")
+        self.assertEqual(result["kind"],"RESEARCH")
+        self.assertIn("MACD 데드·RSI 50미만·추세약세 동시 발생 제외",
+                      result["early_missing"])
+
+    def test_missing_recent_bars_blocks_early_watch(self):
+        self.m["data_gap_recent"]=True
+        self.assertEqual(self.classify()["kind"],"RESEARCH")
+
+    def test_trend_watch_requires_previous_strict_watch_gate(self):
+        self.m["macd_h4"]["state"]="GOLDEN"
+        self.strict["checks"].update({
+            "일봉 MA20 상향 + 22봉 연속":True,
+            "4시간봉 MA20 상회·상향 + 21봉 연속":True})
+        self.combined["watch_ready"]=True
+        self.combined["signal"]="WATCH"
+        result=self.classify()
+        self.assertEqual(result["kind"],"TREND_WATCH")
+        self.assertTrue(result["trend_ready"])
+
+    def test_previous_v143_buy_retains_buy_when_early_conditions_fail(self):
+        self.combined["signal"]="BUY"
+        self.m["data_gap_recent"]=True
+        self.m["score"]=7
+        self.assertEqual(self.classify("BUY")["kind"],"BUY")
+
+    def test_no_original_candidate_cannot_become_early_watch(self):
+        self.assertEqual(self.classify(None)["kind"],"RESEARCH")
 
 if __name__=="__main__":
     unittest.main()
