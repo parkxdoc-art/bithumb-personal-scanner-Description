@@ -27,6 +27,7 @@ from btc_mtf_watch_v144 import classify_watch_tracks
 from btc_mtf_replay_v145 import HourlyReplayPath
 from btc_mtf_quality_v146 import snapshot_liquidity, investigate_missing_hour
 from btc_mtf_study_v147 import compare_watch_cohorts
+from chart360_mini_lab import HTML as CHART360_HTML, run_backtest as run_chart360_backtest
 
 VERSION = "BTC MTF V1.4.9"
 KST = ZoneInfo("Asia/Seoul")
@@ -649,6 +650,31 @@ def study_v147_api():
         return jsonify(ok=True,version=VERSION,study=report)
     except (TypeError,ValueError) as ex:
         return jsonify(ok=False,error=str(ex)[:180]),400
+
+
+@app.get("/chart360")
+def chart360_page():
+    """Dedicated structure experiment page; the V1.4.9 root is unchanged."""
+    return Response(CHART360_HTML, content_type="text/html; charset=utf-8")
+
+
+@app.post("/api/chart360")
+def chart360_replay_api():
+    """Read-only Bithumb 4H/15M/1M replay. No user credentials or orders."""
+    try:
+        raw=request.get_json(silent=True) or {}
+        if not isinstance(raw,dict):
+            raise ValueError("JSON 객체 필요")
+        markets=raw.get("markets",["KRW-XRP"])
+        hours=int(raw.get("hours",12))
+        fee_each=float(raw.get("fee_each",.04))
+        # Input validation is also performed by run_backtest.
+        result=run_chart360_backtest(markets=markets,hours=hours,fee_each=fee_each)
+        return jsonify(ok=True,result=result)
+    except (TypeError,ValueError) as e:
+        return jsonify(ok=False,error=str(e)[:160]),400
+    except Exception as e:
+        return jsonify(ok=False,error="연구 요청 실패: "+str(e)[:150]),502
 
 
 @app.get("/")
