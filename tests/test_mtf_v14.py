@@ -8,6 +8,7 @@ from btc_mtf_combo_v143 import evaluate_combined, REQUIRED_TREND_CHECKS
 from btc_mtf_watch_v144 import classify_watch_tracks
 from btc_mtf_replay_v145 import HourlyReplayPath
 from btc_mtf_quality_v146 import snapshot_liquidity, investigate_missing_hour
+from btc_mtf_study_v147 import compare_watch_cohorts
 from unittest.mock import patch
 import bithumb_btc_mtf_v1 as main
 from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
@@ -547,6 +548,117 @@ class MicroGapV146Test(unittest.TestCase):
             self.assertTrue(all(x["backtest"]["status"]=="UNKNOWN"
                                 and x["backtest"]["net_pct"] is None
                                 for x in data["items"]))
+
+
+class CohortStudyV147Test(unittest.TestCase):
+    def row(self, market, at="2026-11-13 15:00:00", kind="EARLY_WATCH",
+            score=4, bars=24, net=None, status="UNKNOWN", legacy="WATCH"):
+        return {
+            "market":market,"at":at,"kind":kind,"legacy_signal":legacy,
+            "liquidity_audit":{
+                "checks_passed":score,
+                "hourly_bars_observed":bars,
+                "observed_turnover_is_complete":bars==24,
+                "observed_turnover_24h_krw":150_000_000,
+            },
+            "backtest":{"status":status,"net_pct":net,
+                        "reason":"missing 1h" if status=="UNKNOWN" else ""},
+        }
+
+    def test_all_unknown_100_percent_missing_not_zero_percent_profit(self):
+        rows=[self.row("KRW-BLUE"),self.row("KRW-MBL")]
+        report=compare_watch_cohorts(rows,scanned=15,issues=3)
+        self.assertEqual(report["summary"]["candidates"],2)
+        self.assertEqual(report["summary"]["unknown"],2)
+        self.assertEqual(report["summary"]["resolved"],0)
+        self.assertIsNone(report["summary"]["positive_fraction_resolved_pct"])
+        self.assertIsNone(report["summary"]["mean_hypothetical_net_pct"])
+        self.assertEqual(report["scanned"],15)
+        self.assertEqual(report["issues"],3)
+
+    def test_resolved_only_average_and_fee_is_already_in_simulated_net(self):
+        rows=[
+            self.row("KRW-BLUE",net=3.0,status="RESOLVED"),
+            self.row("KRW-2Z",net=-1.0,status="RESOLVED"),
+            self.row("KRW-MBL",net=None,status="UNKNOWN")
+        ]
+        report=compare_watch_cohorts(rows,fee_each=.04)
+        self.assertEqual(report["summary"]["positive"],1)
+        self.assertEqual(report["summary"]["nonpositive"],1)
+        self.assertEqual(report["summary"]["unknown"],1)
+        self.assertEqual(report["summary"]["mean_hypothetical_net_pct"],1.0)
+        self.assertEqual(report["summary"]["positive_fraction_resolved_pct"],50.0)
+        self.assertEqual(report["fee_each_pct"],.04)
+
+    def test_watch_buy_and_research_categories_do_not_mix(self):
+        rows=[
+            self.row("KRW-BLUE",kind="EARLY_WATCH",net=1,status="RESOLVED"),
+            self.row("KRW-MBL",kind="TREND_WATCH",net=-2,status="RESOLVED"),
+            self.row("KRW-2Z",kind="BUY",net=5,status="RESOLVED",legacy="BUY"),
+            self.row("KRW-NXPC",kind="RESEARCH",net=None,legacy="BUY")
+        ]
+        r=compare_watch_cohorts(rows)
+        count={x["label"]:x["candidates"] for x in r["by_kind"]}
+        self.assertEqual(count,{"BUY":1,"EARLY_WATCH":1,"TREND_WATCH":1,"RESEARCH":1})
+        self.assertEqual(r["original_buy"]["candidates"],2)
+        self.assertEqual(r["original_buy"]["resolved"],1)
+        self.assertTrue(all(x["watch_is_not_trade"] for x in r["by_kind"]))
+
+    def test_quality_four_not_automatically_complete_24h(self):
+        one=self.row("KRW-MBL",score=4,bars=23)
+        r=compare_watch_cohorts([one])
+        self.assertEqual(r["rows"][0]["quality"],"Q4")
+        self.assertEqual(r["rows"][0]["coverage"],"INCOMPLETE_24H")
+
+    def test_quality_coverage_missing_is_unverified(self):
+        one=self.row("KRW-MBL")
+        one["liquidity_audit"]={}
+        r=compare_watch_cohorts([one])
+        self.assertEqual(r["rows"][0]["quality"],"Q_UNKNOWN")
+        self.assertEqual(r["rows"][0]["coverage"],"UNKNOWN_24H")
+
+    def test_duplicate_coin_time_removed_but_other_dates_kept(self):
+        a=self.row("KRW-BLUE",at="2026-11-12 15:00:00")
+        b=self.row("KRW-BLUE",at="2026-11-13 15:00:00")
+        r=compare_watch_cohorts([a,a,b])
+        self.assertEqual(r["summary"]["candidates"],2)
+        self.assertEqual(r["summary"]["unique_markets"],1)
+        self.assertEqual(r["summary"]["unique_snapshots"],2)
+        self.assertEqual(r["duplicates_skipped"],1)
+        self.assertEqual(len(r["by_day"]),2)
+
+    def test_invalid_resolved_nan_stays_unknown(self):
+        x=self.row("KRW-MBL",net=float("nan"),status="RESOLVED")
+        y=self.row("KRW-2Z",net=None,status="RESOLVED")
+        r=compare_watch_cohorts([x,y])
+        self.assertEqual(r["summary"]["resolved"],0)
+        self.assertEqual(r["summary"]["unknown"],2)
+        self.assertIsNone(r["rows"][0]["net_pct"])
+
+    def test_bad_fields_and_oversized_input_rejected(self):
+        self.assertRaises(ValueError,compare_watch_cohorts,[{}]*1501)
+        self.assertRaises(ValueError,compare_watch_cohorts,[],fee_each=.5)
+        r=compare_watch_cohorts([{"market":"BAD","at":"2026-11-13","kind":"BUY"}])
+        self.assertEqual(r["summary"]["candidates"],0)
+        self.assertEqual(r["invalid_skipped"],1)
+
+    def test_api_is_read_only_and_rejects_live(self):
+        client=main.app.test_client()
+        rows=[self.row("KRW-BLUE",net=-0.2,status="RESOLVED")]
+        resp=client.post("/api/study-v147",json={
+            "mode":"backtest","strategy":"swing","fee":.04,
+            "items":rows,"scanned":10,"issues":2})
+        self.assertEqual(resp.status_code,200,resp.get_json())
+        data=resp.get_json()
+        self.assertEqual(data["study"]["summary"]["candidates"],1)
+        self.assertEqual(data["study"]["by_kind"][1]["label"],"EARLY_WATCH")
+        self.assertEqual(data["study"]["by_kind"][1]["resolved"],1)
+        invalid=client.post("/api/study-v147",json={
+            "mode":"live","strategy":"swing","fee":.04,"items":rows})
+        self.assertEqual(invalid.status_code,400)
+        invalid2=client.post("/api/study-v147",json={
+            "mode":"backtest","strategy":"scalp","fee":.04,"items":rows})
+        self.assertEqual(invalid2.status_code,400)
 
 if __name__=="__main__":
     unittest.main()
