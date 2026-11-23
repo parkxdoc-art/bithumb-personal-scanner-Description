@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from bithumb_btc_mtf_v1 import KST, strict_swing_gate, swing_backtest_exit, tf_end, is_contiguous
 from btc_mtf_macd_v141 import analyze_macd, all_macd_views
 from btc_mtf_explain_v142 import build_explanation
+from btc_mtf_combo_v143 import evaluate_combined, REQUIRED_TREND_CHECKS
 from test_mtf_v141_api import FocusDiagnosticTest  # include focus API regression in Render's V1.4 test pattern
 
 def make_bars(start,n,delta):
@@ -177,6 +178,72 @@ class ExplainableSnapshotTest(unittest.TestCase):
         d=self.explain()
         self.assertFalse(d["factors"]["trend"][-1]["passed"])
         self.assertTrue(any("MACD" in w for w in d["warnings"]))
+
+
+class CombinedSignalTest(unittest.TestCase):
+    """The original signal alone can never bypass structure/entry/risk checks."""
+    def setUp(self):
+        start=datetime(2026,10,1,tzinfo=KST)
+        self.h4=[
+            {"t":start+timedelta(hours=4*i), "o":95+i*.5,
+             "h":99+i*.5, "l":94+i*.5, "c":96+i*.5, "turnover":100}
+            for i in range(6)
+        ]
+        self.h4[-1].update({"o":102.0,"c":106.0,"h":107.0,"l":101.0,"turnover":250})
+        self.m={"score":10,"technical_score":7,"quality_score":3,"body_ratio":.72,"volume_ratio":2.5}
+        self.strict={"passed":True, "checks":{key:True for key in REQUIRED_TREND_CHECKS}}
+        self.evidence={
+            "scores":{"structure":100,"timing":100,"trend":100,
+                      "setup":100,"entry":100,"safety":100},
+            "sell_pressure_proxy":{"red_candle_turnover_pct":20.0},
+            "plan":{"plan_valid":True},
+        }
+
+    def classify(self,original="BUY"):
+        return evaluate_combined(original,self.strict,self.evidence,
+                                 self.m,self.h4,is_contiguous)
+
+    def test_only_old_buy_and_completed_breakout_can_be_combined_buy(self):
+        r=self.classify()
+        self.assertEqual(r["signal"],"BUY")
+        self.assertTrue(r["latest_completed_4h_breakout"])
+        self.assertLess(r["prior_3bar_breakout_level"],self.h4[-1]["c"])
+        self.assertTrue(r["buy_ready"])
+
+    def test_old_watch_remains_watch_even_if_other_gates_pass(self):
+        r=self.classify("WATCH")
+        self.assertEqual(r["signal"],"WATCH")
+        self.assertFalse(r["buy_ready"])
+
+    def test_no_current_bar_breakout_means_watch_not_buy(self):
+        self.h4[-1].update({"o":98,"c":100,"h":103,"l":97})
+        r=self.classify()
+        self.assertFalse(r["latest_completed_4h_breakout"])
+        self.assertEqual(r["signal"],"WATCH")
+
+    def test_sell_turnover_proxy_and_structure_score_are_real_watch_filters(self):
+        self.evidence["sell_pressure_proxy"]["red_candle_turnover_pct"]=75
+        self.evidence["scores"]["structure"]=50
+        r=self.classify()
+        self.assertEqual(r["signal"],"RESEARCH")
+        self.assertFalse(r["watch_ready"])
+        self.assertTrue(any("음봉 거래대금" in t for t in r["missing_watch"]))
+        self.assertTrue(any("구조 점수" in t for t in r["missing_watch"]))
+
+    def test_unavailable_red_candle_ratio_does_not_become_zero(self):
+        self.evidence["sell_pressure_proxy"]["red_candle_turnover_pct"]=None
+        self.assertEqual(self.classify()["signal"],"RESEARCH")
+
+    def test_noncontiguous_four_hour_bars_block_combined_watch(self):
+        self.h4[-2]["t"]+=timedelta(hours=1)
+        r=self.classify()
+        self.assertFalse(r["watch_ready"])
+        self.assertEqual(r["signal"],"RESEARCH")
+
+    def test_existing_strict_gate_is_not_bypassed(self):
+        self.strict["checks"]["일봉 MA20 상향 + 22봉 연속"]=False
+        r=self.classify()
+        self.assertEqual(r["signal"],"RESEARCH")
 
 if __name__=="__main__":
     unittest.main()
