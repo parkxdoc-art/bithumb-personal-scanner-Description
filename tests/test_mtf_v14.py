@@ -660,5 +660,90 @@ class CohortStudyV147Test(unittest.TestCase):
             "mode":"backtest","strategy":"scalp","fee":.04,"items":rows})
         self.assertEqual(invalid2.status_code,400)
 
+
+class ExactHistoricalCandleBoundaryV148Test(unittest.TestCase):
+    """Historical exact closes are included; live near-close safety stays."""
+
+    def setUp(self):
+        self.snapshot=datetime(2026,11,18,15,0,0,tzinfo=KST)
+        self.server_time=datetime(2026,11,23,21,54,0,tzinfo=KST)
+
+    def raw(self,stamp,turnover=6_000_000):
+        return {
+            "candle_date_time_kst":stamp.strftime("%Y-%m-%dT%H:%M:%S"),
+            "opening_price":100,"high_price":101,"low_price":99,
+            "trade_price":100,"candle_acc_trade_price":turnover,
+        }
+
+    def test_historical_hour_ending_exactly_at_1500_is_included(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=2)),
+             self.raw(self.snapshot-timedelta(hours=1)),
+             self.raw(self.snapshot)]
+        with patch.object(main,"now_kst",return_value=self.server_time),\
+             patch.object(main,"api_get",return_value=raw) as api:
+            candles=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+        self.assertEqual([x["t"] for x in candles],
+                         [self.snapshot-timedelta(hours=2),
+                          self.snapshot-timedelta(hours=1)])
+        self.assertEqual(api.call_args.args[1]["to"],"2026-11-18 15:00:00")
+
+    def test_historical_hourly_liquidity_has_full_24_verified_hours(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=i)) for i in range(1,25)]
+        with patch.object(main,"now_kst",return_value=self.server_time),\
+             patch.object(main,"api_get",return_value=raw):
+            rows=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+        quality=snapshot_liquidity(rows,self.snapshot)
+        self.assertEqual(quality["hourly_bars_observed"],24)
+        self.assertEqual(quality["recent_6h_bars_observed"],6)
+        self.assertTrue(quality["observed_turnover_is_complete"])
+        self.assertEqual(quality["checks_passed"],4)
+        self.assertNotIn("2026-11-18 14:00",quality["missing_hour_samples_kst"])
+
+    def test_live_at_exact_close_maintains_two_second_guard(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=1))]
+        now=self.snapshot+timedelta(seconds=1)
+        with patch.object(main,"now_kst",return_value=now),\
+             patch.object(main,"api_get",return_value=raw):
+            rows=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+        self.assertEqual(rows,[])
+
+    def test_live_after_two_seconds_can_include_closed_hour(self):
+        raw=[self.raw(self.snapshot-timedelta(hours=1))]
+        now=self.snapshot+timedelta(seconds=3)
+        with patch.object(main,"now_kst",return_value=now),\
+             patch.object(main,"api_get",return_value=raw):
+            rows=main.candles("KRW-XRP","1h",self.snapshot,count=50)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]["t"],self.snapshot-timedelta(hours=1))
+
+    def test_historical_four_hour_and_daily_exact_closes(self):
+        at4=datetime(2026,11,18,16,0,tzinfo=KST)
+        atday=datetime(2026,11,18,0,0,tzinfo=KST)
+        with patch.object(main,"now_kst",return_value=self.server_time):
+            with patch.object(main,"api_get",
+                              return_value=[self.raw(at4-timedelta(hours=4)),
+                                            self.raw(at4)]):
+                h4=main.candles("KRW-XRP","4h",at4,count=40)
+            with patch.object(main,"api_get",
+                              return_value=[self.raw(atday-timedelta(days=1)),
+                                            self.raw(atday)]):
+                day=main.candles("KRW-XRP","day",atday,count=40)
+        self.assertEqual([x["t"] for x in h4],[at4-timedelta(hours=4)])
+        self.assertEqual([x["t"] for x in day],[atday-timedelta(days=1)])
+
+    def test_historical_just_before_exact_close_cannot_look_ahead(self):
+        at=self.snapshot-timedelta(seconds=1)
+        with patch.object(main,"now_kst",return_value=self.server_time),\
+             patch.object(main,"api_get",
+                          return_value=[self.raw(self.snapshot-timedelta(hours=1))]):
+            rows=main.candles("KRW-XRP","1h",at,count=50)
+        self.assertEqual(rows,[])
+
+    def test_candle_logic_does_not_change_buy_watch_rules(self):
+        with patch.object(main,"now_kst",return_value=self.server_time):
+            cutoff=main.candle_close_cutoff(self.snapshot)
+        self.assertEqual(cutoff,self.snapshot)
+        self.assertFalse(cutoff<self.snapshot)
+
 if __name__=="__main__":
     unittest.main()
