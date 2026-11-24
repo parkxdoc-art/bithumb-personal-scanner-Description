@@ -669,7 +669,8 @@ def chart360_replay_api():
         hours=int(raw.get("hours",12))
         fee_each=float(raw.get("fee_each",.04))
         # Input validation is also performed by run_backtest.
-        result=run_chart360_backtest(markets=markets,hours=hours,fee_each=fee_each)
+        result=run_chart360_backtest(markets=markets,hours=hours,fee_each=fee_each,
+                                      asof_kst=raw.get("asof_kst"))
         return jsonify(ok=True,result=result)
     except (TypeError,ValueError) as e:
         return jsonify(ok=False,error=str(e)[:160]),400
