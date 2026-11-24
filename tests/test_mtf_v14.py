@@ -867,7 +867,7 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
         client=main.app.test_client()
         page=client.get("/chart360")
         self.assertEqual(page.status_code,200)
-        self.assertIn("CHART360 MINI V0.3",page.get_data(as_text=True))
+        self.assertIn("CHART360 MINI V0.4",page.get_data(as_text=True))
         self.assertEqual(client.get("/health").get_json()["version"],"BTC MTF V1.4.9")
         invalid=client.post("/api/chart360",json={"markets":["KRW-XRP"],"hours":100})
         self.assertEqual(invalid.status_code,400)
@@ -1000,7 +1000,7 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
 
     def test_lab_has_independent_diagnostic_csv_and_nonempty_entry_gate(self):
         from chart360_mini_lab import HTML, VERSION
-        self.assertEqual(VERSION,"CHART360 MINI V0.3")
+        self.assertEqual(VERSION,"CHART360 MINI V0.4")
         self.assertIn('id="diagnostic-csv"',HTML)
         self.assertIn("primary_blocker_code",HTML)
         self.assertIn("event_details",HTML)
@@ -1008,14 +1008,14 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
         self.assertIn("$('csv').disabled=trades.length===0",HTML)
         self.assertIn("String.fromCharCode(0xFEFF)",HTML)
         self.assertIn("String.fromCharCode(10)",HTML)
-        self.assertIn("CHART360_MINI_V0_3_",HTML)
+        self.assertIn("CHART360_MINI_V0_4_",HTML)
         self.assertNotIn("CHART360_MINI_V0_1_",HTML)
 
     def test_readonly_route_v02_root_scanner_still_v149(self):
         client=main.app.test_client()
         p=client.get("/chart360")
         self.assertEqual(p.status_code,200)
-        self.assertIn("CHART360 MINI V0.3",p.get_data(as_text=True))
+        self.assertIn("CHART360 MINI V0.4",p.get_data(as_text=True))
         root=client.get("/health")
         self.assertEqual(root.status_code,200)
         self.assertEqual(root.get_json()["version"],"BTC MTF V1.4.9")
@@ -1127,7 +1127,7 @@ class Chart360MiniV03ABRegressionTest(unittest.TestCase):
                          now=self.at,getter=bad)
         self.assertEqual(len(out["markets"]),2)
         for m in out["markets"]:
-            self.assertEqual(set(m["variants"]),{"A","B"})
+            self.assertEqual(set(m["variants"]),{"A","B","C"})
             self.assertEqual(m["variants"]["A"]["diagnostic"]["primary_blocker_code"],"DATA_API_ERROR")
             self.assertEqual(m["variants"]["B"]["diagnostic"]["primary_blocker_code"],"DATA_API_ERROR")
         self.assertEqual(out["comparison"]["A"]["signals"],0)
@@ -1138,20 +1138,124 @@ class Chart360MiniV03ABRegressionTest(unittest.TestCase):
         def bad(*_):raise RuntimeError("API down")
         out=run_backtest(markets=list(MARKETS),hours=6,now=self.at,getter=bad)
         self.assertEqual(len(out["markets"]),5)
-        self.assertEqual(len(out["markets"][0]["variants"]),2)
+        self.assertEqual(len(out["markets"][0]["variants"]),3)
         self.assertRaises(ValueError,run_backtest,markets=list(MARKETS)+["KRW-XRP"],hours=6,now=self.at,getter=bad)
 
     def test_html_ab_market_and_csv_are_labeled(self):
         from chart360_mini_lab import HTML, VERSION
-        self.assertEqual(VERSION,"CHART360 MINI V0.3")
+        self.assertEqual(VERSION,"CHART360 MINI V0.4")
         self.assertIn('<option value="ALL">5종목 한 번에 비교</option>',HTML)
-        self.assertIn("AB_DIAGNOSTIC",HTML)
-        self.assertIn("AB_TRADES",HTML)
+        self.assertIn("ABC_DIAGNOSTIC",HTML)
+        self.assertIn("ABC_TRADES",HTML)
         self.assertIn("h4_gate_required",HTML)
         self.assertIn("last.markets.flatMap",HTML)
-        self.assertIn("CHART360_MINI_V0_3_",HTML)
+        self.assertIn("CHART360_MINI_V0_4_",HTML)
         self.assertNotIn("CHART360_MINI_V0_2_",HTML)
 
+
+
+
+class Chart360MiniV04ClosedConfirmationTest(unittest.TestCase):
+    """Only one new choice: confirm 1m close after B's completed breakout."""
+    def setUp(self):
+        self.parent=Chart360MiniV03ABRegressionTest()
+        self.parent.setUp()
+
+    def scenario(self,confirmation=True):
+        m1=self.parent.m1()
+        t=self.parent.at
+        if confirmation:
+            m1[33]=self.parent.bar(t+timedelta(minutes=3),lo=104.7,
+                hi=105.1,close=104.9,open_=104.8)
+            m1[34]=self.parent.bar(t+timedelta(minutes=4),lo=104.3,
+                hi=105.3,close=104.8,open_=104.95)
+        return m1,self.parent.m15_choch(),self.parent.h4(False)
+
+    def test_C_entry_one_closed_minute_later_without_changing_B(self):
+        from chart360_mini_lab import replay
+        one,m15,h4=self.scenario(True)
+        b=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,
+                 require_h4=False)
+        c=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,
+                 require_h4=False,confirmation_bars=1)
+        self.assertEqual(b["summary"]["signals"],1)
+        self.assertEqual(c["summary"]["signals"],1)
+        self.assertEqual(b["trades"][0]["entry_kst"],
+                         (self.parent.at+timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M"))
+        self.assertEqual(c["trades"][0]["entry_kst"],
+                         (self.parent.at+timedelta(minutes=4)).strftime("%Y-%m-%d %H:%M"))
+        self.assertEqual(c["trades"][0]["entry_delay_minutes"],1)
+        self.assertEqual(c["trades"][0]["signal"],"C_CONFIRM_TEST")
+        self.assertEqual(c["trades"][0]["confirm_bullish_continuation"],True)
+        self.assertEqual(b["trades"][0]["confirm_bullish_continuation"],None)
+        self.assertIn("breakout_body_pct",b["trades"][0])
+        self.assertIn("prior20_1m_contiguous",c["trades"][0])
+
+    def test_C_rejects_bearish_confirmation_while_B_still_enters(self):
+        from chart360_mini_lab import replay
+        one,m15,h4=self.scenario(False)
+        b=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,
+                 require_h4=False)
+        c=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,
+                 require_h4=False,confirmation_bars=1)
+        self.assertEqual(b["summary"]["signals"],1)
+        self.assertEqual(c["summary"]["signals"],0)
+        self.assertGreaterEqual(c["stats"]["confirm_rejected"],1)
+        self.assertEqual(c["diagnostic"]["primary_blocker_code"],"M1_CONFIRM_REJECTED")
+
+    def test_C_missing_next_complete_minute_does_not_invent_entry(self):
+        from chart360_mini_lab import replay
+        one,m15,h4=self.scenario(True)
+        one=one[:34] # C's confirmation candle closed; no following open
+        c=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,
+                 require_h4=False,confirmation_bars=1)
+        self.assertEqual(c["summary"]["signals"],0)
+        self.assertGreaterEqual(c["stats"]["confirm_gap"],1)
+        self.assertEqual(c["diagnostic"]["primary_blocker_code"],"M1_CONFIRM_DATA_GAP")
+
+    def test_C_cannot_see_future_confirmation_at_breakout_time(self):
+        from chart360_mini_lab import replay
+        one,m15,h4=self.scenario(True)
+        # Remove confirmation candle. There is no permitted completed candle
+        # after breakout, so C cannot use its future close.
+        c=replay("KRW-XRP",one[:33],m15,h4,scan_begin=self.parent.at,
+                 require_h4=False,confirmation_bars=1)
+        self.assertEqual(c["summary"]["signals"],0)
+
+    def test_A_and_B_output_unchanged_when_C_is_evaluated(self):
+        from chart360_mini_lab import replay
+        one,m15,h4=self.scenario(True)
+        a1=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,require_h4=True)
+        b1=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,require_h4=False)
+        c=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,require_h4=False,confirmation_bars=1)
+        a2=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,require_h4=True)
+        b2=replay("KRW-XRP",one,m15,h4,scan_begin=self.parent.at,require_h4=False)
+        self.assertEqual(a1["trades"],a2["trades"])
+        self.assertEqual(b1["trades"],b2["trades"])
+        self.assertEqual(a1["summary"],a2["summary"])
+        self.assertEqual(b1["summary"],b2["summary"])
+        self.assertEqual(c["variant"],"C")
+
+    def test_error_three_variant_rows_and_comparison_still_zero(self):
+        from chart360_mini_lab import run_backtest
+        def fail(*args): raise RuntimeError("503")
+        r=run_backtest(markets=["KRW-XRP"],hours=6,
+                       now=self.parent.at,getter=fail)
+        self.assertEqual(set(r["markets"][0]["variants"]),{"A","B","C"})
+        self.assertEqual(r["comparison"]["C"]["signals"],0)
+        self.assertEqual(r["comparison"]["C"]["unknown"],0)
+
+    def test_v04_html_csv_includes_C_confirmation_and_both_features(self):
+        from chart360_mini_lab import HTML,VERSION
+        self.assertEqual(VERSION,"CHART360 MINI V0.4")
+        self.assertIn("['A','B','C']",HTML)
+        self.assertIn("confirm_reject_event",HTML)
+        self.assertIn("confirm_gap_event",HTML)
+        self.assertIn("breakout_upper_wick_pct",HTML)
+        self.assertIn("prior20_1m_contiguous",HTML)
+        self.assertIn("ABC_DIAGNOSTIC",HTML)
+        self.assertIn("ABC_TRADES",HTML)
+        self.assertIn("CHART360_MINI_V0_4_",HTML)
 
 
 if __name__=="__main__":
