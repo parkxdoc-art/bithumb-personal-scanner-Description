@@ -867,7 +867,7 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
         client=main.app.test_client()
         page=client.get("/chart360")
         self.assertEqual(page.status_code,200)
-        self.assertIn("CHART360 MINI V0.2",page.get_data(as_text=True))
+        self.assertIn("CHART360 MINI V0.3",page.get_data(as_text=True))
         self.assertEqual(client.get("/health").get_json()["version"],"BTC MTF V1.4.9")
         invalid=client.post("/api/chart360",json={"markets":["KRW-XRP"],"hours":100})
         self.assertEqual(invalid.status_code,400)
@@ -1000,7 +1000,7 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
 
     def test_lab_has_independent_diagnostic_csv_and_nonempty_entry_gate(self):
         from chart360_mini_lab import HTML, VERSION
-        self.assertEqual(VERSION,"CHART360 MINI V0.2")
+        self.assertEqual(VERSION,"CHART360 MINI V0.3")
         self.assertIn('id="diagnostic-csv"',HTML)
         self.assertIn("primary_blocker_code",HTML)
         self.assertIn("event_details",HTML)
@@ -1008,17 +1008,149 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
         self.assertIn("$('csv').disabled=!(t.signals>0)",HTML)
         self.assertIn("String.fromCharCode(0xFEFF)",HTML)
         self.assertIn("String.fromCharCode(10)",HTML)
-        self.assertIn("CHART360_MINI_V0_2_",HTML)
+        self.assertIn("CHART360_MINI_V0_3_",HTML)
         self.assertNotIn("CHART360_MINI_V0_1_",HTML)
 
     def test_readonly_route_v02_root_scanner_still_v149(self):
         client=main.app.test_client()
         p=client.get("/chart360")
         self.assertEqual(p.status_code,200)
-        self.assertIn("CHART360 MINI V0.2",p.get_data(as_text=True))
+        self.assertIn("CHART360 MINI V0.3",p.get_data(as_text=True))
         root=client.get("/health")
         self.assertEqual(root.status_code,200)
         self.assertEqual(root.get_json()["version"],"BTC MTF V1.4.9")
+
+
+
+class Chart360MiniV03ABRegressionTest(unittest.TestCase):
+    def setUp(self):
+        from chart360_mini_lab import KST
+        self.at=datetime(2026,11,24,12,0,tzinfo=KST)
+
+    def bar(self,t,lo=103.2,hi=103.9,close=103.5,open_=103.5,v=2000000):
+        return {"t":t,"o":open_,"h":hi,"l":lo,"c":close,"v":v}
+
+    def m15_choch(self):
+        start=self.at-timedelta(minutes=17*15)
+        out=[]
+        for i in range(17):
+            t=start+timedelta(minutes=15*i)
+            if i<8:
+                out.append(self.bar(t,lo=95,hi=120,close=100,open_=100))
+            elif i<16:
+                out.append(self.bar(t,lo=85,hi=102,close=98,open_=98))
+            else:
+                out.append(self.bar(t,lo=99,hi=105,close=104,open_=100))
+        return out
+
+    def h4(self,bearish=False):
+        start=self.at-timedelta(hours=48)
+        out=[]
+        for i in range(12):
+            t=start+timedelta(hours=i*4)
+            hi=(115 if i<6 else 105) if bearish else 111
+            lo=(95 if i<6 else 90) if bearish else 95
+            out.append(self.bar(t,lo=lo,hi=hi,close=100,open_=100))
+        return out
+
+    def m1(self):
+        start=self.at-timedelta(minutes=30)
+        out=[self.bar(start+timedelta(minutes=i)) for i in range(140)]
+        out[30]=self.bar(self.at,lo=102,hi=104,close=103,open_=103.5)
+        out[31]=self.bar(self.at+timedelta(minutes=1),lo=102.7,hi=103.9,close=103.2,open_=103.3)
+        out[32]=self.bar(self.at+timedelta(minutes=2),lo=103.4,hi=105,close=104.8,open_=103.5)
+        for i in range(33,140):
+            t=start+timedelta(minutes=i)
+            out[i]=self.bar(t,lo=104.0,hi=105.0,close=104.8,open_=104.9)
+        return out
+
+    def test_ab_only_h4_gate_differs_in_same_synthetic_candles(self):
+        from chart360_mini_lab import replay
+        minute=self.m1()
+        m15=self.m15_choch()
+        h4=self.h4(False)
+        a=replay("KRW-XRP",minute,m15,h4,scan_begin=self.at,require_h4=True)
+        b=replay("KRW-XRP",minute,m15,h4,scan_begin=self.at,require_h4=False)
+        self.assertEqual(a["summary"]["signals"],0)
+        self.assertEqual(b["summary"]["signals"],1)
+        self.assertEqual(a["diagnostic"]["primary_blocker_code"],"H4_LH_LL_FAILED")
+        self.assertEqual(b["diagnostic"]["entry_event"],1)
+        self.assertEqual(b["trades"][0]["signal"],"B_ENTRY_TEST")
+        self.assertFalse(b["h4_gate_required"])
+        self.assertEqual(b["trades"][0]["m15_choch_kst"],self.at.strftime("%Y-%m-%d %H:%M"))
+        self.assertEqual(b["trades"][0]["entry_kst"],(self.at+timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M"))
+
+    def test_ab_not_extrapolated_from_future_candles(self):
+        from chart360_mini_lab import replay
+        one=self.m1()[:33]
+        b=replay("KRW-XRP",one,self.m15_choch(),self.h4(False),
+                 scan_begin=self.at,require_h4=False)
+        self.assertEqual(b["summary"]["signals"],0)
+
+    def test_4h_missing_is_a_blocker_only_in_A(self):
+        from chart360_mini_lab import replay
+        one=self.m1()
+        a=replay("KRW-XRP",one,self.m15_choch(),[],
+                 scan_begin=self.at,require_h4=True)
+        b=replay("KRW-XRP",one,self.m15_choch(),[],
+                 scan_begin=self.at,require_h4=False)
+        self.assertEqual(a["summary"]["signals"],0)
+        self.assertEqual(a["diagnostic"]["primary_blocker_code"],"H4_DATA_MISSING")
+        self.assertEqual(b["summary"]["signals"],1)
+        self.assertEqual(b["diagnostic"]["primary_blocker_code"],"ENTRY_TEST")
+        self.assertIsNone(b["diagnostic"]["h4_snapshot_lower_high"])
+
+    def test_replay_with_realistic_api_returns_both_variants_from_same_calls(self):
+        from chart360_mini_lab import run_backtest
+        minute=self.m1()
+        m15=self.m15_choch()
+        h4=self.h4(False)
+        called=[]
+        def getter(market,tf,to,count):
+            called.append((market,tf))
+            data={1:minute,15:m15,240:h4}[tf]
+            return [x for x in data if x["t"]<to][-count:]
+        now=self.at+timedelta(hours=2)
+        result=run_backtest(markets=["KRW-XRP"],hours=6,now=now,getter=getter)
+        item=result["markets"][0]
+        self.assertEqual(item["summary"],item["variants"]["A"]["summary"])
+        self.assertEqual(result["comparison"]["A"]["signals"],0)
+        self.assertEqual(result["comparison"]["B"]["signals"],1)
+        self.assertEqual(result["comparison"]["B"]["resolved"],1)
+        self.assertEqual(result["total"]["signals"],0)
+        self.assertLessEqual(len(called),10)  # one dataset fetched, NOT once per variant
+
+    def test_api_error_returns_both_zero_rows_for_diagnostic_export(self):
+        from chart360_mini_lab import run_backtest
+        def bad(*_):raise RuntimeError("API down")
+        out=run_backtest(markets=["KRW-XRP","KRW-NEAR"],hours=12,
+                         now=self.at,getter=bad)
+        self.assertEqual(len(out["markets"]),2)
+        for m in out["markets"]:
+            self.assertEqual(set(m["variants"]),{"A","B"})
+            self.assertEqual(m["variants"]["A"]["diagnostic"]["primary_blocker_code"],"DATA_API_ERROR")
+            self.assertEqual(m["variants"]["B"]["diagnostic"]["primary_blocker_code"],"DATA_API_ERROR")
+        self.assertEqual(out["comparison"]["A"]["signals"],0)
+        self.assertEqual(out["comparison"]["B"]["signals"],0)
+
+    def test_input_accepts_five_krw_coins_rejects_six(self):
+        from chart360_mini_lab import run_backtest, MARKETS
+        def bad(*_):raise RuntimeError("API down")
+        out=run_backtest(markets=list(MARKETS),hours=6,now=self.at,getter=bad)
+        self.assertEqual(len(out["markets"]),5)
+        self.assertEqual(len(out["markets"][0]["variants"]),2)
+        self.assertRaises(ValueError,run_backtest,markets=list(MARKETS)+["KRW-XRP"],hours=6,now=self.at,getter=bad)
+
+    def test_html_ab_market_and_csv_are_labeled(self):
+        from chart360_mini_lab import HTML, VERSION
+        self.assertEqual(VERSION,"CHART360 MINI V0.3")
+        self.assertIn('<option value="ALL">5종목 한 번에 비교</option>',HTML)
+        self.assertIn("AB_DIAGNOSTIC",HTML)
+        self.assertIn("AB_TRADES",HTML)
+        self.assertIn("h4_gate_required",HTML)
+        self.assertIn("last.markets.flatMap",HTML)
+        self.assertIn("CHART360_MINI_V0_3_",HTML)
+        self.assertNotIn("CHART360_MINI_V0_2_",HTML)
 
 
 if __name__=="__main__":
