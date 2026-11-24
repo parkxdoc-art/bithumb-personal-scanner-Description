@@ -1418,5 +1418,37 @@ class Chart360MiniV05MultiDayRegressionTest(unittest.TestCase):
         self.assertNotIn("CHART360_MINI_V0_4_",HTML)
 
 
+
+class Chart360MiniV05TemporaryLiveProbe(unittest.TestCase):
+    def test_real_public_bithumb_3day_five_markets_and_7day_one_market(self):
+        """One-time read-only research probe, removed after verification."""
+        import json
+        from chart360_mini_lab import run_backtest, MARKETS
+        for hours,markets in ((72,list(MARKETS)),(168,["KRW-XRP"])):
+            try:
+                result=run_backtest(markets=markets,hours=hours,fee_each=.04)
+                print("CHART360_V05_REAL_SUMMARY "+json.dumps({
+                  "hours":hours,"asof":result["asof_kst"],
+                  "scan_begin":result["scan_begin_kst"],
+                  "scan_end":result["scan_end_kst"],
+                  "failed_markets":result["failed_markets"],
+                  "comparison":result["comparison"],
+                  "pair_summary":result["pair_summary"],
+                  "daily_count":len(result["daily_overall"]),
+                },ensure_ascii=False,default=str),flush=True)
+                for item in result["markets"]:
+                    print("CHART360_V05_REAL_MARKET "+json.dumps({
+                      "hours":hours,"market":item["market"],"error":item.get("error"),
+                      "audit":item.get("data_audit"),
+                      "B":item["variants"]["B"]["summary"],
+                      "C":item["variants"]["C"]["summary"],
+                      "paired_count":len(item["pairs"]),
+                      "days":len(item["daily"]),
+                    },ensure_ascii=False,default=str),flush=True)
+            except Exception as exc:
+                print("CHART360_V05_REAL_UNAVAILABLE "+json.dumps({
+                    "hours":hours,"error":str(exc)[:240]},ensure_ascii=False),flush=True)
+
+
 if __name__=="__main__":
     unittest.main()
