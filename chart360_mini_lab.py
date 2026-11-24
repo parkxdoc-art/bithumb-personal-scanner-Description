@@ -77,9 +77,12 @@ def historical_1m(market, end, hours=12, getter=_minute_data):
             break
         cursor = oldest  # Bithumb 'to' is exclusive
     bars = sorted(seen.values(), key=lambda x:x["t"])
+    expected=int(hours*60+30)
     return bars, {"pages":pages, "minutes_observed":len(bars),
-                  "minutes_requested":int(hours*60+30),
-                  "incomplete":len(bars) < hours*60 + 15}
+                  "minutes_requested":expected,
+                  "minutes_missing":max(0,expected-len(bars)),
+                  "coverage_pct":round(len(bars)/expected*100,2),
+                  "incomplete":len(bars)<expected}
 
 
 def _h4_bearish(h4, at):
@@ -581,12 +584,12 @@ function downloadCsv(headers,rows,kind){
 }
 $('diagnostic-csv').onclick=()=>{
  if(!last)return;
- const headers=['version','market','variant','h4_gate_required','scan_begin_kst','asof_kst','lookback_hours','fee_each_pct','minute_bars_observed','minute_bars_requested','m15_bars','h4_bars','h4_snapshot_code','h4_snapshot_lower_high','h4_snapshot_lower_low','m15_events_all_history','m15_events_in_test','m15_events_overlapping_test','h4_event_pass','h4_missing_event','h4_failed_event','pullback_event','m1_breakout_event','entry_event','gap_event','risk_reject_event','confirm_reject_event','confirm_gap_event','confirmation_bars','primary_blocker_code','primary_blocker_text','reason_counts_json','event_details_json','total_trades','resolved','unknown','error'];
+ const headers=['version','market','variant','h4_gate_required','scan_begin_kst','asof_kst','lookback_hours','fee_each_pct','minute_bars_observed','minute_bars_requested','minute_bars_missing','minute_coverage_pct','m15_bars','h4_bars','h4_snapshot_code','h4_snapshot_lower_high','h4_snapshot_lower_low','m15_events_all_history','m15_events_in_test','m15_events_overlapping_test','h4_event_pass','h4_missing_event','h4_failed_event','pullback_event','m1_breakout_event','entry_event','gap_event','risk_reject_event','confirm_reject_event','confirm_gap_event','confirmation_bars','primary_blocker_code','primary_blocker_text','reason_counts_json','event_details_json','total_trades','resolved','unknown','error'];
  const lines=last.markets.flatMap(m=>['A','B','C'].map(k=>{
   const v=m.variants?.[k]||{},d=v.diagnostic||{},a=m.data_audit||{},sm=v.summary||{};
   return [last.version,m.market,k,k==='A'?'TRUE':'FALSE',
    d.scan_begin_kst||last.scan_begin_kst,last.asof_kst,last.lookback_hours,last.fee_each_pct,
-   a.minutes_observed??'',a.minutes_requested??'',a.m15_bars??'',a.h4_bars??'',
+   a.minutes_observed??'',a.minutes_requested??'',a.minutes_missing??'',a.coverage_pct??'',a.m15_bars??'',a.h4_bars??'',
    d.h4_snapshot_code||'',d.h4_snapshot_lower_high??'',d.h4_snapshot_lower_low??'',
    d.m15_events_all_history??'',d.m15_events_in_test??'',d.m15_events_overlapping_test??'',
    d.h4_event_pass??'',d.h4_missing_event??'',d.h4_failed_event??'',d.pullback_event??'',
