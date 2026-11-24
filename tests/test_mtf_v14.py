@@ -1153,5 +1153,28 @@ class Chart360MiniV03ABRegressionTest(unittest.TestCase):
         self.assertNotIn("CHART360_MINI_V0_2_",HTML)
 
 
+    def test_temporary_real_bithumb_5coin_24h_A_B_probe(self):
+        """Temporary read-only integration probe; report failures as unknown."""
+        import json
+        from chart360_mini_lab import run_backtest, MARKETS
+        try:
+            result=run_backtest(markets=list(MARKETS),hours=24,fee_each=.04)
+            print("CHART360_V03_REAL_AB_TOTAL "+json.dumps({
+                "at":result["asof_kst"],"comparison":result["comparison"]
+            },ensure_ascii=False),flush=True)
+            for item in result["markets"]:
+                print("CHART360_V03_REAL_AB_MARKET "+json.dumps({
+                    "at":result["asof_kst"],"market":item["market"],"error":item.get("error"),
+                    "bars":item.get("data_audit",{}).get("minutes_observed"),
+                    "m15_in_test":item.get("variants",{}).get("B",{}).get("diagnostic",{}).get("m15_events_in_test"),
+                    "A":item.get("variants",{}).get("A",{}).get("summary"),
+                    "B":item.get("variants",{}).get("B",{}).get("summary"),
+                    "B_reasons":item.get("variants",{}).get("B",{}).get("diagnostic",{}).get("reason_counts"),
+                    "B_examples":item.get("variants",{}).get("B",{}).get("trades",[])[:3]
+                },ensure_ascii=False,default=str),flush=True)
+        except Exception as exc:
+            print("CHART360_V03_REAL_AB_UNAVAILABLE "+str(exc)[:220],flush=True)
+
+
 if __name__=="__main__":
     unittest.main()
