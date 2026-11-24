@@ -1,4 +1,4 @@
-"""CHARTWALA360 inspired MINI structure research V0.2 — read-only.
+"""CHARTWALA360 inspired MINI structure research V0.3 — read-only.
 
 H4 context -> M15 bullish CHoCH -> post-CHoCH pullback -> M1
 closed swing-break -> next 1m open. This is a quantified experiment
@@ -14,7 +14,7 @@ import requests
 
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com/v1/candles/minutes/"
-VERSION = "CHART360 MINI V0.2"
+VERSION = "CHART360 MINI V0.3"
 MAX_MINUTE_PAGES = 8
 MARKETS = ("KRW-XRP", "KRW-ETH", "KRW-NEAR", "KRW-SOL", "KRW-DOGE")
 
@@ -147,7 +147,9 @@ def _simulate(minute, entry_index, entry_price, stop_price, fee_each, max_hold=6
             "hold_minutes":max(0,len(minute)-entry_index)}
 
 
-def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None):
+def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None,
+           require_h4=True):
+    """A: required 4H bearish LH+LL; B: 4H information only, same entry rules."""
     """All indicators and references use data strictly available at signal."""
     if fee_each not in (.04,.25):
         raise ValueError("fee_each must be 0.04 or 0.25")
@@ -213,7 +215,7 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
                     trace["h4_ok"]=True
                 else:
                     trace["h4_structure_failed"]=True
-        if context is None or not all(context):
+        if require_h4 and (context is None or not all(context)):
             continue
         if at==ev["end"]+timedelta(minutes=1):
             stats["h4_context_ok"]+=1
@@ -259,9 +261,11 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
             if trace is not None: trace["risk_rejected"]=True
             continue
         # 7 checked features, including a numeric volume subcondition.
-        score=sum([bool(context[0]), bool(context[1]), True, pulled,
+        score=sum([bool(context and context[0]), bool(context and context[1]), True, pulled,
                    r["c"]>reference, impulse, vratio>=1.1])
-        sig="BUY_TEST" if score>=6 else "WATCH_TEST"
+        # B's score retains both H4 evidence flags for fair comparison, but
+        # does not require either H4 flag to validate its entry structure.
+        sig=("BUY_TEST" if score>=6 else "WATCH_TEST") if require_h4 else "B_ENTRY_TEST"
         exit=_simulate(minute,i+1,entry,stop,fee_each)
         trades.append({"market":market,"signal":sig,
                        "signal_kst":at.strftime("%Y-%m-%d %H:%M"),
@@ -299,6 +303,8 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
         if e["m1_gap"]: return "M1_DATA_GAP"
         if e["pullback"] and e["structure_invalidated"]: return "PULLBACK_INVALIDATED"
         if e["pullback"]: return "M1_NO_BREAKOUT"
+        if not require_h4:
+            return "M1_NO_PULLBACK" if e["observed_1m_bars"] else "M1_NO_CANDLES"
         if e["h4_ok"]: return "M1_NO_PULLBACK"
         if e["h4_data_missing"]: return "H4_DATA_MISSING"
         if e["h4_structure_failed"]: return "H4_LH_LL_FAILED"
@@ -333,6 +339,8 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
                if reason_counts else "NO_CHoCH")
     diagnostic = {
         "version": VERSION, "market": market,
+        "variant":"A" if require_h4 else "B",
+        "h4_gate_required":require_h4,
         "scan_begin_kst":diagnostic_begin.strftime("%Y-%m-%d %H:%M") if diagnostic_begin else None,
         "last_actual_1m_kst":minute[-1]["t"].strftime("%Y-%m-%d %H:%M") if minute else None,
         "m15_events_all_history":len(events),
@@ -358,7 +366,9 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
     resolved=[t["net_pct"] for t in trades if t["status"]=="RESOLVED"]
     wins=sum(x>0 for x in resolved)
     return {
-        "market":market,"trades":trades,"stats":stats,"diagnostic":diagnostic,
+        "market":market,"variant":"A" if require_h4 else "B",
+        "h4_gate_required":require_h4,
+        "trades":trades,"stats":stats,"diagnostic":diagnostic,
         "summary":{"signals":len(trades),"resolved":len(resolved),
                    "unknown":len(trades)-len(resolved),"positive":wins,
                    "nonpositive":len(resolved)-wins,
@@ -369,8 +379,8 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
 
 def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
                  now=None, getter=_minute_data):
-    if not isinstance(markets,(list,tuple)) or not 1<=len(markets)<=3:
-        raise ValueError("choose 1–3 markets")
+    if not isinstance(markets,(list,tuple)) or not 1<=len(markets)<=5:
+        raise ValueError("choose 1–5 markets")
     if any(m not in MARKETS for m in markets):
         raise ValueError("unsupported Bithumb KRW symbol")
     hours=int(hours)
@@ -388,27 +398,53 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
                  if r["t"]+timedelta(minutes=15)<=end]
             h4=[r for r in getter(market,240,end+timedelta(minutes=1),100)
                 if r["t"]+timedelta(hours=4)<=end]
-            result=replay(market,one,m15,h4,fee_each,scan_begin=end-timedelta(hours=hours))
-            result["data_audit"]={**audit,"m15_bars":len(m15),"h4_bars":len(h4),
-                                  "first_1m_kst":one[0]["t"].strftime("%Y-%m-%d %H:%M") if one else None,
-                                  "last_1m_kst":one[-1]["t"].strftime("%Y-%m-%d %H:%M") if one else None}
+            begin=end-timedelta(hours=hours)
+            a=replay(market,one,m15,h4,fee_each,scan_begin=begin,require_h4=True)
+            b=replay(market,one,m15,h4,fee_each,scan_begin=begin,require_h4=False)
+            audit={**audit,"m15_bars":len(m15),"h4_bars":len(h4),
+                   "first_1m_kst":one[0]["t"].strftime("%Y-%m-%d %H:%M") if one else None,
+                   "last_1m_kst":one[-1]["t"].strftime("%Y-%m-%d %H:%M") if one else None}
+            # A remains at the legacy top level for API compatibility.
+            result={**a,"data_audit":audit,"variants":{"A":a,"B":b}}
             output.append(result)
         except Exception as exc:
             message=str(exc)[:200]
+            base_d={"version":VERSION,"market":market,
+                    "primary_blocker_code":"DATA_API_ERROR",
+                    "primary_blocker_text":"빗썸 데이터 조회 실패",
+                    "reason_counts":{"DATA_API_ERROR":1},"event_details":[]}
+            base_s={"signals":0,"resolved":0,"unknown":0,"positive":0,
+                    "nonpositive":0,"mean_net_pct":None}
+            variants={variant:{"market":market,"variant":variant,
+                               "h4_gate_required":variant=="A","trades":[],
+                               "diagnostic":{**base_d,"variant":variant,
+                                             "h4_gate_required":variant=="A"},
+                               "summary":base_s,"stats":{}}
+                      for variant in ("A","B")}
             output.append({"market":market,"error":message,"trades":[],
-                           "diagnostic":{"version":VERSION,"market":market,
-                                         "primary_blocker_code":"DATA_API_ERROR",
-                                         "primary_blocker_text":"빗썸 데이터 조회 실패",
-                                         "reason_counts":{"DATA_API_ERROR":1},
-                                         "event_details":[]},
-                           "stats":{},"summary":{"signals":0,"resolved":0,"unknown":0}})
+                           "variants":variants,"diagnostic":base_d,
+                           "stats":{},"summary":base_s})
     alltrades=[t for r in output for t in r.get("trades",[])]
     known=[t["net_pct"] for t in alltrades if t["status"]=="RESOLVED"]
+    def variant_total(variant):
+        trades=[t for r in output
+                for t in r["variants"][variant]["trades"]]
+        resolved=[t["net_pct"] for t in trades if t["status"]=="RESOLVED"]
+        return {"signals":len(trades),"resolved":len(resolved),
+                "unknown":len(trades)-len(resolved),
+                "positive":sum(x>0 for x in resolved),
+                "nonpositive":sum(x<=0 for x in resolved),
+                "mean_net_pct":round(sum(resolved)/len(resolved),3) if resolved else None}
+    comparison={"A":variant_total("A"),"B":variant_total("B"),
+                "extra_B_signals":sum(len(r["variants"]["B"]["trades"])-
+                                       len(r["variants"]["A"]["trades"]) for r in output),
+                "reference":"동일 캔들·수수료·청산 규칙, 4H LH+LL 필수 여부만 비교"}
+
     return {
         "version":VERSION,"mode":"historical_public_candles_only",
         "asof_kst":end.strftime("%Y-%m-%d %H:%M"),"lookback_hours":hours,
         "scan_begin_kst":(end-timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M"),
-        "fee_each_pct":fee_each,"markets":output,
+        "fee_each_pct":fee_each,"markets":output,"comparison":comparison,
         "total":{"signals":len(alltrades),"resolved":len(known),
                  "unknown":len(alltrades)-len(known),
                  "positive":sum(x>0 for x in known),
@@ -416,6 +452,8 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
                  "mean_net_pct":round(sum(known)/len(known),3) if known else None},
         "warnings":["실제 매매 아님, 1분봉 종가 확인 후 다음 1분봉 시가 체결 가정",
                     "거래소 1분봉 공백은 채우지 않으며 미확정은 손익 계산 제외",
+                    "A: 4H LH+LL 필수, B: 4H 참고만. B는 종가·눌림·손절·수수료 기준 동일",
+                    "A와 B의 같은 거래는 중복 표본이므로 합산 금지. BUY_TEST/B_ENTRY_TEST는 실전 주문 지시 아님",
                     "초간단 연구판: 4H/15M/1M 구조조건의 수치적 근사, FVG/오더블록 미구현",
                     "슬리피지와 유동성 충격은 0으로 가정, 수익성 입증 아님"],
     }
@@ -423,9 +461,9 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
 
 HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>CHART360 MINI V0.2 · 구조전환 연구실</title>
+<title>CHART360 MINI V0.3 · 구조전환 연구실</title>
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{background:#101827;color:#eaf1ff;font:15px system-ui;margin:0}main{max-width:900px;margin:auto;padding:20px 14px}.panel{border:1px solid #30405a;border-radius:15px;background:#1a263b;padding:16px;margin:12px 0}h1{font-size:23px}h2{font-size:17px}p,small{color:#afc0d7}input,select,button{background:#253652;border:1px solid #445978;color:#fff;border-radius:9px;padding:10px;font:inherit}button{background:#3db7a4;color:#071b21;font-weight:800;cursor:pointer}button:disabled{opacity:.5}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:6px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:9px 7px;border-bottom:1px solid #374861;text-align:left;white-space:nowrap}.scroll{overflow-x:auto}#status{margin:10px 0}a{color:#79dfd0}</style></head><body><main>
-<h1>CHART360 MINI V0.2</h1><p>WAIT. VERIFY. THEN ACT. · 4H → 15M → 1M 구조전환 <b>별도 실험판</b></p>
+<h1>CHART360 MINI V0.3</h1><p>WAIT. VERIFY. THEN ACT. · 4H → 15M → 1M 구조전환 <b>별도 실험판</b></p>
 <section class="panel"><h2>빗썸 실제 캔들 · 간단 백테스트</h2>
 <div class="row"><label class="field">시장<select id="market"><option>KRW-XRP</option><option>KRW-ETH</option><option>KRW-NEAR</option><option>KRW-SOL</option><option>KRW-DOGE</option></select></label>
 <label class="field">과거 구간<select id="hours"><option value="6">6시간</option><option value="12" selected>12시간</option><option value="24">24시간</option></select></label>
@@ -433,7 +471,7 @@ HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <button id="run">실제 캔들 백테스트</button></div>
 <small>4H 하락 LH/LL · 15M 상승 CHoCH · 1M 눌림 후 고점 돌파 · 다음 봉 시가로 진입 가정 · 1.5R 익절, 구조적 손절, 60분 한도.</small>
 <div id="status">검사 전</div></section>
-<section class="panel"><h2>V0.2 · 단계별 진단 <small>진입 0건도 기록</small></h2>
+<section class="panel"><h2>V0.3 · 단계별 진단 <small>진입 0건도 기록</small></h2>
 <div id="diagnostic">4H → 15M → 1M에서 어느 단계가 막혔는지 검색 후 표시돼.</div>
 <div class="row" style="margin:10px 0"><button id="diagnostic-csv" disabled>코인별 진단 CSV · 0건도 저장</button><button id="csv" disabled>가상 진입 CSV · 신호 있을 때만</button></div>
 </section>
@@ -472,7 +510,7 @@ function downloadCsv(headers,rows,kind){
  const q=s=>'"'+String(s??'').replace(/"/g,'""')+'"';
  const csv=String.fromCharCode(0xFEFF)+[headers,...rows].map(row=>row.map(q).join(',')).join(String.fromCharCode(10));
  const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
- const a=document.createElement('a');a.href=url;a.download='CHART360_MINI_V0_2_'+kind+'_'+last.asof_kst.replace(/[^0-9]/g,'')+'.csv';
+ const a=document.createElement('a');a.href=url;a.download='CHART360_MINI_V0_3_'+kind+'_'+last.asof_kst.replace(/[^0-9]/g,'')+'.csv';
  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 }
 $('diagnostic-csv').onclick=()=>{
