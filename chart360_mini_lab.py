@@ -1,4 +1,4 @@
-"""CHARTWALA360 inspired MINI structure research V0.4 — read-only.
+"""CHARTWALA360 inspired MINI structure research V0.5 — read-only.
 
 H4 context -> M15 bullish CHoCH -> post-CHoCH pullback -> M1
 closed swing-break -> next 1m open. This is a quantified experiment
@@ -14,8 +14,8 @@ import requests
 
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com/v1/candles/minutes/"
-VERSION = "CHART360 MINI V0.4"
-MAX_MINUTE_PAGES = 8
+VERSION = "CHART360 MINI V0.5"
+MAX_MINUTE_PAGES = 72
 MARKETS = ("KRW-XRP", "KRW-ETH", "KRW-NEAR", "KRW-SOL", "KRW-DOGE")
 
 
@@ -57,32 +57,61 @@ def _minute_data(market, tf, to, count=200):
     raise RuntimeError(f"Bithumb {market} {tf}m: {str(err)[:140]}")
 
 
-def historical_1m(market, end, hours=12, getter=_minute_data):
-    """Paginate *actual* exchange minutes: max 200 per API call, no fills."""
-    if not (2 <= hours <= 24):
-        raise ValueError("2~24 hours required")
-    begin = end - timedelta(hours=hours, minutes=30)
-    seen, cursor = {}, end + timedelta(minutes=1)
-    pages = 0
-    while pages < MAX_MINUTE_PAGES:
-        rows = getter(market, 1, cursor, 200)
-        pages += 1
-        if not rows:
-            break
+def historical_1m(market, end, hours=12, getter=_minute_data, scan_end=None):
+    """Collect true exchange candles. Signal period ends before exit-only future."""
+    if not (2<=hours<=168):raise ValueError("2~168 hours required")
+    boundary=scan_end if scan_end is not None else end
+    if boundary>end:raise ValueError("signal end cannot exceed fetched end")
+    begin=boundary-timedelta(hours=hours,minutes=30)
+    expected=int((end-begin).total_seconds()/60)
+    limit=min(MAX_MINUTE_PAGES,max(8,math.ceil(expected/200)+6))
+    seen,cursor={},end+timedelta(minutes=1)
+    pages=0
+    hit_begin=False
+    while pages<limit:
+        rows=getter(market,1,cursor,200)
+        pages+=1
+        if not rows:break
         for r in rows:
-            if begin <= r["t"] and r["t"] + timedelta(minutes=1) <= end:
-                seen[r["t"]] = r
-        oldest = min(r["t"] for r in rows)
-        if oldest <= begin or oldest >= cursor:
+            if begin<=r["t"] and r["t"]+timedelta(minutes=1)<=end:
+                seen[r["t"]]=r
+        oldest=min(r["t"] for r in rows)
+        if oldest<=begin:
+            hit_begin=True
             break
-        cursor = oldest  # Bithumb 'to' is exclusive
-    bars = sorted(seen.values(), key=lambda x:x["t"])
-    expected=int(hours*60+30)
-    return bars, {"pages":pages, "minutes_observed":len(bars),
-                  "minutes_requested":expected,
-                  "minutes_missing":max(0,expected-len(bars)),
-                  "coverage_pct":round(len(bars)/expected*100,2),
-                  "incomplete":len(bars)<expected}
+        if oldest>=cursor:raise RuntimeError("1m pagination cursor not advancing")
+        cursor=oldest
+    bars=sorted(seen.values(),key=lambda x:x["t"])
+    return bars,{"pages":pages,"minutes_observed":len(bars),
+        "minutes_requested":expected,"minutes_missing":max(0,expected-len(bars)),
+        "coverage_pct":round(len(bars)/expected*100,2),
+        "incomplete":len(bars)<expected,
+        "pagination_exhausted":pages>=limit and not hit_begin,
+        "read_window_start_kst":begin.strftime("%Y-%m-%d %H:%M"),
+        "read_window_end_kst":end.strftime("%Y-%m-%d %H:%M")}
+
+
+def historical_15m(market,signal_begin,signal_end,getter=_minute_data):
+    """Full CHoCH history, incl. 90m overlap and 17 15m warmup bars."""
+    begin=signal_begin-timedelta(minutes=90+17*15)
+    cursor=signal_end+timedelta(minutes=1)
+    seen={}
+    pages=0
+    while pages<12:
+        rows=getter(market,15,cursor,200)
+        pages+=1
+        if not rows:break
+        for r in rows:
+            if r["t"]>=begin and r["t"]+timedelta(minutes=15)<=signal_end:
+                seen[r["t"]]=r
+        oldest=min(r["t"] for r in rows)
+        if oldest<=begin:break
+        if oldest>=cursor:raise RuntimeError("15m pagination cursor not advancing")
+        cursor=oldest
+    bars=sorted(seen.values(),key=lambda x:x["t"])
+    return bars,{"m15_pages":pages,"m15_bars":len(bars),
+        "m15_first_kst":bars[0]["t"].strftime("%Y-%m-%d %H:%M") if bars else None}
+
 
 
 def _h4_bearish(h4, at):
@@ -150,8 +179,8 @@ def _simulate(minute, entry_index, entry_price, stop_price, fee_each, max_hold=6
             "hold_minutes":max(0,len(minute)-entry_index)}
 
 
-def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None,
-           require_h4=True, confirmation_bars=0):
+def replay(market, minute, m15, h4, fee_each=.04, max_trades=None, scan_begin=None,
+           require_h4=True, confirmation_bars=0, scan_end=None):
     """A: H4 required; B: H4 informational; C: B plus one closed M1 confirmation."""
     if confirmation_bars not in (0,1):
         raise ValueError("confirmation_bars must be 0 or 1")
@@ -167,7 +196,7 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None,
     # retry or the full 45h of downloaded 15m indicator history.
     diagnostic_begin = scan_begin if scan_begin is not None else (
         minute[0]["t"] if minute else None)
-    diagnostic_end = minute[-1]["t"]+timedelta(minutes=1) if minute else None
+    diagnostic_end = scan_end if scan_end is not None else (minute[-1]["t"]+timedelta(minutes=1) if minute else None)
     relevant = [ev for ev in events if diagnostic_begin is not None
                 and diagnostic_end is not None
                 and diagnostic_begin-timedelta(minutes=90) <= ev["end"] <= diagnostic_end]
@@ -198,6 +227,8 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None,
         at=r["t"] + timedelta(minutes=1)
         if scan_begin is not None and at < scan_begin:
             continue  # indicator warm-up bars are not eligible entry times
+        if scan_end is not None and at>=scan_end:
+            continue  # future 60m is only for exits, not signals
         if cooldown_until and at < cooldown_until:
             continue
         ev=next((v for v in reversed(events)
@@ -327,7 +358,7 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None,
         stats["entries"]+=1
         if trace is not None: trace["entries"]+=1
         cooldown_until=at+timedelta(minutes=65)
-        if len(trades)>=max_trades:
+        if max_trades is not None and len(trades)>=max_trades:
             break
     # Mutually exclusive final reason per relevant M15 event. Signals
     # and exits above are not changed; the new audit is observation only.
@@ -525,9 +556,9 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
 
 HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>CHART360 MINI V0.4 · 구조전환 연구실</title>
+<title>CHART360 MINI V0.5 · 구조전환 연구실</title>
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{background:#101827;color:#eaf1ff;font:15px system-ui;margin:0}main{max-width:900px;margin:auto;padding:20px 14px}.panel{border:1px solid #30405a;border-radius:15px;background:#1a263b;padding:16px;margin:12px 0}h1{font-size:23px}h2{font-size:17px}p,small{color:#afc0d7}input,select,button{background:#253652;border:1px solid #445978;color:#fff;border-radius:9px;padding:10px;font:inherit}button{background:#3db7a4;color:#071b21;font-weight:800;cursor:pointer}button:disabled{opacity:.5}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:6px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:9px 7px;border-bottom:1px solid #374861;text-align:left;white-space:nowrap}.scroll{overflow-x:auto}#status{margin:10px 0}a{color:#79dfd0}</style></head><body><main>
-<h1>CHART360 MINI V0.4</h1><p>WAIT. VERIFY. THEN ACT. · 4H → 15M → 1M 구조전환 <b>별도 실험판</b></p>
+<h1>CHART360 MINI V0.5</h1><p>WAIT. VERIFY. THEN ACT. · 4H → 15M → 1M 구조전환 <b>별도 실험판</b></p>
 <section class="panel"><h2>빗썸 실제 캔들 · 간단 백테스트</h2>
 <div class="row"><label class="field">시장<select id="market"><option>KRW-XRP</option><option>KRW-ETH</option><option>KRW-NEAR</option><option>KRW-SOL</option><option>KRW-DOGE</option><option value="ALL">5종목 한 번에 비교</option></select></label>
 <label class="field">과거 구간<select id="hours"><option value="6">6시간</option><option value="12" selected>12시간</option><option value="24">24시간</option></select></label>
@@ -535,7 +566,7 @@ HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <button id="run">실제 캔들 백테스트</button></div>
 <small><b>A형:</b> 4H LH+LL 필수. <b>B형:</b> 4H 참고만, 1분 종가 돌파 뒤 바로 다음 시가 진입. <b>C형:</b> B형 돌파 뒤 추가 완료 1분봉이 양봉이며 돌파봉 종가보다 높은지 확인 후 그 다음 시가 진입. 공통: 15M CHoCH→눌림→1M 돌파, 구조적 손절·1.5R·60분·같은 수수료. 가상 연구 신호, 자동 주문 없음.</small>
 <div id="status">검사 전</div></section>
-<section class="panel"><h2>V0.4 · A/B/C 비교 및 단계별 진단 <small>진입 0건도 기록</small></h2>
+<section class="panel"><h2>V0.5 · A/B/C 비교 및 단계별 진단 <small>진입 0건도 기록</small></h2>
 <div id="ab-summary" class="scroll">A: 4H 필수 / B: 바로 진입 / C: 1분 확인 후 진입</div>
 <div id="diagnostic">4H → 15M → 1M에서 어느 단계가 막혔는지 검색 후 표시돼.</div>
 <div class="row" style="margin:10px 0"><button id="diagnostic-csv" disabled>A/B/C 진단 CSV · 0건도 저장</button><button id="csv" disabled>A/B/C 가상 진입 CSV · 신호 있을 때만</button></div>
@@ -579,7 +610,7 @@ function downloadCsv(headers,rows,kind){
  const q=s=>'"'+String(s??'').replace(/"/g,'""')+'"';
  const csv=String.fromCharCode(0xFEFF)+[headers,...rows].map(row=>row.map(q).join(',')).join(String.fromCharCode(10));
  const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
- const a=document.createElement('a');a.href=url;a.download='CHART360_MINI_V0_4_'+kind+'_'+last.asof_kst.replace(/[^0-9]/g,'')+'.csv';
+ const a=document.createElement('a');a.href=url;a.download='CHART360_MINI_V0_5_'+kind+'_'+last.asof_kst.replace(/[^0-9]/g,'')+'.csv';
  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 }
 $('diagnostic-csv').onclick=()=>{
