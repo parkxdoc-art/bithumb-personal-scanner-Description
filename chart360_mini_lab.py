@@ -574,94 +574,118 @@ def _pair_summary(pairs):
 
 
 def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
-                 now=None, getter=_minute_data):
+                 now=None, getter=_minute_data, asof_kst=None):
+    """Up to 7d of original A/B/C rules, all entries timed to closed bars."""
     if not isinstance(markets,(list,tuple)) or not 1<=len(markets)<=5:
         raise ValueError("choose 1–5 markets")
-    if any(m not in MARKETS for m in markets):
-        raise ValueError("unsupported Bithumb KRW symbol")
+    if any(m not in MARKETS for m in markets) or len(set(markets))!=len(markets):
+        raise ValueError("unsupported/duplicate Bithumb KRW market")
     hours=int(hours)
-    if hours not in (6,12,24):
-        raise ValueError("hours: 6, 12 or 24")
+    if hours not in (6,12,24,72,168):
+        raise ValueError("hours: 6,12,24,72,168")
     if fee_each not in (.04,.25):
-        raise ValueError("fee each: 0.04 or 0.25")
-    # 1h final margin makes every potential 60m exit verifiable by now.
-    end=(now or datetime.now(KST)).astimezone(KST).replace(second=0,microsecond=0)-timedelta(minutes=2)
+        raise ValueError("fee each: .04 or .25")
+    if now is not None and asof_kst is not None:
+        raise ValueError("now and asof_kst cannot be provided together")
+    if asof_kst is not None:
+        # Fixed KST cutoff shared across 5 independent 7d API requests.
+        end=datetime.strptime(asof_kst,"%Y-%m-%d %H:%M").replace(tzinfo=KST)
+        age=(datetime.now(KST)-end).total_seconds()
+        if age<60 or age>5400:
+            raise ValueError("asof_kst must be between 1 and 90 minutes old")
+    else:
+        end=(now or datetime.now(KST)).astimezone(KST).replace(
+            second=0,microsecond=0)-timedelta(minutes=2)
+    scan_end=end-timedelta(minutes=60)
+    scan_begin=scan_end-timedelta(hours=hours)
     output=[]
     for market in markets:
+        one=[]
+        audit={}
         try:
-            one,audit=historical_1m(market,end,hours,getter)
-            m15=[r for r in getter(market,15,end+timedelta(minutes=1),180)
-                 if r["t"]+timedelta(minutes=15)<=end]
-            h4=[r for r in getter(market,240,end+timedelta(minutes=1),100)
-                if r["t"]+timedelta(hours=4)<=end]
-            begin=end-timedelta(hours=hours)
-            a=replay(market,one,m15,h4,fee_each,scan_begin=begin,require_h4=True)
-            b=replay(market,one,m15,h4,fee_each,scan_begin=begin,require_h4=False)
-            c=replay(market,one,m15,h4,fee_each,scan_begin=begin,
-                     require_h4=False,confirmation_bars=1)
-            audit={**audit,"m15_bars":len(m15),"h4_bars":len(h4),
-                   "first_1m_kst":one[0]["t"].strftime("%Y-%m-%d %H:%M") if one else None,
-                   "last_1m_kst":one[-1]["t"].strftime("%Y-%m-%d %H:%M") if one else None}
-            # A remains at the legacy top level for API compatibility.
-            result={**a,"data_audit":audit,"variants":{"A":a,"B":b,"C":c}}
-            output.append(result)
+            # 60 real minutes AFTER scan_end for exit evaluation only.
+            one,audit=historical_1m(market,end,hours,getter,scan_end=scan_end)
+            m15,m15_audit=historical_15m(market,scan_begin,scan_end,getter)
+            h4=[r for r in getter(market,240,scan_end+timedelta(minutes=1),100)
+                if r["t"]+timedelta(hours=4)<=scan_end]
+            a=replay(market,one,m15,h4,fee_each,scan_begin=scan_begin,
+                     require_h4=True,scan_end=scan_end)
+            b=replay(market,one,m15,h4,fee_each,scan_begin=scan_begin,
+                     require_h4=False,scan_end=scan_end)
+            c=replay(market,one,m15,h4,fee_each,scan_begin=scan_begin,
+                     require_h4=False,confirmation_bars=1,scan_end=scan_end)
+            audit={**audit,**m15_audit,"h4_bars":len(h4),
+                "first_1m_kst":one[0]["t"].strftime("%Y-%m-%d %H:%M") if one else None,
+                "last_1m_kst":one[-1]["t"].strftime("%Y-%m-%d %H:%M") if one else None}
+            out={**a,"data_audit":audit,"variants":{"A":a,"B":b,"C":c}}
         except Exception as exc:
             message=str(exc)[:200]
-            base_d={"version":VERSION,"market":market,
-                    "primary_blocker_code":"DATA_API_ERROR",
-                    "primary_blocker_text":"빗썸 데이터 조회 실패",
-                    "reason_counts":{"DATA_API_ERROR":1},"event_details":[]}
-            base_s={"signals":0,"resolved":0,"unknown":0,"positive":0,
-                    "nonpositive":0,"mean_net_pct":None}
-            variants={variant:{"market":market,"variant":variant,
-                               "h4_gate_required":variant=="A",
-                               "confirmation_bars":1 if variant=="C" else 0,
-                               "trades":[],
-                               "diagnostic":{**base_d,"variant":variant,
-                                             "confirmation_bars":1 if variant=="C" else 0,
-                                             "h4_gate_required":variant=="A"},
-                               "summary":base_s,"stats":{}}
-                      for variant in ("A","B","C")}
-            output.append({"market":market,"error":message,"trades":[],
-                           "variants":variants,"diagnostic":base_d,
-                           "stats":{},"summary":base_s})
+            d={"version":VERSION,"market":market,
+               "primary_blocker_code":"DATA_API_ERROR",
+               "primary_blocker_text":"빗썸 데이터 조회 실패",
+               "reason_counts":{"DATA_API_ERROR":1},"event_details":[]}
+            sm={"signals":0,"resolved":0,"unknown":0,"positive":0,
+                "nonpositive":0,"mean_net_pct":None}
+            variants={v:{"market":market,"variant":v,
+                         "h4_gate_required":v=="A",
+                         "confirmation_bars":1 if v=="C" else 0,
+                         "trades":[],
+                         "diagnostic":{**d,"variant":v,
+                             "confirmation_bars":1 if v=="C" else 0,
+                             "h4_gate_required":v=="A"},
+                         "summary":sm,"stats":{}}
+                      for v in ("A","B","C")}
+            out={"market":market,"error":message,"trades":[],
+                 "variants":variants,"diagnostic":d,"data_audit":audit,
+                 "stats":{},"summary":sm}
+        out["daily"]=_daily_rows(market,out["variants"],one,scan_begin,scan_end,
+                                error=out.get("error"))
+        out["pairs"]=_paired_trades(market,out["variants"])
+        output.append(out)
     alltrades=[t for r in output for t in r.get("trades",[])]
     known=[t["net_pct"] for t in alltrades if t["status"]=="RESOLVED"]
-    def variant_total(variant):
-        trades=[t for r in output
-                for t in r["variants"][variant]["trades"]]
+    def variant_total(v):
+        trades=[t for r in output for t in r["variants"][v]["trades"]]
         resolved=[t["net_pct"] for t in trades if t["status"]=="RESOLVED"]
         return {"signals":len(trades),"resolved":len(resolved),
                 "unknown":len(trades)-len(resolved),
                 "positive":sum(x>0 for x in resolved),
                 "nonpositive":sum(x<=0 for x in resolved),
                 "mean_net_pct":round(sum(resolved)/len(resolved),3) if resolved else None}
-    comparison={"A":variant_total("A"),"B":variant_total("B"),
-                "C":variant_total("C"),
-                "difference_B_minus_A":sum(len(r["variants"]["B"]["trades"])-
-                                           len(r["variants"]["A"]["trades"]) for r in output),
-                "difference_C_minus_B":sum(len(r["variants"]["C"]["trades"])-
-                                           len(r["variants"]["B"]["trades"]) for r in output),
-                "reference":"A: 4H 필수, B: 4H 참고/즉시 다음 1m 시가, C: B+1분 확인 후 다음 봉 시가. 동일 캔들/수수료/익절손절. C는 1분 늦게 진입해 손익이 달라짐"}
-
+    comparisons={"A":variant_total("A"),"B":variant_total("B"),
+                 "C":variant_total("C"),
+                 "difference_B_minus_A":sum(len(r["variants"]["B"]["trades"])-
+                     len(r["variants"]["A"]["trades"]) for r in output),
+                 "difference_C_minus_B":sum(len(r["variants"]["C"]["trades"])-
+                     len(r["variants"]["B"]["trades"]) for r in output),
+                 "reference":"A 4H 필수 / B 돌파 다음 봉 시가 / C 추가 1분 확인 후 다음 시가. 4H 제외 및 1분 확인 외 진입 기준 동일"}
+    daily=[r for m in output for r in m["daily"]]
+    pairs=[p for m in output for p in m["pairs"]]
     return {
         "version":VERSION,"mode":"historical_public_candles_only",
-        "asof_kst":end.strftime("%Y-%m-%d %H:%M"),"lookback_hours":hours,
-        "scan_begin_kst":(end-timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M"),
-        "fee_each_pct":fee_each,"markets":output,"comparison":comparison,
+        "asof_kst":end.strftime("%Y-%m-%d %H:%M"),
+        "scan_begin_kst":scan_begin.strftime("%Y-%m-%d %H:%M"),
+        "scan_end_kst":scan_end.strftime("%Y-%m-%d %H:%M"),
+        "exit_horizon_minutes":60,"lookback_hours":hours,
+        "lookback_days":hours/24,"fee_each_pct":fee_each,
+        "markets":output,"comparison":comparisons,
+        "daily_by_market":daily,"daily_overall":_aggregate_daily(daily),
+        "pair_rows":pairs,"pair_summary":_pair_summary(pairs),
+        "failed_markets":[m["market"] for m in output if m.get("error")],
         "total":{"signals":len(alltrades),"resolved":len(known),
                  "unknown":len(alltrades)-len(known),
                  "positive":sum(x>0 for x in known),
                  "negative_or_zero":sum(x<=0 for x in known),
                  "mean_net_pct":round(sum(known)/len(known),3) if known else None},
-        "warnings":["실제 매매 아님, 1분봉 종가 확인 후 다음 1분봉 시가 체결 가정",
-                    "거래소 1분봉 공백은 채우지 않으며 미확정은 손익 계산 제외",
-                    "A: 4H LH+LL 필수, B: 4H 참고만. B는 종가·눌림·손절·수수료 기준 동일",
-                    "A/B/C 독립 재생(거래 중복 합산 금지). C는 B 돌파 뒤 추가 1분봉 양봉 종가 상승을 확인하고 그 다음 시가에 진입",
-                    "BUY_TEST/B_ENTRY_TEST/C_CONFIRM_TEST는 실전 주문 지시 아님",
-                    "초간단 연구판: 4H/15M/1M 구조조건의 수치적 근사, FVG/오더블록 미구현",
-                    "슬리피지와 유동성 충격은 0으로 가정, 수익성 입증 아님"],
+        "warnings":[
+            "3/7일 신호 기간은 시작~종료까지 72/168시간의 연속 구간. KST 날짜별 첫째/마지막 날짜는 부분일일 수 있음",
+            "마지막 신호 탐색 시각은 최신 완료분봉보다 60분 빠르며, 이후 60분은 청산 확인 전용",
+            "자료 수집 공백을 거래 없음이나 손실로 간주하지 않음. 데이터 조회 실패 시 해당 종목 별도 표기",
+            "A/B/C의 같은 돌파는 중복 표본, 승률과 평균은 UNKNOWN 제외한 확정분만",
+            "후향적 실험일 뿐, 슬리피지 0%, 다음 봉 시가 체결 가정, 실거래 신호 아님"
+        ]
     }
+
 
 
 HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
