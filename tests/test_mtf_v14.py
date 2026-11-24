@@ -1424,7 +1424,7 @@ class Chart360MiniV05TemporaryLiveProbe(unittest.TestCase):
         """One-time read-only research probe, removed after verification."""
         import json
         from chart360_mini_lab import run_backtest, MARKETS
-        for hours,markets in ((72,list(MARKETS)),(168,["KRW-XRP"])):
+        for hours,markets in ((168,list(MARKETS)),):
             try:
                 result=run_backtest(markets=markets,hours=hours,fee_each=.04)
                 print("CHART360_V05_REAL_SUMMARY "+json.dumps({
