@@ -43,6 +43,8 @@ FEE_CHOICES = (0.04, 0.25)
 _CACHE = {}
 _LOCK = threading.Lock()
 app = Flask(__name__)
+from orderflow_mini_v02 import register_orderflow_v02
+register_orderflow_v02(app)
 
 
 def now_kst():
