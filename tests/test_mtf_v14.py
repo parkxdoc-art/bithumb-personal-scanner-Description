@@ -1258,5 +1258,29 @@ class Chart360MiniV04ClosedConfirmationTest(unittest.TestCase):
         self.assertIn("CHART360_MINI_V0_4_",HTML)
 
 
+class Chart360MiniV04OneTimeLiveProbe(unittest.TestCase):
+    def test_live_5coins_24h(self):
+        import json
+        from chart360_mini_lab import run_backtest, MARKETS
+        try:
+            r=run_backtest(markets=list(MARKETS),hours=24,fee_each=.04)
+            print("CHART360_V04_LIVE_SUMMARY "+json.dumps({
+                "at_kst":r["asof_kst"],"window":r["scan_begin_kst"],
+                "comparison":r["comparison"]},ensure_ascii=False),flush=True)
+            for m in r["markets"]:
+                print("CHART360_V04_LIVE_MARKET "+json.dumps({
+                    "market":m["market"],"error":m.get("error"),
+                    "data_audit":m.get("data_audit"),
+                    "A":m["variants"]["A"]["summary"],
+                    "B":m["variants"]["B"]["summary"],
+                    "C":m["variants"]["C"]["summary"],
+                    "C_reasons":m["variants"]["C"]["diagnostic"]["reason_counts"],
+                    "B_trades":m["variants"]["B"]["trades"],
+                    "C_trades":m["variants"]["C"]["trades"],
+                },ensure_ascii=False,default=str),flush=True)
+        except Exception as exc:
+            print("CHART360_V04_LIVE_UNAVAILABLE "+str(exc)[:220],flush=True)
+
+
 if __name__=="__main__":
     unittest.main()
