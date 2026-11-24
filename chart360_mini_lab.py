@@ -297,6 +297,8 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=None, scan_begin=No
         entry_idx=i+1
         confirm_pass=None
         if confirmation_bars:
+            if scan_end is not None and at+timedelta(minutes=1)>=scan_end:
+                continue  # confirmation signal would close beyond test window
             if i+2>=len(minute):
                 stats["confirm_gap"]+=1
                 if trace is not None:trace["confirm_gap"]=True
@@ -868,5 +870,24 @@ $('csv').onclick=()=>{
  const rows=last.markets.flatMap(m=>['A','B','C'].flatMap(k=>(m.variants?.[k]?.trades||[]).map(t=>fields.map(field=>field==='variant'?k:t[field]??''))));
  if(!rows.length)return;
  downloadCsv(fields,rows,'ABC_TRADES');
+};
+
+$('daily-csv').onclick=()=>{
+ if(!last)return;
+ const fields=['date_kst','market','variant','partial_day','window_start_kst','window_end_kst',
+   'minutes_expected','minutes_observed','minutes_missing','coverage_pct','data_status',
+   'signals','resolved','positive','nonpositive','unknown','tp','stop','time_exit',
+   'net_sum_pct','mean_net_pct','unknown_reasons_json'];
+ const rows=(last.daily_by_market||[]).map(d=>fields.map(k=>
+   k==='unknown_reasons_json'?JSON.stringify(d.unknown_reasons||{}):d[k]??''));
+ downloadCsv(fields,rows,'DAILY_MARKET');
+};
+$('pairs-csv').onclick=()=>{
+ if(!last)return;
+ const fields=['market','breakout_kst','match_status','B_entry_kst','C_entry_kst',
+ 'B_exit_reason','C_exit_reason','B_net_pct','C_net_pct',
+ 'C_minus_B_pctpoints','comparison'];
+ const rows=(last.pair_rows||[]).map(p=>fields.map(k=>p[k]??''));
+ downloadCsv(fields,rows,'BC_PAIRED_BREAKOUTS');
 };
 })();</script></body></html>'''
