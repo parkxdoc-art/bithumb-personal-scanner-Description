@@ -695,17 +695,19 @@ HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <h1>CHART360 MINI V0.5</h1><p>WAIT. VERIFY. THEN ACT. · 4H → 15M → 1M 구조전환 <b>별도 실험판</b></p>
 <section class="panel"><h2>빗썸 실제 캔들 · 간단 백테스트</h2>
 <div class="row"><label class="field">시장<select id="market"><option>KRW-XRP</option><option>KRW-ETH</option><option>KRW-NEAR</option><option>KRW-SOL</option><option>KRW-DOGE</option><option value="ALL">5종목 한 번에 비교</option></select></label>
-<label class="field">과거 구간<select id="hours"><option value="6">6시간</option><option value="12" selected>12시간</option><option value="24">24시간</option></select></label>
+<label class="field">검증 기간<select id="hours"><option value="6">6시간</option><option value="12">12시간</option><option value="24">24시간</option><option value="72" selected>최근 3일</option><option value="168">최근 7일</option></select></label>
 <label class="field">편도 수수료<select id="fee"><option value=".04">0.04%</option><option value=".25">0.25%</option></select></label>
-<button id="run">실제 캔들 백테스트</button></div>
+<button id="run">실제 캔들 백테스트</button></div><p><small>다일자 검색은 완료봉 기준 연속 72시간/168시간이야. 마지막 60분은 가상 청산 확인 전용으로 확보하고 매수 신호는 만들지 않아. 5종목 선택 시 3·7일은 종목별 요청으로 나누어 같은 종료 시각에 맞춰 비교해.</small></p>
 <small><b>A형:</b> 4H LH+LL 필수. <b>B형:</b> 4H 참고만, 1분 종가 돌파 뒤 바로 다음 시가 진입. <b>C형:</b> B형 돌파 뒤 추가 완료 1분봉이 양봉이며 돌파봉 종가보다 높은지 확인 후 그 다음 시가 진입. 공통: 15M CHoCH→눌림→1M 돌파, 구조적 손절·1.5R·60분·같은 수수료. 가상 연구 신호, 자동 주문 없음.</small>
 <div id="status">검사 전</div></section>
 <section class="panel"><h2>V0.5 · A/B/C 비교 및 단계별 진단 <small>진입 0건도 기록</small></h2>
 <div id="ab-summary" class="scroll">A: 4H 필수 / B: 바로 진입 / C: 1분 확인 후 진입</div>
 <div id="diagnostic">4H → 15M → 1M에서 어느 단계가 막혔는지 검색 후 표시돼.</div>
-<div class="row" style="margin:10px 0"><button id="diagnostic-csv" disabled>A/B/C 진단 CSV · 0건도 저장</button><button id="csv" disabled>A/B/C 가상 진입 CSV · 신호 있을 때만</button></div>
+<div class="row" style="margin:10px 0"><button id="diagnostic-csv" disabled>A/B/C 진단 CSV</button><button id="csv" disabled>A/B/C 가상 진입 CSV</button><button id="daily-csv" disabled>날짜별 손익·분봉 CSV</button><button id="pairs-csv" disabled>B/C 동일 돌파 비교 CSV</button></div>
 </section>
-<section class="panel"><h2>연구 결과 <small>실거래 아님</small></h2><div id="results">검색 버튼을 눌러줘.</div></section>
+<section class="panel"><h2>날짜별 성과 · KST <small>처음·마지막 날짜는 부분일 수 있어</small></h2><div id="daily-view">검색 후 표시돼.</div></section>
+<section class="panel"><h2>같은 돌파 B/C 짝 비교 <small>미확정 제외</small></h2><div id="pair-view">검색 후 표시돼.</div></section>
+<section class="panel"><h2>가상 진입 기록 <small>실거래 아님</small></h2><div id="results">검색 버튼을 눌러줘.</div></section>
 <p>기존 BTC MTF V1.4.9는 수정하지 않은 별도 경로야. <a href="/">기존 스캐너로 이동</a></p>
 </main><script>(()=>{
 const $=id=>document.getElementById(id),escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
