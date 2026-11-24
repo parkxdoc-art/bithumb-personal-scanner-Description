@@ -1,4 +1,4 @@
-"""CHARTWALA360 inspired MINI structure research V0.1 — read-only.
+"""CHARTWALA360 inspired MINI structure research V0.2 — read-only.
 
 H4 context -> M15 bullish CHoCH -> post-CHoCH pullback -> M1
 closed swing-break -> next 1m open. This is a quantified experiment
@@ -14,7 +14,7 @@ import requests
 
 KST = ZoneInfo("Asia/Seoul")
 API = "https://api.bithumb.com/v1/candles/minutes/"
-VERSION = "CHART360 MINI V0.1"
+VERSION = "CHART360 MINI V0.2"
 MAX_MINUTE_PAGES = 8
 MARKETS = ("KRW-XRP", "KRW-ETH", "KRW-NEAR", "KRW-SOL", "KRW-DOGE")
 
@@ -155,6 +155,27 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
     m15=sorted(m15,key=lambda r:r["t"])
     h4=sorted(h4,key=lambda r:r["t"])
     events=_m15_chochs(m15)
+    # An event is eligible if its 90-minute post-CHoCH window overlaps
+    # the requested test interval. Count diagnostic events, not each 1m
+    # retry or the full 45h of downloaded 15m indicator history.
+    diagnostic_begin = scan_begin if scan_begin is not None else (
+        minute[0]["t"] if minute else None)
+    diagnostic_end = minute[-1]["t"]+timedelta(minutes=1) if minute else None
+    relevant = [ev for ev in events if diagnostic_begin is not None
+                and diagnostic_end is not None
+                and diagnostic_begin-timedelta(minutes=90) <= ev["end"] <= diagnostic_end]
+    event_states = {
+        ev["end"]: {
+            "choch_kst":ev["end"].strftime("%Y-%m-%d %H:%M"),
+            "inside_requested_window":ev["end"] >= diagnostic_begin,
+            "observed_1m_bars":0,"h4_ok":False,
+            "h4_data_missing":False,"h4_structure_failed":False,
+            "h4_lower_high":False,"h4_lower_low":False,
+            "pullback":False,"structure_invalidated":False,
+            "m1_breakout":False,"m1_gap":False,"risk_rejected":False,
+            "entries":0,
+        } for ev in relevant
+    }
     stats={"m15_choch_events":len(events),"h4_context_ok":0,
            "pullbacks":0,"m1_breakouts":0,"entries":0,
            "reject_risk":0,"reject_gap":0}
@@ -180,6 +201,18 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
             pulled=False
             pull_low=None
         context=_h4_bearish(h4,at)
+        trace=event_states.get(ev["end"])
+        if trace is not None:
+            trace["observed_1m_bars"]+=1
+            if context is None:
+                trace["h4_data_missing"]=True
+            else:
+                trace["h4_lower_high"] = trace["h4_lower_high"] or bool(context[0])
+                trace["h4_lower_low"] = trace["h4_lower_low"] or bool(context[1])
+                if all(context):
+                    trace["h4_ok"]=True
+                else:
+                    trace["h4_structure_failed"]=True
         if context is None or not all(context):
             continue
         if at==ev["end"]+timedelta(minutes=1):
@@ -189,11 +222,13 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
             pulled=True
             pull_low=r["l"]
             stats["pullbacks"]+=1
+            if trace is not None: trace["pullback"]=True
             continue
         if not pulled:
             continue
         pull_low=min(pull_low,r["l"])
         if pull_low < ev["level"]*.975:
+            if trace is not None: trace["structure_invalidated"]=True
             pulled=False
             continue
         previous=minute[i-5:i]
@@ -201,23 +236,27 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
             previous[j+1]["t"]-previous[j]["t"]!=timedelta(minutes=1)
             for j in range(4)):
             stats["reject_gap"]+=1
+            if trace is not None: trace["m1_gap"]=True
             continue
         reference=max(x["h"] for x in previous)
         impulse=r["c"]>r["o"] and (r["c"]-r["o"])/max(r["h"]-r["l"],1e-12)>.55
         if not (r["c"]>reference and r["c"]>ev["level"] and impulse):
             continue
         stats["m1_breakouts"]+=1
+        if trace is not None: trace["m1_breakout"]=True
         avg_vol=sum(x["v"] for x in minute[i-20:i])/20
         vratio=r["v"]/avg_vol if avg_vol>0 else 0
         nextbar=minute[i+1]
         if nextbar["t"]-r["t"]!=timedelta(minutes=1):
             stats["reject_gap"]+=1
+            if trace is not None: trace["m1_gap"]=True
             continue
         entry=nextbar["o"]
         stop=pull_low*.999
         risk=(entry-stop)/entry*100
         if risk<.25 or risk>3 or entry<=stop:
             stats["reject_risk"]+=1
+            if trace is not None: trace["risk_rejected"]=True
             continue
         # 7 checked features, including a numeric volume subcondition.
         score=sum([bool(context[0]), bool(context[1]), True, pulled,
@@ -235,13 +274,69 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
                        "m15_choch_kst":ev["end"].strftime("%Y-%m-%d %H:%M"),
                        **exit})
         stats["entries"]+=1
+        if trace is not None: trace["entries"]+=1
         cooldown_until=at+timedelta(minutes=65)
         if len(trades)>=max_trades:
             break
+    # Mutually exclusive final reason per relevant M15 event. Signals
+    # and exits above are not changed; the new audit is observation only.
+    reasons = {
+        "ENTRY_TEST": "가상 진입 기록",
+        "M1_BREAKOUT_RISK_REJECT": "1분봉 돌파 후 손절 거리 기준 탈락",
+        "M1_DATA_GAP": "1분봉 연속성 또는 다음 진입봉 부족",
+        "M1_NO_BREAKOUT": "눌림 확인 후 1분봉 스윙 고점 종가 돌파 없음",
+        "PULLBACK_INVALIDATED": "눌림이 구조 무효화 가격 아래로 내려감",
+        "M1_NO_PULLBACK": "4시간 하락구조 충족 후 눌림 조건 불충족",
+        "H4_DATA_MISSING": "4시간봉 12개 완료봉 부족 또는 시각 불연속",
+        "H4_LH_LL_FAILED": "4시간봉의 낮아진 고점/저점 조건 불충족",
+        "M1_NO_CANDLES": "15분 CHoCH 이후 분석 가능한 1분봉 없음",
+        "NO_CHoCH": "선택 구간 전후 90분에 유효한 15분 CHoCH 없음",
+        "M1_NOT_EVALUATED": "1분봉 구간 또는 쿨다운 때문에 후속조건 미평가",
+    }
+    def cause(e):
+        if e["entries"]: return "ENTRY_TEST"
+        if e["m1_breakout"] and e["risk_rejected"]: return "M1_BREAKOUT_RISK_REJECT"
+        if e["m1_gap"]: return "M1_DATA_GAP"
+        if e["pullback"] and e["structure_invalidated"]: return "PULLBACK_INVALIDATED"
+        if e["pullback"]: return "M1_NO_BREAKOUT"
+        if e["h4_ok"]: return "M1_NO_PULLBACK"
+        if e["h4_data_missing"]: return "H4_DATA_MISSING"
+        if e["h4_structure_failed"]: return "H4_LH_LL_FAILED"
+        if not e["observed_1m_bars"]: return "M1_NO_CANDLES"
+        return "M1_NOT_EVALUATED"
+    event_rows = list(event_states.values())
+    for e in event_rows:
+        e["reason_code"] = cause(e)
+        e["reason_text"] = reasons[e["reason_code"]]
+    from collections import Counter
+    reason_counts = dict(Counter(e["reason_code"] for e in event_rows))
+    blocker = (max(reason_counts, key=lambda x:reason_counts[x])
+               if reason_counts else "NO_CHoCH")
+    diagnostic = {
+        "version": VERSION, "market": market,
+        "scan_begin_kst":diagnostic_begin.strftime("%Y-%m-%d %H:%M") if diagnostic_begin else None,
+        "last_actual_1m_kst":minute[-1]["t"].strftime("%Y-%m-%d %H:%M") if minute else None,
+        "m15_events_all_history":len(events),
+        "m15_events_in_test":sum(bool(x["inside_requested_window"]) for x in event_rows),
+        "m15_events_overlapping_test":len(event_rows),
+        "h4_event_pass":sum(bool(x["h4_ok"]) for x in event_rows),
+        "h4_missing_event":sum(bool(x["h4_data_missing"]) for x in event_rows),
+        "h4_failed_event":sum(bool(x["h4_structure_failed"]) for x in event_rows),
+        "pullback_event":sum(bool(x["pullback"]) for x in event_rows),
+        "m1_breakout_event":sum(bool(x["m1_breakout"]) for x in event_rows),
+        "entry_event":sum(bool(x["entries"]) for x in event_rows),
+        "gap_event":sum(bool(x["m1_gap"]) for x in event_rows),
+        "risk_reject_event":sum(bool(x["risk_rejected"]) for x in event_rows),
+        "reason_counts":reason_counts,
+        "primary_blocker_code":blocker,
+        "primary_blocker_text":reasons[blocker],
+        "event_details":event_rows,
+        "note":"CHoCH 45시간 전체 기록과 이번 검사시간 내 이벤트는 별개. 이벤트별 단계 통과 집계이며 실제 주문 아님.",
+    }
     resolved=[t["net_pct"] for t in trades if t["status"]=="RESOLVED"]
     wins=sum(x>0 for x in resolved)
     return {
-        "market":market,"trades":trades,"stats":stats,
+        "market":market,"trades":trades,"stats":stats,"diagnostic":diagnostic,
         "summary":{"signals":len(trades),"resolved":len(resolved),
                    "unknown":len(trades)-len(resolved),"positive":wins,
                    "nonpositive":len(resolved)-wins,
@@ -277,7 +372,13 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
                                   "last_1m_kst":one[-1]["t"].strftime("%Y-%m-%d %H:%M") if one else None}
             output.append(result)
         except Exception as exc:
-            output.append({"market":market,"error":str(exc)[:200],"trades":[],
+            message=str(exc)[:200]
+            output.append({"market":market,"error":message,"trades":[],
+                           "diagnostic":{"version":VERSION,"market":market,
+                                         "primary_blocker_code":"DATA_API_ERROR",
+                                         "primary_blocker_text":"빗썸 데이터 조회 실패",
+                                         "reason_counts":{"DATA_API_ERROR":1},
+                                         "event_details":[]},
                            "stats":{},"summary":{"signals":0,"resolved":0,"unknown":0}})
     alltrades=[t for r in output for t in r.get("trades",[])]
     known=[t["net_pct"] for t in alltrades if t["status"]=="RESOLVED"]
@@ -300,9 +401,9 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
 
 HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>CHART360 MINI V0.1 · 구조전환 연구실</title>
+<title>CHART360 MINI V0.2 · 구조전환 연구실</title>
 <style>:root{color-scheme:dark}*{box-sizing:border-box}body{background:#101827;color:#eaf1ff;font:15px system-ui;margin:0}main{max-width:900px;margin:auto;padding:20px 14px}.panel{border:1px solid #30405a;border-radius:15px;background:#1a263b;padding:16px;margin:12px 0}h1{font-size:23px}h2{font-size:17px}p,small{color:#afc0d7}input,select,button{background:#253652;border:1px solid #445978;color:#fff;border-radius:9px;padding:10px;font:inherit}button{background:#3db7a4;color:#071b21;font-weight:800;cursor:pointer}button:disabled{opacity:.5}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:6px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:9px 7px;border-bottom:1px solid #374861;text-align:left;white-space:nowrap}.scroll{overflow-x:auto}#status{margin:10px 0}a{color:#79dfd0}</style></head><body><main>
-<h1>CHART360 MINI V0.1</h1><p>WAIT. VERIFY. THEN ACT. · 4H → 15M → 1M 구조전환 <b>별도 실험판</b></p>
+<h1>CHART360 MINI V0.2</h1><p>WAIT. VERIFY. THEN ACT. · 4H → 15M → 1M 구조전환 <b>별도 실험판</b></p>
 <section class="panel"><h2>빗썸 실제 캔들 · 간단 백테스트</h2>
 <div class="row"><label class="field">시장<select id="market"><option>KRW-XRP</option><option>KRW-ETH</option><option>KRW-NEAR</option><option>KRW-SOL</option><option>KRW-DOGE</option></select></label>
 <label class="field">과거 구간<select id="hours"><option value="6">6시간</option><option value="12" selected>12시간</option><option value="24">24시간</option></select></label>
@@ -331,6 +432,6 @@ finally{b.disabled=false;}
 $('csv').onclick=()=>{if(!last)return;const h=['market','signal','signal_kst','entry_kst','entry','stop','target','risk_pct','score','score_total','volume_ratio','m15_choch_kst','status','net_pct','exit_reason','hold_minutes'];
  const rows=[h,...last.markets.flatMap(x=>(x.trades||[]).map(t=>h.map(k=>t[k]??'')))];
  const q=s=>'"'+String(s??'').replace(/"/g,'""')+'"';let csv='\ufeff'+rows.map(x=>x.map(q).join(',')).join('\n');
- const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='CHART360_MINI_V0_1_'+last.asof_kst.replace(/[^0-9]/g,'')+'.csv';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='CHART360_MINI_V0_2_'+last.asof_kst.replace(/[^0-9]/g,'')+'.csv';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
 };
 })();</script></body></html>'''
