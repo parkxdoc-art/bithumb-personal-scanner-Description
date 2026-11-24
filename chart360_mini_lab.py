@@ -436,8 +436,8 @@ def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
                 "nonpositive":sum(x<=0 for x in resolved),
                 "mean_net_pct":round(sum(resolved)/len(resolved),3) if resolved else None}
     comparison={"A":variant_total("A"),"B":variant_total("B"),
-                "extra_B_signals":sum(len(r["variants"]["B"]["trades"])-
-                                       len(r["variants"]["A"]["trades"]) for r in output),
+                "difference_B_minus_A":sum(len(r["variants"]["B"]["trades"])-
+                                          len(r["variants"]["A"]["trades"]) for r in output),
                 "reference":"동일 캔들·수수료·청산 규칙, 4H LH+LL 필수 여부만 비교"}
 
     return {
