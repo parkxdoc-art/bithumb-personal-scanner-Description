@@ -1258,28 +1258,28 @@ class Chart360MiniV04ClosedConfirmationTest(unittest.TestCase):
         self.assertIn("CHART360_MINI_V0_4_",HTML)
 
 
-class Chart360MiniV04OneTimeLiveProbe(unittest.TestCase):
-    def test_live_5coins_24h(self):
-        import json
-        from chart360_mini_lab import run_backtest, MARKETS
-        try:
-            r=run_backtest(markets=list(MARKETS),hours=24,fee_each=.04)
-            print("CHART360_V04_LIVE_SUMMARY "+json.dumps({
-                "at_kst":r["asof_kst"],"window":r["scan_begin_kst"],
-                "comparison":r["comparison"]},ensure_ascii=False),flush=True)
-            for m in r["markets"]:
-                print("CHART360_V04_LIVE_MARKET "+json.dumps({
-                    "market":m["market"],"error":m.get("error"),
-                    "data_audit":m.get("data_audit"),
-                    "A":m["variants"]["A"]["summary"],
-                    "B":m["variants"]["B"]["summary"],
-                    "C":m["variants"]["C"]["summary"],
-                    "C_reasons":m["variants"]["C"]["diagnostic"]["reason_counts"],
-                    "B_trades":m["variants"]["B"]["trades"],
-                    "C_trades":m["variants"]["C"]["trades"],
-                },ensure_ascii=False,default=str),flush=True)
-        except Exception as exc:
-            print("CHART360_V04_LIVE_UNAVAILABLE "+str(exc)[:220],flush=True)
+
+
+class Chart360MiniV04DataCoverageTest(unittest.TestCase):
+    def test_full_30m_warmup_and_6h_candles_means_complete_only_if_all_observed(self):
+        from chart360_mini_lab import historical_1m, KST
+        end=datetime(2026,11,24,12,0,tzinfo=KST)
+        start=end-timedelta(minutes=390)
+        rows=[{"t":start+timedelta(minutes=i),
+               "o":100,"h":101,"l":99,"c":100,"v":1.0}
+              for i in range(390)]
+        def complete(m,tf,to,count):
+            return [r for r in rows if r["t"]<to][-count:]
+        bars,audit=historical_1m("KRW-XRP",end,6,getter=complete)
+        self.assertEqual(len(bars),390)
+        self.assertEqual(audit["minutes_missing"],0)
+        self.assertEqual(audit["coverage_pct"],100.0)
+        self.assertFalse(audit["incomplete"])
+        rows.pop(100)
+        _,audit=historical_1m("KRW-XRP",end,6,getter=complete)
+        self.assertEqual(audit["minutes_missing"],1)
+        self.assertTrue(audit["incomplete"])
+        self.assertLess(audit["coverage_pct"],100.0)
 
 
 if __name__=="__main__":
