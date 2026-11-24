@@ -1,0 +1,481 @@
+ORDERFLOW MINI V0.1 — FULL RESEARCH SOURCE ARCHIVE
+Public five-market orderbook + last trade REST snapshots; no authentication or order execution.
+Independent /orderflow and /api/orderflow mounted in BTC MTF V1.4.9 Flask app.
+IMPORTANT: the TXT is a multi-file archive; do not execute the whole text as one .py file.
+
+===========================================================================
+FILE: orderflow_mini_lab.py (COMPLETE STANDALONE LAB MODULE)
+===========================================================================
+"""Bithumb ORDERFLOW MINI V0.1: public REST snapshots, no trading.
+
+Only five fixed KRW markets. One best-five-level orderbook snapshot and
+recent actual trades per refresh. No claims of persistent walls or predictive BUY.
+"""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from threading import Lock
+from zoneinfo import ZoneInfo
+import math
+import time
+
+import requests
+
+VERSION = "ORDERFLOW MINI V0.1"
+MARKETS = ("KRW-XRP", "KRW-ETH", "KRW-NEAR", "KRW-SOL", "KRW-DOGE")
+API = "https://api.bithumb.com"
+KST = ZoneInfo("Asia/Seoul")
+TRADE_WINDOW_SECONDS = 30
+TRADE_COUNT = 200
+CACHE_SECONDS = 8
+_CACHE = {"at": 0.0, "data": None}
+_LOCK = Lock()
+
+
+def _request(path, params):
+    """Read-only public API; no credentials or orders."""
+    response = requests.get(
+        API + path,
+        params=params,
+        headers={"Accept": "application/json", "User-Agent": "personal-orderflow-research/0.1"},
+        timeout=(3, 7),
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise ValueError("Bithumb response was not an array")
+    return data
+
+
+def _number(x):
+    try:
+        n = float(x)
+        return n if math.isfinite(n) and n >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def analyze(market, book, trades, now_ms, trade_error=None):
+    """Pure function: distinguish resting orders from executed trades."""
+    result = {
+        "market": market, "version": VERSION,
+        "book_ok": False, "trade_ok": trade_error is None,
+        "error": None, "trade_error": trade_error,
+        "book_timestamp_ms": None, "book_age_s": None,
+        "bid5_krw": None, "ask5_krw": None, "bid_ask_ratio": None,
+        "bid_share_pct": None, "best_bid": None, "best_ask": None,
+        "spread_pct": None, "bids": [], "asks": [],
+        "trade_count_30s": None, "trade_buy_krw_30s": None,
+        "trade_sell_krw_30s": None, "trade_net_krw_30s": None,
+        "trade_buy_share_pct_30s": None, "trade_total_krw_30s": None,
+        "trade_sample_capped": False, "last_trade_age_s": None,
+        "checks": {}, "score": None, "score_total": 4, "status": "데이터 확인",
+    }
+    if not isinstance(book, dict) or book.get("market") != market:
+        result["error"] = "호가 응답 없음"
+        return result
+    units = book.get("orderbook_units") or []
+    bids, asks = [], []
+    for u in units:
+        if not isinstance(u, dict):
+            continue
+        bp, ap = _number(u.get("bid_price")), _number(u.get("ask_price"))
+        bs, a_s = _number(u.get("bid_size")), _number(u.get("ask_size"))
+        if bp and bs is not None and bs > 0:
+            bids.append({"price": bp, "size": bs, "krw": bp * bs})
+        if ap and a_s is not None and a_s > 0:
+            asks.append({"price": ap, "size": a_s, "krw": ap * a_s})
+    bids = sorted(bids, key=lambda x: -x["price"])[:5]
+    asks = sorted(asks, key=lambda x: x["price"])[:5]
+    if not bids or not asks or asks[0]["price"] <= bids[0]["price"]:
+        result["error"] = "유효한 매수·매도 1호가 없음"
+        return result
+    ts = _number(book.get("timestamp"))
+    age = (now_ms - ts) / 1000 if ts is not None else None
+    result.update(
+        book_ok=True, book_timestamp_ms=int(ts) if ts is not None else None,
+        book_age_s=round(age, 1) if age is not None else None,
+        bids=bids, asks=asks, best_bid=bids[0]["price"], best_ask=asks[0]["price"],
+    )
+    bidkrw, askkrw = sum(x["krw"] for x in bids), sum(x["krw"] for x in asks)
+    spread = 100 * (asks[0]["price"] - bids[0]["price"]) / (
+        (asks[0]["price"] + bids[0]["price"]) / 2
+    )
+    result.update(
+        bid5_krw=round(bidkrw), ask5_krw=round(askkrw),
+        bid_ask_ratio=round(bidkrw / askkrw, 3) if askkrw else None,
+        bid_share_pct=round(100 * bidkrw / (bidkrw + askkrw), 1) if bidkrw + askkrw else None,
+        spread_pct=round(spread, 4),
+    )
+    fresh = age is not None and -5 <= age <= 30
+    result["book_fresh"] = fresh
+    if not fresh:
+        result["error"] = "호가 갱신 시각이 오래됐거나 비정상적임"
+
+    if trade_error is not None or not isinstance(trades, list):
+        result["trade_ok"] = False
+    else:
+        eligible = []
+        valid = []
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            if t.get("market") not in (None, market):
+                continue
+            stamp = _number(t.get("timestamp"))
+            price, volume = _number(t.get("trade_price")), _number(t.get("trade_volume"))
+            side = t.get("ask_bid")
+            if stamp is None or not price or not volume or side not in ("BID", "ASK"):
+                continue
+            # Do not use future trades or trades outside 30s.
+            if stamp > now_ms + 1000 or stamp < now_ms - 120000:
+                continue
+            valid.append((stamp, side, price * volume))
+            if now_ms - 30000 <= stamp <= now_ms + 1000:
+                eligible.append((stamp, side, price * volume))
+        if valid:
+            result["last_trade_age_s"] = round((now_ms - max(x[0] for x in valid)) / 1000, 1)
+        # If all 200 recent ticks occurred inside 30 seconds, REST truncated
+        # the window. A ratio based on them is biased, so do not score it.
+        capped = len(trades) >= TRADE_COUNT and valid and min(x[0] for x in valid) >= now_ms - 30000
+        buys = sum(v for _, side, v in eligible if side == "BID")
+        sells = sum(v for _, side, v in eligible if side == "ASK")
+        total = buys + sells
+        result.update(
+            trade_sample_capped=bool(capped),
+            trade_count_30s=len(eligible),
+            trade_buy_krw_30s=round(buys),
+            trade_sell_krw_30s=round(sells),
+            trade_net_krw_30s=round(buys - sells),
+            trade_total_krw_30s=round(total),
+            trade_buy_share_pct_30s=round(100 * buys / total, 1) if total else None,
+        )
+    # Conditions are exploratory screen labels, NOT probability or BUY signals.
+    # Never score stale books, API failures or incomplete trade windows.
+    trade_valid = (
+        result["trade_ok"] and not result["trade_sample_capped"]
+        and result["trade_count_30s"] is not None
+        and result["trade_count_30s"] >= 3
+    )
+    checks = {
+        "근접 5호가 매수대금 우세(1.25배 이상)": bool(fresh and result["bid_ask_ratio"] is not None and result["bid_ask_ratio"] >= 1.25),
+        "최근 30초 매수 체결 비중(58% 이상)": bool(trade_valid and result["trade_buy_share_pct_30s"] is not None and result["trade_buy_share_pct_30s"] >= 58),
+        "호가 스프레드(0.20% 이하)": bool(fresh and spread <= 0.20),
+        "최근 30초 체결대금(1천만원 이상)": bool(trade_valid and result["trade_total_krw_30s"] >= 10000000),
+    }
+    result["checks"] = checks
+    if not fresh or not result["trade_ok"] or result["trade_sample_capped"] or not trade_valid:
+        result["status"] = "자료 주의"
+        # A partial score would give a false impression of 0/4.
+        result["score"] = None
+    else:
+        result["score"] = sum(checks.values())
+        result["status"] = "관찰 우세" if result["score"] == 4 else (
+            "추가 관찰" if result["score"] >= 2 else "관망"
+        )
+    return result
+
+
+def scan(fetcher=None, now_ms=None):
+    """One snapshot. All five markets use the same server time cutoff."""
+    fetcher = fetcher or _request
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    books = fetcher("/v1/orderbook", {"markets": ",".join(MARKETS)})
+    book_by_market = {
+        x.get("market"): x for x in books if isinstance(x, dict) and x.get("market") in MARKETS
+    }
+    trade_by_market, errors = {}, {}
+    def get_trades(market):
+        return fetcher("/v1/trades/ticks", {"market": market, "count": TRADE_COUNT})
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(get_trades, m): m for m in MARKETS}
+        for future in as_completed(futures):
+            market = futures[future]
+            try:
+                trade_by_market[market] = future.result()
+            except Exception as exc:
+                errors[market] = str(exc)[:150]
+    items = [
+        analyze(m, book_by_market.get(m), trade_by_market.get(m), now_ms, errors.get(m))
+        for m in MARKETS
+    ]
+    return {
+        "version": VERSION, "source": "Bithumb public REST API",
+        "fetched_at_ms": now_ms, "refresh_interval_seconds": 15,
+        "markets": items, "count": len(items),
+        "notes": [
+            "근접 5호가 금액은 현재 대기 잔량이다. 실제 매수 체결로 해석하면 안 된다.",
+            "매수·매도 체결은 최근 30초의 REST 표본이며 WebSocket 누적 CVD가 아니다.",
+            "매수벽 유지·주문 취소 여부는 단일 호가 스냅샷으로 판단할 수 없다.",
+            "4/4 점수는 임의 설정한 관찰조건 충족 개수이지 수익 확률/BUY 신호가 아니다.",
+            "최소 체결대금, 수수료, 슬리피지, 호가 깊이는 실전 적합성을 보장하지 않는다.",
+        ],
+    }
+
+
+def cached_scan():
+    """Prevent unnecessary repeat public-API requests across page viewers."""
+    with _LOCK:
+        elapsed = time.monotonic() - _CACHE["at"]
+        if _CACHE["data"] is not None and 0 <= elapsed < CACHE_SECONDS:
+            return {**_CACHE["data"], "cached": True}
+        payload = scan()
+        _CACHE.update(at=time.monotonic(), data=payload)
+        return {**payload, "cached": False}
+
+
+HTML = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ORDERFLOW MINI V0.1 · 빗썸 수급 탐색</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;background:#101925;color:#f0f5fc;font:14px/1.6 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:16px}h1{font-size:23px;margin:0 0 5px}h2{font-size:17px;margin:2px 0 10px}
+p,.muted,small{color:#abbbcb}p{margin:6px 0 12px}.panel{background:#1a293b;border:1px solid #344963;border-radius:14px;padding:16px;margin-top:14px}
+.action{display:flex;align-items:center;flex-wrap:wrap;gap:9px}button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid #527181;padding:9px 12px;background:#244258;color:white}
+button.primary{background:#39c3ad;border-color:#39c3ad;color:#06251f;font-weight:700}button:disabled{opacity:.45;cursor:default}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:14px}.coin{text-align:left;min-height:155px;background:#1a293b;border:1px solid #344963;display:block}
+.coin.sel{border-color:#3fddba;box-shadow:inset 0 0 0 1px #3fddba}.coin h3{margin:0 0 8px;font-size:16px}
+.value{font-size:22px;font-weight:750;font-variant-numeric:tabular-nums}.good{color:#46d3ac}.bad{color:#ff9c9c}.muted{color:#a9bbcb}.tag{font-size:11px;border:1px solid #60768b;border-radius:20px;padding:3px 7px;white-space:nowrap}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px}.kpi{background:#112031;border-radius:10px;padding:12px}.kpi b{display:block;font-size:19px;font-variant-numeric:tabular-nums}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:9px;border-bottom:1px solid #35495c;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto}a{color:#69dfc7}
+.bar{height:12px;background:#e0767f;border-radius:8px;overflow:hidden}.bar span{display:block;height:100%;background:#3bcf9b}
+@media(max-width:480px){main{padding:11px}.panel{padding:12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.coin{padding:10px;min-height:174px}.value{font-size:19px}}
+</style></head><body><main>
+<h1>빗썸 실시간 수급 탐색기 <span class="muted">V0.1</span></h1>
+<p>호가 5단계와 최근 30초 실제 체결을 한 화면에서 비교하는 <b>별도 연구판</b>이야. 주문 기능은 없어.</p>
+<div class="action"><button class="primary" id="refresh">지금 검색</button><button id="auto">자동 갱신: 켜짐</button><button id="csv" disabled>현재 결과 CSV</button><span class="muted" id="info">아직 검색하지 않았어.</span></div>
+<div class="grid" id="cards"></div>
+<section class="panel"><h2 id="detail-title">호가와 체결 상세</h2><div id="detail"><p>위에서 검색하면 코인별 데이터를 확인할 수 있어.</p></div></section>
+<section class="panel"><h2>4가지 관찰 조건</h2><p>근접 5호가 매수대금 1.25배 이상 · 최근 30초 매수 체결 비중 58% 이상 · 스프레드 0.20% 이하 · 최근 30초 체결대금 1천만원 이상.</p>
+<p>이 값은 연구용 임시 기준이며 <b>4/4가 BUY나 수익 확률을 뜻하지 않아.</b> 호가가 많아도 취소될 수 있고, 주문량 감소가 매수 체결이라는 증거는 아니야.</p>
+<p>15초 간격 REST 조회이므로 호가벽의 지속성·초단위 주문 취소·정밀 누적 CVD는 아직 측정하지 않아. 체결 표본이 200건 제한에 걸리거나 데이터가 오래되면 점수를 보류해.</p>
+<p>실전에서는 편도 수수료·왕복 스프레드·슬리피지를 별도로 고려해야 해. <a href="/">기존 BTC MTF 스캐너</a> · <a href="/chart360">CHART360 연구실</a></p></section>
+<script>
+(function(){
+const el=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const won=n=>n==null?'—':Number(n).toLocaleString('ko-KR',{maximumFractionDigits:0})+'원';
+const num=(n,d=2)=>n==null?'—':Number(n).toLocaleString('ko-KR',{maximumFractionDigits:d});
+let latest=null,selected='KRW-XRP',active=true,busy=false,timer=null;
+function card(x){
+ const score=x.score==null?'—/4':x.score+'/4';
+ const buy=x.trade_buy_share_pct_30s==null?'—':num(x.trade_buy_share_pct_30s,1)+'%';
+ const bad=!!x.error||!x.trade_ok||x.trade_sample_capped;
+ return '<button type="button" class="coin '+(selected===x.market?'sel':'')+'" data-market="'+esc(x.market)+'">'
+  +'<h3>'+esc(x.market.replace('KRW-',''))+' <span class="tag">'+esc(x.status)+'</span></h3>'
+  +'<div class="muted">관찰조건</div><div class="value">'+score+'</div>'
+  +'<div class="muted">30초 매수 체결 비중 <b class="'+(x.trade_buy_share_pct_30s>=58?'good':'')+'">'+buy+'</b></div>'
+  +'<div class="muted">근접 5호가 매수/매도 <b>'+num(x.bid_ask_ratio,2)+'배</b></div>'
+  +(bad?'<small class="bad">데이터 주의 · 상세 확인</small>':'')
+  +'</button>';
+}
+function detail(x){
+ if(!x)return '<p>검색 결과가 없어.</p>';
+ const checks=Object.entries(x.checks||{}).map(([k,v])=>'<tr><td>'+esc(k)+'</td><td>'+(v?'✓ 충족':'— 미충족')+'</td></tr>').join('');
+ const units=(bid)=>'<div class="scroll"><table><thead><tr><th>가격</th><th>잔량</th><th>호가대금</th></tr></thead><tbody>'
+ +(bid||[]).map(r=>'<tr><td>'+num(r.price,8)+'</td><td>'+num(r.size,6)+'</td><td>'+won(r.krw)+'</td></tr>').join('')
+ +'</tbody></table></div>';
+ const share=x.bid_share_pct==null?50:x.bid_share_pct;
+ return (x.error?'<p class="bad">호가 주의: '+esc(x.error)+'</p>':'')
+  +(x.trade_error?'<p class="bad">체결 조회 실패: '+esc(x.trade_error)+'</p>':'')
+  +(x.trade_sample_capped?'<p class="bad">최근 30초 거래가 조회 상한 200건에 걸려 체결 비중은 일부 표본이야. 점수를 보류했어.</p>':'')
+  +'<div class="kpis">'
+  +'<div class="kpi"><span class="muted">최우선 매수 / 매도</span><b>'+num(x.best_bid,8)+' / '+num(x.best_ask,8)+'</b></div>'
+  +'<div class="kpi"><span class="muted">스프레드</span><b>'+num(x.spread_pct,4)+'%</b></div>'
+  +'<div class="kpi"><span class="muted">매수 5호가 대기대금</span><b class="good">'+won(x.bid5_krw)+'</b></div>'
+  +'<div class="kpi"><span class="muted">매도 5호가 대기대금</span><b class="bad">'+won(x.ask5_krw)+'</b></div>'
+  +'<div class="kpi"><span class="muted">최근 30초 매수 체결</span><b class="good">'+won(x.trade_buy_krw_30s)+'</b></div>'
+  +'<div class="kpi"><span class="muted">최근 30초 매도 체결</span><b class="bad">'+won(x.trade_sell_krw_30s)+'</b></div>'
+  +'<div class="kpi"><span class="muted">최근 30초 순매수 체결대금</span><b>'+won(x.trade_net_krw_30s)+'</b></div>'
+  +'<div class="kpi"><span class="muted">최근 30초 체결 건수</span><b>'+num(x.trade_count_30s,0)+'</b></div></div>'
+  +'<p class="muted">호가 갱신 경과: '+num(x.book_age_s,1)+'초 · 최근 체결 경과: '+num(x.last_trade_age_s,1)+'초. 단일 스냅샷은 매수벽 유지 여부를 확인하지 못해.</p>'
+  +'<h2>근접 5호가 대기금액 비중</h2><div class="bar"><span style="width:'+Math.max(0,Math.min(100,share))+'%"></span></div>'
+  +'<p>매수 '+num(x.bid_share_pct,1)+'% / 매도 '+num(x.bid_share_pct==null?null:100-x.bid_share_pct,1)+'% (주문 잔량 기준, 체결 아님)</p>'
+  +'<h2>관찰조건 확인</h2><div class="scroll"><table>'+checks+'</table></div>'
+  +'<div class="kpis"><div><h2>매수 1~5호가</h2>'+units(x.bids)+'</div><div><h2>매도 1~5호가</h2>'+units(x.asks)+'</div></div>';
+}
+function render(){
+ if(!latest)return;
+ const list=[...latest.markets].sort((a,b)=>(b.score==null?-1:b.score)-(a.score==null?-1:a.score));
+ el('cards').innerHTML=list.map(card).join('');
+ const x=latest.markets.find(x=>x.market===selected)||latest.markets[0];
+ el('detail-title').textContent=x.market+' · 호가 / 실제 체결';
+ el('detail').innerHTML=detail(x);
+ el('csv').disabled=false;
+ const time=new Date(latest.fetched_at_ms).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul'});
+ el('info').textContent='KST '+time+' · 5종목 · '+(latest.cached?'최근 서버 조회 재사용':'새 조회')+' · 15초 간격';
+}
+el('cards').addEventListener('click',e=>{const b=e.target.closest('button[data-market]');if(!b)return;selected=b.dataset.market;render();});
+async function update(){
+ if(busy||document.hidden)return;
+ busy=true;el('refresh').disabled=true;el('info').textContent='빗썸 공개 호가·체결 조회 중…';
+ try{
+  const res=await fetch('/api/orderflow',{cache:'no-store'});
+  const data=await res.json();
+  if(!res.ok||!data.ok)throw Error(data.error||'조회 오류');
+  latest=data.result;render();
+ }catch(e){el('info').textContent='조회 실패: '+String(e.message||e);}
+ finally{busy=false;el('refresh').disabled=false;}
+}
+function setAuto(){
+ el('auto').textContent='자동 갱신: '+(active?'켜짐':'꺼짐');
+ if(timer){clearInterval(timer);timer=null;}
+ if(active)timer=setInterval(update,15000);
+}
+el('refresh').onclick=update;
+el('auto').onclick=()=>{active=!active;setAuto();};
+el('csv').onclick=()=>{
+ if(!latest)return;
+ const fields=['market','status','score','bid5_krw','ask5_krw','bid_ask_ratio','bid_share_pct','best_bid','best_ask','spread_pct','trade_buy_krw_30s','trade_sell_krw_30s','trade_net_krw_30s','trade_buy_share_pct_30s','trade_count_30s','trade_total_krw_30s','trade_sample_capped','book_age_s','last_trade_age_s','error','trade_error'];
+ const quote=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
+ const csv=String.fromCharCode(65279)+[fields,...latest.markets.map(m=>fields.map(k=>m[k]??''))].map(r=>r.map(quote).join(',')).join(String.fromCharCode(10));
+ const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;a.download='ORDERFLOW_MINI_V0_1_'+new Date(latest.fetched_at_ms).toLocaleString('sv-SE',{timeZone:'Asia/Seoul'}).replace(/[^0-9]/g,'').slice(0,12)+'.csv';
+ document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
+};
+setAuto();update();
+})();
+</script></main></body></html>'''
+
+===========================================================================
+FILE: bithumb_btc_mtf_v1.py (ONLY ADDITIVE IMPORT & ROUTES)
+===========================================================================
+from orderflow_mini_lab import HTML as ORDERFLOW_HTML, cached_scan as scan_orderflow_snapshot
+
+@app.get("/orderflow")
+def orderflow_mini_page():
+    """Independent, read-only public orderbook/last-trade mini lab."""
+    return Response(ORDERFLOW_HTML, content_type="text/html; charset=utf-8")
+
+
+@app.get("/api/orderflow")
+def orderflow_mini_data():
+    """Public market data only: no login, API keys or order requests."""
+    try:
+        return jsonify(ok=True, result=scan_orderflow_snapshot())
+    except Exception as exc:
+        return jsonify(ok=False, error="호가/체결 조회 실패: "+str(exc)[:140]), 502
+
+
+
+===========================================================================
+FILE: tests/test_mtf_v14.py (ORDERFLOW UNIT REGRESSION TEST CLASS)
+===========================================================================
+class OrderflowMiniV01ResearchTest(unittest.TestCase):
+    def setUp(self):
+        import orderflow_mini_lab as flow
+        self.flow=flow
+        self.now=1800000000000
+
+    def book(self,market="KRW-XRP",age_ms=1000):
+        return {"market":market,"timestamp":self.now-age_ms,
+            "orderbook_units":[{"bid_price":100,"bid_size":1000000,
+                                "ask_price":100.1,"ask_size":100000}]}
+
+    def ticks(self,market="KRW-XRP"):
+        return ([{"market":market,"timestamp":self.now-2000,
+                  "trade_price":100,"trade_volume":50000,"ask_bid":"BID"}]*4+
+                [{"market":market,"timestamp":self.now-3000,
+                  "trade_price":100,"trade_volume":25000,"ask_bid":"ASK"}]*2)
+
+    def test_book_notional_and_actual_trade_are_separate(self):
+        r=self.flow.analyze("KRW-XRP",self.book(),self.ticks(),self.now)
+        self.assertTrue(r["book_ok"])
+        self.assertEqual(r["bid5_krw"],100000000)
+        self.assertEqual(r["ask5_krw"],10010000)
+        self.assertEqual(r["trade_buy_krw_30s"],20000000)
+        self.assertEqual(r["trade_sell_krw_30s"],5000000)
+        self.assertEqual(r["trade_net_krw_30s"],15000000)
+        self.assertEqual(r["trade_buy_share_pct_30s"],80)
+        self.assertEqual(r["score"],4)
+        self.assertEqual(r["status"],"관찰 우세")
+        self.assertEqual(r["trade_count_30s"],6)
+
+    def test_stale_orderbook_is_not_a_signal(self):
+        r=self.flow.analyze("KRW-XRP",self.book(age_ms=90000),
+                            self.ticks(),self.now)
+        self.assertIsNone(r["score"])
+        self.assertFalse(r["book_fresh"])
+        self.assertEqual(r["status"],"자료 주의")
+
+    def test_rest_trade_sample_capped_blocks_scoring(self):
+        many=self.ticks()[:1]*self.flow.TRADE_COUNT
+        r=self.flow.analyze("KRW-XRP",self.book(),many,self.now)
+        self.assertTrue(r["trade_sample_capped"])
+        self.assertIsNone(r["score"])
+
+    def test_no_recent_trades_is_not_fabricated_buy_or_zero_score(self):
+        old=[{"market":"KRW-XRP","timestamp":self.now-60000,
+              "trade_price":100,"trade_volume":200,
+              "ask_bid":"BID"}]
+        r=self.flow.analyze("KRW-XRP",self.book(),old,self.now)
+        self.assertEqual(r["trade_count_30s"],0)
+        self.assertIsNone(r["trade_buy_share_pct_30s"])
+        self.assertIsNone(r["score"])
+        self.assertEqual(r["status"],"자료 주의")
+
+    def test_trade_error_keeps_book_notional_but_no_score(self):
+        r=self.flow.analyze("KRW-XRP",self.book(),None,self.now,
+                            trade_error="429 Too Many Requests")
+        self.assertTrue(r["book_ok"])
+        self.assertEqual(r["bid5_krw"],100000000)
+        self.assertIsNone(r["score"])
+        self.assertIn("429",r["trade_error"])
+
+    def test_all_five_fixed_markets_scan_one_book_and_trade_each(self):
+        calls=[]
+        def fetch(path,params):
+            calls.append((path,params))
+            if path=="/v1/orderbook":
+                return [self.book(m) for m in self.flow.MARKETS]
+            return self.ticks(params["market"])
+        out=self.flow.scan(fetcher=fetch,now_ms=self.now)
+        self.assertEqual(out["version"],"ORDERFLOW MINI V0.1")
+        self.assertEqual(len(out["markets"]),5)
+        self.assertEqual(len(calls),6)
+        self.assertEqual(sum(path=="/v1/orderbook" for path,_ in calls),1)
+        self.assertEqual(len(set(x["market"] for x in out["markets"])),5)
+        self.assertTrue(all(x["score"]==4 for x in out["markets"]))
+        self.assertTrue(all(x["trade_count_30s"]==6 for x in out["markets"]))
+
+    def test_bad_orderbook_cannot_create_false_candidate(self):
+        r=self.flow.analyze("KRW-XRP",
+                            {"market":"KRW-XRP","orderbook_units":[]},
+                            self.ticks(),self.now)
+        self.assertFalse(r["book_ok"])
+        self.assertIsNone(r["score"])
+        self.assertEqual(r["status"],"데이터 확인")
+
+    def test_html_and_isolated_routes_leave_existing_health_unchanged(self):
+        from unittest.mock import patch
+        self.assertIn("ORDERFLOW MINI V0.1",self.flow.HTML)
+        self.assertIn("data-market",self.flow.HTML)
+        self.assertIn("setInterval(update,15000)",self.flow.HTML)
+        self.assertIn("ORDERFLOW_MINI_V0_1_",self.flow.HTML)
+        self.assertIn("최근 30초",self.flow.HTML)
+        c=main.app.test_client()
+        home=c.get("/health")
+        self.assertEqual(home.status_code,200)
+        self.assertEqual(home.get_json()["version"],"BTC MTF V1.4.9")
+        page=c.get("/orderflow")
+        self.assertEqual(page.status_code,200)
+        self.assertIn("ORDERFLOW MINI V0.1",page.get_data(as_text=True))
+        with patch.object(main,"scan_orderflow_snapshot",
+                          return_value={"markets":[],"version":"ORDERFLOW MINI V0.1"}):
+            response=c.get("/api/orderflow")
+            self.assertEqual(response.status_code,200)
+            self.assertTrue(response.get_json()["ok"])
+
+    def test_api_failure_reports_error_not_fake_success(self):
+        from unittest.mock import patch
+        with patch.object(main,"scan_orderflow_snapshot",side_effect=RuntimeError("429")):
+            response=main.app.test_client().get("/api/orderflow")
+            self.assertEqual(response.status_code,502)
+            self.assertFalse(response.get_json()["ok"])
+            self.assertIn("429",response.get_json()["error"])
+
+
+
