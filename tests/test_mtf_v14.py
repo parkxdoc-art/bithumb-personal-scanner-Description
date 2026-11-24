@@ -1562,5 +1562,29 @@ class OrderflowMiniV01ResearchTest(unittest.TestCase):
             self.assertIn("429",response.get_json()["error"])
 
 
+
+class OrderflowMiniV01TemporaryPublicProbe(unittest.TestCase):
+    def test_public_5market_orderbook_and_trade_live_readonly(self):
+        """One-time public REST read-only shape check; removed afterward."""
+        import json
+        from orderflow_mini_lab import scan
+        try:
+            result=scan()
+            print("ORDERFLOW_V01_LIVE "+json.dumps({
+                "version":result["version"],"timestamp":result["fetched_at_ms"],
+                "markets":[{
+                  "market":m["market"],"book_ok":m["book_ok"],
+                  "trade_ok":m["trade_ok"],"score":m["score"],
+                  "ratio":m["bid_ask_ratio"],"spread":m["spread_pct"],
+                  "trade30":m["trade_count_30s"],
+                  "buy_share30":m["trade_buy_share_pct_30s"],
+                  "capped":m["trade_sample_capped"],
+                  "error":m["error"],"trade_error":m["trade_error"]
+                } for m in result["markets"]]
+            },ensure_ascii=False),flush=True)
+        except Exception as exc:
+            print("ORDERFLOW_V01_LIVE_UNAVAILABLE "+str(exc)[:240],flush=True)
+
+
 if __name__=="__main__":
     unittest.main()
