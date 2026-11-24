@@ -867,7 +867,7 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
         client=main.app.test_client()
         page=client.get("/chart360")
         self.assertEqual(page.status_code,200)
-        self.assertIn("CHART360 MINI V0.1",page.get_data(as_text=True))
+        self.assertIn("CHART360 MINI V0.2",page.get_data(as_text=True))
         self.assertEqual(client.get("/health").get_json()["version"],"BTC MTF V1.4.9")
         invalid=client.post("/api/chart360",json={"markets":["KRW-XRP"],"hours":100})
         self.assertEqual(invalid.status_code,400)
@@ -887,6 +887,131 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
         from chart360_mini_lab import replay
         self.assertTrue(callable(replay))
         self.assertNotIn("order",main.app.url_map.__str__().lower())
+
+
+
+class Chart360MiniV02FunnelTest(unittest.TestCase):
+    def setUp(self):
+        from chart360_mini_lab import KST
+        self.at=datetime(2026,11,24,12,0,tzinfo=KST)
+
+    def bar(self,t,lo=99,hi=101,close=100,open_=100,v=2000000):
+        return {"t":t,"o":open_,"h":hi,"l":lo,"c":close,"v":v}
+
+    def choch(self):
+        # Event closes at self.at. Completed, consecutive 15m rows.
+        start=self.at-timedelta(minutes=17*15)
+        rows=[]
+        for i in range(17):
+            t=start+timedelta(minutes=15*i)
+            if i<8: r=self.bar(t,lo=95,hi=120)
+            elif i<16:r=self.bar(t,lo=85,hi=102,close=98)
+            else:r=self.bar(t,lo=99,hi=105,close=104,open_=100)
+            rows.append(r)
+        return rows
+
+    def h4(self,bearish=True):
+        rows=[]
+        start=self.at-timedelta(hours=48)
+        for i in range(12):
+            t=start+timedelta(hours=4*i)
+            hi=115 if i<6 else 105
+            lo=95 if i<6 else 90
+            if not bearish:hi=111;lo=95
+            rows.append(self.bar(t,hi=hi,lo=lo))
+        return rows
+
+    def one_minutes(self,lo=101):
+        return [self.bar(self.at+timedelta(minutes=i),lo=lo,hi=102,
+                         close=101,open_=101) for i in range(90)]
+
+    def test_zero_trade_no_choch_has_market_diagnostic_not_empty(self):
+        from chart360_mini_lab import replay
+        bars=self.one_minutes()
+        out=replay("KRW-XRP",bars,[],self.h4(),scan_begin=self.at)
+        d=out["diagnostic"]
+        self.assertEqual(out["summary"]["signals"],0)
+        self.assertEqual(d["primary_blocker_code"],"NO_CHoCH")
+        self.assertEqual(d["m15_events_in_test"],0)
+        self.assertEqual(d["event_details"],[])
+        self.assertIsNone(out["summary"]["mean_net_pct"])
+
+    def test_event_h4_missing_has_exact_reason_and_no_trade(self):
+        from chart360_mini_lab import replay
+        out=replay("KRW-XRP",self.one_minutes(),self.choch(),[],
+                   scan_begin=self.at)
+        d=out["diagnostic"]
+        self.assertEqual(d["m15_events_in_test"],1)
+        self.assertEqual(d["h4_missing_event"],1)
+        self.assertEqual(d["h4_event_pass"],0)
+        self.assertEqual(d["primary_blocker_code"],"H4_DATA_MISSING")
+        self.assertEqual(d["event_details"][0]["reason_code"],"H4_DATA_MISSING")
+        self.assertEqual(out["summary"]["signals"],0)
+
+    def test_h4_lh_ll_mismatch_identified_separately(self):
+        from chart360_mini_lab import replay
+        out=replay("KRW-XRP",self.one_minutes(),self.choch(),
+                   self.h4(False),scan_begin=self.at)
+        d=out["diagnostic"]
+        self.assertEqual(d["h4_failed_event"],1)
+        self.assertEqual(d["h4_missing_event"],0)
+        self.assertEqual(d["primary_blocker_code"],"H4_LH_LL_FAILED")
+        self.assertEqual(d["h4_snapshot_code"],"H4_NO_LH_NO_LL")
+        self.assertEqual(d["event_details"][0]["entries"],0)
+
+    def test_h4_pass_and_pullback_without_m1_breakout(self):
+        from chart360_mini_lab import replay
+        out=replay("KRW-XRP",self.one_minutes(),self.choch(),
+                   self.h4(True),scan_begin=self.at)
+        d=out["diagnostic"]
+        self.assertEqual(d["h4_event_pass"],1)
+        self.assertEqual(d["pullback_event"],1)
+        self.assertEqual(d["m1_breakout_event"],0)
+        self.assertEqual(d["primary_blocker_code"],"M1_NO_BREAKOUT")
+        self.assertEqual(out["summary"]["signals"],0)
+
+    def test_no_data_api_error_still_has_diagnostic_row(self):
+        from chart360_mini_lab import run_backtest
+        def fail(market,tf,to,count):
+            raise RuntimeError("HTTP 503")
+        out=run_backtest(markets=["KRW-XRP","KRW-ETH"],hours=6,
+                         now=self.at,getter=fail)
+        self.assertEqual(len(out["markets"]),2)
+        self.assertEqual(out["total"]["signals"],0)
+        for item in out["markets"]:
+            self.assertEqual(item["diagnostic"]["primary_blocker_code"],"DATA_API_ERROR")
+            self.assertEqual(item["diagnostic"]["reason_counts"],{"DATA_API_ERROR":1})
+            self.assertIn("503",item["error"])
+
+    def test_stage_diagnostics_do_not_change_original_trade_signals(self):
+        from chart360_mini_lab import replay
+        one=self.one_minutes()
+        a=replay("KRW-XRP",one,self.choch(),self.h4(),scan_begin=self.at)
+        b=replay("KRW-XRP",one,self.choch(),self.h4(),scan_begin=self.at)
+        self.assertEqual(a["trades"],b["trades"])
+        self.assertEqual(a["summary"],b["summary"])
+
+    def test_lab_has_independent_diagnostic_csv_and_nonempty_entry_gate(self):
+        from chart360_mini_lab import HTML, VERSION
+        self.assertEqual(VERSION,"CHART360 MINI V0.2")
+        self.assertIn('id="diagnostic-csv"',HTML)
+        self.assertIn("primary_blocker_code",HTML)
+        self.assertIn("event_details",HTML)
+        self.assertIn("$('diagnostic-csv').disabled=false",HTML)
+        self.assertIn("$('csv').disabled=!(t.signals>0)",HTML)
+        self.assertIn("String.fromCharCode(0xFEFF)",HTML)
+        self.assertIn("String.fromCharCode(10)",HTML)
+        self.assertIn("CHART360_MINI_V0_2_",HTML)
+        self.assertNotIn("CHART360_MINI_V0_1_",HTML)
+
+    def test_readonly_route_v02_root_scanner_still_v149(self):
+        client=main.app.test_client()
+        p=client.get("/chart360")
+        self.assertEqual(p.status_code,200)
+        self.assertIn("CHART360 MINI V0.2",p.get_data(as_text=True))
+        root=client.get("/health")
+        self.assertEqual(root.status_code,200)
+        self.assertEqual(root.get_json()["version"],"BTC MTF V1.4.9")
 
 
 if __name__=="__main__":
