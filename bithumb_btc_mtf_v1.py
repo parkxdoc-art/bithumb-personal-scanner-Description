@@ -28,6 +28,7 @@ from btc_mtf_replay_v145 import HourlyReplayPath
 from btc_mtf_quality_v146 import snapshot_liquidity, investigate_missing_hour
 from btc_mtf_study_v147 import compare_watch_cohorts
 from chart360_mini_lab import HTML as CHART360_HTML, run_backtest as run_chart360_backtest
+from orderflow_mini_lab import HTML as ORDERFLOW_HTML, cached_scan as scan_orderflow_snapshot
 
 VERSION = "BTC MTF V1.4.9"
 KST = ZoneInfo("Asia/Seoul")
@@ -650,6 +651,21 @@ def study_v147_api():
         return jsonify(ok=True,version=VERSION,study=report)
     except (TypeError,ValueError) as ex:
         return jsonify(ok=False,error=str(ex)[:180]),400
+
+
+@app.get("/orderflow")
+def orderflow_mini_page():
+    """Independent, read-only public orderbook/last-trade mini lab."""
+    return Response(ORDERFLOW_HTML, content_type="text/html; charset=utf-8")
+
+
+@app.get("/api/orderflow")
+def orderflow_mini_data():
+    """Public market data only: no login, API keys or order requests."""
+    try:
+        return jsonify(ok=True, result=scan_orderflow_snapshot())
+    except Exception as exc:
+        return jsonify(ok=False, error="호가/체결 조회 실패: "+str(exc)[:140]), 502
 
 
 @app.get("/chart360")
