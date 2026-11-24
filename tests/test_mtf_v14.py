@@ -867,7 +867,7 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
         client=main.app.test_client()
         page=client.get("/chart360")
         self.assertEqual(page.status_code,200)
-        self.assertIn("CHART360 MINI V0.4",page.get_data(as_text=True))
+        self.assertIn("CHART360 MINI V0.5",page.get_data(as_text=True))
         self.assertEqual(client.get("/health").get_json()["version"],"BTC MTF V1.4.9")
         invalid=client.post("/api/chart360",json={"markets":["KRW-XRP"],"hours":100})
         self.assertEqual(invalid.status_code,400)
@@ -1000,7 +1000,7 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
 
     def test_lab_has_independent_diagnostic_csv_and_nonempty_entry_gate(self):
         from chart360_mini_lab import HTML, VERSION
-        self.assertEqual(VERSION,"CHART360 MINI V0.4")
+        self.assertEqual(VERSION,"CHART360 MINI V0.5")
         self.assertIn('id="diagnostic-csv"',HTML)
         self.assertIn("primary_blocker_code",HTML)
         self.assertIn("event_details",HTML)
@@ -1008,14 +1008,14 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
         self.assertIn("$('csv').disabled=trades.length===0",HTML)
         self.assertIn("String.fromCharCode(0xFEFF)",HTML)
         self.assertIn("String.fromCharCode(10)",HTML)
-        self.assertIn("CHART360_MINI_V0_4_",HTML)
+        self.assertIn("CHART360_MINI_V0_5_",HTML)
         self.assertNotIn("CHART360_MINI_V0_1_",HTML)
 
     def test_readonly_route_v02_root_scanner_still_v149(self):
         client=main.app.test_client()
         p=client.get("/chart360")
         self.assertEqual(p.status_code,200)
-        self.assertIn("CHART360 MINI V0.4",p.get_data(as_text=True))
+        self.assertIn("CHART360 MINI V0.5",p.get_data(as_text=True))
         root=client.get("/health")
         self.assertEqual(root.status_code,200)
         self.assertEqual(root.get_json()["version"],"BTC MTF V1.4.9")
@@ -1143,13 +1143,13 @@ class Chart360MiniV03ABRegressionTest(unittest.TestCase):
 
     def test_html_ab_market_and_csv_are_labeled(self):
         from chart360_mini_lab import HTML, VERSION
-        self.assertEqual(VERSION,"CHART360 MINI V0.4")
+        self.assertEqual(VERSION,"CHART360 MINI V0.5")
         self.assertIn('<option value="ALL">5종목 한 번에 비교</option>',HTML)
         self.assertIn("ABC_DIAGNOSTIC",HTML)
         self.assertIn("ABC_TRADES",HTML)
         self.assertIn("h4_gate_required",HTML)
         self.assertIn("last.markets.flatMap",HTML)
-        self.assertIn("CHART360_MINI_V0_4_",HTML)
+        self.assertIn("CHART360_MINI_V0_5_",HTML)
         self.assertNotIn("CHART360_MINI_V0_2_",HTML)
 
 
@@ -1247,7 +1247,7 @@ class Chart360MiniV04ClosedConfirmationTest(unittest.TestCase):
 
     def test_v04_html_csv_includes_C_confirmation_and_both_features(self):
         from chart360_mini_lab import HTML,VERSION
-        self.assertEqual(VERSION,"CHART360 MINI V0.4")
+        self.assertEqual(VERSION,"CHART360 MINI V0.5")
         self.assertIn("['A','B','C']",HTML)
         self.assertIn("confirm_reject_event",HTML)
         self.assertIn("confirm_gap_event",HTML)
@@ -1255,7 +1255,7 @@ class Chart360MiniV04ClosedConfirmationTest(unittest.TestCase):
         self.assertIn("prior20_1m_contiguous",HTML)
         self.assertIn("ABC_DIAGNOSTIC",HTML)
         self.assertIn("ABC_TRADES",HTML)
-        self.assertIn("CHART360_MINI_V0_4_",HTML)
+        self.assertIn("CHART360_MINI_V0_5_",HTML)
 
 
 
@@ -1280,6 +1280,142 @@ class Chart360MiniV04DataCoverageTest(unittest.TestCase):
         self.assertEqual(audit["minutes_missing"],1)
         self.assertTrue(audit["incomplete"])
         self.assertLess(audit["coverage_pct"],100.0)
+
+
+
+class Chart360MiniV05MultiDayRegressionTest(unittest.TestCase):
+    def setUp(self):
+        from chart360_mini_lab import KST
+        self.end=datetime(2026,11,24,19,0,tzinfo=KST)
+
+    def candle(self,t):
+        return {"t":t,"o":100.0,"h":101.0,"l":99.0,"c":100.0,"v":1_000_000.0}
+
+    def fixture(self,hours=168):
+        begin=self.end-timedelta(hours=hours,minutes=30)
+        return [self.candle(begin+timedelta(minutes=i))
+                for i in range(hours*60+30)]
+
+    def test_paged_seven_days_1m_over_fifty_200_bar_calls(self):
+        from chart360_mini_lab import historical_1m
+        data=self.fixture(168)
+        calls=[]
+        def getter(market,tf,to,count):
+            calls.append((to,count))
+            return [r for r in data if r["t"]<to][-count:]
+        bars,audit=historical_1m("KRW-XRP",self.end,168,getter=getter)
+        self.assertEqual(len(bars),10110)
+        self.assertEqual(audit["minutes_requested"],10110)
+        self.assertEqual(audit["minutes_observed"],10110)
+        self.assertFalse(audit["incomplete"])
+        self.assertEqual(audit["coverage_pct"],100.0)
+        self.assertGreater(len(calls),50)
+        self.assertLess(len(calls),65)
+        self.assertTrue(all(n<=200 for _,n in calls))
+        self.assertTrue(all(calls[i+1][0]<calls[i][0]
+                            for i in range(len(calls)-1)))
+
+    def test_bars_after_signal_end_are_exit_only(self):
+        from chart360_mini_lab import historical_1m
+        end=self.end
+        scan_end=end-timedelta(minutes=60)
+        begin=scan_end-timedelta(hours=72,minutes=30)
+        data=[self.candle(begin+timedelta(minutes=i))
+              for i in range(int((end-begin).total_seconds()/60))]
+        def getter(m,tf,to,count):
+            return [r for r in data if r["t"]<to][-count:]
+        bars,audit=historical_1m("KRW-XRP",end,72,getter=getter,scan_end=scan_end)
+        self.assertEqual(len(bars),72*60+90)
+        self.assertEqual(audit["minutes_requested"],72*60+90)
+        self.assertEqual(sum(b["t"]>=scan_end for b in bars),60)
+
+    def test_15minute_backfill_over_200_rows(self):
+        from chart360_mini_lab import historical_15m
+        signal_end=self.end
+        signal_begin=signal_end-timedelta(hours=168)
+        start=signal_begin-timedelta(hours=7)
+        bars=[self.candle(start+timedelta(minutes=15*i)) for i in range(710)]
+        calls=[]
+        def getter(m,tf,to,count):
+            calls.append((tf,to,count))
+            return [r for r in bars if r["t"]<to][-count:]
+        out,audit=historical_15m("KRW-XRP",signal_begin,signal_end,getter)
+        self.assertGreater(len(out),650)
+        self.assertGreater(len(calls),3)
+        self.assertTrue(all(c[0]==15 and c[2]==200 for c in calls))
+        self.assertLessEqual(out[-1]["t"]+timedelta(minutes=15),signal_end)
+
+    def test_calendar_split_boundary_partial_days_and_zero_signals(self):
+        from chart360_mini_lab import _daily_rows
+        start=datetime(2026,11,17,18,0,tzinfo=self.end.tzinfo)
+        finish=start+timedelta(hours=168)
+        data=[]
+        variants={k:{"trades":[]} for k in ("A","B","C")}
+        daily=_daily_rows("KRW-XRP",variants,data,start,finish)
+        self.assertEqual(len(daily),8*3)
+        self.assertTrue(daily[0]["partial_day"])
+        self.assertFalse(next(x for x in daily if x["date_kst"]=="2026-11-18")["partial_day"])
+        self.assertEqual(daily[0]["signals"],0)
+        self.assertIsNone(daily[0]["mean_net_pct"])
+        self.assertEqual(daily[0]["data_status"],"INCOMPLETE")
+        self.assertEqual(daily[-1]["date_kst"],"2026-11-24")
+
+    def test_paired_comparison_ignores_unknown_and_matches_breakout(self):
+        from chart360_mini_lab import _paired_trades,_pair_summary
+        def t(breakout,entry,status,net,reason):
+            return {"breakout_kst":breakout,"entry_kst":entry,
+                    "status":status,"net_pct":net,"exit_reason":reason}
+        b={"trades":[t("2026-11-20 10:00","2026-11-20 10:00","RESOLVED",1.2,"TP_1_5R"),
+                     t("2026-11-20 11:00","2026-11-20 11:00","UNKNOWN",None,"MISSING_1M_BAR"),
+                     t("2026-11-20 12:00","2026-11-20 12:00","RESOLVED",-1,"STOP")]}
+        c={"trades":[t("2026-11-20 10:00","2026-11-20 10:01","RESOLVED",1.5,"TP_1_5R"),
+                     t("2026-11-20 11:00","2026-11-20 11:01","RESOLVED",0.8,"TP_1_5R"),
+                     t("2026-11-20 13:00","2026-11-20 13:01","RESOLVED",0.1,"TIME_EXIT")]}
+        pairs=_paired_trades("KRW-XRP",{"A":{"trades":[]},"B":b,"C":c})
+        m=_pair_summary(pairs)
+        self.assertEqual(m["paired"],2)
+        self.assertEqual(m["resolved_pairs"],1)
+        self.assertEqual(m["unresolved_pairs"],1)
+        self.assertEqual(m["B_only"],1)
+        self.assertEqual(m["C_only"],1)
+        self.assertEqual(m["mean_C_minus_B_pctpoints"],0.3)
+
+    def test_three_day_no_data_error_has_dates_not_fake_losses(self):
+        from chart360_mini_lab import run_backtest
+        def fail(*args):raise RuntimeError("503 no data")
+        out=run_backtest(markets=["KRW-XRP"],hours=72,now=self.end,getter=fail)
+        self.assertEqual(len(out["daily_by_market"]),12)
+        self.assertEqual(out["comparison"]["B"]["signals"],0)
+        self.assertEqual(out["failed_markets"],["KRW-XRP"])
+        self.assertTrue(all(row["data_status"]=="API_ERROR" for row in out["daily_by_market"]))
+        self.assertTrue(all(row["unknown"]==0 for row in out["daily_by_market"]))
+        self.assertEqual(out["pair_summary"]["paired"],0)
+
+    def test_seven_day_time_window_is_168_hours_and_evaluation_end_hour_earlier(self):
+        from chart360_mini_lab import run_backtest
+        def fail(*args):raise RuntimeError("temporarily unavailable")
+        out=run_backtest(markets=["KRW-XRP"],hours=168,now=self.end,getter=fail)
+        from datetime import datetime as DT
+        start=DT.fromisoformat(out["scan_begin_kst"])
+        stop=DT.fromisoformat(out["scan_end_kst"])
+        self.assertEqual(stop-start,timedelta(hours=168))
+        self.assertEqual(DT.fromisoformat(out["asof_kst"])-stop,timedelta(minutes=60))
+        self.assertEqual(out["exit_horizon_minutes"],60)
+        self.assertEqual(out["comparison"]["A"]["resolved"],0)
+
+    def test_html_has_7_day_daywise_and_paired_CSV_export(self):
+        from chart360_mini_lab import HTML,VERSION
+        self.assertEqual(VERSION,"CHART360 MINI V0.5")
+        self.assertIn('<option value="72" selected>최근 3일</option>',HTML)
+        self.assertIn('<option value="168">최근 7일</option>',HTML)
+        self.assertIn('id="daily-csv"',HTML)
+        self.assertIn('id="pairs-csv"',HTML)
+        self.assertIn('id="daily-view"',HTML)
+        self.assertIn('id="pair-view"',HTML)
+        self.assertIn("BC_PAIRED_BREAKOUTS",HTML)
+        self.assertIn("DAILY_MARKET",HTML)
+        self.assertIn("asof_kst:asof||null",HTML)
+        self.assertNotIn("CHART360_MINI_V0_4_",HTML)
 
 
 if __name__=="__main__":
