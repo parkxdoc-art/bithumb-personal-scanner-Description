@@ -888,8 +888,12 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
         self.assertTrue(callable(replay))
         for rule in main.app.url_map.iter_rules():
             if "order" in rule.rule.lower():
-                self.assertFalse(set(rule.methods or ()) & {"POST","PUT","PATCH","DELETE"},
-                                 "no order-capable HTTP route allowed: "+rule.rule)
+                methods = set(rule.methods or ()) & {"POST","PUT","PATCH","DELETE"}
+                # Only the two exact local paper-research collection controls may POST.
+                if rule.rule in {"/api/orderflow-v02/start", "/api/orderflow-v02/stop"}:
+                    self.assertEqual(methods, {"POST"})
+                else:
+                    self.assertFalse(methods, "no order-capable HTTP route allowed: "+rule.rule)
 
 
 
@@ -1562,6 +1566,55 @@ class OrderflowMiniV01ResearchTest(unittest.TestCase):
             self.assertIn("429",response.get_json()["error"])
 
 
+
+
+class OrderflowV02IntegrationTest(unittest.TestCase):
+    def test_public_pages_and_state(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from flask import Flask
+        from orderflow_mini_v02 import Engine, register_orderflow_v02
+        with TemporaryDirectory() as d:
+            app=Flask("orderflow_test")
+            engine=Engine(path=str(Path(d)/"test.sqlite3"))
+            register_orderflow_v02(app, engine)
+            c=app.test_client()
+            for path in ("/orderflow-v02","/orderflow-v02/live"):
+                response=c.get(path)
+                self.assertEqual(response.status_code,200)
+                self.assertIn("V0.2",response.get_data(as_text=True))
+            response=c.get("/api/orderflow-v02/state")
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.get_json()["fee_roundtrip_pct"],0.08)
+            self.assertEqual(response.get_json()["total_signals"],0)
+            self.assertEqual(c.get("/api/orderflow-v02/csv/trades").status_code,200)
+            self.assertEqual(c.get("/api/orderflow-v02/csv/unknown").status_code,404)
+
+    def test_collection_controls_never_place_orders(self):
+        from flask import Flask
+        from unittest.mock import Mock
+        from orderflow_mini_v02 import register_orderflow_v02
+        app=Flask("orderflow_controls")
+        engine=Mock()
+        register_orderflow_v02(app,engine)
+        c=app.test_client()
+        with patch("orderflow_mini_v02.requests.get") as get, patch("orderflow_mini_v02.requests.post") as post:
+            self.assertTrue(c.post("/api/orderflow-v02/start").get_json()["ok"])
+            self.assertTrue(c.post("/api/orderflow-v02/stop").get_json()["ok"])
+            engine.start.assert_called_once_with()
+            engine.stop.assert_called_once_with()
+            get.assert_not_called()
+            post.assert_not_called()
+        self.assertEqual(c.post("/api/orderflow-v02/order").status_code,404)
+        self.assertEqual(c.get("/api/orderflow-v02/start").status_code,405)
+
+    def test_existing_app_routes_and_fee(self):
+        from orderflow_mini_v02 import net_pct
+        c=main.app.test_client()
+        self.assertEqual(c.get("/orderflow-v02").status_code,200)
+        self.assertEqual(c.get("/orderflow-v02/live").status_code,200)
+        self.assertEqual(c.get("/health").get_json()["version"],"BTC MTF V1.4.9")
+        self.assertAlmostEqual(net_pct(100,100),100*(.9996/1.0004-1),places=10)
 
 
 if __name__=="__main__":
