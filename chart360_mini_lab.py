@@ -530,12 +530,12 @@ HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <label class="field">과거 구간<select id="hours"><option value="6">6시간</option><option value="12" selected>12시간</option><option value="24">24시간</option></select></label>
 <label class="field">편도 수수료<select id="fee"><option value=".04">0.04%</option><option value=".25">0.25%</option></select></label>
 <button id="run">실제 캔들 백테스트</button></div>
-<small><b>A형:</b> 4H 하락 LH+LL 필수 / <b>B형:</b> 4H 참고만. 두 방식 모두 15M 상승 CHoCH → 눌림 → 1M 종가 고점 돌파 → 다음 1분봉 시가 가상 진입, 구조적 손절·1.5R·60분·동일 수수료 적용. B형은 연구 신호이며 실전 BUY가 아냐. 5종목×24시간은 조회에 시간이 걸릴 수 있어.</small>
+<small><b>A형:</b> 4H LH+LL 필수. <b>B형:</b> 4H 참고만, 1분 종가 돌파 뒤 바로 다음 시가 진입. <b>C형:</b> B형 돌파 뒤 추가 완료 1분봉이 양봉이며 돌파봉 종가보다 높은지 확인 후 그 다음 시가 진입. 공통: 15M CHoCH→눌림→1M 돌파, 구조적 손절·1.5R·60분·같은 수수료. 가상 연구 신호, 자동 주문 없음.</small>
 <div id="status">검사 전</div></section>
-<section class="panel"><h2>V0.4 · A/B 비교 및 단계별 진단 <small>진입 0건도 기록</small></h2>
-<div id="ab-summary" class="scroll">A: 4H LH+LL 필수 / B: 4H 참고</div>
+<section class="panel"><h2>V0.4 · A/B/C 비교 및 단계별 진단 <small>진입 0건도 기록</small></h2>
+<div id="ab-summary" class="scroll">A: 4H 필수 / B: 바로 진입 / C: 1분 확인 후 진입</div>
 <div id="diagnostic">4H → 15M → 1M에서 어느 단계가 막혔는지 검색 후 표시돼.</div>
-<div class="row" style="margin:10px 0"><button id="diagnostic-csv" disabled>A/B 진단 CSV · 0건도 저장</button><button id="csv" disabled>A/B 가상 진입 CSV · 신호 있을 때만</button></div>
+<div class="row" style="margin:10px 0"><button id="diagnostic-csv" disabled>A/B/C 진단 CSV · 0건도 저장</button><button id="csv" disabled>A/B/C 가상 진입 CSV · 신호 있을 때만</button></div>
 </section>
 <section class="panel"><h2>연구 결과 <small>실거래 아님</small></h2><div id="results">검색 버튼을 눌러줘.</div></section>
 <p>기존 BTC MTF V1.4.9는 수정하지 않은 별도 경로야. <a href="/">기존 스캐너로 이동</a></p>
@@ -543,30 +543,30 @@ HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 const $=id=>document.getElementById(id),escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let last=null;
 const marketChoice=()=>$('market').value==='ALL'?['KRW-XRP','KRW-ETH','KRW-NEAR','KRW-SOL','KRW-DOGE']:[$('market').value];
-$('run').onclick=async()=>{const b=$('run');b.disabled=true;last=null;$('csv').disabled=true;$('diagnostic-csv').disabled=true;$('status').textContent='동일 빗썸 4H·15M·1M 캔들로 A/B 독립 재생 중…';
+$('run').onclick=async()=>{const b=$('run');b.disabled=true;last=null;$('csv').disabled=true;$('diagnostic-csv').disabled=true;$('status').textContent='동일 빗썸 4H·15M·1M 캔들로 A/B/C 병렬 재생 중…';
 try{const res=await fetch('/api/chart360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({markets:marketChoice(),hours:Number($('hours').value),fee_each:Number($('fee').value)})});
  const d=await res.json();if(!res.ok||!d.ok)throw Error(d.error||'API 오류');last=d.result;
  const compare=last.comparison||{},markets=last.markets||[];
- const rows=['A','B'].map(k=>({key:k,x:compare[k]||{}}));
- $('status').textContent='완료 · '+last.asof_kst+' KST · '+last.lookback_hours+'시간 · '+markets.length+'종목 · A/B 동일 캔들 비교';
- $('ab-summary').innerHTML='<p><b>A형: 기존 4시간 LH+LL 필수 / B형: 4시간 참고만</b> · 신호·수익률은 연구용 가상값이야. A와 B 거래 중복 합산 금지.</p>'
+ const rows=['A','B','C'].map(k=>({key:k,x:compare[k]||{}}));
+ $('status').textContent='완료 · '+last.asof_kst+' KST · '+last.lookback_hours+'시간 · '+markets.length+'종목 · A/B/C 동일 캔들 비교';
+ $('ab-summary').innerHTML='<p><b>A: 4시간 필수 / B: 1분 돌파 직후 / C: 1분 추가 양봉 종가 확인 후</b> · 셋 모두 연구용 가상값이고 거래를 합산하면 안 돼. <b>B와 C의 진입시각·체결가가 다르다</b>는 점도 주의해 줘.</p>'
   +'<table><thead><tr><th>방식</th><th>진입</th><th>확정</th><th>UNKNOWN</th><th>양수</th><th>비양수</th><th>확정분 평균 순손익</th></tr></thead><tbody>'
-  +rows.map(v=>'<tr><td>'+v.key+(v.key==='A'?' · 필수':' · 참고')+'</td><td>'+(v.x.signals??0)+'</td><td>'+(v.x.resolved??0)+'</td><td>'+(v.x.unknown??0)+'</td><td>'+(v.x.positive??0)+'</td><td>'+(v.x.nonpositive??0)+'</td><td>'+escape(v.x.mean_net_pct??'미산정')+(v.x.mean_net_pct==null?'':'%')+'</td></tr>').join('')+'</tbody></table>';
- const variantRows=markets.flatMap(x=>['A','B'].map(k=>({market:x.market,key:k,
+  +rows.map(v=>'<tr><td>'+v.key+(v.key==='A'?' · 4H 필수':v.key==='C'?' · 추가 확인':' · 즉시')+'</td><td>'+(v.x.signals??0)+'</td><td>'+(v.x.resolved??0)+'</td><td>'+(v.x.unknown??0)+'</td><td>'+(v.x.positive??0)+'</td><td>'+(v.x.nonpositive??0)+'</td><td>'+escape(v.x.mean_net_pct??'미산정')+(v.x.mean_net_pct==null?'':'%')+'</td></tr>').join('')+'</tbody></table>';
+ const variantRows=markets.flatMap(x=>['A','B','C'].map(k=>({market:x.market,key:k,
    v:x.variants?.[k]||{},a:x.data_audit||{},error:x.error||''})));
- $('diagnostic').innerHTML='<p>이전 V0.2의 4H 탈락 원인을 A형에 그대로 유지하고, B형에서 <b>같은 이벤트가 다음 단계로 진행하는지</b> 확인해. 진입 0건도 아래에 기록돼.</p>'
-  +'<div class="scroll"><table><thead><tr><th>코인</th><th>A/B</th><th>15M CHoCH (검사구간)</th><th>4H 통과</th><th>눌림</th><th>1M 돌파</th><th>진입</th><th>주요 사유</th><th>1M 확보</th></tr></thead><tbody>'
-  +variantRows.map(x=>{const d=x.v.diagnostic||{};return '<tr><td>'+escape(x.market)+'</td><td>'+x.key+'</td><td>'+(d.m15_events_in_test??'—')+'</td><td>'+(d.h4_event_pass??'—')+'</td><td>'+(d.pullback_event??'—')+'</td><td>'+(d.m1_breakout_event??'—')+'</td><td>'+(d.entry_event??0)+'</td><td>'+escape(d.primary_blocker_text||x.error||'진단 불가')+'</td><td>'+escape(x.a.minutes_observed??'—')+'/'+escape(x.a.minutes_requested??'—')+'</td></tr>'}).join('')+'</tbody></table></div>'
+ $('diagnostic').innerHTML='<p>A형은 4H 필수, B형은 4H 제외, C형은 B형보다 1분 늦은 <b>완료봉 상승 확인</b>이 핵심 차이야. 진입 0건도 기록해.</p>'
+  +'<div class="scroll"><table><thead><tr><th>코인</th><th>A/B/C</th><th>15M CHoCH (검사구간)</th><th>4H 통과</th><th>눌림</th><th>1M 돌파</th><th>C 확인 실패</th><th>진입</th><th>주요 사유</th><th>1M 확보</th></tr></thead><tbody>'
+  +variantRows.map(x=>{const d=x.v.diagnostic||{};return '<tr><td>'+escape(x.market)+'</td><td>'+x.key+'</td><td>'+(d.m15_events_in_test??'—')+'</td><td>'+(d.h4_event_pass??'—')+'</td><td>'+(d.pullback_event??'—')+'</td><td>'+(d.m1_breakout_event??'—')+'</td><td>'+(d.confirm_reject_event??'—')+'</td><td>'+(d.entry_event??0)+'</td><td>'+escape(d.primary_blocker_text||x.error||'진단 불가')+'</td><td>'+escape(x.a.minutes_observed??'—')+'/'+escape(x.a.minutes_requested??'—')+'</td></tr>'}).join('')+'</tbody></table></div>'
   +'<details><summary>15분 CHoCH 개별 이벤트 탈락 사유 확인</summary>'
   +variantRows.map(x=>{const d=x.v.diagnostic||{};return '<p><b>'+escape(x.market)+' '+x.key+'</b> · 15M 전체 이력 '+(d.m15_events_all_history??'—')+' · 검사 구간 '+(d.m15_events_in_test??'—')+' · 90분 겹침 '+(d.m15_events_overlapping_test??'—')+' · 최근 실측 1M 기준 H4 참고 '+escape(d.h4_snapshot_code||'—')+'</p>'
   +'<div class="scroll"><table><tr><th>CHoCH 마감</th><th>4H LH</th><th>4H LL</th><th>눌림</th><th>1분 돌파</th><th>탈락 사유</th></tr>'
   +(d.event_details||[]).map(e=>'<tr><td>'+escape(e.choch_kst)+'</td><td>'+(e.h4_lower_high?'✓':'—')+'</td><td>'+(e.h4_lower_low?'✓':'—')+'</td><td>'+(e.pullback?'✓':'—')+'</td><td>'+(e.m1_breakout?'✓':'—')+'</td><td>'+escape(e.reason_text)+'</td></tr>').join('')+'</table></div>';}).join('')+'</details>'
   +'<p>15M 전체 이력의 CHoCH와 검사구간 CHoCH는 다르며, 단계별 이벤트 수는 중복 집계될 수 있어. 1분봉 공백을 0거래로 채우지 않아.</p>';
- const trades=markets.flatMap(x=>['A','B'].flatMap(k=>(x.variants?.[k]?.trades||[]).map(t=>({...t,variant:k}))));
+ const trades=markets.flatMap(x=>['A','B','C'].flatMap(k=>(x.variants?.[k]?.trades||[]).map(t=>({...t,variant:k}))));
  $('results').innerHTML=trades.length?
  '<div class="scroll"><table><tr><th>코인</th><th>방식</th><th>시간</th><th>점수</th><th>진입</th><th>손절</th><th>결과</th><th>순손익%</th></tr>'
  +trades.map(t=>'<tr><td>'+escape(t.market)+'</td><td>'+escape(t.variant)+'</td><td>'+escape(t.entry_kst)+'</td><td>'+escape(t.score)+'/7</td><td>'+escape(t.entry)+'</td><td>'+escape(t.stop)+'</td><td>'+escape(t.exit_reason)+'</td><td>'+escape(t.net_pct??'UNKNOWN')+'</td></tr>').join('')+'</table></div>':
- '<p>이번 검사에서는 A/B 모두 가상 진입 0건. 위 비교 표와 진단 CSV에서 단계별 사유를 확인해 줘.</p>';
+ '<p>이번 검사에서는 A/B/C 모두 가상 진입 0건. 위 비교 표와 진단 CSV에서 단계별 사유를 확인해 줘.</p>';
  $('diagnostic-csv').disabled=false;
  $('csv').disabled=trades.length===0;
 }catch(e){$('status').textContent='오류: '+String(e.message||e);}
@@ -581,8 +581,8 @@ function downloadCsv(headers,rows,kind){
 }
 $('diagnostic-csv').onclick=()=>{
  if(!last)return;
- const headers=['version','market','variant','h4_gate_required','scan_begin_kst','asof_kst','lookback_hours','fee_each_pct','minute_bars_observed','minute_bars_requested','m15_bars','h4_bars','h4_snapshot_code','h4_snapshot_lower_high','h4_snapshot_lower_low','m15_events_all_history','m15_events_in_test','m15_events_overlapping_test','h4_event_pass','h4_missing_event','h4_failed_event','pullback_event','m1_breakout_event','entry_event','gap_event','risk_reject_event','primary_blocker_code','primary_blocker_text','reason_counts_json','event_details_json','total_trades','resolved','unknown','error'];
- const lines=last.markets.flatMap(m=>['A','B'].map(k=>{
+ const headers=['version','market','variant','h4_gate_required','scan_begin_kst','asof_kst','lookback_hours','fee_each_pct','minute_bars_observed','minute_bars_requested','m15_bars','h4_bars','h4_snapshot_code','h4_snapshot_lower_high','h4_snapshot_lower_low','m15_events_all_history','m15_events_in_test','m15_events_overlapping_test','h4_event_pass','h4_missing_event','h4_failed_event','pullback_event','m1_breakout_event','entry_event','gap_event','risk_reject_event','confirm_reject_event','confirm_gap_event','confirmation_bars','primary_blocker_code','primary_blocker_text','reason_counts_json','event_details_json','total_trades','resolved','unknown','error'];
+ const lines=last.markets.flatMap(m=>['A','B','C'].map(k=>{
   const v=m.variants?.[k]||{},d=v.diagnostic||{},a=m.data_audit||{},sm=v.summary||{};
   return [last.version,m.market,k,k==='A'?'TRUE':'FALSE',
    d.scan_begin_kst||last.scan_begin_kst,last.asof_kst,last.lookback_hours,last.fee_each_pct,
@@ -591,17 +591,18 @@ $('diagnostic-csv').onclick=()=>{
    d.m15_events_all_history??'',d.m15_events_in_test??'',d.m15_events_overlapping_test??'',
    d.h4_event_pass??'',d.h4_missing_event??'',d.h4_failed_event??'',d.pullback_event??'',
    d.m1_breakout_event??'',d.entry_event??'',d.gap_event??'',d.risk_reject_event??'',
+   d.confirm_reject_event??'',d.confirm_gap_event??'',d.confirmation_bars??0,
    d.primary_blocker_code||'',d.primary_blocker_text||'',
    JSON.stringify(d.reason_counts||{}),JSON.stringify(d.event_details||[]),
    sm.signals??0,sm.resolved??0,sm.unknown??0,m.error||''];
  }));
- downloadCsv(headers,lines,'AB_DIAGNOSTIC');
+ downloadCsv(headers,lines,'ABC_DIAGNOSTIC');
 };
 $('csv').onclick=()=>{
  if(!last)return;
- const fields=['market','variant','signal','signal_kst','entry_kst','entry','stop','target','risk_pct','score','score_total','volume_ratio','m15_choch_kst','status','net_pct','exit_reason','hold_minutes'];
- const rows=last.markets.flatMap(m=>['A','B'].flatMap(k=>(m.variants?.[k]?.trades||[]).map(t=>fields.map(field=>field==='variant'?k:t[field]??''))));
+ const fields=['market','variant','signal','signal_kst','entry_kst','entry','stop','target','risk_pct','score','score_total','volume_ratio','breakout_kst','entry_delay_minutes','breakout_body_pct','breakout_upper_wick_pct','breakout_range_pct','prior20_1m_contiguous','minutes_after_choch','confirm_bullish_continuation','m15_choch_kst','status','net_pct','exit_reason','hold_minutes'];
+ const rows=last.markets.flatMap(m=>['A','B','C'].flatMap(k=>(m.variants?.[k]?.trades||[]).map(t=>fields.map(field=>field==='variant'?k:t[field]??''))));
  if(!rows.length)return;
- downloadCsv(fields,rows,'AB_TRADES');
+ downloadCsv(fields,rows,'ABC_TRADES');
 };
 })();</script></body></html>'''
