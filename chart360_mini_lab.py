@@ -463,6 +463,116 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=None, scan_begin=No
     }
 
 
+
+def _daily_rows(market,variants,one,scan_begin,scan_end,error=None):
+    """KST calendar dates, partial boundary days, including zero-trade dates."""
+    today=scan_begin.replace(hour=0,minute=0,second=0,microsecond=0)
+    stamps={r["t"] for r in one}
+    out=[]
+    while today<scan_end:
+        tomorrow=today+timedelta(days=1)
+        start=max(today,scan_begin)
+        stop=min(tomorrow,scan_end)
+        exp=int((stop-start).total_seconds()/60)
+        obs=sum(start<=stamp<stop for stamp in stamps)
+        day=today.strftime("%Y-%m-%d")
+        for v in ("A","B","C"):
+            trades=[t for t in variants[v]["trades"] if t["entry_kst"].startswith(day)]
+            known=[t["net_pct"] for t in trades if t["status"]=="RESOLVED"]
+            out.append({"date_kst":day,"market":market,"variant":v,
+                "partial_day":exp<1440,
+                "window_start_kst":start.strftime("%Y-%m-%d %H:%M"),
+                "window_end_kst":stop.strftime("%Y-%m-%d %H:%M"),
+                "minutes_expected":exp,"minutes_observed":obs,
+                "minutes_missing":max(0,exp-obs),
+                "coverage_pct":round(obs/exp*100,2) if exp else None,
+                "data_status":"API_ERROR" if error else ("INCOMPLETE" if obs<exp else "COMPLETE"),
+                "signals":len(trades),"resolved":len(known),
+                "positive":sum(x>0 for x in known),
+                "nonpositive":sum(x<=0 for x in known),
+                "unknown":len(trades)-len(known),
+                "tp":sum(t["exit_reason"]=="TP_1_5R" for t in trades),
+                "stop":sum(t["exit_reason"]=="STOP" for t in trades),
+                "time_exit":sum(t["exit_reason"]=="TIME_EXIT" for t in trades),
+                "net_sum_pct":round(sum(known),4) if known else None,
+                "mean_net_pct":round(sum(known)/len(known),4) if known else None,
+                "unknown_reasons":dict(__import__("collections").Counter(
+                    t["exit_reason"] for t in trades if t["status"]!="RESOLVED")),
+            })
+        today=tomorrow
+    return out
+
+
+def _paired_trades(market,variants):
+    """Pair by original breakout minute, NEVER by delayed C entry minute."""
+    bs={t["breakout_kst"]:t for t in variants["B"]["trades"]}
+    cs={t["breakout_kst"]:t for t in variants["C"]["trades"]}
+    out=[]
+    for stamp in sorted(set(bs)|set(cs)):
+        b=bs.get(stamp)
+        c=cs.get(stamp)
+        both=bool(b and c)
+        resolved=bool(both and b["status"]=="RESOLVED" and c["status"]=="RESOLVED")
+        delta=round(c["net_pct"]-b["net_pct"],4) if resolved else None
+        out.append({"market":market,"breakout_kst":stamp,
+           "match_status":"PAIRED" if both else ("B_ONLY" if b else "C_ONLY"),
+           "B_entry_kst":b["entry_kst"] if b else None,
+           "C_entry_kst":c["entry_kst"] if c else None,
+           "B_exit_reason":b["exit_reason"] if b else None,
+           "C_exit_reason":c["exit_reason"] if c else None,
+           "B_net_pct":b["net_pct"] if b else None,
+           "C_net_pct":c["net_pct"] if c else None,
+           "C_minus_B_pctpoints":delta,
+           "comparison":"C_BETTER" if delta is not None and delta>0
+                        else ("C_WORSE" if delta is not None and delta<0
+                              else ("SAME" if delta==0 else "UNRESOLVED_OR_UNMATCHED"))})
+    return out
+
+
+def _aggregate_daily(daily):
+    groups={}
+    for row in daily:
+        key=(row["date_kst"],row["variant"])
+        g=groups.setdefault(key,{"date_kst":key[0],"variant":key[1],
+            "markets":0,"error_markets":0,"partial_day":False,
+            "minutes_observed":0,"minutes_expected":0,
+            "signals":0,"resolved":0,"positive":0,"nonpositive":0,
+            "unknown":0,"tp":0,"stop":0,"time_exit":0,
+            "net_sum_pct":0.0})
+        g["markets"]+=1
+        g["error_markets"]+=row["data_status"]=="API_ERROR"
+        g["partial_day"]|=row["partial_day"]
+        for col in ("minutes_observed","minutes_expected","signals","resolved",
+                    "positive","nonpositive","unknown","tp","stop","time_exit"):
+            g[col]+=row[col]
+        if row["net_sum_pct"] is not None:g["net_sum_pct"]+=row["net_sum_pct"]
+    out=[]
+    for key in sorted(groups):
+        g=groups[key]
+        g["minutes_missing"]=max(0,g["minutes_expected"]-g["minutes_observed"])
+        g["coverage_pct"]=round(g["minutes_observed"]/g["minutes_expected"]*100,2) if g["minutes_expected"] else None
+        g["mean_net_pct"]=round(g["net_sum_pct"]/g["resolved"],4) if g["resolved"] else None
+        g["net_sum_pct"]=round(g["net_sum_pct"],4) if g["resolved"] else None
+        out.append(g)
+    return out
+
+
+def _pair_summary(pairs):
+    matched=[p for p in pairs if p["match_status"]=="PAIRED"]
+    known=[p for p in matched if p["C_minus_B_pctpoints"] is not None]
+    return {"paired":len(matched),"resolved_pairs":len(known),
+            "unresolved_pairs":len(matched)-len(known),
+            "B_only":sum(p["match_status"]=="B_ONLY" for p in pairs),
+            "C_only":sum(p["match_status"]=="C_ONLY" for p in pairs),
+            "C_better":sum(p["comparison"]=="C_BETTER" for p in known),
+            "C_worse":sum(p["comparison"]=="C_WORSE" for p in known),
+            "same":sum(p["comparison"]=="SAME" for p in known),
+            "mean_C_minus_B_pctpoints":
+                round(sum(p["C_minus_B_pctpoints"] for p in known)/len(known),4)
+                if known else None}
+
+
+
 def run_backtest(markets=("KRW-XRP",), hours=12, fee_each=.04,
                  now=None, getter=_minute_data):
     if not isinstance(markets,(list,tuple)) or not 1<=len(markets)<=5:
