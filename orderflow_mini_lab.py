@@ -157,7 +157,7 @@ def analyze(market, book, trades, now_ms, trade_error=None):
         "최근 30초 체결대금(1천만원 이상)": bool(trade_valid and result["trade_total_krw_30s"] >= 10000000),
     }
     result["checks"] = checks
-    if not fresh or not result["trade_ok"] or result["trade_sample_capped"]:
+    if not fresh or not result["trade_ok"] or result["trade_sample_capped"] or not trade_valid:
         result["status"] = "자료 주의"
         # A partial score would give a false impression of 0/4.
         result["score"] = None
