@@ -936,6 +936,13 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
         self.assertEqual(d["event_details"],[])
         self.assertIsNone(out["summary"]["mean_net_pct"])
 
+    def test_no_one_minute_data_is_not_misreported_as_no_choch(self):
+        from chart360_mini_lab import replay
+        out=replay("KRW-XRP",[],self.choch(),self.h4(),scan_begin=self.at)
+        self.assertEqual(out["summary"]["signals"],0)
+        self.assertEqual(out["diagnostic"]["primary_blocker_code"],"M1_NO_CANDLES")
+        self.assertEqual(out["diagnostic"]["last_actual_1m_kst"],None)
+
     def test_event_h4_missing_has_exact_reason_and_no_trade(self):
         from chart360_mini_lab import replay
         out=replay("KRW-XRP",self.one_minutes(),self.choch(),[],
