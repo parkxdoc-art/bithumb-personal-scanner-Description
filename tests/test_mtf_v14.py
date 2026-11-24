@@ -1005,7 +1005,7 @@ class Chart360MiniV02FunnelTest(unittest.TestCase):
         self.assertIn("primary_blocker_code",HTML)
         self.assertIn("event_details",HTML)
         self.assertIn("$('diagnostic-csv').disabled=false",HTML)
-        self.assertIn("$('csv').disabled=!(t.signals>0)",HTML)
+        self.assertIn("$('csv').disabled=trades.length===0",HTML)
         self.assertIn("String.fromCharCode(0xFEFF)",HTML)
         self.assertIn("String.fromCharCode(10)",HTML)
         self.assertIn("CHART360_MINI_V0_3_",HTML)
