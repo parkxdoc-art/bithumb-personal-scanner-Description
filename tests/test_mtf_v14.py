@@ -1444,5 +1444,120 @@ class Chart360MiniV05SignalWindowSafetyTest(unittest.TestCase):
                          asof_kst="2026-11-24 19:58")
 
 
+
+class OrderflowMiniV01ResearchTest(unittest.TestCase):
+    def setUp(self):
+        import orderflow_mini_lab as flow
+        self.flow=flow
+        self.now=1800000000000
+
+    def book(self,market="KRW-XRP",age_ms=1000):
+        return {"market":market,"timestamp":self.now-age_ms,
+            "orderbook_units":[{"bid_price":100,"bid_size":1000000,
+                                "ask_price":100.1,"ask_size":100000}]}
+
+    def ticks(self,market="KRW-XRP"):
+        return ([{"market":market,"timestamp":self.now-2000,
+                  "trade_price":100,"trade_volume":50000,"ask_bid":"BID"}]*4+
+                [{"market":market,"timestamp":self.now-3000,
+                  "trade_price":100,"trade_volume":25000,"ask_bid":"ASK"}]*2)
+
+    def test_book_notional_and_actual_trade_are_separate(self):
+        r=self.flow.analyze("KRW-XRP",self.book(),self.ticks(),self.now)
+        self.assertTrue(r["book_ok"])
+        self.assertEqual(r["bid5_krw"],100000000)
+        self.assertEqual(r["ask5_krw"],10010000)
+        self.assertEqual(r["trade_buy_krw_30s"],20000000)
+        self.assertEqual(r["trade_sell_krw_30s"],5000000)
+        self.assertEqual(r["trade_net_krw_30s"],15000000)
+        self.assertEqual(r["trade_buy_share_pct_30s"],80)
+        self.assertEqual(r["score"],4)
+        self.assertEqual(r["status"],"관찰 우세")
+        self.assertEqual(r["trade_count_30s"],6)
+
+    def test_stale_orderbook_is_not_a_signal(self):
+        r=self.flow.analyze("KRW-XRP",self.book(age_ms=90000),
+                            self.ticks(),self.now)
+        self.assertIsNone(r["score"])
+        self.assertFalse(r["book_fresh"])
+        self.assertEqual(r["status"],"자료 주의")
+
+    def test_rest_trade_sample_capped_blocks_scoring(self):
+        many=self.ticks()[:1]*self.flow.TRADE_COUNT
+        r=self.flow.analyze("KRW-XRP",self.book(),many,self.now)
+        self.assertTrue(r["trade_sample_capped"])
+        self.assertIsNone(r["score"])
+
+    def test_no_recent_trades_is_not_fabricated_buy_or_zero_score(self):
+        old=[{"market":"KRW-XRP","timestamp":self.now-60000,
+              "trade_price":100,"trade_volume":200,
+              "ask_bid":"BID"}]
+        r=self.flow.analyze("KRW-XRP",self.book(),old,self.now)
+        self.assertEqual(r["trade_count_30s"],0)
+        self.assertIsNone(r["trade_buy_share_pct_30s"])
+        self.assertIsNone(r["score"])
+        self.assertEqual(r["status"],"자료 주의")
+
+    def test_trade_error_keeps_book_notional_but_no_score(self):
+        r=self.flow.analyze("KRW-XRP",self.book(),None,self.now,
+                            trade_error="429 Too Many Requests")
+        self.assertTrue(r["book_ok"])
+        self.assertEqual(r["bid5_krw"],100000000)
+        self.assertIsNone(r["score"])
+        self.assertIn("429",r["trade_error"])
+
+    def test_all_five_fixed_markets_scan_one_book_and_trade_each(self):
+        calls=[]
+        def fetch(path,params):
+            calls.append((path,params))
+            if path=="/v1/orderbook":
+                return [self.book(m) for m in self.flow.MARKETS]
+            return self.ticks(params["market"])
+        out=self.flow.scan(fetcher=fetch,now_ms=self.now)
+        self.assertEqual(out["version"],"ORDERFLOW MINI V0.1")
+        self.assertEqual(len(out["markets"]),5)
+        self.assertEqual(len(calls),6)
+        self.assertEqual(sum(path=="/v1/orderbook" for path,_ in calls),1)
+        self.assertEqual(len(set(x["market"] for x in out["markets"])),5)
+        self.assertTrue(all(x["score"]==4 for x in out["markets"]))
+        self.assertTrue(all(x["trade_count_30s"]==6 for x in out["markets"]))
+
+    def test_bad_orderbook_cannot_create_false_candidate(self):
+        r=self.flow.analyze("KRW-XRP",
+                            {"market":"KRW-XRP","orderbook_units":[]},
+                            self.ticks(),self.now)
+        self.assertFalse(r["book_ok"])
+        self.assertIsNone(r["score"])
+        self.assertEqual(r["status"],"데이터 확인")
+
+    def test_html_and_isolated_routes_leave_existing_health_unchanged(self):
+        from unittest.mock import patch
+        self.assertIn("ORDERFLOW MINI V0.1",self.flow.HTML)
+        self.assertIn("data-market",self.flow.HTML)
+        self.assertIn("setInterval(update,15000)",self.flow.HTML)
+        self.assertIn("ORDERFLOW_MINI_V0_1_",self.flow.HTML)
+        self.assertIn("최근 30초",self.flow.HTML)
+        c=main.app.test_client()
+        home=c.get("/health")
+        self.assertEqual(home.status_code,200)
+        self.assertEqual(home.get_json()["version"],"BTC MTF V1.4.9")
+        page=c.get("/orderflow")
+        self.assertEqual(page.status_code,200)
+        self.assertIn("ORDERFLOW MINI V0.1",page.get_data(as_text=True))
+        with patch.object(main,"scan_orderflow_snapshot",
+                          return_value={"markets":[],"version":"ORDERFLOW MINI V0.1"}):
+            response=c.get("/api/orderflow")
+            self.assertEqual(response.status_code,200)
+            self.assertTrue(response.get_json()["ok"])
+
+    def test_api_failure_reports_error_not_fake_success(self):
+        from unittest.mock import patch
+        with patch.object(main,"scan_orderflow_snapshot",side_effect=RuntimeError("429")):
+            response=main.app.test_client().get("/api/orderflow")
+            self.assertEqual(response.status_code,502)
+            self.assertFalse(response.get_json()["ok"])
+            self.assertIn("429",response.get_json()["error"])
+
+
 if __name__=="__main__":
     unittest.main()
