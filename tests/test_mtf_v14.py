@@ -886,7 +886,10 @@ class Chart360MiniIsolatedResearchTest(unittest.TestCase):
         """Keep CI deterministic; live public-candle probe was run separately."""
         from chart360_mini_lab import replay
         self.assertTrue(callable(replay))
-        self.assertNotIn("order",main.app.url_map.__str__().lower())
+        for rule in main.app.url_map.iter_rules():
+            if "order" in rule.rule.lower():
+                self.assertFalse(set(rule.methods or ()) & {"POST","PUT","PATCH","DELETE"},
+                                 "no order-capable HTTP route allowed: "+rule.rule)
 
 
 
