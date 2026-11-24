@@ -310,6 +310,19 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
         e["reason_text"] = reasons[e["reason_code"]]
     from collections import Counter
     reason_counts = dict(Counter(e["reason_code"] for e in event_rows))
+    # Snapshot context is a separate retrospective diagnostic.
+    # It is NEVER fed into an earlier signal decision.
+    h4_at_test_end = _h4_bearish(h4, diagnostic_end) if diagnostic_end else None
+    if h4_at_test_end is None:
+        h4_at_end_code = "H4_DATA_MISSING"
+    elif all(h4_at_test_end):
+        h4_at_end_code = "H4_BEARISH_LH_LL"
+    elif not h4_at_test_end[0] and not h4_at_test_end[1]:
+        h4_at_end_code = "H4_NO_LH_NO_LL"
+    elif not h4_at_test_end[0]:
+        h4_at_end_code = "H4_NO_LOWER_HIGH"
+    else:
+        h4_at_end_code = "H4_NO_LOWER_LOW"
     blocker = (max(reason_counts, key=lambda x:reason_counts[x])
                if reason_counts else "NO_CHoCH")
     diagnostic = {
@@ -317,6 +330,9 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
         "scan_begin_kst":diagnostic_begin.strftime("%Y-%m-%d %H:%M") if diagnostic_begin else None,
         "last_actual_1m_kst":minute[-1]["t"].strftime("%Y-%m-%d %H:%M") if minute else None,
         "m15_events_all_history":len(events),
+        "h4_snapshot_code":h4_at_end_code,
+        "h4_snapshot_lower_high":h4_at_test_end[0] if h4_at_test_end else None,
+        "h4_snapshot_lower_low":h4_at_test_end[1] if h4_at_test_end else None,
         "m15_events_in_test":sum(bool(x["inside_requested_window"]) for x in event_rows),
         "m15_events_overlapping_test":len(event_rows),
         "h4_event_pass":sum(bool(x["h4_ok"]) for x in event_rows),
@@ -430,7 +446,7 @@ try{const res=await fetch('/api/chart360',{method:'POST',headers:{'Content-Type'
  $('diagnostic').innerHTML='<p><b>우선 확인: '+escape(diagnosis.primary_blocker_text||'진단 불가')+'</b> · '+escape(diagnosis.primary_blocker_code||'NO_DATA')+'</p>'
    +'<div class="scroll"><table><thead><tr><th>검사 단계</th><th>발견 이벤트 수</th></tr></thead><tbody>'
    +stageCols.map(([label,num])=>'<tr><td>'+escape(label)+'</td><td>'+(num??'—')+'</td></tr>').join('')+'</tbody></table></div>'
-   +'<p>1분봉 관측 '+(quality.minutes_observed??'—')+'/'+(quality.minutes_requested??'—')+' · 15분봉 '+(quality.m15_bars??'—')+' · 4시간봉 '+(quality.h4_bars??'—')+' · 캔들 공백은 0거래로 처리하지 않아.</p>'
+   +'<p>검사 종료 시점 4H 참고 상태: '+escape(diagnosis.h4_snapshot_code||'확인 불가')+' (사후 진단 전용) · 1분봉 관측 '+(quality.minutes_observed??'—')+'/'+(quality.minutes_requested??'—')+' · 15분봉 '+(quality.m15_bars??'—')+' · 4시간봉 '+(quality.h4_bars??'—')+' · 캔들 공백은 0거래로 처리하지 않아.</p>'
    +(detail.error?'<p>API 오류: '+escape(detail.error)+'</p>':'')
    +'<details><summary>15분 CHoCH 발생별 탈락 사유 자세히 보기</summary><div class="scroll"><table><tr><th>CHoCH 마감</th><th>4H LH</th><th>4H LL</th><th>눌림</th><th>1M 돌파</th><th>결과</th></tr>'
    +(diagnosis.event_details||[]).map(x=>'<tr><td>'+escape(x.choch_kst)+'</td><td>'+(x.h4_lower_high?'✓':'—')+'</td><td>'+(x.h4_lower_low?'✓':'—')+'</td><td>'+(x.pullback?'✓':'—')+'</td><td>'+(x.m1_breakout?'✓':'—')+'</td><td>'+escape(x.reason_text)+'</td></tr>').join('')
@@ -448,17 +464,18 @@ finally{b.disabled=false;}
 };
 function downloadCsv(headers,rows,kind){
  const q=s=>'"'+String(s??'').replace(/"/g,'""')+'"';
- const csv='\\ufeff'+[headers,...rows].map(row=>row.map(q).join(',')).join('\\n');
+ const csv=String.fromCharCode(0xFEFF)+[headers,...rows].map(row=>row.map(q).join(',')).join(String.fromCharCode(10));
  const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
  const a=document.createElement('a');a.href=url;a.download='CHART360_MINI_V0_2_'+kind+'_'+last.asof_kst.replace(/[^0-9]/g,'')+'.csv';
  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 }
 $('diagnostic-csv').onclick=()=>{
  if(!last)return;
- const headers=['version','market','scan_begin_kst','asof_kst','lookback_hours','fee_each_pct','minute_bars_observed','minute_bars_requested','m15_bars','h4_bars','m15_events_all_history','m15_events_in_test','m15_events_overlapping_test','h4_event_pass','h4_missing_event','h4_failed_event','pullback_event','m1_breakout_event','entry_event','gap_event','risk_reject_event','primary_blocker_code','primary_blocker_text','reason_counts_json','event_details_json','total_trades','resolved','unknown','error'];
+ const headers=['version','market','scan_begin_kst','asof_kst','lookback_hours','fee_each_pct','minute_bars_observed','minute_bars_requested','m15_bars','h4_bars','h4_snapshot_code','h4_snapshot_lower_high','h4_snapshot_lower_low','m15_events_all_history','m15_events_in_test','m15_events_overlapping_test','h4_event_pass','h4_missing_event','h4_failed_event','pullback_event','m1_breakout_event','entry_event','gap_event','risk_reject_event','primary_blocker_code','primary_blocker_text','reason_counts_json','event_details_json','total_trades','resolved','unknown','error'];
  const rows=last.markets.map(x=>{const d=x.diagnostic||{},a=x.data_audit||{},sm=x.summary||{};return [
  last.version,x.market,d.scan_begin_kst||last.scan_begin_kst,last.asof_kst,last.lookback_hours,last.fee_each_pct,
  a.minutes_observed??'',a.minutes_requested??'',a.m15_bars??'',a.h4_bars??'',
+ d.h4_snapshot_code||'',d.h4_snapshot_lower_high??'',d.h4_snapshot_lower_low??'',
  d.m15_events_all_history??'',d.m15_events_in_test??'',d.m15_events_overlapping_test??'',
  d.h4_event_pass??'',d.h4_missing_event??'',d.h4_failed_event??'',d.pullback_event??'',
  d.m1_breakout_event??'',d.entry_event??'',d.gap_event??'',d.risk_reject_event??'',
