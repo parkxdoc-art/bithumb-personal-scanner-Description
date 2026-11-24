@@ -323,7 +323,13 @@ def replay(market, minute, m15, h4, fee_each=.04, max_trades=8, scan_begin=None)
         h4_at_end_code = "H4_NO_LOWER_HIGH"
     else:
         h4_at_end_code = "H4_NO_LOWER_LOW"
-    blocker = (max(reason_counts, key=lambda x:reason_counts[x])
+    missing_test_minutes = (
+        not minute or
+        (diagnostic_begin is not None and diagnostic_end is not None
+         and diagnostic_end <= diagnostic_begin)
+    )
+    blocker = ("M1_NO_CANDLES" if missing_test_minutes else
+               max(reason_counts, key=lambda x:reason_counts[x])
                if reason_counts else "NO_CHoCH")
     diagnostic = {
         "version": VERSION, "market": market,
@@ -446,7 +452,7 @@ try{const res=await fetch('/api/chart360',{method:'POST',headers:{'Content-Type'
  $('diagnostic').innerHTML='<p><b>우선 확인: '+escape(diagnosis.primary_blocker_text||'진단 불가')+'</b> · '+escape(diagnosis.primary_blocker_code||'NO_DATA')+'</p>'
    +'<div class="scroll"><table><thead><tr><th>검사 단계</th><th>발견 이벤트 수</th></tr></thead><tbody>'
    +stageCols.map(([label,num])=>'<tr><td>'+escape(label)+'</td><td>'+(num??'—')+'</td></tr>').join('')+'</tbody></table></div>'
-   +'<p>검사 종료 시점 4H 참고 상태: '+escape(diagnosis.h4_snapshot_code||'확인 불가')+' (사후 진단 전용) · 1분봉 관측 '+(quality.minutes_observed??'—')+'/'+(quality.minutes_requested??'—')+' · 15분봉 '+(quality.m15_bars??'—')+' · 4시간봉 '+(quality.h4_bars??'—')+' · 캔들 공백은 0거래로 처리하지 않아.</p>'
+   +'<p>마지막 실측 1분봉 기준 4H 상태: '+escape(diagnosis.h4_snapshot_code||'확인 불가')+' (사후 진단 전용) · 1분봉 관측 '+(quality.minutes_observed??'—')+'/'+(quality.minutes_requested??'—')+' · 15분봉 '+(quality.m15_bars??'—')+' · 4시간봉 '+(quality.h4_bars??'—')+' · 캔들 공백은 0거래로 처리하지 않아.</p>'
    +(detail.error?'<p>API 오류: '+escape(detail.error)+'</p>':'')
    +'<details><summary>15분 CHoCH 발생별 탈락 사유 자세히 보기</summary><div class="scroll"><table><tr><th>CHoCH 마감</th><th>4H LH</th><th>4H LL</th><th>눌림</th><th>1M 돌파</th><th>결과</th></tr>'
    +(diagnosis.event_details||[]).map(x=>'<tr><td>'+escape(x.choch_kst)+'</td><td>'+(x.h4_lower_high?'✓':'—')+'</td><td>'+(x.h4_lower_low?'✓':'—')+'</td><td>'+(x.pullback?'✓':'—')+'</td><td>'+(x.m1_breakout?'✓':'—')+'</td><td>'+escape(x.reason_text)+'</td></tr>').join('')
