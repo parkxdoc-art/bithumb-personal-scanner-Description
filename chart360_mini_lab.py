@@ -713,12 +713,93 @@ HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 const $=id=>document.getElementById(id),escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let last=null;
 const marketChoice=()=>$('market').value==='ALL'?['KRW-XRP','KRW-ETH','KRW-NEAR','KRW-SOL','KRW-DOGE']:[$('market').value];
-$('run').onclick=async()=>{const b=$('run');b.disabled=true;last=null;$('csv').disabled=true;$('diagnostic-csv').disabled=true;$('status').textContent='동일 빗썸 4H·15M·1M 캔들로 A/B/C 병렬 재생 중…';
-try{const res=await fetch('/api/chart360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({markets:marketChoice(),hours:Number($('hours').value),fee_each:Number($('fee').value)})});
- const d=await res.json();if(!res.ok||!d.ok)throw Error(d.error||'API 오류');last=d.result;
+
+function combineRuns(parts){
+ const root={...parts[0],markets:parts.flatMap(p=>p.markets),
+   daily_by_market:parts.flatMap(p=>p.daily_by_market||[]),
+   pair_rows:parts.flatMap(p=>p.pair_rows||[])};
+ const totalFor=k=>{
+   const trades=root.markets.flatMap(m=>m.variants?.[k]?.trades||[]);
+   const resolved=trades.filter(t=>t.status==='RESOLVED').map(t=>t.net_pct);
+   return {signals:trades.length,resolved:resolved.length,
+      unknown:trades.length-resolved.length,
+      positive:resolved.filter(x=>x>0).length,
+      nonpositive:resolved.filter(x=>x<=0).length,
+      mean_net_pct:resolved.length?+(resolved.reduce((a,b)=>a+b,0)/resolved.length).toFixed(3):null};
+ };
+ root.comparison={A:totalFor('A'),B:totalFor('B'),C:totalFor('C'),
+   difference_B_minus_A:0,difference_C_minus_B:0};
+ root.comparison.difference_B_minus_A=root.comparison.B.signals-root.comparison.A.signals;
+ root.comparison.difference_C_minus_B=root.comparison.C.signals-root.comparison.B.signals;
+ root.total={...root.comparison.A,negative_or_zero:root.comparison.A.nonpositive};
+ root.failed_markets=root.markets.filter(m=>m.error).map(m=>m.market);
+ const map=new Map();
+ for(const r of root.daily_by_market){
+   const key=r.date_kst+'|'+r.variant;
+   let g=map.get(key);
+   if(!g){g={date_kst:r.date_kst,variant:r.variant,markets:0,error_markets:0,
+       partial_day:false,minutes_expected:0,minutes_observed:0,
+       signals:0,resolved:0,positive:0,nonpositive:0,unknown:0,
+       tp:0,stop:0,time_exit:0,net_sum_pct:0};map.set(key,g)}
+   g.markets++;g.error_markets+=r.data_status==='API_ERROR'?1:0;
+   g.partial_day ||= !!r.partial_day;
+   for(const n of ['minutes_expected','minutes_observed','signals','resolved',
+       'positive','nonpositive','unknown','tp','stop','time_exit'])g[n]+=Number(r[n]||0);
+   g.net_sum_pct+=Number(r.net_sum_pct||0);
+ }
+ root.daily_overall=Array.from(map.values()).sort((a,b)=>
+   a.date_kst.localeCompare(b.date_kst)||a.variant.localeCompare(b.variant)).map(g=>{
+   g.minutes_missing=g.minutes_expected-g.minutes_observed;
+   g.coverage_pct=g.minutes_expected?+(100*g.minutes_observed/g.minutes_expected).toFixed(2):null;
+   g.mean_net_pct=g.resolved?+(g.net_sum_pct/g.resolved).toFixed(4):null;
+   g.net_sum_pct=g.resolved?+g.net_sum_pct.toFixed(4):null;
+   return g;
+ });
+ const paired=root.pair_rows.filter(p=>p.match_status==='PAIRED');
+ const known=paired.filter(p=>p.C_minus_B_pctpoints!=null);
+ root.pair_summary={paired:paired.length,resolved_pairs:known.length,
+    unresolved_pairs:paired.length-known.length,
+    B_only:root.pair_rows.filter(p=>p.match_status==='B_ONLY').length,
+    C_only:root.pair_rows.filter(p=>p.match_status==='C_ONLY').length,
+    C_better:known.filter(p=>p.C_minus_B_pctpoints>0).length,
+    C_worse:known.filter(p=>p.C_minus_B_pctpoints<0).length,
+    same:known.filter(p=>p.C_minus_B_pctpoints===0).length,
+    mean_C_minus_B_pctpoints:known.length?
+       +(known.reduce((a,p)=>a+p.C_minus_B_pctpoints,0)/known.length).toFixed(4):null};
+ return root;
+}
+async function fetchStudy(markets,hours,fee,asof){
+ const res=await fetch('/api/chart360',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({markets,hours,fee_each:fee,asof_kst:asof||null})});
+ const data=await res.json();
+ if(!res.ok||!data.ok)throw Error(data.error||'API 오류');
+ return data.result;
+}
+async function loadStudy(){
+ const markets=marketChoice(),hours=Number($('hours').value),fee=Number($('fee').value);
+ // Single-market requests keep long 7day API queries below Render's 120s
+ // timeout. The FIRST server-provided KST cutoff is reused unchanged.
+ if(markets.length===1||hours<=24)return await fetchStudy(markets,hours,fee,null);
+ const parts=[];
+ let cutoff=null;
+ for(let i=0;i<markets.length;i++){
+   $('status').textContent='3·7일 분봉 조회 중: '+(i+1)+'/'+markets.length+' · '+markets[i];
+   const part=await fetchStudy([markets[i]],hours,fee,cutoff);
+   if(!cutoff)cutoff=part.asof_kst;
+   parts.push(part);
+ }
+ return combineRuns(parts);
+}
+
+$('run').onclick=async()=>{const b=$('run');b.disabled=true;last=null;
+ for(const id of ['csv','diagnostic-csv','daily-csv','pairs-csv'])$(id).disabled=true;
+ $('status').textContent='동일 빗썸 완료봉으로 3·7일 백테스트 분석 중…';
+try{last=await loadStudy();
  const compare=last.comparison||{},markets=last.markets||[];
  const rows=['A','B','C'].map(k=>({key:k,x:compare[k]||{}}));
- $('status').textContent='완료 · '+last.asof_kst+' KST · '+last.lookback_hours+'시간 · '+markets.length+'종목 · A/B/C 동일 캔들 비교';
+ $('status').textContent='완료 · '+last.scan_begin_kst+' ~ '+last.scan_end_kst+' KST · '+markets.length+'종목 · 누락/실패 '+(last.failed_markets||[]).length+'종목';
+ if((last.failed_markets||[]).length)$('status').textContent+=' · 데이터 조회 실패: '+last.failed_markets.join(', ');
  $('ab-summary').innerHTML='<p><b>A: 4시간 필수 / B: 1분 돌파 직후 / C: 1분 추가 양봉 종가 확인 후</b> · 셋 모두 연구용 가상값이고 거래를 합산하면 안 돼. <b>B와 C의 진입시각·체결가가 다르다</b>는 점도 주의해 줘.</p>'
   +'<table><thead><tr><th>방식</th><th>진입</th><th>확정</th><th>UNKNOWN</th><th>양수</th><th>비양수</th><th>확정분 평균 순손익</th></tr></thead><tbody>'
   +rows.map(v=>'<tr><td>'+v.key+(v.key==='A'?' · 4H 필수':v.key==='C'?' · 추가 확인':' · 즉시')+'</td><td>'+(v.x.signals??0)+'</td><td>'+(v.x.resolved??0)+'</td><td>'+(v.x.unknown??0)+'</td><td>'+(v.x.positive??0)+'</td><td>'+(v.x.nonpositive??0)+'</td><td>'+escape(v.x.mean_net_pct??'미산정')+(v.x.mean_net_pct==null?'':'%')+'</td></tr>').join('')+'</tbody></table>';
@@ -737,6 +818,19 @@ try{const res=await fetch('/api/chart360',{method:'POST',headers:{'Content-Type'
  '<div class="scroll"><table><tr><th>코인</th><th>방식</th><th>시간</th><th>점수</th><th>진입</th><th>손절</th><th>결과</th><th>순손익%</th></tr>'
  +trades.map(t=>'<tr><td>'+escape(t.market)+'</td><td>'+escape(t.variant)+'</td><td>'+escape(t.entry_kst)+'</td><td>'+escape(t.score)+'/7</td><td>'+escape(t.entry)+'</td><td>'+escape(t.stop)+'</td><td>'+escape(t.exit_reason)+'</td><td>'+escape(t.net_pct??'UNKNOWN')+'</td></tr>').join('')+'</table></div>':
  '<p>이번 검사에서는 A/B/C 모두 가상 진입 0건. 위 비교 표와 진단 CSV에서 단계별 사유를 확인해 줘.</p>';
+
+ const daily=last.daily_overall||[];
+ $('daily-view').innerHTML='<p>일별 A/B/C 진입 시각을 KST 날짜로 분류해. 날짜 경계는 부분일일 수 있고, UNKNOWN은 손실에 포함하지 않아.</p>'
+   +'<div class="scroll"><table><tr><th>날짜</th><th>방식</th><th>구간</th><th>진입</th><th>수익</th><th>비양수</th><th>UNKNOWN</th><th>평균 순손익</th><th>1m 확보율</th><th>오류시장</th></tr>'
+   +daily.map(x=>'<tr><td>'+escape(x.date_kst)+'</td><td>'+escape(x.variant)+'</td><td>'+(x.partial_day?'부분':'전체')+'</td><td>'+x.signals+'</td><td>'+x.positive+'</td><td>'+x.nonpositive+'</td><td>'+x.unknown+'</td><td>'+escape(x.mean_net_pct??'미산정')+(x.mean_net_pct==null?'':'%')+'</td><td>'+escape(x.coverage_pct??'—')+'%</td><td>'+x.error_markets+'</td></tr>').join('')+'</table></div>';
+ const pairs=last.pair_rows||[],summary=last.pair_summary||{};
+ $('pair-view').innerHTML='<p>같은 1분봉 돌파 시각을 기준으로 B/C를 매칭했어. C는 한 봉 늦게 진입하므로 가상 체결가·손익이 달라. 일치하지 않는 돌파는 억지로 짝짓지 않아.</p>'
+  +'<p>같은 돌파 '+(summary.paired??0)+' · 양쪽 확정 '+(summary.resolved_pairs??0)+' · C 개선 '+(summary.C_better??0)+' · C 악화 '+(summary.C_worse??0)+' · 동일 '+(summary.same??0)+' · 한쪽만 진입 B '+(summary.B_only??0)+' / C '+(summary.C_only??0)+' · 확정분 평균 차이 '+escape(summary.mean_C_minus_B_pctpoints??'미산정')+'%p</p>'
+  +'<div class="scroll"><table><tr><th>종목</th><th>돌파 KST</th><th>짝 유형</th><th>B 순손익</th><th>C 순손익</th><th>C-B (%p)</th></tr>'
+  +pairs.slice(0,100).map(p=>'<tr><td>'+escape(p.market)+'</td><td>'+escape(p.breakout_kst)+'</td><td>'+escape(p.match_status)+'</td><td>'+escape(p.B_net_pct??'UNKNOWN')+'</td><td>'+escape(p.C_net_pct??'UNKNOWN')+'</td><td>'+escape(p.C_minus_B_pctpoints??'비교불가')+'</td></tr>').join('')+'</table></div>'
+  +(pairs.length>100?'<p>화면에는 상위 100건만 보여줘. 전체 결과는 CSV로 저장할 수 있어.</p>':'');
+ $('daily-csv').disabled=false;
+ $('pairs-csv').disabled=false;
  $('diagnostic-csv').disabled=false;
  $('csv').disabled=trades.length===0;
 }catch(e){$('status').textContent='오류: '+String(e.message||e);}
