@@ -1419,35 +1419,29 @@ class Chart360MiniV05MultiDayRegressionTest(unittest.TestCase):
 
 
 
-class Chart360MiniV05TemporaryLiveProbe(unittest.TestCase):
-    def test_real_public_bithumb_3day_five_markets_and_7day_one_market(self):
-        """One-time read-only research probe, removed after verification."""
-        import json
-        from chart360_mini_lab import run_backtest, MARKETS
-        for hours,markets in ((168,list(MARKETS)),):
-            try:
-                result=run_backtest(markets=markets,hours=hours,fee_each=.04)
-                print("CHART360_V05_REAL_SUMMARY "+json.dumps({
-                  "hours":hours,"asof":result["asof_kst"],
-                  "scan_begin":result["scan_begin_kst"],
-                  "scan_end":result["scan_end_kst"],
-                  "failed_markets":result["failed_markets"],
-                  "comparison":result["comparison"],
-                  "pair_summary":result["pair_summary"],
-                  "daily_count":len(result["daily_overall"]),
-                },ensure_ascii=False,default=str),flush=True)
-                for item in result["markets"]:
-                    print("CHART360_V05_REAL_MARKET "+json.dumps({
-                      "hours":hours,"market":item["market"],"error":item.get("error"),
-                      "audit":item.get("data_audit"),
-                      "B":item["variants"]["B"]["summary"],
-                      "C":item["variants"]["C"]["summary"],
-                      "paired_count":len(item["pairs"]),
-                      "days":len(item["daily"]),
-                    },ensure_ascii=False,default=str),flush=True)
-            except Exception as exc:
-                print("CHART360_V05_REAL_UNAVAILABLE "+json.dumps({
-                    "hours":hours,"error":str(exc)[:240]},ensure_ascii=False),flush=True)
+class Chart360MiniV05SignalWindowSafetyTest(unittest.TestCase):
+    def test_C_requires_confirmation_close_inside_requested_signal_window(self):
+        from chart360_mini_lab import replay
+        example=Chart360MiniV04ClosedConfirmationTest()
+        example.setUp()
+        minute,m15,h4=example.scenario(True)
+        t=example.parent.at
+        a=replay("KRW-XRP",minute,m15,h4,scan_begin=t,
+                 scan_end=t+timedelta(minutes=4),require_h4=False)
+        c=replay("KRW-XRP",minute,m15,h4,scan_begin=t,
+                 scan_end=t+timedelta(minutes=4),
+                 require_h4=False,confirmation_bars=1)
+        self.assertEqual(a["summary"]["signals"],1)
+        self.assertEqual(c["summary"]["signals"],0)
+
+    def test_two_different_cutoffs_not_accepted_in_one_replay(self):
+        from chart360_mini_lab import run_backtest
+        from datetime import datetime
+        from chart360_mini_lab import KST
+        now=datetime(2026,11,24,20,0,tzinfo=KST)
+        with self.assertRaises(ValueError):
+            run_backtest(markets=["KRW-XRP"],hours=168,now=now,
+                         asof_kst="2026-11-24 19:58")
 
 
 if __name__=="__main__":
