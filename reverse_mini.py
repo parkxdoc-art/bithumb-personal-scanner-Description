@@ -5,7 +5,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "REVERSE SWING V1.4 LIVE + PAPER"
+VERSION = "REVERSE SWING V1.4.1 LIVE + PAPER"
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9))
 DAY = 86400
@@ -1114,6 +1114,22 @@ def preset14_ok(s,preset):
     if not s:return False
     depth,days=LIVE14_PRESETS[preset]
     return s["peak_to_last_pct"]<=-depth and s["down_days"]>=days
+def spike141(rows,cut,price=None,lookback=20):
+    # Inspect the 20 completed daily changes plus today's observed high.
+    # Prior close is included as another base to catch opening gaps.
+    by={r[0]:r for r in rows}
+    best=None;hits=0
+    for t in range(cut-lookback*DAY,cut+DAY,DAY):
+        prev=by.get(t-DAY);r=by.get(t)
+        if not prev or not r or not all(math.isfinite(v) and v>0 for v in (prev[4],r[1],r[2],r[4])):return None
+        high=max(r[2],r[4],price if t==cut and price is not None else 0)
+        base=min(r[1],prev[4])
+        value=pct(high,base)
+        hit=spike121(base,high)
+        hits+=int(hit)
+        if best is None or value>best["lookback_max_spike_pct"]:
+            best=dict(lookback_max_spike_pct=value,lookback_max_spike_date=iso(t)[:10],lookback_spike_basis="day_open" if r[1]<=prev[4] else "previous_close")
+    return dict(best,lookback_spike_days=hits,lookback_spike_excluded=hits>0,spike_lookback_days=lookback)
 def run12(preset=None):
     begin=time.monotonic()
     try:
@@ -1135,16 +1151,20 @@ def run12(preset=None):
                 coverage.append(dict(market=m,status="preset_fail",down_days=s["down_days"],peak_to_last_pct=s["peak_to_last_pct"]));continue
             if x and s:
                 ds=daily_spike121(rows,cut)
+                audit=spike141(rows,cut) if preset else {}
                 if ds is None:coverage.append(dict(market=m,status="no_quote"))
-                elif ds["spike"]:coverage.append(dict(market=m,status="spike_excluded",day_high_pct=ds["day_high_pct"]))
-                else:out.append(dict(market=m,**dict(x,**ds)));coverage.append(dict(market=m,status="daily_match",day_high_pct=ds["day_high_pct"]))
+                elif audit is None:coverage.append(dict(market=m,status="spike_history_missing",day_high_pct=ds["day_high_pct"]))
+                elif ds["spike"] or audit.get("lookback_spike_excluded"):coverage.append(dict(market=m,status="spike_excluded",day_high_pct=ds["day_high_pct"],**audit))
+                else:
+                    out.append(dict(market=m,**dict(x,**ds,**audit)))
+                    coverage.append(dict(market=m,status="daily_match",day_high_pct=ds["day_high_pct"],**audit))
             else:coverage.append(dict(market=m,status=why if not x else "strength_fail"))
         if not valid:raise RuntimeError("유효 일봉 없음")
         # One fixed hour boundary for the entire second phase.
         hcut=(int(now().timestamp())//HOUR)*HOUR
         patch(phase="1시간봉 반등 확인",done=0,total=len(out),market_success=success)
         def hourfetch(x):
-            return candles(x,60,int(now().timestamp()),12,latest=True),candles(x,1440,int(now().timestamp()),2,latest=True)
+            return candles(x,60,int(now().timestamp()),12,latest=True),candles(x,1440,int(now().timestamp()),22 if preset else 2,latest=True)
         bymarket={x["market"]:x for x in out}
         covmap={x["market"]:x for x in coverage};kept=[]
         for m,pack in parallel(list(bymarket),hourfetch):
@@ -1152,11 +1172,14 @@ def run12(preset=None):
             ds=daily_spike121(dr,cut)
             if ds is None:
                 covmap[m].update(status="no_quote");continue
-            if ds["spike"]:
-                covmap[m].update(status="spike_excluded",day_high_pct=ds["day_high_pct"]);continue
+            audit=spike141(dr,cut) if preset else {}
+            if audit is None:
+                covmap[m].update(status="spike_history_missing");continue
+            if ds["spike"] or audit.get("lookback_spike_excluded"):
+                covmap[m].update(status="spike_excluded",day_high_pct=ds["day_high_pct"],**audit);continue
             h=cross12({r[0]:r for r in hr},hcut)
-            x.update(ds,observed_at=iso(int(now().timestamp())),status="BUY" if h and h["cross"] else "WATCH",hour_signal_time=iso(hcut),hour_ma5=h["ma5"] if h else None,hour_close=h["close"] if h else None,hour_valid=h is not None)
-            covmap[m].update(status=x["status"],day_high_pct=ds["day_high_pct"]);kept.append(x)
+            x.update(ds,**audit,observed_at=iso(int(now().timestamp())),status="BUY" if h and h["cross"] else "WATCH",hour_signal_time=iso(hcut),hour_ma5=h["ma5"] if h else None,hour_close=h["close"] if h else None,hour_valid=h is not None)
+            covmap[m].update(status=x["status"],day_high_pct=ds["day_high_pct"],**audit);kept.append(x)
         out=kept
         nowts=int(now().timestamp())
         if day_start(nowts,anchor)!=cut or nowts//HOUR*HOUR!=hcut:raise RuntimeError("일봉/시간봉 경계 변경: 다시 검색")
@@ -1164,6 +1187,8 @@ def run12(preset=None):
         summary=[dict(signal_day=iso(cut)[:10],signal_time=iso(cut),finished_at=iso(nowts),universe=len(universe),market_success=success,valid=valid,matches=len(out),spike_excluded=sum(x["status"]=="spike_excluded" for x in coverage),buys=sum(x["status"]=="BUY" for x in out),watches=sum(x["status"]=="WATCH" for x in out),hour_missing=sum(not x["hour_valid"] for x in out),history_missing=sum(x["status"]=="history" for x in coverage),no_quote=sum(x["status"]=="no_quote" for x in coverage),fee_oneway_pct=.04)]
         if preset:
             depth,days=LIVE14_PRESETS[preset]
+            summary[0].update(spike_lookback_days=20,spike_history_missing=sum(x["status"]=="spike_history_missing" for x in coverage))
+            summary[0]["past_spike_excluded"]=sum(x["status"]=="spike_excluded" and x.get("lookback_max_spike_date","")<iso(cut)[:10] for x in coverage)
             with state_lock:scan_id=state["scan_id"]
             for row in out+coverage+summary:
                 row.update(preset=preset,min_drawdown_pct=depth,min_down_days=days,scan_id=scan_id)
@@ -1305,14 +1330,14 @@ renderPaper();
 
 poll();setInterval(poll,2000);
 </script></html>"""
-HTML14=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V1.4 LIVE + PAPER</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1000px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}button,a,select,input{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:10px;margin:4px;border-radius:7px;text-decoration:none}input{background:#10151d}button:disabled{opacity:.5}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px}.coin{background:#111923;border:1px solid #3b4d60;border-radius:12px;padding:12px}.coin h3{margin:0 0 8px}.line{display:flex;justify-content:space-between;gap:10px;margin:6px 0}.green{color:#72ddb0}.red{color:#ff9b9b}.muted{color:#a9bac9}h1{font-size:23px;margin-bottom:4px}</style><h1>REVERSE SWING V1.4 LIVE + PAPER</h1><a href="/live12">기존 V1.2.1</a><a href="/research131">V1.3.1 비교 연구</a><section><h2>실전 매수 후보 검색</h2><p>20일 하락 추세 + 선택한 하락폭·하락일 수 + 전일 거래량 2배 이상 + D-3 대비 2배 이상 · RSI 제외</p><small>당일 시가 대비 고가 30% 이상 급등 시 제외. 강화 일봉 조건 충족 WATCH. 가장 최근 완료 1시간봉의 SMA5 상향 돌파만 BUY 후보. 미완료 봉 제외. BUY 신호는 해당 1시간 동안 유효. 검증 전 실전 매수 권장 아님. 검색 시점의 가격은 실제 체결가가 아니며 당일 시가 진입 백테스트와 다를 수 있음. 최고가 매도 가정 결과는 실제 승률이 아님. 자동 주문 없음. 별도 매도·손절 신호 미검증. 기존 보유 종목은 직접 제외.</small><p><label for="preset">검색 조건</label><select id="preset"><option value="A">A · 30% / 15일</option><option value="B" selected>B · 35% / 14일</option><option value="C">C · 40% / 15일</option></select><button id="go">전체 코인 검색 시작</button></p><p id="applied" class="muted">조건을 선택하고 검색해 주세요.</p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section><h2>모의매매 계좌</h2><small>가상 원금 100만원, 1회 투자금 변경 가능. 현재가 조회 후 전량 가상 체결(편도 0.04%). 직접 매수/매도, 7일 경과 표시만 제공. 실제 주문 없음. 기록은 이 브라우저에만 저장, 기기·브라우저 변경/데이터 삭제 시 유실될 수 있음. CSV 백업 권장.</small><p>1회 투자금(원) <input id="paperAmount" type="number" min="5000" step="1000" value="100000" style="width:105px"><button id="refreshPaper">보유 가격 갱신</button><button id="paperCSV">모의매매 CSV</button></p><p id="paperSummary"></p><p id="paperWin"></p><p id="paperMsg" class="muted"></p><h3>보유 종목</h3><div class="cards" id="paperOpen"></div><details><summary>청산 기록 (최근 100건)</summary><div class="cards" id="paperClosed"></div></details></section><section id="out" hidden><h2 id="headline"></h2><p id="audit" class="muted"></p><p id="notice" class="muted"></p><a href="/csv/features?mode=live14">매수 후보 CSV</a><a href="/csv/summary?mode=live14">검색 요약 CSV</a><a href="/csv/coverage?mode=live14">수집 상태 CSV</a><a href="/csv/errors?mode=live14">오류 CSV</a><p><input id="query" placeholder="코인 검색" style="width:105px"><select id="sort"><option value="market">종목명 순</option><option value="volume">거래량 증가율 순</option><option value="depth">고점 대비 하락폭 순</option><option value="gap">당일 시가 대비 변동률 순</option></select></p><p id="count"></p><div class="cards" id="cards"></div><button id="more">더 보기</button></section><script>
+HTML14=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V1.4.1 LIVE + PAPER</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1000px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}button,a,select,input{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:10px;margin:4px;border-radius:7px;text-decoration:none}input{background:#10151d}button:disabled{opacity:.5}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px}.coin{background:#111923;border:1px solid #3b4d60;border-radius:12px;padding:12px}.coin h3{margin:0 0 8px}.line{display:flex;justify-content:space-between;gap:10px;margin:6px 0}.green{color:#72ddb0}.red{color:#ff9b9b}.muted{color:#a9bac9}h1{font-size:23px;margin-bottom:4px}</style><h1>REVERSE SWING V1.4.1 LIVE + PAPER</h1><a href="/live12">기존 V1.2.1</a><a href="/research131">V1.3.1 비교 연구</a><section><h2>실전 매수 후보 검색</h2><p>20일 하락 추세 + 선택한 하락폭·하락일 수 + 전일 거래량 2배 이상 + D-3 대비 2배 이상 · RSI 제외</p><small>최근 20일과 오늘의 일별 고가가 시가 또는 전일 종가 대비 한 번이라도 30% 이상 상승하면 제외. 과거 급등 이력 부족 시 제외. 강화 일봉 조건 충족 WATCH. 가장 최근 완료 1시간봉의 SMA5 상향 돌파만 BUY 후보. 미완료 봉 제외. BUY 신호는 해당 1시간 동안 유효. 검증 전 실전 매수 권장 아님. 검색 시점의 가격은 실제 체결가가 아니며 당일 시가 진입 백테스트와 다를 수 있음. 최고가 매도 가정 결과는 실제 승률이 아님. 자동 주문 없음. 별도 매도·손절 신호 미검증. 기존 보유 종목은 직접 제외.</small><p><label for="preset">검색 조건</label><select id="preset"><option value="A">A · 30% / 15일</option><option value="B" selected>B · 35% / 14일</option><option value="C">C · 40% / 15일</option></select><button id="go">전체 코인 검색 시작</button></p><p id="applied" class="muted">조건을 선택하고 검색해 주세요.</p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section><h2>모의매매 계좌</h2><small>가상 원금 100만원, 1회 투자금 변경 가능. 현재가 조회 후 전량 가상 체결(편도 0.04%). 직접 매수/매도, 7일 경과 표시만 제공. 실제 주문 없음. 기록은 이 브라우저에만 저장, 기기·브라우저 변경/데이터 삭제 시 유실될 수 있음. CSV 백업 권장.</small><p>1회 투자금(원) <input id="paperAmount" type="number" min="5000" step="1000" value="100000" style="width:105px"><button id="refreshPaper">보유 가격 갱신</button><button id="paperCSV">모의매매 CSV</button></p><p id="paperSummary"></p><p id="paperWin"></p><p id="paperMsg" class="muted"></p><h3>보유 종목</h3><div class="cards" id="paperOpen"></div><details><summary>청산 기록 (최근 100건)</summary><div class="cards" id="paperClosed"></div></details></section><section id="out" hidden><h2 id="headline"></h2><p id="audit" class="muted"></p><p id="notice" class="muted"></p><a href="/csv/features?mode=live14">매수 후보 CSV</a><a href="/csv/summary?mode=live14">검색 요약 CSV</a><a href="/csv/coverage?mode=live14">수집 상태 CSV</a><a href="/csv/errors?mode=live14">오류 CSV</a><p><input id="query" placeholder="코인 검색" style="width:105px"><select id="sort"><option value="market">종목명 순</option><option value="volume">거래량 증가율 순</option><option value="depth">고점 대비 하락폭 순</option><option value="gap">당일 시가 대비 변동률 순</option></select></p><p id="count"></p><div class="cards" id="cards"></div><button id="more">더 보기</button></section><script>
 const $=id=>document.getElementById(id);let result=null,loading=false,limit=5,loadedScan=null;const names={A:"A · 30% / 15일",B:"B · 35% / 14일",C:"C · 40% / 15일"};
 function num(x){return typeof x==='number'?x.toLocaleString('ko-KR',{maximumSignificantDigits:8}):'—'}
 function pct(x){return typeof x==='number'?(x>0?'+':'')+x.toFixed(2)+'%':'—'}
 function node(tag,txt,cls){let e=document.createElement(tag);if(txt!=null)e.textContent=txt;if(cls)e.className=cls;return e}
 function line(card,k,v,cls){let r=node('div',null,'line');r.append(node('span',k,'muted'),node('strong',v,cls));card.append(r)}
-function render(){if(!result)return;let q=$('query').value.trim().toUpperCase(),sort=$('sort').value;let a=result.rank.filter(x=>x.market.includes(q));let key={volume:'volume_increase_pct',depth:'peak_to_last_pct',gap:'change_from_open_pct'}[sort];if(key)a.sort((x,y)=>sort==='depth'?(x[key]??Infinity)-(y[key]??Infinity):(y[key]??-Infinity)-(x[key]??-Infinity));else a.sort((x,y)=>x.market.localeCompare(y.market));$('count').textContent=a.length+'종목 · '+Math.min(limit,a.length)+'개 표시';a.sort((x,y)=>Number(y.status==="BUY")-Number(x.status==="BUY"));let cards=a.slice(0,limit).map(x=>{let c=node('article',null,'coin');c.append(node('h3',x.market.replace('KRW-','')+' · '+(x.status==='BUY'?'BUY 후보':'WATCH'),x.status==='BUY'?'green':'muted'));line(c,'적용 검색식',names[x.preset]||x.preset);line(c,'검색 시 참고가',num(x.reference_price)+'원');line(c,'당일 시가',num(x.day_open)+'원');line(c,'시가 대비',pct(x.change_from_open_pct),x.change_from_open_pct>=0?'green':'red');line(c,'당일 최고 상승률',pct(x.day_high_pct));line(c,'20일 실제 하락일',x.down_days+'/20일');line(c,'20일 종가 변화',pct(x.trend_net_pct),'red');line(c,'고점 대비 전일 종가',pct(x.peak_to_last_pct),'red');line(c,'거래량 배수',num(x.vol_ratio_d3)+' → '+num(x.vol_ratio_d1)+'배','green');line(c,'거래량 배수 증가율',pct(x.volume_increase_pct));line(c,'참고가 기준 본전',num(x.breakeven_price)+'원');line(c,'신호 확정(KST)',x.signal_time);line(c,'가격 조회(KST)',x.observed_at);line(c,'1시간봉 5이평',num(x.hour_ma5));line(c,'1시간봉 확인',x.hour_valid?x.hour_signal_time:'데이터 부족');line(c,'7일째 일봉 날짜',x.planned_last_day);let b=node('button',paperStats().open.some(t=>t.market===x.market)?'모의 보유 중':'모의매수');b.disabled=x.status!=='BUY'||paperBusy||!storageOK||paperStats().open.some(t=>t.market===x.market);b.onclick=()=>paperBuy(x);c.append(b);return c});$('cards').replaceChildren(...cards);$('more').hidden=a.length<=limit}
-function show(){let x=result.summary[0];$('applied').textContent='결과 적용 조건: '+names[x.preset];$('headline').textContent='BUY '+x.buys+'개 · WATCH '+x.watches+'개 · 급등 제외 '+x.spike_excluded+'개';$('audit').textContent='신호 확정 '+x.signal_time+' KST · 검색 완료 '+x.finished_at+' KST · 분석 '+x.valid+'/'+x.universe+' · 이력 부족 '+x.history_missing+' · 현재가 없음 '+x.no_quote;$('notice').textContent='수수료 편도 0.04% 적용. 본전가는 참고가 기준 이론값(호가단위·슬리피지 미반영). 직접 매매 전 현재가와 보유 여부 확인.';limit=5;render()}
+function render(){if(!result)return;let q=$('query').value.trim().toUpperCase(),sort=$('sort').value;let a=result.rank.filter(x=>x.market.includes(q));let key={volume:'volume_increase_pct',depth:'peak_to_last_pct',gap:'change_from_open_pct'}[sort];if(key)a.sort((x,y)=>sort==='depth'?(x[key]??Infinity)-(y[key]??Infinity):(y[key]??-Infinity)-(x[key]??-Infinity));else a.sort((x,y)=>x.market.localeCompare(y.market));$('count').textContent=a.length+'종목 · '+Math.min(limit,a.length)+'개 표시';a.sort((x,y)=>Number(y.status==="BUY")-Number(x.status==="BUY"));let cards=a.slice(0,limit).map(x=>{let c=node('article',null,'coin');c.append(node('h3',x.market.replace('KRW-','')+' · '+(x.status==='BUY'?'BUY 후보':'WATCH'),x.status==='BUY'?'green':'muted'));line(c,'적용 검색식',names[x.preset]||x.preset);line(c,'검색 시 참고가',num(x.reference_price)+'원');line(c,'당일 시가',num(x.day_open)+'원');line(c,'시가 대비',pct(x.change_from_open_pct),x.change_from_open_pct>=0?'green':'red');line(c,'당일 최고 상승률',pct(x.day_high_pct));line(c,'20일+오늘 최대 일중 급등',pct(x.lookback_max_spike_pct));line(c,'최대 급등 날짜',x.lookback_max_spike_date||'—');line(c,'20일 실제 하락일',x.down_days+'/20일');line(c,'20일 종가 변화',pct(x.trend_net_pct),'red');line(c,'고점 대비 전일 종가',pct(x.peak_to_last_pct),'red');line(c,'거래량 배수',num(x.vol_ratio_d3)+' → '+num(x.vol_ratio_d1)+'배','green');line(c,'거래량 배수 증가율',pct(x.volume_increase_pct));line(c,'참고가 기준 본전',num(x.breakeven_price)+'원');line(c,'신호 확정(KST)',x.signal_time);line(c,'가격 조회(KST)',x.observed_at);line(c,'1시간봉 5이평',num(x.hour_ma5));line(c,'1시간봉 확인',x.hour_valid?x.hour_signal_time:'데이터 부족');line(c,'7일째 일봉 날짜',x.planned_last_day);let b=node('button',paperStats().open.some(t=>t.market===x.market)?'모의 보유 중':'모의매수');b.disabled=x.status!=='BUY'||paperBusy||!storageOK||paperStats().open.some(t=>t.market===x.market);b.onclick=()=>paperBuy(x);c.append(b);return c});$('cards').replaceChildren(...cards);$('more').hidden=a.length<=limit}
+function show(){let x=result.summary[0];$('applied').textContent='결과 적용 조건: '+names[x.preset];$('headline').textContent='BUY '+x.buys+'개 · WATCH '+x.watches+'개 · 20일+오늘 급등 제외 '+x.spike_excluded+'개';$('audit').textContent='신호 확정 '+x.signal_time+' KST · 검색 완료 '+x.finished_at+' KST · 분석 '+x.valid+'/'+x.universe+' · 이력 부족 '+x.history_missing+' · 현재가 없음 '+x.no_quote+' · 급등 이력 미확인 '+x.spike_history_missing;$('notice').textContent='수수료 편도 0.04% 적용. 본전가는 참고가 기준 이론값(호가단위·슬리피지 미반영). 직접 매매 전 현재가와 보유 여부 확인.';limit=5;render()}
 $('preset').onchange=()=>{if(result)$('applied').textContent='현재 결과: '+names[result.summary[0].preset]+' · 다음 검색: '+names[$('preset').value]};$('query').oninput=$('sort').onchange=()=>{limit=5;render()};$('more').onclick=()=>{limit+=5;render()};
 $('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/live14/start?preset='+encodeURIComponent($('preset').value),{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 연구 실행 중');result=null;loadedScan=null;$('out').hidden=true;await poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};
 async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';$('preset').disabled=s.status==='running';if(s.mode!=='live14'){$('out').hidden=true;result=null;$('phase').textContent=s.status==='running'?'다른 연구 실행 중':'대기';return}$('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 오류 '+s.error_count+' · 전체 '+(s.elapsed_seconds??'—')+'초';$('errors').textContent=s.errors.join('\n');if(s.status==='running'){$('applied').textContent='검색 중: '+names[s.preset];result=null;loadedScan=null;$('out').hidden=true}if(s.status==='done'&&loadedScan!==s.scan_id&&!loading){loading=true;try{let r=await fetch('/results',{cache:'no-store'});if(!r.ok)throw Error(r.status);let d=await r.json();if(!d.summary[0]||d.summary[0].preset!==s.preset||d.summary[0].scan_id!==s.scan_id)return;result=d;loadedScan=s.scan_id;$('preset').value=s.preset;$('out').hidden=false;show()}finally{loading=false}}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
@@ -1353,7 +1378,7 @@ function renderPaper(){
  let hist=s.closed.slice().reverse().slice(0,100).map(t=>{let c=node('article',null,'coin');c.append(node('h3',t.market+' · 청산 완료'));line(c,'매수 조건',names[t.preset]||'기존 기록');line(c,'매수 / 매도',num(t.buy)+' / '+num(t.sell));line(c,'매수 시각',paperTime(t.boughtAt));line(c,'매도 시각',paperTime(t.closedAt));line(c,'순손익',num(t.pnl)+'원 / '+pct(t.netPct),t.pnl>=0?'green':'red');return c});$('paperClosed').replaceChildren(...hist);if(!hist.length)$('paperClosed').textContent='청산 기록 없음';if(!storageOK)paperMsg('브라우저 저장소 사용 불가 또는 기록 손상. 모의매매를 중단합니다.');
 }
 $('refreshPaper').onclick=refreshPaper;
-$('paperCSV').onclick=()=>{let keys=['market','preset','minDrawdownPct','minDownDays','signalTime','boughtAt','amount','buy','qty','deadline','closedAt','sell','proceeds','pnl','netPct'];let esc=v=>'"'+String(v??'').replaceAll('"','""')+'"';let rows=[keys.join(','),...account.trades.map(x=>keys.map(k=>esc(x[k])).join(','))];let url=URL.createObjectURL(new Blob(['\ufeff'+rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));let a=document.createElement('a');a.href=url;a.download='REVERSE_SWING_V1_4_PAPER_'+new Date().toISOString().slice(0,10)+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+$('paperCSV').onclick=()=>{let keys=['market','preset','minDrawdownPct','minDownDays','signalTime','boughtAt','amount','buy','qty','deadline','closedAt','sell','proceeds','pnl','netPct'];let esc=v=>'"'+String(v??'').replaceAll('"','""')+'"';let rows=[keys.join(','),...account.trades.map(x=>keys.map(k=>esc(x[k])).join(','))];let url=URL.createObjectURL(new Blob(['\ufeff'+rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));let a=document.createElement('a');a.href=url;a.download='REVERSE_SWING_V1_4_1_PAPER_'+new Date().toISOString().slice(0,10)+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
 renderPaper();
 
 poll();setInterval(poll,2000);
@@ -1668,7 +1693,7 @@ class Handler(BaseHTTPRequestHandler):
                 snap=dict(R13)
             if snap["status"]!="done":return self.js({"error":"not complete"},409)
             return self.send(csv13(snap),"text/csv; charset=utf-8",filename="REVERSE_SWING_V1_3_1_RESEARCH_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
-        if p=="/live14":return self.send(HTML14,"text/html; charset=utf-8")
+        if p in ("/live14","/live141"):return self.send(HTML14,"text/html; charset=utf-8")
         if p in ("/live","/live12"):return self.send(HTML12,"text/html; charset=utf-8")
         if p=="/back12":return self.send(HTMLB12,"text/html; charset=utf-8")
         if p in ("/live10","/live11"):return self.send(HTML10,"text/html; charset=utf-8")
@@ -1701,9 +1726,12 @@ class Handler(BaseHTTPRequestHandler):
                 if p=="/paper/entry":
                     if markets[0] not in quotes or at>=(cut+DAY)*1000:return self.js({"error":"expired or quote missing"},409)
                     if match.get("status")=="BUY":
-                        dr=candles(markets[0],1440,int(now().timestamp()),2,latest=True)
+                        dr=candles(markets[0],1440,int(now().timestamp()),22 if match.get("preset") else 2,latest=True)
                         ds=daily_spike121(dr,cut)
                         if not ds or spike121(ds["day_open"],max(ds["day_high"],quotes[markets[0]]["price"])):return self.js({"error":"30% spike or missing data"},409)
+                        if match.get("preset"):
+                            audit=spike141(dr,cut,quotes[markets[0]]["price"])
+                            if audit is None or audit["lookback_spike_excluded"]:return self.js({"error":"historical 30% spike or missing data"},409)
                         if int(now().timestamp())>=min(cut+DAY,hstart+HOUR):return self.js({"error":"expired"},409)
                     return self.js(dict(quotes[markets[0]],signal_deadline_ms=signal_deadline,preset=match.get("preset"),min_drawdown_pct=match.get("min_drawdown_pct"),min_down_days=match.get("min_down_days")))
                 return self.js({"quotes":quotes})
@@ -1821,7 +1849,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V1_4_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V1_4_1_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -1955,7 +1983,16 @@ def selftest():
     assert not preset14_ok(dict(peak_to_last_pct=-34.99,down_days=20),"B")
     assert preset14_ok(dict(peak_to_last_pct=-40,down_days=15),"C")
     assert not preset14_ok(dict(peak_to_last_pct=-40,down_days=14),"C")
-    print("REVERSE SWING V1.4 live presets + legacy live/research self-test PASS",flush=True)
+    cut141=start+21*DAY
+    plain141=[(start+i*DAY,100,129.99,90,100,10,1000) for i in range(22)]
+    assert not spike141(plain141,cut141)["lookback_spike_excluded"]
+    hist141=list(plain141);hist141[3]=(start+3*DAY,100,130,90,100,10,1000)
+    assert spike141(hist141,cut141)["lookback_spike_excluded"] and spike141(hist141,cut141)["lookback_max_spike_date"]==iso(start+3*DAY)[:10]
+    gap141=list(plain141);gap141[3]=(start+3*DAY,125,130,100,110,10,1000)
+    assert spike141(gap141,cut141)["lookback_spike_excluded"]
+    assert spike141(plain141[1:],cut141) is None
+    assert spike141(plain141,cut141,130)["lookback_spike_excluded"]
+    print("REVERSE SWING V1.4.1 historical spike guard self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
