@@ -49,6 +49,8 @@ from orderflow_mini_v03 import register_flow_v03
 register_flow_v03(app)
 from elliott_wave_mini import register_elliott
 register_elliott(app)
+from flow_price_mini import register_flow_price
+register_flow_price(app)
 
 
 def now_kst():
