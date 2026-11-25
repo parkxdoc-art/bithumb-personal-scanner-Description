@@ -1316,6 +1316,151 @@ $('go').onclick=async()=>{try{$('go').disabled=true;const r=await fetch('/start?
 async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if(s.mode==='stage2'||s.mode==='stage3'||s.mode==='reverse4'||s.mode==='reverse5'||s.mode==='reverse6'||s.mode==='reverse7'){$('output').hidden=true;return}if((s.status==='done'||s.status==='error')&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
 poll();setInterval(poll,2000);
 </script></html>"""
+
+# V1.3 research only: separate job state, no changes to live or paper account.
+R13_LOCK=threading.Lock()
+R13={"status":"idle","phase":"대기","done":0,"total":0,"summary":[],"features":[],"coverage":[],"errors":[]}
+R13_ARMS={
+    "A":"기존 V1.2.1","B":"고점 대비 40% 하락","C":"하락일 15일 이상",
+    "D":"전일 거래량 3배","E":"전일 거래량 4배","F":"진입가 SMA5 위",
+    "G":"SMA5 상승 전환","H":"RSI 과매도 반등","I":"MACD 히스토그램 증가",
+    "J":"아래꼬리 매수세","K":"양봉+거래량 증가","L":"BTC 상대강도",
+    "M":"40% 하락+SMA5 지지"}
+def r13patch(**kw):
+    with R13_LOCK:R13.update(kw)
+def r13error(s):
+    with R13_LOCK:R13["errors"].append(str(s))
+def r13parallel(items,fn):
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        jobs={pool.submit(fn,x):x for x in items}
+        for job in as_completed(jobs):
+            m=jobs[job]
+            try:yield m,job.result()
+            except Exception as e:r13error(str(m)+": "+str(e));yield m,None
+            finally:
+                with R13_LOCK:R13["done"]+=1
+def r13relative(by,btc,t):
+    a=by.get(t-DAY);b=by.get(t-6*DAY);x=btc.get(t-DAY);y=btc.get(t-6*DAY)
+    if not all((a,b,x,y)) or min(a[4],b[4],x[4],y[4])<=0:return None
+    return pct(a[4],b[4])-pct(x[4],y[4])
+def r13flags(s,seq,entry,rs):
+    # 80 completed hourly bars, all indicators computed before entry.
+    closes=[r[4] for r in seq];p=entry[1];a=seq[-1]
+    ma=mean(closes[-5:]);prev=mean(closes[-6:-1]);old=mean(closes[-7:-2])
+    r0=rsi(closes[:-1]);r1=rsi(closes);_,m0=macd(closes[:-1]);_,m1=macd(closes)
+    span=a[2]-a[3];wick=(min(a[1],a[4])-a[3])/span if span>0 else 0
+    vr=ratio(a[5],mean([r[5] for r in seq[-21:-1]]))
+    flags=dict(A=True,B=s["peak_to_last_pct"]<=-40,C=s["down_days"]>=15,D=s["vol_ratio_d1"]>=3,E=s["vol_ratio_d1"]>=4,F=p>ma,G=ma>prev and prev<=old,H=r0<35 and r1>r0,I=m1>m0,J=wick>=.4 and a[4]>=a[3]+.6*span and span>0,K=a[4]>a[1] and vr is not None and vr>=1.5,L=rs>0)
+    flags["M"]=flags["B"] and flags["F"]
+    return flags,dict(hour_sma5=ma,hour_sma5_prev=prev,hour_rsi_prev=r0,hour_rsi=r1,hour_macd_hist_prev=m0,hour_macd_hist=m1,lower_wick_ratio=wick,hour_volume_ratio=vr,relative_btc_5d_pp=rs,entry_vs_sma5_pct=pct(p,ma))
+def r13summary(rows,days,period,arm):
+    n=len(rows)
+    def avg(k):return mean([r[k] for r in rows]) if n else None
+    def rate(k):return 100*sum(r["peak_net_pct"]>=k for r in rows)/n if n else None
+    return dict(period=period,arm=arm,condition=R13_ARMS[arm],count=n,signals_per_day=n/days if days else None,opportunity_pct=100*sum(r["peak_net_pct"]>0 for r in rows)/n if n else None,hit_3_pct=rate(3),hit_5_pct=rate(5),peak_median_pct=statistics.median(r["peak_net_pct"] for r in rows) if n else None,close_win_pct=100*sum(r["close_net_pct"]>0 for r in rows)/n if n else None,close_mean_pct=avg("close_net_pct"),worst_low_median_pct=statistics.median(r["worst_low_net_pct"] for r in rows) if n else None)
+def r13fetch_hours(m,dates):
+    # Merge only the actual required observation intervals. No all-market minute scan.
+    ranges=[]
+    for t in sorted(dates):
+        left=t-80*HOUR;right=t+8*DAY
+        if ranges and left<=ranges[-1][1]:ranges[-1][1]=max(right,ranges[-1][1])
+        else:ranges.append([left,right])
+    out={}
+    for left,right in ranges:
+        pages=math.ceil((right-left)/(200*HOUR))+1
+        for r in candles(m,60,right,200,pages=pages,latest=False):
+            if left<=r[0]<right:out[r[0]]=r
+    return out
+def run13(days):
+    begin=time.monotonic()
+    try:
+        end=int(now().timestamp());universe=sorted({x["market"] for x in api("market/all") if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
+        btcrows=candles("KRW-BTC",1440,end,200,latest=True)
+        if len(btcrows)<days+30:raise RuntimeError("BTC 일봉 부족")
+        anchor=btcrows[-1][0]%DAY;cut=day_start(end,anchor)
+        if anchor%HOUR or btcrows[-1][0]!=cut:raise RuntimeError("일봉 경계 불일치")
+        btc={r[0]:r for r in btcrows}
+        # Latest mature day is 8 full days before today's opening, allowing 23h delay and 168h outcome.
+        starts=[cut-(days+7-i)*DAY for i in range(days)]
+        split=starts[days*2//3];early=[t for t in starts if t+8*DAY<=split];late=[t for t in starts if t>=split]
+        r13patch(phase="전체 일봉 검색",done=0,total=len(universe),universe=len(universe),first=iso(starts[0]),last=iso(starts[-1]),split=iso(split),early_days=len(early),late_days=len(late))
+        setups={};cov=[];success=0
+        for m,rows in r13parallel(universe,lambda m:candles(m,1440,end,200,latest=True)):
+            if not rows or any(r[0]%DAY!=anchor for r in rows):
+                cov.append(dict(market=m,daily_status="fetch_error"));continue
+            success+=1;by={r[0]:r for r in rows};a=[]
+            for t in starts:
+                s=setup12(rows,t)
+                if s:a.append((t,s,r13relative(by,btc,t)))
+            if a:setups[m]=a
+            cov.append(dict(market=m,daily_status="ok",daily_signals=len(a)))
+        if not success:raise RuntimeError("일봉 수집 실패")
+        r13patch(phase="후보 시간봉 수집 및 비교",done=0,total=len(setups),market_success=success,daily_signals=sum(len(a) for a in setups.values()))
+        details=[];audit={x["market"]:x for x in cov}
+        for m,by in r13parallel(list(setups),lambda m:r13fetch_hours(m,[t for t,s,rs in setups[m]])):
+            counts=dict(hour_valid=0,hour_missing=0,relative_missing=0,no_cross=0,spike_excluded=0,baseline_signals=0)
+            for t,s,rs in setups[m]:
+                if rs is None:counts["relative_missing"]+=1;continue
+                if not by or any(t+i*HOUR not in by or min(by[t+i*HOUR][1:5])<=0 for i in range(-80,192)):
+                    counts["hour_missing"]+=1;continue
+                counts["hour_valid"]+=1
+                # Match V1.2.1 historical baseline: first completed crossover after daily open.
+                hit=next((i for i in range(1,24) if cross12(by,t+i*HOUR)["cross"]),None)
+                if hit is None:counts["no_cross"]+=1;continue
+                entry=t+hit*HOUR
+                seen=max([by[t+i*HOUR][2] for i in range(hit)]+[by[entry][1]])
+                if spike121(by[t][1],seen):counts["spike_excluded"]+=1;continue
+                history=[by[entry-i*HOUR] for i in range(80,0,-1)]
+                future=[by[entry+i*HOUR] for i in range(168)]
+                result=result12(future)
+                if not result:counts["hour_missing"]+=1;continue
+                flags,features=r13flags(s,history,by[entry],rs)
+                lo=min(r[3] for r in future);p=result["buy_price"]
+                worst=100*(lo/p*(1-FEE81)/(1+FEE81)-1)
+                period="EARLY" if t in early else "LATE" if t in late else "GAP"
+                details.append(dict(market=m,signal_day=iso(t)[:10],entry_time=iso(entry),entry_ts=entry,period=period,**s,**features,**result,worst_low_net_pct=worst,preentry_day_high_pct=pct(seen,by[t][1]),**{"pass_"+k:v for k,v in flags.items()}))
+                counts["baseline_signals"]+=1
+            audit[m].update(counts)
+        # Each arm independently enforces 7-day no-reentry per coin. Also retain raw signal rows for audit.
+        details.sort(key=lambda r:(r["entry_ts"],r["market"]))
+        summary=[]
+        for arm in R13_ARMS:
+            last={};kept=[]
+            for r in details:
+                accept=r["pass_"+arm] and r["entry_ts"]>=last.get(r["market"],0)
+                r["trade_"+arm]=accept
+                if accept:
+                    kept.append(r);last[r["market"]]=r["entry_ts"]+7*DAY
+            for name,n in (("ALL",days),("EARLY",len(early)),("LATE",len(late))):
+                rows=kept if name=="ALL" else [r for r in kept if r["period"]==name]
+                summary.append(r13summary(rows,n,name,arm))
+        r13patch(status="done",phase="완료",done=len(setups),summary=summary,features=details,coverage=cov,elapsed=round(time.monotonic()-begin,1),baseline_raw=len(details))
+    except Exception as e:r13error(e);r13patch(status="error",phase="실패")
+def start13(days):
+    with R13_LOCK:
+        if R13["status"]=="running":return False
+        R13.clear();R13.update(status="running",phase="준비",done=0,total=0,days=days,summary=[],features=[],coverage=[],errors=[])
+    threading.Thread(target=run13,args=(days,),daemon=True).start()
+    return True
+def csv13(snapshot):
+    # One rectangular CSV with named sections and complete union of columns.
+    rows=[]
+    excluded={"summary","features","coverage","errors"}
+    rows.append(dict(section="settings",**{k:v for k,v in snapshot.items() if k not in excluded},fee_oneway_pct=.04,holding_hours=168))
+    for k in ("summary","features","coverage"):
+        rows.extend(dict(section=k,**r) for r in snapshot[k])
+    rows.extend(dict(section="errors",message=e) for e in snapshot["errors"])
+    cols=list(dict.fromkeys(k for r in rows for k in r))
+    out=io.StringIO();w=csv.DictWriter(out,fieldnames=cols);w.writeheader();w.writerows(rows)
+    return out.getvalue().encode("utf-8-sig")
+HTML13=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V1.3 RESEARCH</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1100px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:12px;margin:12px 0}button,a,select{display:inline-block;background:#225b51;color:white;padding:10px;margin:4px;border:1px solid #476073;border-radius:7px;text-decoration:none}button:disabled{opacity:.5}table{border-collapse:collapse;white-space:nowrap;width:100%}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left;position:sticky;left:0;background:#19232e}progress{width:100%}.scroll{overflow:auto}small{color:#b4c4d1;line-height:1.7}</style><h1>REVERSE SWING V1.3 RESEARCH</h1><a href="/live12">기존 V1.2.1 실시간·모의매매</a><section><h2>강화 조건 비교</h2><p>기존 일봉 조건 + 첫 1시간봉 SMA5 상향 돌파 + 당일 30% 급등 제외를 기준으로, 추가 조건 12개 비교.</p><small>진입은 돌파 다음 시간봉 시가. 편도 0.04%, 각 군 동일 코인 7일 재진입 금지. 완전한 시간봉 이력만 비교. 후반 구간은 시간순 별도 확인용이며 독립적인 미래 검증은 아님. 최고가 도달률은 수익 기회, 7일 종료가 승률은 청산 가정. 실제 체결/손절 없음. 현재 상장 종목 기준으로 상장폐지 편향 가능. 연구 결과는 기존 실시간 검색에 자동 반영하지 않음.</small><p>검증 진입일 <select id="days"><option value="30">30일</option><option value="60" selected>60일</option><option value="90">90일</option></select><button id="go">비교 백테스트 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="audit"></p><pre id="err" style="white-space:pre-wrap"></pre></section><section id="out" hidden><h2>비교 성적</h2><a href="/research13/csv">전체 결과 CSV 받기</a><p><select id="period"><option value="ALL">전체</option><option value="EARLY">전반</option><option value="LATE">후반</option></select></p><div class="scroll" id="table"></div><small>전반/후반 경계 이전 7일 신호는 전반 성적에서 제외. 전체에는 포함. 표본 적은 조건은 성적이 높아도 추가 검증 필요. RSI: 직전 RSI14 35 미만 후 상승. MACD: 히스토그램 증가. 아래꼬리: 봉 길이 40% 이상 및 종가 범위 상위 40%. 양봉+거래량: 전 20시간 평균 대비 1.5배. BTC 상대강도: 완료 일봉 5일 수익률이 BTC보다 높음. F는 진입 시가 기준이며 이후 지지는 보장하지 않음.</small></section><script>
+const $=x=>document.getElementById(x);let data=null;
+function render(){if(!data)return;let rows=data.summary.filter(x=>x.period===$('period').value);let t=document.createElement('table'),h=t.insertRow();for(let s of ['조건','건수','하루 평균','기회율%','+3% 도달','+5% 도달','최고가 중앙%','7일 승률%','7일 평균%','최저가 중앙%']){let th=document.createElement('th');th.textContent=s;h.append(th)}for(let x of rows){let r=t.insertRow();for(let v of [x.arm+' '+x.condition,x.count,x.signals_per_day,x.opportunity_pct,x.hit_3_pct,x.hit_5_pct,x.peak_median_pct,x.close_win_pct,x.close_mean_pct,x.worst_low_median_pct]){let cell=r.insertCell();cell.textContent=typeof v==='number'?Number(v.toFixed(2)):v??'—'}if(x.count<20)r.cells[1].style.color='#ffc978'}$('table').replaceChildren(t)}
+$('period').onchange=render;$('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/research13/start?days='+$('days').value,{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('이미 실행 중');data=null;$('out').hidden=true;poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};
+async function poll(){try{let r=await fetch('/research13/status',{cache:'no-store'}),s=await r.json();$('go').disabled=s.status==='running';$('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('audit').textContent='전체 '+(s.universe??'—')+'종목 · 일봉 성공 '+(s.market_success??'—')+' · 일봉 신호 '+(s.daily_signals??'—')+' · 시간봉 기본 신호 '+(s.baseline_raw??'—')+' · 오류 '+s.error_count+' · 기간 '+(s.first??'—')+' ~ '+(s.last??'—');$('err').textContent=s.errors.join('\n');if(s.status==='done'){data=s;$('out').hidden=false;render()}else{$('out').hidden=true;data=null}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
+poll();setInterval(poll,2500);
+</script></html>"""
+
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
         if not isinstance(body,bytes):body=body.encode()
@@ -1327,6 +1472,12 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/research13/start":
+            try:
+                days=int(parse_qs(u.query).get("days",["60"])[0])
+                if days not in (30,60,90):raise ValueError()
+            except ValueError:return self.js({"error":"invalid days"},400)
+            return self.js({"started":start13(days)})
         if u.path=="/live12/start":return self.js({"started":start12("live12")})
         if u.path=="/back12/start":return self.js({"started":start12("back12")})
         if u.path=="/live10/start":return self.js({"started":start10()})
@@ -1360,6 +1511,17 @@ class Handler(BaseHTTPRequestHandler):
         if p=="/":return self.send(HTML,"text/html; charset=utf-8")
         if p=="/stage2":return self.send(HTML2,"text/html; charset=utf-8")
         if p=="/stage3":return self.send(HTML3,"text/html; charset=utf-8")
+        if p=="/research13":return self.send(HTML13,"text/html; charset=utf-8")
+        if p=="/research13/status":
+            with R13_LOCK:
+                data={k:v for k,v in R13.items() if k not in ("features","coverage","errors")}
+                data.update(errors=R13["errors"][-20:],error_count=len(R13["errors"]))
+            return self.js(data)
+        if p=="/research13/csv":
+            with R13_LOCK:
+                snap=dict(R13)
+            if snap["status"]!="done":return self.js({"error":"not complete"},409)
+            return self.send(csv13(snap),"text/csv; charset=utf-8",filename="REVERSE_SWING_V1_3_RESEARCH_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
         if p in ("/live","/live12"):return self.send(HTML12,"text/html; charset=utf-8")
         if p=="/back12":return self.send(HTMLB12,"text/html; charset=utf-8")
         if p in ("/live10","/live11"):return self.send(HTML10,"text/html; charset=utf-8")
@@ -1624,7 +1786,12 @@ def selftest():
     assert spike121(100,130) and not spike121(100,129.99)
     assert daily_spike121([(c10,100,150,90,99,10,1000)],c10)["spike"]
     assert daily_spike121([],c10) is None
-    print("REVERSE SWING V1.2.1 self-test PASS",flush=True)
+    seq13=[(start+i*HOUR,100+i*.01,102+i*.01,98+i*.01,100+i*.01,10,1000) for i in range(80)]
+    flags13,vals13=r13flags(dict(peak_to_last_pct=-42,down_days=15,vol_ratio_d1=3.5),seq13,(start+80*HOUR,102,103,101,102,10,1000),1)
+    assert flags13["A"] and flags13["B"] and flags13["C"] and flags13["D"] and not flags13["E"] and flags13["F"] and flags13["M"]
+    assert r13summary([],30,"ALL","A")["close_win_pct"] is None
+    assert b"section" in csv13(dict(status="done",summary=[],features=[],coverage=[],errors=[]))
+    print("REVERSE SWING V1.2.1 live + V1.3 research self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
