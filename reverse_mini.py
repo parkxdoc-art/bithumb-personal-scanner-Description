@@ -5,7 +5,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "REVERSE MINI V0.1.1"
+VERSION = "REVERSE MINI V0.1.2"
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9))
 DAY = 86400
@@ -17,6 +17,7 @@ state_lock = threading.Lock()
 state = {"status":"idle","phase":"대기","done":0,"total":0,"rank":[],"features":[],"summary":[],"errors":[],"coverage":[]}
 def now(): return datetime.now(UTC)
 def iso(t): return datetime.fromtimestamp(t,KST).strftime("%Y-%m-%d %H:%M")
+def day_start(t,anchor=0): return ((t-anchor)//DAY)*DAY+anchor
 def kststr(t): return datetime.fromtimestamp(t,KST).strftime("%Y-%m-%dT%H:%M:%S")
 def api(path, **params):
     global next_request
@@ -27,7 +28,7 @@ def api(path, **params):
             next_request=time.monotonic()+0.16
         try:
             u=BASE+path+"?"+urlencode(params)
-            with urlopen(Request(u,headers={"Accept":"application/json","User-Agent":"ReverseMini/0.1.1"}),timeout=12) as r:
+            with urlopen(Request(u,headers={"Accept":"application/json","User-Agent":"ReverseMini/0.1.2"}),timeout=12) as r:
                 result=json.load(r)
             if not isinstance(result,list): raise ValueError(str(result)[:200])
             return result
@@ -155,10 +156,10 @@ def first_event(rows,start,end,base,threshold):
 # Shared BTC history cache, keyed by timeframe and cut rounded down to a candle boundary.
 btc_cache={}; btc_lock=threading.Lock()
 def btc_history(unit,cut):
-    key=(unit,cut//(unit*60))
+    key=(unit,cut)
     with btc_lock:
         if key in btc_cache:return btc_cache[key]
-    data=candles("KRW-BTC",unit,cut//(unit*60)*(unit*60),40)
+    data=candles("KRW-BTC",unit,cut,41)
     with btc_lock: btc_cache[key]=data
     return data
 def analyze(case,all_daily,run_end):
@@ -182,9 +183,9 @@ def analyze(case,all_daily,run_end):
         cut=event-delta
         item={"market":m,"day":r["day"],"rank":r["rank"],"partial":r["partial"],"short_history":r["short_history"],"event_status":r["event_status"],"event_kst":r["event_kst"],"offset":label,"unit_minutes":unit,"cut_kst":iso(cut)}
         try:
-            rows=candles(m,unit,cut//(unit*60)*(unit*60),200) if unit!=1440 else [x for x in all_daily[m] if x[0]+DAY<=cut]
+            rows=candles(m,unit,cut,200) if unit!=1440 else [x for x in all_daily[m] if x[0]+DAY<=cut]
             if unit==1440 and rows and len(rows)<200:
-                try: rows=candles(m,unit,cut//DAY*DAY,200)
+                try: rows=candles(m,unit,cut,200)
                 except Exception as e: record_error(m+" daily history: "+str(e))
             try: btc=btc_history(unit,cut)
             except Exception as e: btc=None; record_error("BTC "+label+": "+str(e))
@@ -212,20 +213,27 @@ def summarize(fs):
     return out
 def run(days,threshold,include_today):
     try:
-        run_end=int(now().timestamp()); current=run_end//DAY*DAY
-        starts=[current-i*DAY for i in range(days,0,-1)]+([current] if include_today else [])
+        run_end=int(now().timestamp())
         markets=api("market/all")
         universe=sorted({x["market"] for x in markets if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
         patch(phase="일별 전체 시장 순위 수집",done=0,total=len(universe),universe=len(universe),run_kst=iso(run_end))
         if not universe: raise RuntimeError("원화 마켓 목록 0개: API 목록 응답 "+str(markets[:2]))
         probe=candles("KRW-BTC",1440,run_end,30,latest=True)
         patch(probe_count=len(probe),probe_latest=iso(probe[-1][0]) if probe else "없음")
-        if not probe or probe[-1][0]<current-DAY: raise RuntimeError("BTC 일봉 최신 데이터 없음: "+str([iso(x[0]) for x in probe[-3:]]))
+        if len(probe)<2: raise RuntimeError("BTC 일봉 부족: "+str([iso(x[0]) for x in probe[-3:]]))
+        anchor=probe[-1][0]%DAY
+        if any(x[0]%DAY!=anchor for x in probe): raise RuntimeError("BTC 일봉 경계 불일치")
+        current=day_start(run_end,anchor)
+        if probe[-1][0]!=current: raise RuntimeError("BTC 최신 일봉 지연: "+str([iso(x[0]) for x in probe[-3:]]))
+        starts=[current-i*DAY for i in range(days,0,-1)]+([current] if include_today else [])
+        patch(day_boundary=iso(current)[11:],probe_latest=iso(probe[-1][0]))
         data={}
         for m,rows in parallel(universe,lambda m:candles(m,1440,run_end,200,latest=True)):
-            if rows: data[m]=rows
+            if rows and all(x[0]%DAY==anchor for x in rows): data[m]=rows
+            elif rows: record_error(m+" BTC와 일봉 경계 불일치: "+iso(rows[-1][0]))
             else: record_error(m+" 일봉 응답 없음")
         rank,coverage=rank_days(data,starts,current,threshold)
+        for row in coverage: row.update(day_boundary_kst=iso(current)[11:],universe=len(universe),daily_success=len(data),btc_latest=iso(probe[-1][0]))
         patch(rank=rank,coverage=coverage,market_success=len(data),phase="급등 전 완료봉 역추적",done=0,total=len(rank))
         if not any(x["valid_markets"] for x in coverage):
             raise RuntimeError("일별 순위 유효 종목 0개. BTC 최신 일봉: "+str([iso(x[0]) for x in probe[-3:]]))
@@ -247,10 +255,10 @@ def start_job(days,threshold,include_today):
     with btc_lock: btc_cache.clear()
     threading.Thread(target=run,args=(days,threshold,include_today),daemon=True).start()
     return True
-HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1.1</title><style>
+HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1.2</title><style>
 *{box-sizing:border-box}body{margin:0 auto;max-width:1050px;padding:16px;background:#10151d;color:#edf2f7;font:14px system-ui,sans-serif}h1{font-size:23px;margin:8px 0}h2{font-size:17px;margin:18px 0 8px}.card{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}label{display:inline-block;margin:6px}input,select,button,a.btn{background:#263646;color:#fff;border:1px solid #476073;border-radius:7px;padding:9px;font:inherit}button,a.btn{cursor:pointer;background:#225b51;text-decoration:none;display:inline-block;margin:4px}button:disabled{opacity:.5}.muted{color:#b4c4d1;line-height:1.6}progress{width:100%;accent-color:#37b89d}.scroll{overflow:auto;max-height:470px}table{border-collapse:collapse;width:100%;white-space:nowrap;font-size:13px}th,td{padding:8px;text-align:left;border-bottom:1px solid #324355}th{position:sticky;top:0;background:#253443}.pos{color:#6be3b7}pre{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#b4c4d1}</style>
-<h1>REVERSE MINI V0.1.1</h1><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
-<div class="card"><label>완료 일수 <select id="days"><option>3</option><option>7</option><option selected>14</option></select></label><label>급등 기준 <select id="threshold"><option>3</option><option selected>5</option><option>10</option></select>%</label><label><input id="today" type="checkbox" checked> 오늘 미완료 별도</label><button id="go">백테스트 시작</button><div class="muted">일봉 KST 09:00~익일 09:00. 전일 종가 대비 당일 종가 상승률 순위. 최초 기준 도달 5분봉 종가 이전 완료봉만 분석. 현재 상장 목록 기준이며 스테이블코인 목록은 제한적. 짧은 이력(이전 일봉 14개 미만)은 별도. 매수 조건 없음.</div></div>
+<h1>REVERSE MINI V0.1.2</h1><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
+<div class="card"><label>완료 일수 <select id="days"><option>3</option><option>7</option><option selected>14</option></select></label><label>급등 기준 <select id="threshold"><option>3</option><option selected>5</option><option>10</option></select>%</label><label><input id="today" type="checkbox" checked> 오늘 미완료 별도</label><button id="go">백테스트 시작</button><div class="muted">일봉 경계는 BTC 실제 수신 시간으로 자동 판별 (현재 관측 KST 00:00). 전일 종가 대비 당일 종가 상승률 순위. 최초 기준 도달 5분봉 종가 이전 완료봉만 분석. 현재 상장 목록 기준이며 스테이블코인 목록은 제한적. 짧은 이력(이전 일봉 14개 미만)은 별도. 매수 조건 없음.</div></div>
 <div class="card"><strong id="phase">대기</strong> <span id="count"></span><progress id="progress" value="0" max="1"></progress><div id="stats" class="muted"></div></div>
 <div id="output" hidden><div class="card"><h2>CSV 저장</h2><a class="btn" href="/csv/rank">일별 TOP10</a><a class="btn" href="/csv/features">상세 지표</a><a class="btn" href="/csv/summary">공통점</a><a class="btn" href="/csv/coverage">수집률</a><a class="btn" href="/csv/errors">오류</a><div class="muted">공통점은 완전 확인 사례만 집계. 분모는 해당 지표의 유효 데이터 수이며, 예측 성과나 수익률이 아님.</div></div>
 <div class="card"><h2>공통점 발견율</h2><label>구분 <select id="cohort"><option value="regular">완료일 일반</option><option value="short_history">짧은 이력</option><option value="partial">오늘 미완료</option></select></label><label>시점 <select id="offset"><option>5분</option><option>15분</option><option>30분</option><option>1시간</option><option>4시간</option><option>24시간</option><option>3일</option><option>7일</option></select></label><label><input type="checkbox" id="pairs"> 2개 조건 조합</label><div class="scroll" id="summary"></div></div>
@@ -302,10 +310,18 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="REVERSE_MINI_V0_1_1_"+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="REVERSE_MINI_V0_1_2_"+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
+    midnight=start-9*3600
+    assert iso(midnight).endswith("00:00")
+    assert day_start(midnight+17*3600,midnight%DAY)==midnight
+    assert day_start(start+17*3600,start%DAY)==start
+    for boundary in (midnight,start):
+        d=[(boundary-DAY,100,100,100,100,1,100),(boundary,100,130,100,120,1,120)]
+        ranked,cov=rank_days({"KRW-A":d},[boundary],boundary+DAY,5)
+        assert len(ranked)==1 and cov[0]["valid_markets"]==1
     rows=[(start+i*300,100,106,99,100+i,1,100) for i in range(10)]
     assert first_event(rows,start,start+3000,100,5)==start+1800
     assert first_event(rows,start,start+1500,100,5) is None
@@ -317,7 +333,7 @@ def selftest():
     rank,cov=rank_days({"KRW-A":daily},[start],start+DAY,5)
     assert rank[0]["market"]=="KRW-A" and abs(rank[0]["gain_pct"]-20)<1e-8 and rank[0]["short_history"]
     assert not summarize([])[0]["available"]
-    print("REVERSE MINI V0.1.1 self-test PASS",flush=True)
+    print("REVERSE MINI V0.1.2 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
