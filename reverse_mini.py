@@ -1439,7 +1439,7 @@ def r131evaluate(t,s,rs,daily,raw,by,repairs):
     entry=t+hit*HOUR
     if any(t+i*HOUR not in by for i in range(hit)):return "preentry_missing",None,entry
     if entry not in raw or not r131valid(raw[entry]):return "entry_no_trade" if entry in repairs else "entry_missing",None,entry
-    seen=max([by[t+i*HOUR][2] for i in range(hit)]+[raw[entry][1]])
+    seen=max([raw[t+i*HOUR][2] for i in range(hit) if t+i*HOUR in raw and r131valid(raw[t+i*HOUR])]+[raw[entry][1]])
     if spike121(op[1],seen):return "spike_excluded",None,entry
     # Need only the 80 hours before actual entry and 168 after, not a blanket 272-hour window.
     hk=[entry-i*HOUR for i in range(80,0,-1)];fk=[entry+i*HOUR for i in range(168)]
