@@ -5,7 +5,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "REVERSE SWING V0.5"
+VERSION = "REVERSE SWING V0.6"
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9))
 DAY = 86400
@@ -618,12 +618,103 @@ def start5():
         state.clear();state.update(mode="reverse5",status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
     threading.Thread(target=run5,daemon=True).start()
     return True
-HTML5=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V0.5</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1000px;margin:auto;padding:16px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}button,a,select{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:10px;margin:4px;border-radius:7px;text-decoration:none}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}</style><h1>REVERSE SWING V0.5</h1><a href="/reverse4">V0.4 급등 전 역추적</a><section><h2>세 가지 조건 전체 시장 비교</h2><p>A: 최근 20일 수익률 음수<br>B: D-3 대비 D-1 거래량 배수 증가 (직전 20일 평균 대비)<br>C: D-1 RSI 40 미만</p><small>2026년 10/28~11/24 동일 28일. D-1까지 마감된 일봉만 사용. 당일 상승률 TOP10과 전체 유효 시장 비교. 7개 조합 및 전체 기준. 이전·최근 14일은 이미 발견에 사용한 기간으로 독립 검증 아님. 매수·보유·손절 조건 없음.</small><p><button id="go">세 조건 검증 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">조건 비교 CSV</a><a href="/csv/features">상세 CSV</a><a href="/csv/rank">TOP10 CSV</a><a href="/csv/coverage">수집률 CSV</a><a href="/csv/errors">오류 CSV</a><p><select id="group"><option value="all">전체 28일</option><option value="earlier">이전 14일</option><option value="recent">최근 14일</option></select></p><small>포착률 = 조건 충족 TOP10 / 유효 TOP10. 적중률 = 조건 충족 TOP10 / 전체 조건 충족. 배수 = 전체 기준 대비 적중률.</small><div class="scroll" id="tab"></div><div class="scroll" id="cov"></div></section><script>
+HTML5=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V0.5</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1000px;margin:auto;padding:16px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}button,a,select{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:10px;margin:4px;border-radius:7px;text-decoration:none}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}</style><h1>REVERSE SWING V0.5</h1><a href="/reverse6">V0.6 하락 추세 연구</a><a href="/reverse4">V0.4 급등 전 역추적</a><section><h2>세 가지 조건 전체 시장 비교</h2><p>A: 최근 20일 수익률 음수<br>B: D-3 대비 D-1 거래량 배수 증가 (직전 20일 평균 대비)<br>C: D-1 RSI 40 미만</p><small>2026년 10/28~11/24 동일 28일. D-1까지 마감된 일봉만 사용. 당일 상승률 TOP10과 전체 유효 시장 비교. 7개 조합 및 전체 기준. 이전·최근 14일은 이미 발견에 사용한 기간으로 독립 검증 아님. 매수·보유·손절 조건 없음.</small><p><button id="go">세 조건 검증 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">조건 비교 CSV</a><a href="/csv/features">상세 CSV</a><a href="/csv/rank">TOP10 CSV</a><a href="/csv/coverage">수집률 CSV</a><a href="/csv/errors">오류 CSV</a><p><select id="group"><option value="all">전체 28일</option><option value="earlier">이전 14일</option><option value="recent">최근 14일</option></select></p><small>포착률 = 조건 충족 TOP10 / 유효 TOP10. 적중률 = 조건 충족 TOP10 / 전체 조건 충족. 배수 = 전체 기준 대비 적중률.</small><div class="scroll" id="tab"></div><div class="scroll" id="cov"></div></section><script>
 const $=id=>document.getElementById(id);let result=null;
 function table(id,heads,rows){let t=document.createElement('table'),tr=t.insertRow();for(const h of heads){let th=document.createElement('th');th.textContent=h;tr.append(th)}for(const row of rows){let tr=t.insertRow();for(const v of row)tr.insertCell().textContent=v??'—'}$(id).replaceChildren(t)}
 function show(){if(!result)return;let g=$('group').value;table('tab',['조건','후보','일평균','전체 발생%','TOP10 포착','포착률%','적중률%','기준 대비 배수'],result.summary.filter(x=>x.group===g).map(x=>[x.rule,x.candidates,x.per_day,x.market_frequency_pct,x.top10_hits,x.top10_recall_pct,x.top10_precision_pct,x.lift]));table('cov',['날짜','순위 유효','조건 유효','TOP10 유효'],result.coverage.filter(x=>g==='all'||x.group===g).map(x=>[x.day,x.valid_markets,x.feature_valid,x.top10_valid]))}
 $('group').onchange=show;$('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/reverse5/start',{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 연구 실행 중');result=null;$('out').hidden=true;await poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};
 async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';if(s.mode!=='reverse5'){$('out').hidden=true;result=null;$('phase').textContent=s.status==='running'?'다른 연구 실행 중':'대기';return}$('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 '+(s.market_success??0)+'/'+(s.universe??0)+' · 오류 '+s.error_count+' · 전체 '+(s.elapsed_seconds??'—')+'초';$('errors').textContent=s.errors.join('\n');if(s.status==='running'){result=null;$('out').hidden=true}if(s.status==='done'&&!result){result=await(await fetch('/results')).json();$('out').hidden=false;show()}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
+poll();setInterval(poll,2000);
+</script></html>"""
+
+
+# V0.6: chronological daily downtrend and pullback depth; winner-only research.
+WINDOW6=(7,10,14,20)
+def trend6(rows,t,n):
+    # n daily close-to-close changes, n+1 consecutive completed candles.
+    by={r[0]:r for r in rows}
+    seq=[by.get(t-i*DAY) for i in range(n+1,0,-1)]
+    if not all(seq):return {"valid":False}
+    if any(min(r[1:5])<=0 for r in seq):return {"valid":False}
+    close=[r[4] for r in seq]
+    daily=[pct(b,a) for a,b in zip(close,close[1:])]
+    down=sum(b<a for a,b in zip(close,close[1:]))
+    streak=longest=0
+    for a,b in zip(close,close[1:]):
+        streak=streak+1 if b<a else 0;longest=max(longest,streak)
+    half=len(seq)//2; first=seq[:half]; last=seq[-half:]
+    lower_high=max(r[2] for r in last)<max(r[2] for r in first)
+    lower_low=min(r[3] for r in last)<min(r[3] for r in first)
+    logc=[math.log(v) for v in close]; mx=n/2; my=mean(logc)
+    slope=sum((i-mx)*(v-my) for i,v in enumerate(logc))/sum((i-mx)**2 for i in range(n+1))
+    # Ordered high->low on strictly different days; no same-day OHLC ordering assumption.
+    peak=seq[0][2];peakidx=0; dd=0.0;ddpeak=0;ddlow=0
+    for i,r in enumerate(seq[1:],1):
+        drop=pct(r[3],peak)
+        if drop<dd:dd=drop;ddpeak=peakidx;ddlow=i
+        if r[2]>peak:peak=r[2];peakidx=i
+    enddrop=pct(close[-1],max(r[2] for r in seq))
+    ret=pct(close[-1],close[0])
+    # A descriptive, transparent trend definition, not an entry rule.
+    trend=ret<0 and slope<0 and lower_high and lower_low
+    return dict(valid=True,start_date=iso(seq[0][0])[:10],end_date=iso(seq[-1][0])[:10],start_close=close[0],end_close=close[-1],net_pct=ret,down_days=down,down_pct=100*down/n,up_days=sum(v>0 for v in daily),flat_days=sum(v==0 for v in daily),longest_down_streak=longest,ending_down_streak=streak,all_days_down=down==n,lower_high=lower_high,lower_low=lower_low,slope_pct_per_day=100*math.expm1(slope),downtrend=trend,peak_to_later_low_pct=dd,drawdown_peak_date=iso(seq[ddpeak][0])[:10] if dd<0 else None,drawdown_low_date=iso(seq[ddlow][0])[:10] if dd<0 else None,peak_to_last_close_pct=enddrop,lower_high_steps=sum(b[2]<a[2] for a,b in zip(seq,seq[1:])),lower_low_steps=sum(b[3]<a[3] for a,b in zip(seq,seq[1:])))
+def eval6(data,rank):
+    fs=[]
+    for case in rank:
+        for n in WINDOW6:
+            v=trend6(data[case["market"]],case["start"],n)
+            fs.append(dict(day=case["day"],market=case["market"],rank=case["rank"],gain_pct=case["gain_pct"],window=n,group="earlier" if case["day"]<"2026-11-11" else "recent",**v))
+    summ=[]
+    for group in ("all","earlier","recent"):
+        for n in WINDOW6:
+            rows=[x for x in fs if x["window"]==n and (group=="all" or x["group"]==group)]
+            valid=[x for x in rows if x["valid"]];tr=[x for x in valid if x["downtrend"]]
+            def med(a,k):return round(statistics.median(x[k] for x in a),3) if a else None
+            def rate(a,k):return round(100*sum(x[k] for x in a)/len(a),2) if a else None
+            for cohort,a in (("all_valid",valid),("downtrend",tr)):
+                bins=[sum(lo<=-x["peak_to_last_close_pct"]<hi for x in a) for lo,hi in ((0,10),(10,20),(20,30),(30,40),(40,50),(50,float("inf")))]
+                summ.append(dict(group=group,window=n,cohort=cohort,cases=len(rows),valid=len(valid),count=len(a),share_pct=round(100*len(a)/len(valid),2) if valid else None,strict_down_count=sum(x["all_days_down"] for x in valid),median_down_days=med(a,"down_days"),median_longest_streak=med(a,"longest_down_streak"),median_net_pct=med(a,"net_pct"),median_peak_to_low_pct=med(a,"peak_to_later_low_pct"),median_peak_to_last_pct=med(a,"peak_to_last_close_pct"),median_surge_pct=med(a,"gain_pct"),depth_0_10=bins[0],depth_10_20=bins[1],depth_20_30=bins[2],depth_30_40=bins[3],depth_40_50=bins[4],depth_50_plus=bins[5]))
+    return fs,summ
+def run6():
+    begin=time.monotonic()
+    try:
+        end=int(now().timestamp())
+        universe=sorted({x["market"] for x in api("market/all") if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
+        probe=candles("KRW-BTC",1440,end,30,latest=True)
+        if not universe or len(probe)<2:raise RuntimeError("시장 목록 또는 BTC 일봉 부족")
+        anchor=probe[-1][0]%DAY;current=day_start(end,anchor)
+        if probe[-1][0]!=current:raise RuntimeError("BTC 일봉 지연")
+        first=day_start(int(datetime(2026,10,28,12,tzinfo=KST).timestamp()),anchor)
+        starts=[first+i*DAY for i in range(28)]
+        if starts[-1]+DAY>end:raise RuntimeError("완료 일봉 부족")
+        patch(phase="전체 일봉 1회 수집",done=0,total=len(universe),universe=len(universe))
+        data={}
+        for m,rows in parallel(universe,lambda m:candles(m,1440,end,200,latest=True)):
+            if rows and all(r[0]%DAY==anchor for r in rows):data[m]=rows
+            else:record_error(m+" 일봉 누락/경계 불일치")
+        rank,cov=rank_days(data,starts,current,5)
+        if not rank:raise RuntimeError("급등 순위 없음")
+        patch(phase="7·10·14·20일 하락 흐름 비교",done=0,total=len(rank),market_success=len(data))
+        rows,summ=eval6(data,rank)
+        if not any(x["valid"] for x in rows):raise RuntimeError("유효 추세 데이터 없음")
+        patch(rank=rank,features=rows,summary=summ,coverage=cov,done=len(rank),status="done",phase="완료",elapsed_seconds=round(time.monotonic()-begin,1))
+    except Exception as e:record_error(str(e));patch(status="error",phase="실패")
+def start6():
+    with state_lock:
+        if state["status"]=="running":return False
+        state.clear();state.update(mode="reverse6",status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
+    threading.Thread(target=run6,daemon=True).start()
+    return True
+HTML6=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V0.6</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1000px;margin:auto;padding:16px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}button,a,select,input{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:10px;margin:4px;border-radius:7px;text-decoration:none}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto;max-height:480px}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}</style><h1>REVERSE SWING V0.6</h1><a href="/reverse4">V0.4 기존 연구</a><section><h2>급등 전 실제 하락 추세 연구</h2><p>10/28~11/24 (2026) 일별 상승 TOP10. 급등 전 완료 일봉의 7·10·14·20일 가격 흐름과 하락폭.</p><small>하락 추세(탐색용 정의): 기간 종가 하락 + 로그 종가 기울기 음수 + 후반 절반의 최고가·최저가가 각각 전반 절반보다 낮음. 매일 하락한 경우와 구분. n일은 n개의 일간 변화(n+1개 종가). 고점→최저점은 서로 다른 날짜에서 고점이 먼저 발생한 경우만 비교. 고점→직전 종가는 해당 기간 최고가 대비 D-1 종가. 매수 조건이나 보유 기간이 아님. 기간들은 중첩되므로 중복 집계 가능.</small><p><button id="go">하락 추세 역추적 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">기간별 비교 CSV</a><a href="/csv/features">상세 결과 CSV</a><a href="/csv/rank">TOP10 CSV</a><a href="/csv/coverage">수집률 CSV</a><a href="/csv/errors">오류 CSV</a><p><select id="group"><option value="all">전체 28일</option><option value="earlier">이전 14일</option><option value="recent">최근 14일</option></select></p><h2>기간별 하락 추세 발견율</h2><div class="scroll" id="tab"></div><h2>하락 추세 사례의 고점 대비 급등 직전 하락폭 분포</h2><div class="scroll" id="bins"></div><h2>개별 코인 결과</h2><p><select id="win"><option>7</option><option>10</option><option>14</option><option selected>20</option></select>일 <select id="filter"><option value="trend">하락 추세</option><option value="all">전체 유효</option><option value="strict">매일 하락</option></select><input id="query" placeholder="코인명" style="width:100px"></p><div id="count"></div><div class="scroll" id="detail"></div></section><script>
+const $=id=>document.getElementById(id);let result=null,features=[];
+function table(id,heads,rows){let t=document.createElement('table'),tr=t.insertRow();for(const h of heads){let th=document.createElement('th');th.textContent=h;tr.append(th)}for(const row of rows){let tr=t.insertRow();for(const v of row)tr.insertCell().textContent=v??'—'}$(id).replaceChildren(t)}
+function fmt(x){return typeof x==='number'?Number(x.toFixed(2)):x}
+function detail(){let g=$('group').value,n=Number($('win').value),q=$('query').value.trim().toUpperCase(),f=$('filter').value;let a=features.filter(x=>x.valid&&x.window===n&&(g==='all'||x.group===g)&&x.market.includes(q)&&(f==='all'||(f==='strict'?x.all_days_down:x.downtrend)));$('count').textContent=a.length+'건';table('detail',['급등일','코인','당일 상승%','하락일수','최장 연속 하락','종가변화%','고점→최저%','고점→직전%'],a.map(x=>[x.day,x.market,fmt(x.gain_pct),x.down_days,x.longest_down_streak,fmt(x.net_pct),fmt(x.peak_to_later_low_pct),fmt(x.peak_to_last_close_pct)]))}
+function show(){if(!result)return;let g=$('group').value;let a=result.summary.filter(x=>x.group===g&&x.cohort==='downtrend');table('tab',['기간','유효','하락추세','비율%','매일 하락','하락일 중앙','연속하락 중앙','종가변화%','고점→최저%','고점→직전%','급등% 중앙'],a.map(x=>[x.window,x.valid,x.count,x.share_pct,x.strict_down_count,x.median_down_days,x.median_longest_streak,x.median_net_pct,x.median_peak_to_low_pct,x.median_peak_to_last_pct,x.median_surge_pct]));table('bins',['기간','0~10%','10~20%','20~30%','30~40%','40~50%','50% 이상'],a.map(x=>[x.window,x.depth_0_10,x.depth_10_20,x.depth_20_30,x.depth_30_40,x.depth_40_50,x.depth_50_plus]));detail()}
+$('group').onchange=show;['win','filter'].forEach(id=>$(id).onchange=detail);$('query').oninput=detail;
+$('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/reverse6/start',{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 연구 실행 중');result=null;features=[];$('out').hidden=true;await poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};
+let loading=false;
+async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';if(s.mode!=='reverse6'){$('out').hidden=true;result=null;$('phase').textContent=s.status==='running'?'다른 연구 실행 중':'대기';return}$('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 '+(s.market_success??0)+'/'+(s.universe??0)+' · 오류 '+s.error_count+' · 전체 '+(s.elapsed_seconds??'—')+'초';$('errors').textContent=s.errors.join('\n');if(s.status==='running'){result=null;$('out').hidden=true}if(s.status==='done'&&!result&&!loading){loading=true;try{let rr=await fetch('/results'),ff=await fetch('/reverse6/details');if(!rr.ok||!ff.ok)throw Error('결과 조회 실패');let a=await rr.json(),b=await ff.json();result=a;features=b;$('out').hidden=false;show()}finally{loading=false}}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
 poll();setInterval(poll,2000);
 </script></html>"""
 
@@ -651,7 +742,7 @@ function table(el,headers,rows){let t=document.createElement('table'),h=t.create
 function summary(){if(!result)return;let a=result.summary.filter(x=>x.cohort===$('cohort').value&&x.offset===$('offset').value&&x.pattern.includes('+')===$('pairs').checked);a.sort((a,b)=>(b.hit_pct??-1)-(a.hit_pct??-1)||b.available-a.available);table('summary',['공통점','발견','유효','대상','발견율'],a.map(x=>[x.name,x.hits,x.available,x.cases,x.hit_pct==null?'—':x.hit_pct.toFixed(1)+'%']))}
 $('cohort').onchange=()=>{if($('cohort').value.startsWith('pre_'))$('offset').value='일 시작 전';else if($('offset').value.startsWith('일 시작'))$('offset').value='5분';summary()};['offset','pairs'].forEach(id=>$(id).onchange=summary);
 $('go').onclick=async()=>{try{$('go').disabled=true;const r=await fetch('/start?days='+$('days').value+'&threshold='+$('threshold').value+'&today='+($('today').checked?1:0),{method:'POST'});if(!r.ok)throw Error(await r.text());$('output').hidden=true;result=null;await poll()}catch(e){$('phase').textContent='시작 실패: '+e.message;$('go').disabled=false}};
-async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if(s.mode==='stage2'||s.mode==='stage3'||s.mode==='reverse4'||s.mode==='reverse5'){$('output').hidden=true;return}if((s.status==='done'||s.status==='error')&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
+async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if(s.mode==='stage2'||s.mode==='stage3'||s.mode==='reverse4'||s.mode==='reverse5'||s.mode==='reverse6'){$('output').hidden=true;return}if((s.status==='done'||s.status==='error')&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
 poll();setInterval(poll,2000);
 </script></html>"""
 class Handler(BaseHTTPRequestHandler):
@@ -665,6 +756,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/reverse6/start":return self.js({"started":start6()})
         if u.path=="/reverse5/start":return self.js({"started":start5()})
         if u.path=="/reverse4/start":
             try:
@@ -686,6 +778,12 @@ class Handler(BaseHTTPRequestHandler):
         if p=="/":return self.send(HTML,"text/html; charset=utf-8")
         if p=="/stage2":return self.send(HTML2,"text/html; charset=utf-8")
         if p=="/stage3":return self.send(HTML3,"text/html; charset=utf-8")
+        if p=="/reverse6":return self.send(HTML6,"text/html; charset=utf-8")
+        if p=="/reverse6/details":
+            with state_lock:
+                if state.get("mode")!="reverse6" or state["status"]!="done":return self.js({"error":"not complete"},409)
+                rows=state["features"]
+            return self.js(rows)
         if p=="/reverse5":return self.send(HTML5,"text/html; charset=utf-8")
         if p=="/reverse4":return self.send(HTML4,"text/html; charset=utf-8")
         if p=="/reverse4/details":
@@ -742,7 +840,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V0_6_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -802,7 +900,15 @@ def selftest():
     rr5,ff5,ss5,cc5=eval5({"KRW-A":hist4,"KRW-BTC":hist4},[t])
     assert len(ff5)==2 and len(ss5)==24 and cc5[0]["top10_valid"]==2
     assert all(not x["A"] and not x["B"] and not x["C"] for x in ff5)
-    print("REVERSE SWING V0.5 self-test PASS",flush=True)
+    down6=[(start+i*DAY,100-i,102-i,98-i,100-i,10,1000) for i in range(30)]
+    x6=trend6(down6,start+25*DAY,20)
+    assert x6["valid"] and x6["downtrend"] and x6["down_days"]==20 and x6["all_days_down"]
+    assert x6["peak_to_later_low_pct"]<0 and x6["drawdown_peak_date"]<x6["drawdown_low_date"]
+    assert not trend6(down6[:15]+down6[16:],start+25*DAY,20)["valid"]
+    assert not trend6(hist4,t,20)["downtrend"]
+    rr6,ss6=eval6({"KRW-A":down6},[dict(case4,start=start+25*DAY)])
+    assert len(rr6)==4 and len(ss6)==24
+    print("REVERSE SWING V0.6 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
