@@ -156,7 +156,7 @@ def btc_history(unit,cut):
     key=(unit,cut//(unit*60))
     with btc_lock:
         if key in btc_cache:return btc_cache[key]
-    data=candles("KRW-BTC",unit,cut,40)
+    data=candles("KRW-BTC",unit,cut//(unit*60)*(unit*60),40)
     with btc_lock: btc_cache[key]=data
     return data
 def analyze(case,all_daily,run_end):
@@ -180,9 +180,9 @@ def analyze(case,all_daily,run_end):
         cut=event-delta
         item={"market":m,"day":r["day"],"rank":r["rank"],"partial":r["partial"],"short_history":r["short_history"],"event_status":r["event_status"],"event_kst":r["event_kst"],"offset":label,"unit_minutes":unit,"cut_kst":iso(cut)}
         try:
-            rows=candles(m,unit,cut,200) if unit!=1440 else [x for x in all_daily[m] if x[0]+DAY<=cut]
+            rows=candles(m,unit,cut//(unit*60)*(unit*60),200) if unit!=1440 else [x for x in all_daily[m] if x[0]+DAY<=cut]
             if unit==1440 and rows and len(rows)<200:
-                try: rows=candles(m,unit,cut,200)
+                try: rows=candles(m,unit,cut//DAY*DAY,200)
                 except Exception as e: record_error(m+" daily history: "+str(e))
             try: btc=btc_history(unit,cut)
             except Exception as e: btc=None; record_error("BTC "+label+": "+str(e))
@@ -237,7 +237,7 @@ def start_job(days,threshold,include_today):
     with btc_lock: btc_cache.clear()
     threading.Thread(target=run,args=(days,threshold,include_today),daemon=True).start()
     return True
-HTML="""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1</title><style>
+HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1</title><style>
 *{box-sizing:border-box}body{margin:0 auto;max-width:1050px;padding:16px;background:#10151d;color:#edf2f7;font:14px system-ui,sans-serif}h1{font-size:23px;margin:8px 0}h2{font-size:17px;margin:18px 0 8px}.card{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}label{display:inline-block;margin:6px}input,select,button,a.btn{background:#263646;color:#fff;border:1px solid #476073;border-radius:7px;padding:9px;font:inherit}button,a.btn{cursor:pointer;background:#225b51;text-decoration:none;display:inline-block;margin:4px}button:disabled{opacity:.5}.muted{color:#b4c4d1;line-height:1.6}progress{width:100%;accent-color:#37b89d}.scroll{overflow:auto;max-height:470px}table{border-collapse:collapse;width:100%;white-space:nowrap;font-size:13px}th,td{padding:8px;text-align:left;border-bottom:1px solid #324355}th{position:sticky;top:0;background:#253443}.pos{color:#6be3b7}pre{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#b4c4d1}</style>
 <h1>REVERSE MINI V0.1</h1><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
 <div class="card"><label>완료 일수 <select id="days"><option>3</option><option>7</option><option selected>14</option></select></label><label>급등 기준 <select id="threshold"><option>3</option><option selected>5</option><option>10</option></select>%</label><label><input id="today" type="checkbox" checked> 오늘 미완료 별도</label><button id="go">백테스트 시작</button><div class="muted">일봉 KST 09:00~익일 09:00. 전일 종가 대비 당일 종가 상승률 순위. 최초 기준 도달 5분봉 종가 이전 완료봉만 분석. 현재 상장 목록 기준이며 스테이블코인 목록은 제한적. 짧은 이력(이전 일봉 14개 미만)은 별도. 매수 조건 없음.</div></div>
