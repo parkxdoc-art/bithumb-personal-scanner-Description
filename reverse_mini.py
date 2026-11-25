@@ -5,7 +5,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "REVERSE MINI V0.2"
+VERSION = "REVERSE SWING V0.3"
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9))
 DAY = 86400
@@ -354,7 +354,105 @@ def start2():
         state.clear();state.update(mode="stage2",status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
     threading.Thread(target=run2,daemon=True).start()
     return True
-HTML2=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.2</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1050px;margin:auto;padding:16px}button,a,select{display:inline-block;color:white;background:#225b51;padding:10px;margin:5px;border:1px solid #476073;border-radius:7px;text-decoration:none}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}progress{width:100%}.scroll{overflow:auto}pre{white-space:pre-wrap}small{color:#b4c4d1}</style><h1>REVERSE MINI V0.2</h1><a href="/">1단계 급등 종목 연구</a><section><h2>2단계 전체 종목 백테스트</h2><p>발견 기간 11/11~11/24 · 이전 비교 기간 10/28~11/10 (2026). 오늘 제외. 일 시작 전 완료 일봉만 사용. 결과는 당일 종가 변화이며 매매 수익률 아님.</p><button id="go">전체 코인 검증 시작</button><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">조건 비교 CSV</a><a href="/csv/features">전체 종목 CSV</a><a href="/csv/coverage">수집률 CSV</a><a href="/csv/errors">오류 CSV</a><p><select id="group"><option value="discovery">발견 기간</option><option value="earlier_holdout">이전 비교 기간</option></select><select id="scope"><option value="all">전체 유효</option><option value="prior_value_100m">전일 거래대금 1억 이상</option></select></p><small>기준 대비 5% 상승률 배수 = 조건군 발생률 / 전체 발생률. TOP10 포착률은 해당 범위 내 유효 TOP10 기준.</small><div class="scroll" id="tab"></div><div class="scroll" id="coverage"></div></section><script>
+
+# V0.3: swing outcomes from daily OHLC only, no intraday execution assumptions.
+HORIZONS3=(1,2,3,5,7)
+FEE3=0.0025
+DATES3=(("earlier",datetime(2026,10,21,12,tzinfo=KST)),("discovery",datetime(2026,11,11,12,tzinfo=KST)))
+daily_cache3={}
+def outcome3(by,t,h,end):
+    if t+h*DAY>end:return None
+    seq=[by.get(t+i*DAY) for i in range(h)]
+    if not all(seq):return None
+    entry=seq[0][1]
+    if entry<=0 or any(r[3]<=0 or r[4]<=0 for r in seq):return None
+    high=max(r[2] for r in seq);low=min(r[3] for r in seq);close=seq[-1][4]
+    peak=pct(high,entry); trough=pct(low,entry)
+    out={"entry_open":entry,"peak_pct":peak,"worst_from_entry_pct":trough,"close_pct":pct(close,entry),"net_close_pct":100*(close/entry*(1-FEE3)/(1+FEE3)-1)}
+    for target in (5,10,20):
+        out["hit"+str(target)]=peak>=target-1e-10
+        out["day_to_"+str(target)]=next((i+1 for i,r in enumerate(seq) if pct(r[2],entry)>=target-1e-10),None)
+    out["down5"]=trough<=-5+1e-10
+    return out
+def eval3(data,dates,end,progress=None):
+    indexed={m:{r[0]:r for r in rows} for m,rows in data.items()}
+    out=[];coverage=[]
+    for idx,(group,t) in enumerate(dates):
+        btc=daily2(data.get("KRW-BTC",[]),t)
+        counts={h:0 for h in HORIZONS3}; eligible=0; listed=0
+        for m,rows in data.items():
+            by=indexed[m]
+            if t-DAY not in by:continue
+            listed+=1
+            x=daily2(rows,t)
+            if not x or not btc or any(x[k] is None for k in ("vol_ratio","vol_ratio7","value_ratio","value_ratio7")):continue
+            eligible+=1
+            flags=rules2(x,btc["ret5"])
+            for h in HORIZONS3:
+                v=outcome3(by,t,h,end)
+                if v is None:continue
+                counts[h]+=1
+                out.append(dict(group=group,day=iso(t)[:10],market=m,horizon=h,liquid=x["prior_value"]>=1e8,**x,**flags,**v))
+        for h in HORIZONS3:coverage.append(dict(group=group,day=iso(t)[:10],horizon=h,listed=listed,eligible=eligible,mature=t+h*DAY<=end,valid=counts[h]))
+        if progress:progress(idx+1)
+    summ=[]
+    def med(rows,key):return round(statistics.median(x[key] for x in rows),3) if rows else None
+    def rate(rows,key):return round(100*sum(x[key] for x in rows)/len(rows),2) if rows else None
+    for group in ("earlier","discovery"):
+        for scope in ("all","prior_value_100m"):
+            for h in HORIZONS3:
+                sample=[x for x in out if x["group"]==group and x["horizon"]==h and (scope=="all" or x["liquid"])]
+                days=len({x["day"] for x in sample})
+                base=sum(x["hit10"] for x in sample)/len(sample) if sample else 0
+                for k,title in RULES2.items():
+                    chosen=[x for x in sample if x[k]];n=len(chosen)
+                    hits=[x["day_to_10"] for x in chosen if x["day_to_10"] is not None]
+                    # Each signal-day is an observation, not an independent trade.
+                    summ.append(dict(group=group,scope=scope,horizon=h,rule=k,name=title,days=days,valid=len(sample),candidates=n,unique_markets=len({x["market"] for x in chosen}),per_day=round(n/days,2) if days else None,hit5_pct=rate(chosen,"hit5"),hit10_pct=rate(chosen,"hit10"),hit20_pct=rate(chosen,"hit20"),lift10=round(sum(x["hit10"] for x in chosen)/n/base,3) if n and base else None,median_peak=med(chosen,"peak_pct"),median_worst=med(chosen,"worst_from_entry_pct"),down5_pct=rate(chosen,"down5"),median_net_close=med(chosen,"net_close_pct"),net_positive_pct=round(100*sum(x["net_close_pct"]>0 for x in chosen)/n,2) if n else None,mean_day_to_10=round(statistics.fmean(hits),2) if hits else None))
+    return out,summ,coverage
+def run3():
+    begin=time.monotonic()
+    try:
+        end=int(now().timestamp())
+        universe=sorted({x["market"] for x in api("market/all") if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
+        if not universe:raise RuntimeError("원화 마켓 0개")
+        probe=candles("KRW-BTC",1440,end,30,latest=True)
+        if len(probe)<2:raise RuntimeError("BTC 일봉 부족")
+        anchor=probe[-1][0]%DAY
+        if probe[-1][0]!=day_start(end,anchor):raise RuntimeError("BTC 일봉 지연")
+        dates=[(group,day_start(int(base.timestamp()),anchor)+i*DAY) for group,base in DATES3 for i in range(14)]
+        patch(phase="전체 일봉 1회 수집",done=0,total=len(universe),universe=len(universe))
+        data={}
+        cached=daily_cache3.get("data")
+        if cached and daily_cache3.get("boundary")==day_start(end,anchor) and daily_cache3.get("universe")==universe and time.monotonic()-daily_cache3["saved"]<900:
+            data=cached;patch(done=len(data),phase="일봉 캐시 재사용",cache_used=True)
+        else:
+            for m,rows in parallel(universe,lambda m:candles(m,1440,end,200,latest=True)):
+                if rows and all(x[0]%DAY==anchor for x in rows):data[m]=rows
+                else:record_error(m+" 일봉 누락/경계 불일치")
+            if len(data)==len(universe):daily_cache3.update(data=data,boundary=day_start(end,anchor),universe=universe,saved=time.monotonic())
+        patch(phase="1·2·3·5·7일 스윙 결과 계산",market_success=len(data),done=0,total=len(dates),fetch_seconds=round(time.monotonic()-begin,1))
+        rows,summ,cov=eval3(data,dates,end,lambda i:patch(done=i))
+        if not rows:raise RuntimeError("유효 스윙 데이터 0건")
+        patch(features=rows,summary=summ,coverage=cov,done=len(dates),status="done",phase="완료",elapsed_seconds=round(time.monotonic()-begin,1))
+    except Exception as e:record_error(str(e));patch(status="error",phase="실패",elapsed_seconds=round(time.monotonic()-begin,1))
+def start3():
+    with state_lock:
+        if state["status"]=="running":return False
+        state.clear();state.update(mode="stage3",status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
+    threading.Thread(target=run3,daemon=True).start()
+    return True
+HTML3=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V0.3</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1100px;margin:auto;padding:16px}button,a,select{display:inline-block;color:white;background:#225b51;padding:10px;margin:4px;border:1px solid #476073;border-radius:7px;text-decoration:none}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}progress{width:100%}.scroll{overflow:auto}pre{white-space:pre-wrap}small{color:#b4c4d1;line-height:1.7}</style><h1>REVERSE SWING V0.3</h1><a href="/">1단계</a><a href="/stage2">2단계</a><section><h2>스윙 전용 전체 시장 백테스트</h2><p>발견 11/11~11/24 · 이전 비교 10/21~11/03 (2026). 일봉만 1회 수집. 1·2·3·5·7일 결과.</p><small>신호는 전일까지 완료된 일봉으로만 산출. 다음 일봉 시가 진입 가정. 종료 종가 수익률에 편도 0.25% 반영. 고가 도달은 익절 보장 아님. 저가는 진입가 대비 하락이며 고점 대비 낙폭이 아님. 기간 미완료·결측 제외, 중복 신호 포함. 자동 주문 없음.</small><p><button id="go">스윙 백테스트 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">조건 비교 CSV</a><a href="/csv/features">상세 결과 CSV</a><a href="/csv/coverage">수집률 CSV</a><a href="/csv/errors">오류 CSV</a><p><select id="group"><option value="earlier">이전 비교 기간</option><option value="discovery">발견 기간</option></select><select id="scope"><option value="all">전체 유효</option><option value="prior_value_100m">전일 거래대금 1억 이상</option></select><select id="horizon"><option>1</option><option>2</option><option selected>3</option><option>5</option><option>7</option></select>일</p><div class="scroll" id="tab"></div><div class="scroll" id="coverage"></div></section><script>
+const $=x=>document.getElementById(x);let result=null;
+function table(id,heads,rows){const t=document.createElement('table'),h=t.insertRow();for(let v of heads){const th=document.createElement('th');th.textContent=v;h.append(th)}for(let r of rows){const tr=t.insertRow();for(let v of r)tr.insertCell().textContent=v??'—'}$(id).replaceChildren(t)}
+function show(){if(!result)return;const h=Number($('horizon').value);let rows=result.summary.filter(x=>x.group===$('group').value&&x.scope===$('scope').value&&x.horizon===h);table('tab',['조건','신호건수','일평균','5% 도달%','10% 도달%','20% 도달%','10% 배수','최고 중앙%','최저 중앙%','-5% 하락%','순종가 중앙%','10%까지 일'],rows.map(x=>[x.name,x.candidates,x.per_day,x.hit5_pct,x.hit10_pct,x.hit20_pct,x.lift10,x.median_peak,x.median_worst,x.down5_pct,x.median_net_close,x.mean_day_to_10]));table('coverage',['날짜','기간완료','조건 유효','결과 유효'],result.coverage.filter(x=>x.group===$('group').value&&x.horizon===h).map(x=>[x.day,x.mature?'완료':'미완료',x.eligible,x.valid]))}
+['group','scope','horizon'].forEach(id=>$(id).onchange=show);
+$('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/stage3/start',{method:'POST'});if(!r.ok)throw Error(await r.text());let v=await r.json();if(!v.started)throw Error('다른 연구 실행 중');result=null;$('out').hidden=true;await poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};
+async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';if(s.mode!=='stage3'){$('out').hidden=true;$('phase').textContent=s.status==='running'?'다른 연구 실행 중':'대기';return}$('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 '+(s.market_success??0)+'/'+(s.universe??0)+' · 오류 '+s.error_count+' · 수집 '+(s.fetch_seconds??'—')+'초 · 전체 '+(s.elapsed_seconds??'—')+'초'+(s.cache_used?' · 캐시 사용':'');$('errors').textContent=s.errors.join('\n');if((s.status==='done'||s.status==='error')&&!result){result=await(await fetch('/results')).json();$('out').hidden=false;show()}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
+poll();setInterval(poll,2000);
+</script></html>"""
+
+HTML2=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.2</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1050px;margin:auto;padding:16px}button,a,select{display:inline-block;color:white;background:#225b51;padding:10px;margin:5px;border:1px solid #476073;border-radius:7px;text-decoration:none}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}progress{width:100%}.scroll{overflow:auto}pre{white-space:pre-wrap}small{color:#b4c4d1}</style><h1>REVERSE MINI V0.2</h1><a href="/stage3">V0.3 스윙 연구</a><a href="/">1단계 급등 종목 연구</a><section><h2>2단계 전체 종목 백테스트</h2><p>발견 기간 11/11~11/24 · 이전 비교 기간 10/28~11/10 (2026). 오늘 제외. 일 시작 전 완료 일봉만 사용. 결과는 당일 종가 변화이며 매매 수익률 아님.</p><button id="go">전체 코인 검증 시작</button><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">조건 비교 CSV</a><a href="/csv/features">전체 종목 CSV</a><a href="/csv/coverage">수집률 CSV</a><a href="/csv/errors">오류 CSV</a><p><select id="group"><option value="discovery">발견 기간</option><option value="earlier_holdout">이전 비교 기간</option></select><select id="scope"><option value="all">전체 유효</option><option value="prior_value_100m">전일 거래대금 1억 이상</option></select></p><small>기준 대비 5% 상승률 배수 = 조건군 발생률 / 전체 발생률. TOP10 포착률은 해당 범위 내 유효 TOP10 기준.</small><div class="scroll" id="tab"></div><div class="scroll" id="coverage"></div></section><script>
 const $=x=>document.getElementById(x);let result=null;
 function table(id,heads,rows){const t=document.createElement('table'),h=t.insertRow();for(let v of heads){const th=document.createElement('th');th.textContent=v;h.append(th)}for(let r of rows){const tr=t.insertRow();for(let v of r)tr.insertCell().textContent=v??'—'}$(id).replaceChildren(t)}
 function show(){if(!result)return;const rows=result.summary.filter(x=>x.group===$('group').value&&x.scope===$('scope').value);table('tab',['조건','대상','일평균','TOP10 포착','TOP10 적중%','5% 이상%','10% 이상%','5% 배수','10% 배수'],rows.map(x=>[x.name,x.candidates,x.per_day,x.top10_hits,x.top10_precision_pct,x.hit5_pct,x.hit10_pct,x.lift5,x.lift10]));table('coverage',['날짜','순위 유효','조건 유효','TOP10 유효'],result.coverage.filter(x=>x.group===$('group').value).map(x=>[x.day,x.valid_markets,x.feature_valid,x.top10_valid]))}
@@ -366,7 +464,7 @@ poll();setInterval(poll,2000);
 
 HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1.3</title><style>
 *{box-sizing:border-box}body{margin:0 auto;max-width:1050px;padding:16px;background:#10151d;color:#edf2f7;font:14px system-ui,sans-serif}h1{font-size:23px;margin:8px 0}h2{font-size:17px;margin:18px 0 8px}.card{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}label{display:inline-block;margin:6px}input,select,button,a.btn{background:#263646;color:#fff;border:1px solid #476073;border-radius:7px;padding:9px;font:inherit}button,a.btn{cursor:pointer;background:#225b51;text-decoration:none;display:inline-block;margin:4px}button:disabled{opacity:.5}.muted{color:#b4c4d1;line-height:1.6}progress{width:100%;accent-color:#37b89d}.scroll{overflow:auto;max-height:470px}table{border-collapse:collapse;width:100%;white-space:nowrap;font-size:13px}th,td{padding:8px;text-align:left;border-bottom:1px solid #324355}th{position:sticky;top:0;background:#253443}.pos{color:#6be3b7}pre{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#b4c4d1}</style>
-<h1>REVERSE MINI V0.1.3</h1><a class="btn" href="/stage2">2단계 전체 코인 검증</a><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
+<h1>REVERSE MINI V0.1.3</h1><a class="btn" href="/stage3">V0.3 스윙 연구</a><a class="btn" href="/stage2">2단계 전체 코인 검증</a><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
 <div class="card"><label>완료 일수 <select id="days"><option>3</option><option>7</option><option selected>14</option></select></label><label>급등 기준 <select id="threshold"><option>3</option><option selected>5</option><option>10</option></select>%</label><label><input id="today" type="checkbox" checked> 오늘 미완료 별도</label><button id="go">백테스트 시작</button><div class="muted">일봉 경계는 BTC 실제 수신 시간으로 자동 판별 (현재 관측 KST 00:00). 전일 종가 대비 당일 종가 상승률 순위. 최초 기준 도달 5분봉 종가 이전 완료봉만 분석. 현재 상장 목록 기준이며 스테이블코인 목록은 제한적. 짧은 이력(이전 일봉 14개 미만)은 별도. 매수 조건 없음.</div></div>
 <div class="card"><strong id="phase">대기</strong> <span id="count"></span><progress id="progress" value="0" max="1"></progress><div id="stats" class="muted"></div></div>
 <div id="output" hidden><div class="card"><h2>CSV 저장</h2><a class="btn" href="/csv/rank">일별 TOP10</a><a class="btn" href="/csv/features">상세 지표</a><a class="btn" href="/csv/summary">공통점</a><a class="btn" href="/csv/coverage">수집률</a><a class="btn" href="/csv/errors">오류</a><div class="muted">확정·분봉 공백·일 시작 전을 별도 집계. 공백 사례는 최초 관측 시점 기준으로 탐색 전용. 일 시작 전은 최초 급등 시점과 독립적. 분모는 해당 지표의 유효 데이터 수이며, 예측 성과나 수익률이 아님.</div></div>
@@ -378,7 +476,7 @@ function table(el,headers,rows){let t=document.createElement('table'),h=t.create
 function summary(){if(!result)return;let a=result.summary.filter(x=>x.cohort===$('cohort').value&&x.offset===$('offset').value&&x.pattern.includes('+')===$('pairs').checked);a.sort((a,b)=>(b.hit_pct??-1)-(a.hit_pct??-1)||b.available-a.available);table('summary',['공통점','발견','유효','대상','발견율'],a.map(x=>[x.name,x.hits,x.available,x.cases,x.hit_pct==null?'—':x.hit_pct.toFixed(1)+'%']))}
 $('cohort').onchange=()=>{if($('cohort').value.startsWith('pre_'))$('offset').value='일 시작 전';else if($('offset').value.startsWith('일 시작'))$('offset').value='5분';summary()};['offset','pairs'].forEach(id=>$(id).onchange=summary);
 $('go').onclick=async()=>{try{$('go').disabled=true;const r=await fetch('/start?days='+$('days').value+'&threshold='+$('threshold').value+'&today='+($('today').checked?1:0),{method:'POST'});if(!r.ok)throw Error(await r.text());$('output').hidden=true;result=null;await poll()}catch(e){$('phase').textContent='시작 실패: '+e.message;$('go').disabled=false}};
-async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if(s.mode==='stage2'){$('output').hidden=true;return}if((s.status==='done'||s.status==='error')&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
+async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if(s.mode==='stage2'||s.mode==='stage3'){$('output').hidden=true;return}if((s.status==='done'||s.status==='error')&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
 poll();setInterval(poll,2000);
 </script></html>"""
 class Handler(BaseHTTPRequestHandler):
@@ -392,6 +490,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/stage3/start":return self.js({"started":start3()})
         if u.path=="/stage2/start":return self.js({"started":start2()})
         if u.path!="/start":return self.js({"error":"not found"},404)
         q=parse_qs(u.query)
@@ -404,6 +503,7 @@ class Handler(BaseHTTPRequestHandler):
         p=urlparse(self.path).path
         if p=="/":return self.send(HTML,"text/html; charset=utf-8")
         if p=="/stage2":return self.send(HTML2,"text/html; charset=utf-8")
+        if p=="/stage3":return self.send(HTML3,"text/html; charset=utf-8")
         if p=="/health":return self.js({"version":VERSION,"ok":True})
         with state_lock:
             if p=="/status":
@@ -421,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V0_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -453,7 +553,13 @@ def selftest():
     assert x and x["ret20"]<0 and rules2(x,0)["D20_R40"]
     rr,ss,cc=eval2({"KRW-BTC":hist,"KRW-A":hist},[start+35*DAY],0)
     assert len(rr)==2 and cc[0]["feature_valid"]==2
-    print("REVERSE MINI V0.2 self-test PASS",flush=True)
+    future={start:(start,100,112,96,105,1,100),start+DAY:(start+DAY,105,121,90,110,1,100)}
+    o=outcome3(future,start,2,start+2*DAY)
+    assert o["hit10"] and o["day_to_10"]==1 and o["hit20"] and o["down5"] and abs(o["net_close_pct"]-100*(1.1*(1-FEE3)/(1+FEE3)-1))<1e-8
+    assert outcome3(future,start,2,start+DAY) is None and outcome3(future,start,3,start+3*DAY) is None
+    rr,ss,cc=eval3({"KRW-BTC":hist,"KRW-A":hist},[("earlier",start+35*DAY)],start+40*DAY)
+    assert len(rr)==8 and len(cc)==5 and any(x["horizon"]==7 and not x["mature"] for x in cc)
+    print("REVERSE SWING V0.3 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
