@@ -1617,5 +1617,65 @@ class OrderflowV02IntegrationTest(unittest.TestCase):
         self.assertAlmostEqual(net_pct(100,100),100*(.9996/1.0004-1),places=10)
 
 
+class OrderflowV03Test(unittest.TestCase):
+    def test_cohorts_and_sample_cap(self):
+        from orderflow_mini_v03 import matches, trade_windows, COHORTS
+        self.assertEqual(len(COHORTS),24)
+        b={'ratio':2,'spread':.1}
+        t={'30':{'buy_share':70,'trade_total':5000000,'last_age':1,'price_change_pct':1}}
+        self.assertEqual(len(matches('KRW-XRP',b,t)),6)
+        self.assertEqual(matches('KRW-USDT',b,t),[])
+        now=1000000
+        ticks=[{'timestamp':(now-10)*1000,'trade_price':100,'trade_volume':1000,'ask_bid':'BID','sequential_id':i} for i in range(200)]
+        self.assertEqual(trade_windows(ticks,now,'KRW-XRP')[0],{})
+        self.assertEqual(trade_windows(ticks,now,'KRW-XRP')[1]['180'],'sample_cap')
+
+    def test_archive_survives_engine_restart_and_pages(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from flask import Flask
+        from orderflow_mini_v03 import Engine,register_flow_v03
+        with TemporaryDirectory() as d:
+            path=str(Path(d)/'archive.sqlite3')
+            e=Engine(path=path)
+            with e.db() as c: e.event(c,'coverage',{'total':485},1000000)
+            first=e.archive()
+            self.assertEqual(first['events'][0]['kind'],'coverage')
+            again=Engine(path=path).archive()
+            self.assertEqual(first,again)
+            self.assertEqual(e.archive(first['events'][0]['seq'])['events'],[])
+            app=Flask('v03_test');register_flow_v03(app,e);client=app.test_client()
+            self.assertEqual(client.get('/flow-v03').status_code,200)
+            self.assertEqual(client.get('/flow-v03/live').status_code,200)
+            self.assertEqual(client.get('/api/flow-v03/state').get_json()['fee_roundtrip_pct'],.08)
+            self.assertEqual(client.get('/api/flow-v03/archive?after=bad').status_code,400)
+            self.assertEqual(client.post('/api/flow-v03/order').status_code,404)
+            self.assertEqual(main.app.test_client().get('/flow-v03').status_code,200)
+
+    def test_v03_cycle_paper_signal_and_archive(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from orderflow_mini_v03 import Engine
+        now=1000000
+        def fetch(path,params):
+            if path.endswith('market/all'): return [{'market':'KRW-XRP'},{'market':'KRW-USDT'}]
+            if path.endswith('orderbook'):
+                return [{'market':m,'timestamp':now*1000,'orderbook_units':[{'bid_price':100,'ask_price':100.1,'bid_size':400000,'ask_size':200000}]} for m in params['markets'].split(',')]
+            if path.endswith('trades/ticks'):
+                return [{'market':params['market'],'timestamp':(now-3+i)*1000,'trade_price':100+i*.01,'trade_volume':40000,'ask_bid':'BID','sequential_id':i} for i in range(3)]
+            raise AssertionError(path)
+        with TemporaryDirectory() as d:
+            e=Engine(path=str(Path(d)/'cycle.sqlite3'),fetch=fetch,clock=lambda:now)
+            result=e.cycle()
+            self.assertEqual(result['total'],2)
+            self.assertEqual(result['eligible'],1)
+            self.assertEqual(result['candidates'][0]['market'],'KRW-XRP')
+            self.assertEqual(len(result['candidates'][0]['cohorts']),24)
+            self.assertEqual(e.state()['total_signals'],24)
+            e.cycle()
+            self.assertEqual(e.state()['total_signals'],24)
+            self.assertTrue(any(x['kind']=='trades' for x in e.archive()['events']))
+
+
 if __name__=="__main__":
     unittest.main()

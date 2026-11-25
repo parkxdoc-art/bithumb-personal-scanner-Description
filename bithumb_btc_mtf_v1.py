@@ -45,6 +45,8 @@ _LOCK = threading.Lock()
 app = Flask(__name__)
 from orderflow_mini_v02 import register_orderflow_v02
 register_orderflow_v02(app)
+from orderflow_mini_v03 import register_flow_v03
+register_flow_v03(app)
 
 
 def now_kst():
