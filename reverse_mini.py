@@ -5,7 +5,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "REVERSE SWING V0.8"
+VERSION = "REVERSE SWING V0.8.1"
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9))
 DAY = 86400
@@ -882,7 +882,7 @@ def start8(target):
         state.clear();state.update(mode="reverse8",status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[],target_net_pct=target)
     threading.Thread(target=run8,args=(target,),daemon=True).start()
     return True
-HTML8=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V0.8</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1050px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:12px;margin:12px 0}button,a,select,input{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:9px;margin:4px;border-radius:7px;text-decoration:none}button:disabled{opacity:.5}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto;max-height:480px}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}</style><h1>REVERSE SWING V0.8</h1><a href="/reverse7">V0.7 당일 비교</a><section><h2>20일 하락 추세 + 거래량 증가</h2><p>RSI 제외. D-3 대비 D-1 거래량 배수 증가. V0.7의 20일 가격 추세 정의 유지.</p><small>10/28~11/24 진입 후보 중 7일 모두 마감된 날짜만 검증. 다음 일봉 시가 진입, 7일 이내 일봉 고가가 목표가에 도달하면 목표가 청산 가정, 미도달 시 7일째 종가 청산. 편도 수수료 0.25%, 별도 손절 없음. 보유 중 같은 종목 재진입 금지, 청산 다음 날부터 재진입 가능. 호가 단위·체결·슬리피지 미반영. 현재 상장 목록 기준, 동일 기간 연구.</small><p>순수익 목표(%) <input id="target" type="number" min="0.01" max="50" step="0.01" value="0.5" style="width:80px"><button id="go">7일 스윙 검증 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">승률 CSV</a><a href="/csv/features">전체 매매 CSV</a><a href="/csv/coverage">일별 결과 CSV</a><a href="/csv/errors">오류 CSV</a><h2>7일 스윙 결과</h2><div id="headline"></div><div class="scroll" id="tab"></div><h2>일별 진입 결과</h2><div class="scroll" id="daily"></div><h2>개별 매매</h2><select id="day"><option value="">전체 날짜</option></select><select id="result"><option value="all">전체</option><option value="win">수익</option><option value="loss">손실</option></select><input id="query" placeholder="코인 검색" style="width:100px"><button id="search">조회</button><p id="count"></p><div class="scroll" id="detail"></div><button id="prev">이전</button><button id="next">다음</button></section><script>
+HTML8=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V0.8</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1050px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:12px;margin:12px 0}button,a,select,input{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:9px;margin:4px;border-radius:7px;text-decoration:none}button:disabled{opacity:.5}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto;max-height:480px}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}</style><h1>REVERSE SWING V0.8</h1><a href="/reverse81">V0.8.1 최대 수익</a><a href="/reverse7">V0.7 당일 비교</a><section><h2>20일 하락 추세 + 거래량 증가</h2><p>RSI 제외. D-3 대비 D-1 거래량 배수 증가. V0.7의 20일 가격 추세 정의 유지.</p><small>10/28~11/24 진입 후보 중 7일 모두 마감된 날짜만 검증. 다음 일봉 시가 진입, 7일 이내 일봉 고가가 목표가에 도달하면 목표가 청산 가정, 미도달 시 7일째 종가 청산. 편도 수수료 0.25%, 별도 손절 없음. 보유 중 같은 종목 재진입 금지, 청산 다음 날부터 재진입 가능. 호가 단위·체결·슬리피지 미반영. 현재 상장 목록 기준, 동일 기간 연구.</small><p>순수익 목표(%) <input id="target" type="number" min="0.01" max="50" step="0.01" value="0.5" style="width:80px"><button id="go">7일 스윙 검증 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">승률 CSV</a><a href="/csv/features">전체 매매 CSV</a><a href="/csv/coverage">일별 결과 CSV</a><a href="/csv/errors">오류 CSV</a><h2>7일 스윙 결과</h2><div id="headline"></div><div class="scroll" id="tab"></div><h2>일별 진입 결과</h2><div class="scroll" id="daily"></div><h2>개별 매매</h2><select id="day"><option value="">전체 날짜</option></select><select id="result"><option value="all">전체</option><option value="win">수익</option><option value="loss">손실</option></select><input id="query" placeholder="코인 검색" style="width:100px"><button id="search">조회</button><p id="count"></p><div class="scroll" id="detail"></div><button id="prev">이전</button><button id="next">다음</button></section><script>
 const $=id=>document.getElementById(id);let result=null,page=1,pages=1,seq=0,loading=false;
 function table(id,heads,rows){let t=document.createElement('table'),tr=t.insertRow();for(const h of heads){let th=document.createElement('th');th.textContent=h;tr.append(th)}for(const row of rows){let tr=t.insertRow();for(const v of row)tr.insertCell().textContent=v??'—'}$(id).replaceChildren(t)}
 function fmt(x){return typeof x==='number'?Number(x.toPrecision(7)):x}
@@ -891,6 +891,95 @@ function show(){let x=result.summary[0];$('headline').textContent='순수익 목
 $('day').onchange=$('result').onchange=$('search').onclick=()=>detail();$('prev').onclick=()=>detail(page-1);$('next').onclick=()=>detail(page+1);
 $('go').onclick=async()=>{try{let t=Number($('target').value);if(!Number.isFinite(t)||t<.01||t>50)throw Error('목표 0.01~50%');$('go').disabled=true;let r=await fetch('/reverse8/start?target='+encodeURIComponent(t),{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 연구 실행 중 또는 설정 오류');result=null;seq++;$('out').hidden=true;await poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};
 async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';if(s.mode!=='reverse8'){$('out').hidden=true;result=null;$('phase').textContent=s.status==='running'?'다른 연구 실행 중':'대기';return}$('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 '+(s.market_success??0)+'/'+(s.universe??0)+' · 오류 '+s.error_count+' · 전체 '+(s.elapsed_seconds??'—')+'초';$('errors').textContent=s.errors.join('\n');if(s.status==='running'){result=null;$('out').hidden=true}if(s.status==='done'&&!result&&!loading){loading=true;try{let r=await fetch('/results');if(!r.ok)throw Error(r.status);result=await r.json();$('out').hidden=false;show()}finally{loading=false}}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
+poll();setInterval(poll,2000);
+</script></html>"""
+
+
+# V0.8.1: maximum attainable profit research, not an executable exit strategy.
+FEE81=.0004
+def outcome81(by,t):
+    seq=[by.get(t+i*DAY) for i in range(7)]
+    if not all(seq) or any(min(r[1:5])<=0 for r in seq):return None
+    entry=seq[0][1]
+    def net(p):return 100*(p/entry*(1-FEE81)/(1+FEE81)-1)
+    peak_i=max(range(7),key=lambda i:seq[i][2])
+    peak=seq[peak_i][2];potential=net(peak);close=seq[-1][4]
+    profitable=potential>1e-10
+    exit_i=peak_i if profitable else 6
+    price=peak if profitable else close
+    return dict(buy_open=entry,peak_price=peak,peak_day=iso(t+peak_i*DAY)[:10],peak_day_number=peak_i+1,peak_net_pct=potential,profit_opportunity=profitable,hypothetical_exit_day=iso(t+exit_i*DAY)[:10],hypothetical_exit_price=price,net_pct=net(price),day7_close=close,day7_net_pct=net(close),worst_from_entry_pct=pct(min(r[3] for r in seq),entry),holding_days=exit_i+1,exit_reason="PEAK_HINDSIGHT" if profitable else "DAY7")
+def stats81(a):
+    n=len(a);w=sum(x["net_pct"]>1e-10 for x in a);l=sum(x["net_pct"]< -1e-10 for x in a)
+    cw=sum(x["day7_net_pct"]>1e-10 for x in a);cl=sum(x["day7_net_pct"]< -1e-10 for x in a)
+    def avg(k):return round(mean([x[k] for x in a]),4) if n else None
+    def med(k):return round(statistics.median(x[k] for x in a),4) if n else None
+    return dict(trades=n,profit_opportunities=w,no_profit=l,flat=n-w-l,opportunity_pct=round(100*w/n,2) if n else None,avg_hypothetical_net_pct=avg("net_pct"),median_hypothetical_net_pct=med("net_pct"),avg_peak_net_pct=avg("peak_net_pct"),median_peak_net_pct=med("peak_net_pct"),highest_peak_net_pct=round(max(x["peak_net_pct"] for x in a),4) if n else None,worst_hypothetical_net_pct=round(min(x["net_pct"] for x in a),4) if n else None,day7_wins=cw,day7_losses=cl,day7_flat=n-cw-cl,day7_win_pct=round(100*cw/n,2) if n else None,avg_day7_net_pct=avg("day7_net_pct"),median_day7_net_pct=med("day7_net_pct"),avg_peak_day=avg("peak_day_number"),hit_net_1=sum(x["peak_net_pct"]>=1 for x in a),hit_net_3=sum(x["peak_net_pct"]>=3 for x in a),hit_net_5=sum(x["peak_net_pct"]>=5 for x in a),hit_net_10=sum(x["peak_net_pct"]>=10 for x in a),hit_net_20=sum(x["peak_net_pct"]>=20 for x in a))
+def eval81(data,starts,end,progress=None):
+    indexed={m:{r[0]:r for r in rows} for m,rows in data.items()}
+    trades=[];daily=[];busy={}
+    for i,t in enumerate(starts):
+        mature=t+7*DAY<=end
+        eligible=signals=overlap=missing=0;a=[]
+        if mature:
+            for m,rows in data.items():
+                by=indexed[m]
+                if t-DAY not in by:continue
+                v=trend6(rows,t,20)
+                if not v["valid"]:continue
+                d1=volume8(rows,t);d3=volume8(rows,t-2*DAY)
+                if d1 is None or d3 is None:continue
+                eligible+=1
+                if not (v["downtrend"] and d1>d3):continue
+                signals+=1
+                if busy.get(m,-1)>t:overlap+=1;continue
+                out=outcome81(by,t)
+                if out is None:missing+=1;continue
+                # Same fixed seven-day signal spacing for BOTH columns;
+                # a future-known peak must never determine a new entry.
+                busy[m]=t+7*DAY
+                a.append(dict(day=iso(t)[:10],market=m,down_days=v["down_days"],trend_net_pct=v["net_pct"],peak_to_last_pct=v["peak_to_last_close_pct"],vol_ratio_d3=d3,vol_ratio_d1=d1,fee_oneway_pct=.04,**out))
+        trades.extend(a)
+        daily.append(dict(day=iso(t)[:10],mature=mature,eligible=eligible,signals=signals,overlap_skipped=overlap,missing_future=missing,**stats81(a)))
+        if progress:progress(i+1)
+    good=[d for d in daily if d["mature"]]
+    summary=[dict(fee_oneway_pct=.04,mature_days=len(good),pending_days=len(daily)-len(good),signals=sum(d["signals"] for d in good),overlap_skipped=sum(d["overlap_skipped"] for d in good),missing_future=sum(d["missing_future"] for d in good),**stats81(trades))]
+    return trades,summary,daily
+def run81():
+    begin=time.monotonic()
+    try:
+        end=int(now().timestamp())
+        universe=sorted({x["market"] for x in api("market/all") if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
+        probe=candles("KRW-BTC",1440,end,30,latest=True)
+        if not universe or len(probe)<2:raise RuntimeError("시장 목록 또는 BTC 일봉 부족")
+        anchor=probe[-1][0]%DAY;current=day_start(end,anchor)
+        if probe[-1][0]!=current:raise RuntimeError("BTC 일봉 지연")
+        first=day_start(int(datetime(2026,10,28,12,tzinfo=KST).timestamp()),anchor)
+        starts=[first+i*DAY for i in range(28)]
+        patch(phase="전체 일봉 1회 수집",done=0,total=len(universe),universe=len(universe))
+        data={}
+        for m,rows in parallel(universe,lambda m:candles(m,1440,end,200,latest=True)):
+            if rows and all(r[0]%DAY==anchor for r in rows):data[m]=rows
+            else:record_error(m+" 일봉 누락/경계 불일치")
+        patch(phase="7일 최대 수익 가능성 비교",done=0,total=28,market_success=len(data))
+        rows,summ,daily=eval81(data,starts,current,lambda i:patch(done=i))
+        if not any(x["eligible"] for x in daily):raise RuntimeError("유효 비교 데이터 없음")
+        patch(features=rows,summary=summ,coverage=daily,done=28,status="done",phase="완료",elapsed_seconds=round(time.monotonic()-begin,1))
+    except Exception as e:record_error(str(e));patch(status="error",phase="실패")
+def start81():
+    with state_lock:
+        if state["status"]=="running":return False
+        state.clear();state.update(mode="reverse81",status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
+    threading.Thread(target=run81,daemon=True).start()
+    return True
+HTML81=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING V0.8.1</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1050px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:12px;margin:12px 0}button,a,select,input{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:9px;margin:4px;border-radius:7px;text-decoration:none}button:disabled{opacity:.5}table{border-collapse:collapse;white-space:nowrap}td,th{padding:8px;border-bottom:1px solid #324355;text-align:right}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto;max-height:480px}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}</style><h1>REVERSE SWING V0.8.1</h1><a href="/reverse8">V0.8 고정익절 비교</a><section><h2>20일 하락 + 거래량 증가 / 7일 최대 수익</h2><p>RSI 제외 · 편도 수수료 0.04% · 고정 익절·손절 없음.</p><small>10/28~11/24 진입일 중 7일 모두 완료된 날만. 전일 마감 신호로 다음 일봉 시가 진입. 7일 고가 중 최고가가 순수익이면 그 가격에 사후 청산했다고 가정, 아니면 7일 종가. 이는 미래 최고가를 알아야 하는 이론적 상한으로 실제 승률 아님. 동일 진입에서 7일 종가 청산 수익률 별도 표시. 최고가 날짜가 다음 진입에 영향을 주지 않도록 같은 종목 7일간 재진입 금지(두 비교군 동일). 슬리피지·체결·호가단위 미반영. 현재 상장 목록 기준.</small><p><button id="go">7일 최대 수익 검증 시작</button></p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section id="out" hidden><a href="/csv/summary">결과 CSV</a><a href="/csv/features">전체 종목 CSV</a><a href="/csv/coverage">일별 CSV</a><a href="/csv/errors">오류 CSV</a><h2>최대 수익 가능성과 7일 종가 비교</h2><p id="headline"></p><div class="scroll" id="tab"></div><h2>7일 내 순수익 도달 분포</h2><div class="scroll" id="hits"></div><h2>일별 결과</h2><div class="scroll" id="daily"></div><h2>개별 종목</h2><select id="day"><option value="">전체 날짜</option></select><select id="kind"><option value="all">전체</option><option value="win">수익 기회 있음</option><option value="loss">수익 기회 없음</option></select><input id="query" placeholder="코인 검색" style="width:100px"><button id="search">조회</button><p id="count"></p><div class="scroll" id="detail"></div><button id="prev">이전</button><button id="next">다음</button></section><script>
+const $=id=>document.getElementById(id);let result=null,page=1,pages=1,seq=0,loading=false;
+function table(id,heads,rows){let t=document.createElement('table'),tr=t.insertRow();for(const h of heads){let th=document.createElement('th');th.textContent=h;tr.append(th)}for(const row of rows){let tr=t.insertRow();for(const v of row)tr.insertCell().textContent=v??'—'}$(id).replaceChildren(t)}
+function fmt(x){return typeof x==='number'?Number(x.toPrecision(7)):x}
+async function detail(p=1){if(!result)return;let token=++seq;try{let q=new URLSearchParams({day:$('day').value,kind:$('kind').value,query:$('query').value,page:String(p)});let r=await fetch('/reverse81/details?'+q,{cache:'no-store'});if(!r.ok)throw Error(r.status);let d=await r.json();if(token!==seq)return;page=d.page;pages=d.pages;$('count').textContent=d.total+'건 · '+page+'/'+pages+' 페이지';table('detail',['진입일','코인','매수가','최고가일','최고가','최대 순수익%','가정 수익%','7일 종가 순수익%','최저 하락%','거래량 D-3','거래량 D-1','고점 대비 하락%'],d.rows.map(x=>[x.day,x.market,fmt(x.buy_open),x.peak_day,fmt(x.peak_price),fmt(x.peak_net_pct),fmt(x.net_pct),fmt(x.day7_net_pct),fmt(x.worst_from_entry_pct),fmt(x.vol_ratio_d3),fmt(x.vol_ratio_d1),fmt(x.peak_to_last_pct)]));$('prev').disabled=page<=1;$('next').disabled=page>=pages}catch(e){if(token===seq)$('count').textContent='조회 실패: '+e.message}}
+function show(){let x=result.summary[0];$('headline').textContent='검증 '+x.mature_days+'일 · 7일 미경과 제외 '+x.pending_days+'일 · 중복 제외 '+x.overlap_skipped+'건 · 누락 '+x.missing_future+'건';table('tab',['구분','매수','수익','손실','보합','비율%','평균 순수익%','중앙값%'],[['최고가 사후 가정',x.trades,x.profit_opportunities,x.no_profit,x.flat,x.opportunity_pct,x.avg_hypothetical_net_pct,x.median_hypothetical_net_pct],['7일 종가 청산',x.trades,x.day7_wins,x.day7_losses,x.day7_flat,x.day7_win_pct,x.avg_day7_net_pct,x.median_day7_net_pct]]);table('hits',['순수익 목표','도달 건수','도달률%'],[1,3,5,10,20].map(k=>[k+'%',x['hit_net_'+k],x.trades?fmt(100*x['hit_net_'+k]/x.trades):null]));let d=result.coverage.filter(x=>x.mature);let o=document.createElement('option');o.value='';o.textContent='전체 날짜';$('day').replaceChildren(o,...d.map(x=>{let a=document.createElement('option');a.value=x.day;a.textContent=x.day;return a}));table('daily',['진입일','매수','수익 기회','기회율%','최고가 가정 평균%','7일 종가 승률%','7일 종가 평균%'],d.map(x=>[x.day,x.trades,x.profit_opportunities,x.opportunity_pct,x.avg_hypothetical_net_pct,x.day7_win_pct,x.avg_day7_net_pct]));detail()}
+$('day').onchange=$('kind').onchange=$('search').onclick=()=>detail();$('prev').onclick=()=>detail(page-1);$('next').onclick=()=>detail(page+1);
+$('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/reverse81/start',{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 연구 실행 중');result=null;seq++;$('out').hidden=true;await poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};
+async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';if(s.mode!=='reverse81'){$('out').hidden=true;result=null;$('phase').textContent=s.status==='running'?'다른 연구 실행 중':'대기';return}$('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 '+(s.market_success??0)+'/'+(s.universe??0)+' · 오류 '+s.error_count+' · 전체 '+(s.elapsed_seconds??'—')+'초';$('errors').textContent=s.errors.join('\n');if(s.status==='running'){result=null;$('out').hidden=true}if(s.status==='done'&&!result&&!loading){loading=true;try{let r=await fetch('/results');if(!r.ok)throw Error(r.status);result=await r.json();$('out').hidden=false;show()}finally{loading=false}}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
 poll();setInterval(poll,2000);
 </script></html>"""
 
@@ -932,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/reverse81/start":return self.js({"started":start81()})
         if u.path=="/reverse8/start":
             try:
                 target=float(parse_qs(u.query).get("target",["0.5"])[0])
@@ -961,6 +1051,21 @@ class Handler(BaseHTTPRequestHandler):
         if p=="/":return self.send(HTML,"text/html; charset=utf-8")
         if p=="/stage2":return self.send(HTML2,"text/html; charset=utf-8")
         if p=="/stage3":return self.send(HTML3,"text/html; charset=utf-8")
+        if p=="/reverse81":return self.send(HTML81,"text/html; charset=utf-8")
+        if p=="/reverse81/details":
+            q=parse_qs(u.query)
+            try:
+                page=int(q.get("page",["1"])[0]);kind=q.get("kind",["all"])[0]
+                day=q.get("day",[""])[0];query=q.get("query",[""])[0].strip().upper()[:40]
+                if kind not in ("all","win","loss"):raise ValueError()
+            except ValueError:return self.js({"error":"invalid filters"},400)
+            with state_lock:
+                if state.get("mode")!="reverse81" or state["status"]!="done":return self.js({"error":"not complete"},409)
+                rows=state["features"]
+            a=[x for x in rows if (not day or x["day"]==day) and query in x["market"] and (kind=="all" or (kind=="win" and x["profit_opportunity"]) or (kind=="loss" and not x["profit_opportunity"]))]
+            a.sort(key=lambda x:(x["day"],x["market"]))
+            pages=max(1,(len(a)+49)//50);page=min(max(1,page),pages)
+            return self.js(dict(total=len(a),page=page,pages=pages,rows=a[(page-1)*50:page*50]))
         if p=="/reverse8":return self.send(HTML8,"text/html; charset=utf-8")
         if p=="/reverse8/details":
             q=parse_qs(u.query)
@@ -1057,7 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -1146,7 +1251,17 @@ def selftest():
     r8,s8,d8=eval8({"KRW-A":vol8},[start+25*DAY,start+30*DAY],start+32*DAY,.5)
     assert len(r8)==1 and s8[0]["mature_days"]==1 and s8[0]["pending_days"]==1
     assert s8[0]["trades"]==1 and d8[0]["signals"]==1
-    print("REVERSE SWING V0.8 self-test PASS",flush=True)
+    a81=outcome81(synthetic8,start)
+    assert a81["profit_opportunity"] and a81["peak_day_number"]==3
+    assert abs(a81["peak_net_pct"]-100*(1.02*(1-.0004)/(1+.0004)-1))<1e-9
+    assert a81["day7_net_pct"]<0 and a81["net_pct"]>0
+    no81={start+i*DAY:(start+i*DAY,100,100,98,99,10,1000) for i in range(7)}
+    b81=outcome81(no81,start)
+    assert not b81["profit_opportunity"] and b81["net_pct"]==b81["day7_net_pct"]
+    assert outcome81({k:v for k,v in synthetic8.items() if k!=start+6*DAY},start) is None
+    r81,s81,d81=eval81({"KRW-A":vol8},[start+25*DAY,start+30*DAY],start+32*DAY)
+    assert len(r81)==1 and s81[0]["mature_days"]==1 and s81[0]["pending_days"]==1
+    print("REVERSE SWING V0.8.1 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
