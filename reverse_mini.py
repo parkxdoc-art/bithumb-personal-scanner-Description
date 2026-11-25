@@ -1633,6 +1633,17 @@ async function poll(){try{let r=await fetch('/research131/status',{cache:'no-sto
 poll();setInterval(poll,2500);
 </script></html>"""
 
+APP_LINK_TEST=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>빗썸 앱 연결 테스트 T0.1</title><style>body{background:#10151d;color:#edf2f7;font:16px system-ui;max-width:620px;margin:auto;padding:18px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:16px;margin:14px 0}a,button{display:block;background:#225b51;color:white;border:1px solid #476073;padding:14px;margin:10px 0;border-radius:8px;text-decoration:none;font:inherit;text-align:center}button{width:100%}small{color:#b4c4d1;line-height:1.7}input{font:inherit;color:#edf2f7;background:#10151d;border:1px solid #476073;padding:9px;border-radius:7px;max-width:90%}#msg{color:#ffcf87;white-space:pre-wrap}</style><h1>빗썸 앱 연결 테스트 T0.1</h1><p>안드로이드 Chrome에서 실행해 주세요. 앱 실행만 시험합니다. 로그인 정보, API 키, 주문 요청은 전혀 수집하거나 전달하지 않습니다.</p><section><h2>1. 설치된 앱 실행</h2><a id="main" href="intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;package=com.btckorea.bithumb;end">① 빗썸 앱 실행 시도</a><small>앱의 런처를 지정하는 시험입니다. 브라우저에서 허용되지 않으면 열리지 않을 수 있습니다.</small><a id="scheme" href="intent://open/#Intent;scheme=bithumb;package=com.btckorea.bithumb;end">② 앱 전용 주소 실행 시도</a><small>bithumb 스킴은 공식 확인되지 않은 시험용 후보입니다. 설치된 빗썸 패키지로만 요청합니다.</small></section><section><h2>2. 종목 직접 연결</h2><p>테스트 종목 <input id="coin" value="MANTA" maxlength="20" aria-label="코인 심볼"></p><button id="copy">종목명 복사</button><a id="trade" href="intent://www.bithumb.com/trade/order/MANTA_KRW#Intent;scheme=https;package=com.btckorea.bithumb;end">③ 해당 종목 앱 화면 실행 시도</a><small>공식 웹 거래 주소를 설치된 앱으로 전달하는 시험입니다. 앱이 해당 주소를 지원하지 않으면 실행되지 않습니다.</small></section><p id="msg" role="status">버튼을 눌러 앱이 열리는지 확인해 주세요. 웹 거래 화면으로 자동 전환하지 않습니다.</p><section><a href="https://play.google.com/store/apps/details?id=com.btckorea.bithumb" target="_blank" rel="noopener noreferrer">④ 공식 Play 스토어에서 열기 (대안)</a><small>Play 스토어의 빗썸 페이지에서 직접 열기를 누르는 방법입니다.</small><a href="/live142">기존 V1.4.2 스캐너 돌아가기</a></section><script>
+const $=id=>document.getElementById(id);
+const fallback=encodeURIComponent(location.origin+location.pathname+"?failed=1");
+function withFallback(a){a.href=a.getAttribute("href").replace(/;end$/,";S.browser_fallback_url="+fallback+";end")}
+withFallback($("main"));withFallback($("scheme"));
+function symbol(){return $("coin").value.trim().toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,20)||"MANTA"}
+function trade(){ $("trade").setAttribute("href","intent://www.bithumb.com/trade/order/"+symbol()+"_KRW#Intent;scheme=https;package=com.btckorea.bithumb;end");withFallback($("trade")); }
+$("coin").addEventListener("input",trade);trade();
+$("copy").onclick=async()=>{try{await navigator.clipboard.writeText(symbol());$("msg").textContent=symbol()+" 복사 완료. 앱이 열리면 검색창에 붙여넣으세요."}catch(e){$("coin").select();$("msg").textContent="자동 복사가 차단되었습니다. 선택된 종목명을 직접 복사해 주세요."}};
+if(new URLSearchParams(location.search).has("failed"))$("msg").textContent="앱 연결을 처리할 수 없어 테스트 페이지로 돌아왔습니다. 다른 번호를 시험해 주세요.";
+</script></html>"""
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
         if not isinstance(body,bytes):body=body.encode()
@@ -1684,6 +1695,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if p=="/app-test":return self.send(APP_LINK_TEST,"text/html; charset=utf-8")
         if p=="/":return self.send(HTML,"text/html; charset=utf-8")
         if p=="/stage2":return self.send(HTML2,"text/html; charset=utf-8")
         if p=="/stage3":return self.send(HTML3,"text/html; charset=utf-8")
