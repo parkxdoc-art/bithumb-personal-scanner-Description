@@ -1,4 +1,4 @@
-"""ELLIOTT WAVE MINI V0.4 | Public Bithumb data, research only.
+"""ELLIOTT WAVE MINI V0.5 | Public Bithumb data, research only.
 Standalone: python elliott_wave_mini.py ; existing Flask: register_elliott(app).
 """
 import os, time, json, math, csv, io, threading, statistics
@@ -10,7 +10,7 @@ from bisect import bisect_right
 from wsgiref.simple_server import make_server, WSGIServer
 from socketserver import ThreadingMixIn
 
-VERSION='ELLIOTT WAVE MINI V0.4'
+VERSION='ELLIOTT WAVE MINI V0.5'
 BASE='/elliott-mini'
 KST=timezone(timedelta(hours=9))
 API='https://api.bithumb.com'
@@ -135,11 +135,12 @@ def coverage(rows,unit,asof):
     latest=stamp(rows[-1][0]+unit*60) if rows else '없음'
     return f'{unit}분봉 {len(rows)}개 / 마지막 마감 {latest} / 기준 {stamp(asof)}'
 
-def get120(symbol,asof):
+def get120(symbol,asof,historical=False):
     reasons=[]
     for unit,count in ((60,200),(30,400)):
         try:
             raw=candles(symbol,unit,count,asof); rows=aggregate(raw,unit,120)
+            if historical and len(rows)>=63: return rows
             if history_ok(rows,120,63,5) and fresh(rows,120,asof): return rows
             reasons.append(f'{coverage(raw,unit,asof)} → {coverage(rows,120,asof)}')
             if len(rows)>=63 and fresh(rows,120,asof): break
@@ -203,6 +204,10 @@ def structure15(rows):
 
 def signals(rows, setup):
     if not setup or not contiguous(rows,1,60): return []
+    # Do not detect pivots across older gaps in the 100-bar pattern window.
+    for j in range(len(rows)-1,0,-1):
+        if rows[j][0]-rows[j-1][0]!=60:
+            rows=rows[j:]; break
     a=atr(rows); last=rows[-1]; prev=rows[-2]; price=last[4]; ma20=sma(rows,20)
     if not a or not bullish(last) or price<ma20 or price<=prev[4]: return []
     rr=rows[-100:]; p=pivots(rr); out=[]
@@ -280,35 +285,69 @@ def simulate(rows,i,sig,fee,hold=60):
     net=(exitp*(1-fee/100)/(entry*(1+fee/100))-1)*100
     return dict(sig,entry=entry,exit=exitp,net=net,why=why,end=end)
 
-def analyze(symbol,turnover,mode,asof,fee,hours):
-    r120=get120(symbol,asof)
-    if mode=='live' and not support120(r120): return [],[],''
+def analyze(symbol,turnover,mode,asof,fee,hours,diag=None):
+    d=diag if diag is not None else {}
+    d.update(h120_pass=0,m15_pass=0,m1_pass=0,valid_minutes=0,signal_count=0,unresolved=0,stage='120분봉')
+    historical=mode=='test'
+    r120=get120(symbol,asof,historical)
+    d['bars120']=len(r120)
+    if not historical and not support120(r120): return [],[],d
+    if not historical: d['h120_pass']=1
+    d['stage']='15분봉'
     r15=candles(symbol,15,300,asof)
-    if not history_ok(r15,15,243,55) or not fresh(r15,15,asof): raise DataGap('15분봉 자료 부족: '+coverage(r15,15,asof))
-    setup=structure15(r15)
-    if mode=='live' and not setup: return [],[],''
-    r1=candles(symbol,1,200 if mode=='live' else hours*60+180,asof)
-    if not contiguous(r1,1,60) or not fresh(r1,1,asof): raise DataGap('1분봉 자료 부족: '+coverage(r1,1,asof))
-    if mode=='live':
-        items=signals(r1,setup); return [dict(x,symbol=symbol,turnover=turnover) for x in items],[],''
+    d['bars15']=len(r15)
+    if (historical and len(r15)<243) or (not historical and (not history_ok(r15,15,243,55) or not fresh(r15,15,asof))):
+        raise DataGap('15분봉 자료 부족: '+coverage(r15,15,asof))
+    if not historical:
+        setup=structure15(r15)
+        if not setup: return [],[],d
+        d['m15_pass']=1
+    d['stage']='1분봉'
+    r1=candles(symbol,1,200 if not historical else hours*60+180,asof)
+    d['bars1']=len(r1)
+    if (historical and len(r1)<60) or (not historical and (not contiguous(r1,1,60) or not fresh(r1,1,asof))):
+        raise DataGap('1분봉 자료 부족: '+coverage(r1,1,asof))
+    if not historical:
+        d.update(m1_pass=1,valid_minutes=1,stage='매수 신호')
+        items=signals(r1,setup)
+        d['signal_count']=len(items)
+        d['stage']='신호 발견' if items else '진입 조건 미충족'
+        return [dict(x,symbol=symbol,turnover=turnover) for x in items],[],d
     ts120=[r[0]+7200 for r in r120]; ts15=[r[0]+900 for r in r15]
     trades=[]; cooldown={}; context={}; cutoff=asof-hours*3600
-    for i in range(60,len(r1)):
+    d['stage']='과거 구간 판정'
+    for i in range(59,len(r1)):
         t=r1[i][0]+60
         if t<cutoff: continue
         k=bisect_right(ts120,t); l=bisect_right(ts15,t)
         if k==0 or l==0 or t-ts120[k-1]>=7200 or t-ts15[l-1]>=900: continue
         key=(k,l)
-        if key not in context: context[key]=structure15(r15[:l]) if support120(r120[:k]) else None
-        if not context[key]: continue
-        for sig in signals(r1[max(0,i-119):i+1],context[key]):
+        if key not in context:
+            h_ok=support120(r120[:k])
+            context[key]=(h_ok,structure15(r15[:l]) if h_ok else None)
+        h_ok,setup=context[key]
+        window=r1[max(0,i-119):i+1]
+        valid=contiguous(window,1,60)
+        if valid: d['valid_minutes']+=1
+        if not h_ok: continue
+        d['h120_pass']=1
+        if not setup: continue
+        d['m15_pass']=1
+        if not valid: continue
+        d['m1_pass']=1
+        for sig in signals(window,setup):
             typ=sig['type']
             if t<=cooldown.get(typ,0): continue
+            d['signal_count']+=1
             result=simulate(r1,i,sig,fee)
             if result:
                 trades.append(dict(result,symbol=symbol)); cooldown[typ]=result['end']+60
-            elif i+60>=len(r1): cooldown[typ]=t+3600
-    return [],trades,''
+            else:
+                d['unresolved']+=1
+                if i+60>=len(r1): cooldown[typ]=t+3600
+    if d['valid_minutes']==0: raise DataGap('검증 구간 연속 1분봉 또는 상위봉 정합 부족')
+    d['stage']='검증 거래 발견' if trades else ('청산 미확정/진입불가' if d['signal_count'] else ('120분봉 조건 미충족' if not d['h120_pass'] else ('15분봉 조건 미충족' if not d['m15_pass'] else ('1분봉 연속 자료 부족' if not d['m1_pass'] else '진입 조건 미충족'))))
+    return [],trades,d
 
 def summarize(trades):
     out={}
@@ -322,7 +361,7 @@ def complete_locked():
     STATE['results'].sort(key=lambda x:(x['type']!='B',-x['aux'],-x['turnover']))
     STATE['trades'].sort(key=lambda x:x['time'],reverse=True)
     STATE.update(running=False,busy=False,ended=stamp(),message=('완료' if STATE['total']>len(STATE['errors']) else ('대상 없음' if not STATE['total'] else '판정 가능한 데이터 없음')))
-    print(f"[ELLIOTT V0.4] done={STATE['done']} total={STATE['total']} errors={len(STATE['errors'])}",flush=True)
+    print(f"[ELLIOTT V0.5] done={STATE['done']} total={STATE['total']} errors={len(STATE['errors'])}",flush=True)
 
 def start(args):
     try:
@@ -332,11 +371,11 @@ def start(args):
     with LOCK:
         if STATE['running']: return {'ok':False,'message':'이미 검색 중'},409
         token=uuid4().hex
-        STATE.update(running=True,busy=True,job_id=token,mode=mode,done=0,total=0,results=[],trades=[],errors=[],started=stamp(),ended='',fee=fee,message='KRW 종목 목록 조회',stats={})
+        STATE.update(running=True,busy=True,job_id=token,mode=mode,done=0,total=0,results=[],trades=[],errors=[],diagnostics=[],started=stamp(),ended='',fee=fee,message='KRW 종목 목록 조회',stats={})
         JOB.clear()
     try:
         LOCAL.deadline=time.monotonic()+35
-        print('[ELLIOTT V0.4] request market list start',flush=True)
+        print('[ELLIOTT V0.5] request market list start',flush=True)
         def progress(msg):
             with LOCK: STATE['message']=msg
         symbols=markets(min_eok,limit,progress)
@@ -344,11 +383,11 @@ def start(args):
             JOB.update(symbols=symbols,asof=time.time()-2,mode=mode,fee=fee,hours=hours)
             STATE.update(total=len(symbols),busy=False,message='차트 검색 중')
             if not symbols: complete_locked()
-        print(f'[ELLIOTT V0.4] request market list OK {len(symbols)}',flush=True)
+        print(f'[ELLIOTT V0.5] request market list OK {len(symbols)}',flush=True)
         return {'ok':True},200
     except Exception as e:
         with LOCK: STATE.update(running=False,busy=False,ended=stamp(),message='검색 실패: '+str(e))
-        print(f'[ELLIOTT V0.4] market list failed: {e}',flush=True)
+        print(f'[ELLIOTT V0.5] market list failed: {e}',flush=True)
         return {'ok':False,'message':str(e)},400
     finally:
         LOCAL.deadline=float('inf')
@@ -364,19 +403,20 @@ def step(args):
         sym,turnover=JOB['symbols'][idx]
         mode,asof,fee,hours=(JOB[k] for k in ('mode','asof','fee','hours'))
         STATE.update(busy=True,message=f'{sym} 차트 조회')
-    results=[]; trades=[]; err=None
+    results=[]; trades=[]; err=None; diag={'symbol':sym}
     try:
         LOCAL.deadline=time.monotonic()+22
-        results,trades,_=analyze(sym,turnover,mode,asof,fee,hours)
+        results,trades,_=analyze(sym,turnover,mode,asof,fee,hours,diag)
     except Exception as e:
         err={'symbol':sym,'kind':'자료부족' if isinstance(e,DataGap) else 'API오류','error':str(e)}
     finally:
         LOCAL.deadline=float('inf')
         with LOCK:
             STATE['done']+=1; STATE['results'].extend(results); STATE['trades'].extend(trades)
+            STATE['diagnostics'].append(dict(diag,reason=err['error'] if err else '',kind=err['kind'] if err else '정상',trade_count=len(trades)))
             if err:
                 STATE['errors'].append(err)
-                if len(STATE['errors'])<=5: print(f'[ELLIOTT V0.4] {err}',flush=True)
+                if len(STATE['errors'])<=5: print(f'[ELLIOTT V0.5] {err}',flush=True)
             STATE['stats']=summarize(STATE['trades'])
             STATE.update(busy=False,message='차트 검색 중')
             if STATE['done']>=STATE['total']: complete_locked()
@@ -386,19 +426,22 @@ def state():
     with LOCK: return json.loads(json.dumps(STATE,ensure_ascii=False))
 
 def export():
-    s=state(); rows=s['trades'] if s['mode']=='test' else s['results']; fields=['symbol','type','time','setup','reason','price','stop','risk','aux','rsi','macd_up','volume','entry','exit','net','why','end']
+    s=state(); rows=s['trades'] if s['mode']=='test' else s['results']
+    fields=['record','mode','symbol','type','time','setup','reason','price','stop','risk','aux','rsi','macd_up','volume','entry','exit','net','why','end','kind','stage','bars120','bars15','bars1','h120_pass','m15_pass','m1_pass','valid_minutes','signal_count','unresolved','trade_count','done','total','error_count']
     f=io.StringIO(); w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore'); w.writeheader()
-    for r in rows: w.writerow(dict(r,time=stamp(r['time']),end=stamp(r['end']) if 'end' in r else ''))
-    return '\ufeff'+f.getvalue(), 'ELLIOTT_WAVE_MINI_V0_4_'+datetime.now(KST).strftime('%Y%m%d%H%M')+'.csv'
+    w.writerow(dict(record='SUMMARY',mode=s['mode'],reason=s['message'],done=s['done'],total=s['total'],error_count=len(s['errors'])))
+    for d in s.get('diagnostics',[]): w.writerow(dict(d,record='DIAG',mode=s['mode']))
+    for r in rows: w.writerow(dict(r,record='TRADE' if s['mode']=='test' else 'SIGNAL',mode=s['mode'],time=stamp(r['time']),end=stamp(r['end']) if 'end' in r else ''))
+    return '\ufeff'+f.getvalue(), 'ELLIOTT_WAVE_MINI_V0_5_'+datetime.now(KST).strftime('%Y%m%d%H%M')+'.csv'
 
-HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ELLIOTT WAVE MINI V0.4</title><style>
+HTML=r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ELLIOTT WAVE MINI V0.5</title><style>
 *{box-sizing:border-box}body{margin:0;background:#f3f5f8;color:#182637;font:15px system-ui,-apple-system,sans-serif}main{max-width:760px;margin:auto;padding:17px}h1{font-size:23px;margin:0 0 6px}p{margin:6px 0;line-height:1.5}.muted,small{color:#637183;font-size:12px}.panel{background:white;border:1px solid #e0e5ec;border-radius:15px;padding:15px;margin:13px 0}.controls{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}label{font-size:12px;color:#536175}select,input,button{font:inherit;border:1px solid #d5dce5;border-radius:8px;padding:10px;width:100%;background:white;color:#182637}label select,label input{display:block;margin-top:5px}button{cursor:pointer;font-weight:700}button.primary{background:#1b5e52;color:white;border-color:#1b5e52}button:disabled{opacity:.5;cursor:default}.two{display:grid;grid-template-columns:1fr 1fr;gap:8px}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.tile{padding:10px;background:#f3f5f8;border-radius:9px}.big{font-size:20px;font-weight:750}.good{color:#087350}.bad{color:#b52d42}h2{font-size:17px;margin:4px 0 12px}.candidate{border-top:1px solid #e6eaf0;padding:11px 0}.line{display:flex;justify-content:space-between;align-items:center;gap:8px}.pill{background:#e5f1eb;color:#126247;border-radius:8px;padding:4px 8px;font-size:12px;font-weight:700}.pricegrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0}.pricegrid strong{display:block;font-size:17px}.progress{height:6px;background:#e3e8ef;border-radius:9px;margin:10px 0;overflow:hidden}.progress>div{height:100%;background:#1b5e52;width:0%}a{color:#236959;text-decoration:none}details{margin-top:10px}summary{cursor:pointer;color:#617184;font-size:13px}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:9px 5px;border-bottom:1px solid #e6eaf0}td:last-child,th:last-child{text-align:right}.scroll{overflow-x:auto}.empty{padding:18px 3px;color:#657386;text-align:center}footer{padding:6px 0 20px}.warn{color:#94621b;font-size:12px}@media(max-width:390px){main{padding:12px}.controls{gap:5px}select,input{padding:8px 4px}h1{font-size:21px}.tile{padding:8px}}
-</style></head><body><main><h1>ELLIOTT WAVE MINI V0.4</h1><p class="muted">빗썸 KRW · 파동 매매 연구 전용 · 자동매매 없음</p><section class="panel"><div class="controls"><label>검색 범위<select id="limit"><option value="10">상위 10</option><option value="30" selected>상위 30</option><option value="50">상위 50</option><option value="100">상위 100</option><option value="0">전체 KRW</option></select></label><label>거래대금(억)<input id="min" type="number" value="1" min="0" step="0.1"></label><label>편도 수수료 %<input id="fee" type="number" value="0.04" min="0" max="2" step="0.01"></label></div><div class="two"><button class="primary" id="live" onclick="start('live')">실시간 검색</button><button id="test" onclick="start('test')">최근 검증</button></div><details><summary>검증 설정 / 검색 기준</summary><label>검증 기간<select id="hours"><option value="3">최근 3시간</option><option value="6">최근 6시간</option></select></label><p class="muted">검증은 상위 10 또는 30개만 지원. 마감봉 기준, 다음 1분봉 시가 진입, 구조적 손절 / 2R 익절 / 반전 경고 / 최대 60분. 미완료 거래 제외, 실제 체결 및 슬리피지 미반영. 현재 거래대금 순위로 과거 검증하므로 표본 편향이 있음.</p><p class="muted">120분봉 60선 지지 및 반전 → 15분봉 ABC/하락 5파 추정 및 240선 상승 (이평선은 실제 관측봉, 최근 구조는 연속봉 기준) → 1분봉 20선 회복 및 A/B/C 돌파. RSI·MACD·거래량은 보조 표시만.</p></details><p id="note" class="warn"></p><div class="progress"><div id="bar"></div></div><div class="line muted"><span id="status">검색 대기</span><span id="time"></span></div></section><section class="panel" id="results"><div class="line"><h2 id="heading">매수 후보</h2><a href="__BASE__/api/csv" id="download" hidden>CSV 저장</a></div><div id="body" class="empty">검색을 시작해 주세요.</div><details id="errs" hidden><summary id="errlabel">제외 / 오류</summary><div id="errbody" class="muted"></div></details></section><footer class="muted">A 첫 돌파 · B 2파 눌림 · C 4파 눌림<br>검색 화면을 열어 두세요. 화면이 닫히면 일시 중지되고 다시 열면 이어집니다.<br>파동은 기계적 추정이며 매수·수익을 보장하지 않습니다. 검색 결과는 가장 최근 마감봉의 신호만 표시합니다.</footer></main><script>
+</style></head><body><main><h1>ELLIOTT WAVE MINI V0.5</h1><p class="muted">빗썸 KRW · 파동 매매 연구 전용 · 자동매매 없음</p><section class="panel"><div class="controls"><label>검색 범위<select id="limit"><option value="10">상위 10</option><option value="30" selected>상위 30</option><option value="50">상위 50</option><option value="100">상위 100</option><option value="0">전체 KRW</option></select></label><label>거래대금(억)<input id="min" type="number" value="1" min="0" step="0.1"></label><label>편도 수수료 %<input id="fee" type="number" value="0.04" min="0" max="2" step="0.01"></label></div><div class="two"><button class="primary" id="live" onclick="start('live')">실시간 검색</button><button id="test" onclick="start('test')">최근 검증</button></div><details><summary>검증 설정 / 검색 기준</summary><label>검증 기간<select id="hours"><option value="3">최근 3시간</option><option value="6">최근 6시간</option></select></label><p class="muted">검증은 상위 10 또는 30개만 지원. 마감봉 기준, 다음 1분봉 시가 진입, 구조적 손절 / 2R 익절 / 반전 경고 / 최대 60분. 미완료 거래 제외, 실제 체결 및 슬리피지 미반영. 현재 거래대금 순위로 과거 검증하므로 표본 편향이 있음.</p><p class="muted">120분봉 60선 지지 및 반전 → 15분봉 ABC/하락 5파 추정 및 240선 상승 (이평선은 실제 관측봉, 최근 구조는 연속봉 기준) → 1분봉 20선 회복 및 A/B/C 돌파. RSI·MACD·거래량은 보조 표시만.</p></details><p id="note" class="warn"></p><div class="progress"><div id="bar"></div></div><div class="line muted"><span id="status">검색 대기</span><span id="time"></span></div></section><section class="panel" id="results"><div class="line"><h2 id="heading">매수 후보</h2><a href="__BASE__/api/csv" id="download" hidden>CSV 저장</a></div><p class="muted" id="flow" hidden></p><div id="body" class="empty">검색을 시작해 주세요.</div><details id="errs" hidden><summary id="errlabel">제외 / 오류</summary><div id="errbody" class="muted"></div></details></section><footer class="muted">A 첫 돌파 · B 2파 눌림 · C 4파 눌림<br>검색 화면을 열어 두세요. 화면이 닫히면 일시 중지되고 다시 열면 이어집니다.<br>파동은 기계적 추정이며 매수·수익을 보장하지 않습니다. 검색 결과는 가장 최근 마감봉의 신호만 표시합니다.</footer></main><script>
 const base='__BASE__';const $=id=>document.getElementById(id);const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));const num=x=>Number(x).toLocaleString('ko-KR',{maximumSignificantDigits:8});const pp=x=>x==null?'—':`${x>=0?'+':''}${Number(x).toFixed(2)}%`;const tm=t=>new Date(t*1000).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});const labels={A:'첫 돌파',B:'2파 눌림',C:'4파 눌림'};let starting=false,advancing=false,refreshing=false,lastBodyKey="",lastErrorKey="";
 async function start(mode){if(starting)return;starting=true;$('live').disabled=$('test').disabled=true;$('status').textContent='KRW 종목 목록 조회';$('note').textContent='';let lim=+$('limit').value;if(mode==='test'&&![10,30].includes(lim)){$('limit').value='30';lim=30;$('note').textContent='경량 검증을 위해 상위 30개로 설정했습니다.'}try{const r=await fetch(base+'/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,limit:lim,min_eok:+$('min').value,fee:+$('fee').value,hours:+$('hours').value})});const j=await r.json();if(!r.ok)$('note').textContent=j.message;await refresh()}catch(e){$('note').textContent='서버 연결 오류'}finally{starting=false;refresh()}}
 function candidate(x){return `<article class="candidate"><div class="line"><strong>${esc(x.symbol)}</strong><span class="pill">${esc(x.type)}형 · ${labels[x.type]}</span></div><div class="pricegrid"><div><small>신호 가격</small><strong>${num(x.price)}</strong></div><div><small>구조적 손절</small><strong class="bad">${num(x.stop)}</strong></div></div><p>${esc(x.setup)} · ${esc(x.reason)}</p><small>보조 ${x.aux}/3 · 손절폭 ${x.risk.toFixed(2)}% · ${tm(x.time)}</small><details><summary>RSI / MACD / 거래량</summary><p class="muted">RSI ${x.rsi.toFixed(1)} · MACD ${x.macd_up?'개선':'둔화'} · 거래량 ${x.volume.toFixed(2)}배</p></details></article>`}
 function backtest(s){let a=s.stats||{};let h='<div class="summary">'+['A','B','C'].map(k=>{let x=a[k]||{n:0,wins:0,losses:0,avg:null};return `<div class="tile"><small>${k}형 ${labels[k]}</small><div class="big">${x.n}건</div><small>${x.wins}승 ${x.losses}패</small><div class="${x.avg>=0?'good':'bad'}">${pp(x.avg)}</div><small>평균 순손익</small></div>`}).join('')+'</div>';if(!s.trades.length)return h+'<p class="empty">완료된 검증 거래 없음</p>';h+='<details><summary>최근 거래 내역</summary><div class="scroll"><table><tr><th>종목</th><th>형</th><th>진입</th><th>청산</th><th>순손익</th></tr>'+s.trades.slice(0,30).map(x=>`<tr><td>${esc(x.symbol)}</td><td>${esc(x.type)}</td><td>${tm(x.time)}</td><td>${esc(x.why)}</td><td class="${x.net>=0?'good':'bad'}">${pp(x.net)}</td></tr>`).join('')+'</table></div><p class="muted">최근 30건만 표시 · CSV에는 전체 완료 거래 저장</p></details>';return h}
-async function refresh(){if(refreshing)return;refreshing=true;try{let r=await fetch(base+'/api/state',{cache:'no-store'});if(!r.ok)throw Error();let s=await r.json();$('live').disabled=$('test').disabled=s.running;$('status').textContent=`${s.message} ${s.total?s.done+'/'+s.total:''}${s.total?' · 정상 '+(s.done-s.errors.length):''}${s.errors.length?' · 부족 '+s.errors.filter(x=>x.kind==='자료부족').length+' / 오류 '+s.errors.filter(x=>x.kind!=='자료부족').length:''}`;$('time').textContent=s.ended||s.started;$('bar').style.width=(s.total?100*s.done/s.total:0)+'%';$('download').hidden=!s.mode||s.running;$('heading').textContent=s.mode==='test'?'검증 결과':'매수 후보 '+(s.results.length?s.results.length+'건':'');const bodyKey=JSON.stringify([s.mode,s.running,s.results,s.trades,s.stats,s.done,s.errors.length,s.message]);if(bodyKey!==lastBodyKey){lastBodyKey=bodyKey;$('body').className='';$('body').innerHTML=s.mode==='test'?backtest(s):s.results.length?s.results.map(candidate).join(''):`<div class="empty">${s.running?esc(s.message)+'…':s.message.startsWith('검색 실패')?esc(s.message):s.mode?(s.done>0&&s.done===s.errors.length?'데이터 부족/오류로 판정 불가':'조건을 충족한 후보 없음'):'검색을 시작해 주세요.'}</div>`;}$('errs').hidden=!s.errors.length;$('errlabel').textContent='제외 / 오류 '+s.errors.length+'건';if(s.running&&!s.busy&&s.job_id&&!advancing)advance(s.job_id);const ek=JSON.stringify(s.errors);if(ek!==lastErrorKey){lastErrorKey=ek;$('errbody').innerHTML=s.errors.map(x=>`<p>${esc(x.symbol)} · ${esc(x.kind||'오류')} · ${esc(x.error)}</p>`).join('')}}catch(e){$('status').textContent='서버 연결 확인 필요'}finally{refreshing=false}}
+async function refresh(){if(refreshing)return;refreshing=true;try{let r=await fetch(base+'/api/state',{cache:'no-store'});if(!r.ok)throw Error();let s=await r.json();$('live').disabled=$('test').disabled=s.running;$('status').textContent=`${s.message} ${s.total?s.done+'/'+s.total:''}${s.total?' · 정상 '+(s.done-s.errors.length):''}${s.errors.length?' · 부족 '+s.errors.filter(x=>x.kind==='자료부족').length+' / 오류 '+s.errors.filter(x=>x.kind!=='자료부족').length:''}`;$('time').textContent=s.ended||s.started;$('bar').style.width=(s.total?100*s.done/s.total:0)+'%';$('download').hidden=!s.mode||s.running;$('heading').textContent=s.mode==='test'?'검증 결과':'매수 후보 '+(s.results.length?s.results.length+'건':'');const bodyKey=JSON.stringify([s.mode,s.running,s.results,s.trades,s.stats,s.done,s.errors.length,s.message]);if(bodyKey!==lastBodyKey){lastBodyKey=bodyKey;$('body').className='';$('body').innerHTML=s.mode==='test'?backtest(s):s.results.length?s.results.map(candidate).join(''):`<div class="empty">${s.running?esc(s.message)+'…':s.message.startsWith('검색 실패')?esc(s.message):s.mode?(s.done>0&&s.done===s.errors.length?'데이터 부족/오류로 판정 불가':'조건을 충족한 후보 없음'):'검색을 시작해 주세요.'}</div>`;}const ds=s.diagnostics||[];$('flow').hidden=!ds.length;$('flow').textContent='통과 종목: 120분 '+ds.filter(x=>x.h120_pass).length+' → 15분 '+ds.filter(x=>x.m15_pass).length+' → 1분 '+ds.filter(x=>x.m1_pass).length+' · 신호 '+ds.reduce((n,x)=>n+(x.signal_count||0),0)+'건';$('errs').hidden=!s.errors.length;$('errlabel').textContent='제외 / 오류 '+s.errors.length+'건';if(s.running&&!s.busy&&s.job_id&&!advancing)advance(s.job_id);const ek=JSON.stringify(s.errors);if(ek!==lastErrorKey){lastErrorKey=ek;$('errbody').innerHTML=s.errors.map(x=>`<p>${esc(x.symbol)} · ${esc(x.kind||'오류')} · ${esc(x.error)}</p>`).join('')}}catch(e){$('status').textContent='서버 연결 확인 필요'}finally{refreshing=false}}
 async function advance(job){if(advancing)return;advancing=true;try{const r=await fetch(base+'/api/step',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:job})});if(!r.ok)throw Error();}catch(e){$('note').textContent='연결 지연 · 자동 재시도'}finally{advancing=false;refresh()}}
 refresh();setInterval(refresh,1000);
 </script></body></html>'''
@@ -409,14 +452,14 @@ def startup_probe():
     try:
         LOCAL.deadline=time.monotonic()+35
         symbols=markets(1,10)
-        print(f'[ELLIOTT V0.4 PROBE] market list {len(symbols)} OK',flush=True)
+        print(f'[ELLIOTT V0.5 PROBE] market list {len(symbols)} OK',flush=True)
         LOCAL.deadline=time.monotonic()+22
         r=get120('BTC',asof)
-        print('[ELLIOTT V0.4 PROBE] BTC '+coverage(r,120,asof),flush=True)
+        print('[ELLIOTT V0.5 PROBE] BTC '+coverage(r,120,asof),flush=True)
         for unit,n in ((15,300),(1,200)):
             rr=candles('BTC',unit,n,asof)
-            print('[ELLIOTT V0.4 PROBE] BTC '+coverage(rr,unit,asof)+f' fresh={fresh(rr,unit,asof)}',flush=True)
-    except Exception as e: print(f'[ELLIOTT V0.4 PROBE] {type(e).__name__}: {e}',flush=True)
+            print('[ELLIOTT V0.5 PROBE] BTC '+coverage(rr,unit,asof)+f' fresh={fresh(rr,unit,asof)}',flush=True)
+    except Exception as e: print(f'[ELLIOTT V0.5 PROBE] {type(e).__name__}: {e}',flush=True)
 
 def register_elliott(app):
     """Add isolated routes to an existing Flask app. Call before app.run()."""
