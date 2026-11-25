@@ -5,7 +5,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "REVERSE MINI V0.1.2"
+VERSION = "REVERSE MINI V0.1.3"
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9))
 DAY = 86400
@@ -28,7 +28,7 @@ def api(path, **params):
             next_request=time.monotonic()+0.16
         try:
             u=BASE+path+"?"+urlencode(params)
-            with urlopen(Request(u,headers={"Accept":"application/json","User-Agent":"ReverseMini/0.1.2"}),timeout=12) as r:
+            with urlopen(Request(u,headers={"Accept":"application/json","User-Agent":"ReverseMini/0.1.3"}),timeout=12) as r:
                 result=json.load(r)
             if not isinstance(result,list): raise ValueError(str(result)[:200])
             return result
@@ -78,6 +78,9 @@ def macd(a):
 def features(rows,unit,cut,btc=None):
     rows=[r for r in rows if r[0]+unit*60<=cut]
     f={"bars":len(rows),"last_bar":iso(rows[-1][0]+unit*60) if rows else None}
+    if rows:
+        f["lag_minutes"]=(cut-rows[-1][0]-unit*60)/60
+        f["gaps_last20"]=sum(max(0,(b[0]-a[0])//(unit*60)-1) for a,b in zip(rows[-21:],rows[-20:]))
     # Missing recent intervals are not treated as a flat or zero-volume series.
     if len(rows)<21 or cut-(rows[-1][0]+unit*60)>=unit*60 or any(b[0]-a[0]!=unit*60 for a,b in zip(rows[-21:],rows[-20:])):
         f["valid"]=False; return f
@@ -107,6 +110,10 @@ def features(rows,unit,cut,btc=None):
     f["macd_bull_cross"]=ph<=0<h if ph is not None and h is not None else None
     f["macd_positive"]=h>0 if h is not None else None
     f["positive_5bar"]=f["ret_5"]>0
+    f["negative_5bar"]=f["ret_5"]<0
+    f["negative_20bar"]=f["ret_20"]<0
+    f["rsi_below_40"]=f["rsi"]<40
+    f["rsi_below_30"]=f["rsi"]<30
     f["bull_candle"]=r[4]>r[1]
     f["lower_wick_40pct"]=f["lower_wick_ratio"]>=.4 if f["lower_wick_ratio"] is not None else None
     if btc:
@@ -115,7 +122,7 @@ def features(rows,unit,cut,btc=None):
             f["btc_relative_5"]=f["ret_5"]-pct(bm[rows[-1][0]],bm[rows[-6][0]])
             f["btc_outperform"]=f["btc_relative_5"]>0
     return f
-PATTERNS={"volume_2x":"거래량 2배","value_2x":"거래대금 2배","volume_3bar_15x":"최근 3봉 거래량 1.5배","higher_low":"저점 상승","breakout_20":"20봉 고점 돌파","rsi_rising":"RSI 상승","rsi_above_50":"RSI 50 이상","ma5_above_ma20":"MA5 > MA20","ma_cluster_1pct":"이평 응축 1%","bb_squeeze":"볼린저 폭 축소","macd_bull_cross":"MACD 히스토그램 양전환","macd_positive":"MACD 히스토그램 양수","positive_5bar":"5봉 상승","bull_candle":"양봉","lower_wick_40pct":"아랫꼬리 40%","btc_outperform":"BTC 상대강도 양수"}
+PATTERNS={"negative_5bar":"5봉 하락","negative_20bar":"20봉 하락","rsi_below_40":"RSI 40 미만","rsi_below_30":"RSI 30 미만","volume_2x":"거래량 2배","value_2x":"거래대금 2배","volume_3bar_15x":"최근 3봉 거래량 1.5배","higher_low":"저점 상승","breakout_20":"20봉 고점 돌파","rsi_rising":"RSI 상승","rsi_above_50":"RSI 50 이상","ma5_above_ma20":"MA5 > MA20","ma_cluster_1pct":"이평 응축 1%","bb_squeeze":"볼린저 폭 축소","macd_bull_cross":"MACD 히스토그램 양전환","macd_positive":"MACD 히스토그램 양수","positive_5bar":"5봉 상승","bull_candle":"양봉","lower_wick_40pct":"아랫꼬리 40%","btc_outperform":"BTC 상대강도 양수"}
 WINDOWS=[("7일",7*DAY,1440),("3일",3*DAY,1440),("24시간",DAY,240),("4시간",14400,60),("1시간",3600,15),("30분",1800,5),("15분",900,5),("5분",300,1)]
 def patch(**kw):
     with state_lock: state.update(kw)
@@ -164,17 +171,26 @@ def btc_history(unit,cut):
     return data
 def analyze(case,all_daily,run_end):
     r=dict(case); m=r["market"]; start=r["start"]; end=min(start+DAY,run_end)
+    pre=[]
+    for label,delta in (("일 시작 전",0),("일 시작 3일 전",3*DAY),("일 시작 7일 전",7*DAY)):
+        cut=start-delta
+        item={"market":m,"day":r["day"],"rank":r["rank"],"partial":r["partial"],"short_history":r["short_history"],"event_status":"pre_day","offset":label,"unit_minutes":1440,"cut_kst":iso(cut)}
+        item.update(features(all_daily[m],1440,cut,all_daily.get("KRW-BTC")))
+        pre.append(item)
     try:
         five=candles(m,5,end,200,2)
         event=first_event(five,start,end,r["previous_close"],r["threshold"])
     except Exception as e:
-        r["event_status"]="fetch_error"; record_error(m+" event: "+str(e));return r,[]
+        r["event_status"]="fetch_error"; record_error(m+" event: "+str(e));return r,pre
     if not event:
         r["event_status"]="no_confirmed_cross" if five else "missing_data"
-        return r,[]
+        return r,pre
     # Check coverage from day start; if missing candles, the first observed crossing is not provably first.
     before=[x for x in five if start<=x[0]<event]
-    r["event_coverage_ok"]=len(before)==(event-start)//300
+    r["event_expected_bars"]=(event-start)//300
+    r["event_observed_bars"]=len(before)
+    r["event_missing_bars"]=r["event_expected_bars"]-len(before)
+    r["event_coverage_ok"]=r["event_missing_bars"]==0
     r["event_status"]="cross_confirmed" if r["event_coverage_ok"] else "first_observed_cross_gap"
     r["event_kst"]=iso(event)
     r["event_elapsed_min"]=(event-start)//60
@@ -193,12 +209,21 @@ def analyze(case,all_daily,run_end):
         except Exception as e:
             item["valid"]=False;item["error"]=str(e);record_error(m+" "+label+": "+str(e))
         fs.append(item)
-    return r,fs
+    return r,fs+pre
 def summarize(fs):
     out=[]
-    for cohort in ("regular","short_history","partial"):
-        for label,_,unit in WINDOWS:
-            group=[x for x in fs if x["offset"]==label and x.get("event_status")=="cross_confirmed" and (("partial" if x["partial"] else "short_history" if x["short_history"] else "regular")==cohort)]
+    for cohort in ("regular","short_history","partial","gap_regular","gap_partial","pre_regular","pre_partial","pre_short_history"):
+        windows=WINDOWS+[(label,0,1440) for label in ("일 시작 전","일 시작 3일 전","일 시작 7일 전")]
+        for label,_,unit in windows:
+            def cohort_of(x):
+                base="partial" if x["partial"] else "short_history" if x["short_history"] else "regular"
+                status=x.get("event_status")
+                if status=="cross_confirmed": return base
+                if status=="first_observed_cross_gap": return "gap_partial" if x["partial"] else "gap_regular"
+                if status=="pre_day": return "pre_"+base
+                return None
+            group=[x for x in fs if x["offset"]==label and cohort_of(x)==cohort]
+            if (label.startswith("일 시작")) != cohort.startswith("pre_"): continue
             for key,title in PATTERNS.items():
                 vals=[x[key] for x in group if x.get("valid") and isinstance(x.get(key),bool)]
                 n=len(vals); hit=sum(vals)
@@ -243,7 +268,7 @@ def run(days,threshold,include_today):
                 results.append(dict(case,event_status="analysis_error"));continue
             r,f=res;results.append(r);fs.extend(f)
         results.sort(key=lambda x:(x["start"],x["rank"]))
-        fs.sort(key=lambda x:(x["day"],x["rank"],[a[0] for a in WINDOWS].index(x["offset"])))
+        fs.sort(key=lambda x:(x["day"],x["rank"],([a[0] for a in WINDOWS]+["일 시작 전","일 시작 3일 전","일 시작 7일 전"]).index(x["offset"])))
         patch(rank=results,features=fs,summary=summarize(fs),status="done",phase="완료" if any(x.get("valid") for x in fs) else "유효 상세 데이터 없음")
         if not any(x.get("valid") for x in fs): record_error("유효 상세 데이터 0건: 공통점 판단 불가")
     except Exception as e:
@@ -255,19 +280,19 @@ def start_job(days,threshold,include_today):
     with btc_lock: btc_cache.clear()
     threading.Thread(target=run,args=(days,threshold,include_today),daemon=True).start()
     return True
-HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1.2</title><style>
+HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1.3</title><style>
 *{box-sizing:border-box}body{margin:0 auto;max-width:1050px;padding:16px;background:#10151d;color:#edf2f7;font:14px system-ui,sans-serif}h1{font-size:23px;margin:8px 0}h2{font-size:17px;margin:18px 0 8px}.card{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}label{display:inline-block;margin:6px}input,select,button,a.btn{background:#263646;color:#fff;border:1px solid #476073;border-radius:7px;padding:9px;font:inherit}button,a.btn{cursor:pointer;background:#225b51;text-decoration:none;display:inline-block;margin:4px}button:disabled{opacity:.5}.muted{color:#b4c4d1;line-height:1.6}progress{width:100%;accent-color:#37b89d}.scroll{overflow:auto;max-height:470px}table{border-collapse:collapse;width:100%;white-space:nowrap;font-size:13px}th,td{padding:8px;text-align:left;border-bottom:1px solid #324355}th{position:sticky;top:0;background:#253443}.pos{color:#6be3b7}pre{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#b4c4d1}</style>
-<h1>REVERSE MINI V0.1.2</h1><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
+<h1>REVERSE MINI V0.1.3</h1><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
 <div class="card"><label>완료 일수 <select id="days"><option>3</option><option>7</option><option selected>14</option></select></label><label>급등 기준 <select id="threshold"><option>3</option><option selected>5</option><option>10</option></select>%</label><label><input id="today" type="checkbox" checked> 오늘 미완료 별도</label><button id="go">백테스트 시작</button><div class="muted">일봉 경계는 BTC 실제 수신 시간으로 자동 판별 (현재 관측 KST 00:00). 전일 종가 대비 당일 종가 상승률 순위. 최초 기준 도달 5분봉 종가 이전 완료봉만 분석. 현재 상장 목록 기준이며 스테이블코인 목록은 제한적. 짧은 이력(이전 일봉 14개 미만)은 별도. 매수 조건 없음.</div></div>
 <div class="card"><strong id="phase">대기</strong> <span id="count"></span><progress id="progress" value="0" max="1"></progress><div id="stats" class="muted"></div></div>
-<div id="output" hidden><div class="card"><h2>CSV 저장</h2><a class="btn" href="/csv/rank">일별 TOP10</a><a class="btn" href="/csv/features">상세 지표</a><a class="btn" href="/csv/summary">공통점</a><a class="btn" href="/csv/coverage">수집률</a><a class="btn" href="/csv/errors">오류</a><div class="muted">공통점은 완전 확인 사례만 집계. 분모는 해당 지표의 유효 데이터 수이며, 예측 성과나 수익률이 아님.</div></div>
-<div class="card"><h2>공통점 발견율</h2><label>구분 <select id="cohort"><option value="regular">완료일 일반</option><option value="short_history">짧은 이력</option><option value="partial">오늘 미완료</option></select></label><label>시점 <select id="offset"><option>5분</option><option>15분</option><option>30분</option><option>1시간</option><option>4시간</option><option>24시간</option><option>3일</option><option>7일</option></select></label><label><input type="checkbox" id="pairs"> 2개 조건 조합</label><div class="scroll" id="summary"></div></div>
+<div id="output" hidden><div class="card"><h2>CSV 저장</h2><a class="btn" href="/csv/rank">일별 TOP10</a><a class="btn" href="/csv/features">상세 지표</a><a class="btn" href="/csv/summary">공통점</a><a class="btn" href="/csv/coverage">수집률</a><a class="btn" href="/csv/errors">오류</a><div class="muted">확정·분봉 공백·일 시작 전을 별도 집계. 공백 사례는 최초 관측 시점 기준으로 탐색 전용. 일 시작 전은 최초 급등 시점과 독립적. 분모는 해당 지표의 유효 데이터 수이며, 예측 성과나 수익률이 아님.</div></div>
+<div class="card"><h2>공통점 발견율</h2><label>구분 <select id="cohort"><option value="regular">완료일 일반</option><option value="short_history">짧은 이력</option><option value="partial">오늘 미완료 (확정)</option><option value="gap_regular">완료일 분봉 공백 (탐색)</option><option value="gap_partial">오늘 분봉 공백 (탐색)</option><option value="pre_regular">완료일 일 시작 전</option><option value="pre_partial">오늘 일 시작 전</option><option value="pre_short_history">짧은 이력 일 시작 전</option></select></label><label>시점 <select id="offset"><option>5분</option><option>15분</option><option>30분</option><option>1시간</option><option>4시간</option><option>24시간</option><option>3일</option><option>7일</option><option>일 시작 전</option><option>일 시작 3일 전</option><option>일 시작 7일 전</option></select></label><label><input type="checkbox" id="pairs"> 2개 조건 조합</label><div class="scroll" id="summary"></div></div>
 <div class="card"><h2>일별 상승 TOP10</h2><div class="scroll" id="rank"></div></div><div class="card"><h2>일별 수집 범위</h2><div class="scroll" id="coverage"></div></div></div><div class="card"><details><summary>수집 오류 <span id="errCount">0</span>건</summary><pre id="errors"></pre></details></div>
 <script>
 const $=id=>document.getElementById(id);let result=null;
 function table(el,headers,rows){let t=document.createElement('table'),h=t.createTHead().insertRow();headers.forEach(v=>{let th=document.createElement('th');th.textContent=v;h.appendChild(th)});let b=t.createTBody();rows.forEach(row=>{let tr=b.insertRow();row.forEach(v=>{let td=tr.insertCell();td.textContent=v??'—'})});$(el).replaceChildren(t)}
 function summary(){if(!result)return;let a=result.summary.filter(x=>x.cohort===$('cohort').value&&x.offset===$('offset').value&&x.pattern.includes('+')===$('pairs').checked);a.sort((a,b)=>(b.hit_pct??-1)-(a.hit_pct??-1)||b.available-a.available);table('summary',['공통점','발견','유효','대상','발견율'],a.map(x=>[x.name,x.hits,x.available,x.cases,x.hit_pct==null?'—':x.hit_pct.toFixed(1)+'%']))}
-['cohort','offset','pairs'].forEach(id=>$(id).onchange=summary);
+$('cohort').onchange=()=>{if($('cohort').value.startsWith('pre_'))$('offset').value='일 시작 전';else if($('offset').value.startsWith('일 시작'))$('offset').value='5분';summary()};['offset','pairs'].forEach(id=>$(id).onchange=summary);
 $('go').onclick=async()=>{try{$('go').disabled=true;const r=await fetch('/start?days='+$('days').value+'&threshold='+$('threshold').value+'&today='+($('today').checked?1:0),{method:'POST'});if(!r.ok)throw Error(await r.text());$('output').hidden=true;result=null;await poll()}catch(e){$('phase').textContent='시작 실패: '+e.message;$('go').disabled=false}};
 async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if((s.status==='done'||s.status==='error')&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
 poll();setInterval(poll,2000);
@@ -310,7 +335,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="REVERSE_MINI_V0_1_2_"+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="REVERSE_MINI_V0_1_3_"+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -333,7 +358,11 @@ def selftest():
     rank,cov=rank_days({"KRW-A":daily},[start],start+DAY,5)
     assert rank[0]["market"]=="KRW-A" and abs(rank[0]["gain_pct"]-20)<1e-8 and rank[0]["short_history"]
     assert not summarize([])[0]["available"]
-    print("REVERSE MINI V0.1.2 self-test PASS",flush=True)
+    assert f["gaps_last20"]==0
+    assert isinstance(f["negative_20bar"],bool)
+    sample=dict(f,offset="일 시작 전",partial=False,short_history=False,event_status="pre_day")
+    assert any(x["cohort"]=="pre_regular" and x["pattern"]=="negative_20bar" and x["available"]==1 for x in summarize([sample]))
+    print("REVERSE MINI V0.1.3 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
