@@ -5,7 +5,7 @@ from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "REVERSE MINI V0.1"
+VERSION = "REVERSE MINI V0.1.1"
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9))
 DAY = 86400
@@ -17,7 +17,7 @@ state_lock = threading.Lock()
 state = {"status":"idle","phase":"대기","done":0,"total":0,"rank":[],"features":[],"summary":[],"errors":[],"coverage":[]}
 def now(): return datetime.now(UTC)
 def iso(t): return datetime.fromtimestamp(t,KST).strftime("%Y-%m-%d %H:%M")
-def utcstr(t): return datetime.fromtimestamp(t,UTC).strftime("%Y-%m-%dT%H:%M:%S")
+def kststr(t): return datetime.fromtimestamp(t,KST).strftime("%Y-%m-%dT%H:%M:%S")
 def api(path, **params):
     global next_request
     for attempt in range(3):
@@ -27,7 +27,7 @@ def api(path, **params):
             next_request=time.monotonic()+0.16
         try:
             u=BASE+path+"?"+urlencode(params)
-            with urlopen(Request(u,headers={"Accept":"application/json","User-Agent":"ReverseMini/0.1"}),timeout=12) as r:
+            with urlopen(Request(u,headers={"Accept":"application/json","User-Agent":"ReverseMini/0.1.1"}),timeout=12) as r:
                 result=json.load(r)
             if not isinstance(result,list): raise ValueError(str(result)[:200])
             return result
@@ -37,12 +37,14 @@ def api(path, **params):
 def parse(row):
     t=int(datetime.fromisoformat(row["candle_date_time_utc"]).replace(tzinfo=UTC).timestamp())
     return (t,float(row["opening_price"]),float(row["high_price"]),float(row["low_price"]),float(row["trade_price"]),float(row["candle_acc_trade_volume"]),float(row["candle_acc_trade_price"]))
-def candles(m, unit, end, count=200, pages=1):
+def candles(m, unit, end, count=200, pages=1, latest=False):
     out={}
     path="candles/days" if unit==1440 else "candles/minutes/"+str(unit)
     cursor=end
-    for _ in range(pages):
-        raw=api(path,market=m,count=min(200,count),to=utcstr(cursor))
+    for page in range(pages):
+        params={"market":m,"count":min(200,count)}
+        if not (latest and page==0): params["to"]=kststr(cursor)
+        raw=api(path,**params)
         if not raw: break
         batch=[parse(r) for r in raw]
         for r in batch:
@@ -212,14 +214,21 @@ def run(days,threshold,include_today):
     try:
         run_end=int(now().timestamp()); current=run_end//DAY*DAY
         starts=[current-i*DAY for i in range(days,0,-1)]+([current] if include_today else [])
-        markets=api("market/all",isDetails="false")
+        markets=api("market/all")
         universe=sorted({x["market"] for x in markets if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
         patch(phase="일별 전체 시장 순위 수집",done=0,total=len(universe),universe=len(universe),run_kst=iso(run_end))
+        if not universe: raise RuntimeError("원화 마켓 목록 0개: API 목록 응답 "+str(markets[:2]))
+        probe=candles("KRW-BTC",1440,run_end,30,latest=True)
+        patch(probe_count=len(probe),probe_latest=iso(probe[-1][0]) if probe else "없음")
+        if not probe or probe[-1][0]<current-DAY: raise RuntimeError("BTC 일봉 최신 데이터 없음: "+str([iso(x[0]) for x in probe[-3:]]))
         data={}
-        for m,rows in parallel(universe,lambda m:candles(m,1440,run_end,200)):
+        for m,rows in parallel(universe,lambda m:candles(m,1440,run_end,200,latest=True)):
             if rows: data[m]=rows
+            else: record_error(m+" 일봉 응답 없음")
         rank,coverage=rank_days(data,starts,current,threshold)
         patch(rank=rank,coverage=coverage,market_success=len(data),phase="급등 전 완료봉 역추적",done=0,total=len(rank))
+        if not any(x["valid_markets"] for x in coverage):
+            raise RuntimeError("일별 순위 유효 종목 0개. BTC 최신 일봉: "+str([iso(x[0]) for x in probe[-3:]]))
         results=[]; fs=[]
         for case,res in parallel(rank,lambda x:analyze(x,data,run_end)):
             if res is None:
@@ -227,7 +236,8 @@ def run(days,threshold,include_today):
             r,f=res;results.append(r);fs.extend(f)
         results.sort(key=lambda x:(x["start"],x["rank"]))
         fs.sort(key=lambda x:(x["day"],x["rank"],[a[0] for a in WINDOWS].index(x["offset"])))
-        patch(rank=results,features=fs,summary=summarize(fs),status="done",phase="완료")
+        patch(rank=results,features=fs,summary=summarize(fs),status="done",phase="완료" if any(x.get("valid") for x in fs) else "유효 상세 데이터 없음")
+        if not any(x.get("valid") for x in fs): record_error("유효 상세 데이터 0건: 공통점 판단 불가")
     except Exception as e:
         record_error(str(e));patch(status="error",phase="실패")
 def start_job(days,threshold,include_today):
@@ -237,9 +247,9 @@ def start_job(days,threshold,include_today):
     with btc_lock: btc_cache.clear()
     threading.Thread(target=run,args=(days,threshold,include_today),daemon=True).start()
     return True
-HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1</title><style>
+HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE MINI V0.1.1</title><style>
 *{box-sizing:border-box}body{margin:0 auto;max-width:1050px;padding:16px;background:#10151d;color:#edf2f7;font:14px system-ui,sans-serif}h1{font-size:23px;margin:8px 0}h2{font-size:17px;margin:18px 0 8px}.card{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}label{display:inline-block;margin:6px}input,select,button,a.btn{background:#263646;color:#fff;border:1px solid #476073;border-radius:7px;padding:9px;font:inherit}button,a.btn{cursor:pointer;background:#225b51;text-decoration:none;display:inline-block;margin:4px}button:disabled{opacity:.5}.muted{color:#b4c4d1;line-height:1.6}progress{width:100%;accent-color:#37b89d}.scroll{overflow:auto;max-height:470px}table{border-collapse:collapse;width:100%;white-space:nowrap;font-size:13px}th,td{padding:8px;text-align:left;border-bottom:1px solid #324355}th{position:sticky;top:0;background:#253443}.pos{color:#6be3b7}pre{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#b4c4d1}</style>
-<h1>REVERSE MINI V0.1</h1><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
+<h1>REVERSE MINI V0.1.1</h1><div class="muted">빗썸 원화마켓 · 일별 상승 TOP 10 · 급등 전 공통점 연구 전용</div>
 <div class="card"><label>완료 일수 <select id="days"><option>3</option><option>7</option><option selected>14</option></select></label><label>급등 기준 <select id="threshold"><option>3</option><option selected>5</option><option>10</option></select>%</label><label><input id="today" type="checkbox" checked> 오늘 미완료 별도</label><button id="go">백테스트 시작</button><div class="muted">일봉 KST 09:00~익일 09:00. 전일 종가 대비 당일 종가 상승률 순위. 최초 기준 도달 5분봉 종가 이전 완료봉만 분석. 현재 상장 목록 기준이며 스테이블코인 목록은 제한적. 짧은 이력(이전 일봉 14개 미만)은 별도. 매수 조건 없음.</div></div>
 <div class="card"><strong id="phase">대기</strong> <span id="count"></span><progress id="progress" value="0" max="1"></progress><div id="stats" class="muted"></div></div>
 <div id="output" hidden><div class="card"><h2>CSV 저장</h2><a class="btn" href="/csv/rank">일별 TOP10</a><a class="btn" href="/csv/features">상세 지표</a><a class="btn" href="/csv/summary">공통점</a><a class="btn" href="/csv/coverage">수집률</a><a class="btn" href="/csv/errors">오류</a><div class="muted">공통점은 완전 확인 사례만 집계. 분모는 해당 지표의 유효 데이터 수이며, 예측 성과나 수익률이 아님.</div></div>
@@ -251,7 +261,7 @@ function table(el,headers,rows){let t=document.createElement('table'),h=t.create
 function summary(){if(!result)return;let a=result.summary.filter(x=>x.cohort===$('cohort').value&&x.offset===$('offset').value&&x.pattern.includes('+')===$('pairs').checked);a.sort((a,b)=>(b.hit_pct??-1)-(a.hit_pct??-1)||b.available-a.available);table('summary',['공통점','발견','유효','대상','발견율'],a.map(x=>[x.name,x.hits,x.available,x.cases,x.hit_pct==null?'—':x.hit_pct.toFixed(1)+'%']))}
 ['cohort','offset','pairs'].forEach(id=>$(id).onchange=summary);
 $('go').onclick=async()=>{try{$('go').disabled=true;const r=await fetch('/start?days='+$('days').value+'&threshold='+$('threshold').value+'&today='+($('today').checked?1:0),{method:'POST'});if(!r.ok)throw Error(await r.text());$('output').hidden=true;result=null;await poll()}catch(e){$('phase').textContent='시작 실패: '+e.message;$('go').disabled=false}};
-async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if(s.status==='done'&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
+async function poll(){try{let r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let s=await r.json();$('phase').textContent=s.phase;$('count').textContent=s.done+' / '+s.total;$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('go').disabled=s.status==='running';$('stats').textContent='시장 수집 '+(s.market_success??0)+' / '+(s.universe??0)+' · 순위 '+s.rank_count+'건 · 상세 '+s.feature_count+'건';$('errors').textContent=s.errors.join('\n');$('errCount').textContent=s.error_count;if((s.status==='done'||s.status==='error')&&!result){let x=await fetch('/results');if(!x.ok)throw Error(x.status);result=await x.json();$('output').hidden=false;summary();table('rank',['일봉 날짜','순위','코인','상승률','급등 확인','시점','구분'],result.rank.map(x=>[x.day,x.rank,x.market,x.gain_pct.toFixed(2)+'%',x.event_status,x.event_kst,x.partial?'미완료':x.short_history?'짧은 이력':'일반']));table('coverage',['일자','유효 시장','상승 시장','선정'],result.coverage.map(x=>[x.day+(x.partial?' (미완료)':''),x.valid_markets,x.positive_markets,x.selected]))}}catch(e){$('phase').textContent='연결 재확인 중: '+e.message} }
 poll();setInterval(poll,2000);
 </script></html>"""
 class Handler(BaseHTTPRequestHandler):
@@ -284,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             elif p.startswith("/csv/"):
                 key=p.split("/")[-1]
                 if key not in ("rank","features","summary","coverage","errors"):return self.js({"error":"not found"},404)
-                if state["status"]!="done":return self.js({"error":"not complete"},409)
+                if state["status"] not in ("done","error"):return self.js({"error":"not complete"},409)
                 x=list(state[key])
             else:return self.js({"error":"not found"},404)
         if not p.startswith("/csv/"):return self.js(x)
@@ -292,9 +302,10 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="REVERSE_MINI_V0_1_"+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="REVERSE_MINI_V0_1_1_"+key.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
+    assert kststr(start).endswith("09:00:00")
     rows=[(start+i*300,100,106,99,100+i,1,100) for i in range(10)]
     assert first_event(rows,start,start+3000,100,5)==start+1800
     assert first_event(rows,start,start+1500,100,5) is None
@@ -306,7 +317,7 @@ def selftest():
     rank,cov=rank_days({"KRW-A":daily},[start],start+DAY,5)
     assert rank[0]["market"]=="KRW-A" and abs(rank[0]["gain_pct"]-20)<1e-8 and rank[0]["short_history"]
     assert not summarize([])[0]["available"]
-    print("REVERSE MINI V0.1 self-test PASS",flush=True)
+    print("REVERSE MINI V0.1.1 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
