@@ -1644,6 +1644,74 @@ $("coin").addEventListener("input",trade);trade();
 $("copy").onclick=async()=>{try{await navigator.clipboard.writeText(symbol());$("msg").textContent=symbol()+" 복사 완료. 앱이 열리면 검색창에 붙여넣으세요."}catch(e){$("coin").select();$("msg").textContent="자동 복사가 차단되었습니다. 선택된 종목명을 직접 복사해 주세요."}};
 if(new URLSearchParams(location.search).has("failed"))$("msg").textContent="앱 연결을 처리할 수 없어 테스트 페이지로 돌아왔습니다. 다른 번호를 시험해 주세요.";
 </script></html>"""
+
+# Independent fixed-entry research; V1.4.3 live state is never modified.
+import base64, zlib
+D15_SOURCE = "REVERSE_SWING_V1_3_1_RESEARCH_202611260705.csv / features / trade_A=True"
+D15_ENTRIES = json.loads(zlib.decompress(base64.b64decode("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")))
+D15_LOCK=threading.Lock()
+D15={"status":"idle","done":0,"total":132,"rows":[],"errors":[]}
+def d15row(entry,raw,cut):
+    m,t,p,ref=entry
+    out=dict(market=m,entry_time=iso(t),buy_price=p)
+    for d in range(1,16):
+        end=t+d*DAY;r=raw.get(end-HOUR)
+        out["day"+str(d)]=round(100*(r[4]/p*(1-FEE81)/(1+FEE81)-1),6) if end<=cut and r131valid(r) else None
+    actual=out["day7"]
+    out["day7_check"]="missing" if actual is None else "ok" if abs(actual-ref)<.0001 else "mismatch"
+    # Keep the original measured D7, rather than silently replacing it.
+    out["day7"]=ref
+    if out["day7_check"]=="mismatch":
+        for d in range(1,16):
+            if d!=7:out["day"+str(d)]=None
+    out["mature_days"]=max(0,min(15,(cut-t)//DAY))
+    out["missing_days"]=sum(out["day"+str(d)] is None for d in range(1,out["mature_days"]+1))
+    return out
+def d15market(item,cut):
+    m,entries=item;raw={};ranges=[]
+    for _,t,_,_ in sorted(entries,key=lambda r:r[1]):
+        end=min(t+15*DAY,cut)
+        if end<=t:continue
+        if ranges and t<=ranges[-1][1]:ranges[-1][1]=max(end,ranges[-1][1])
+        else:ranges.append([t,end])
+    errors=[]
+    for left,right in ranges:
+        try:
+            a,n,why=r131page(m,left,right);raw.update(a)
+            if why!="reached":errors.append(m+" "+iso(left)+": "+why)
+        except Exception as e:errors.append(m+" "+str(e))
+    return [d15row(e,raw,cut) for e in entries],errors
+def d15run():
+    cut=int(now().timestamp())//HOUR*HOUR
+    groups={}
+    for r in D15_ENTRIES:groups.setdefault(r[0],[]).append(r)
+    rows=[];errors=[]
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            jobs={pool.submit(d15market,item,cut):item for item in groups.items()}
+            for job in as_completed(jobs):
+                m,entries=jobs[job]
+                try:
+                    a,b=job.result();rows.extend(a);errors.extend(b)
+                except Exception as e:
+                    errors.append(m+" "+str(e));rows.extend(d15row(r,{},cut) for r in entries)
+                with D15_LOCK:D15.update(done=D15["done"]+1)
+        rows.sort(key=lambda r:(r["entry_time"],r["market"]))
+        with D15_LOCK:D15.update(status="done",rows=rows,errors=errors,cut=iso(cut))
+    except Exception as e:
+        with D15_LOCK:D15.update(status="error",errors=[str(e)])
+def d15start():
+    with D15_LOCK:
+        if D15["status"]=="running":return False
+        D15.clear();D15.update(status="running",done=0,total=len({r[0] for r in D15_ENTRIES}),rows=[],errors=[])
+    threading.Thread(target=d15run,daemon=True).start()
+    return True
+HTML_D15=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REVERSE SWING 15일 가격 추적 T1</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;margin:12px}button,a{display:inline-block;color:white;background:#225b51;padding:11px;border:1px solid #476073;border-radius:7px;text-decoration:none;margin:4px}button:disabled{opacity:.5}progress{width:100%}table{border-collapse:collapse;white-space:nowrap}th,td{padding:8px;border-bottom:1px solid #324355;text-align:right}th:first-child,td:first-child{position:sticky;left:0;background:#19232e;text-align:left}.pos{color:#72ddb0}.neg{color:#ff9b9b}.scroll{overflow-x:auto}small{color:#b4c4d1}</style><h1>15일 가격 추적 T1</h1><p>기존 90일 V1.3.1 기본 진입 174건 · 최초 매수가 고정</p><small>기존 기본 진입 기록이며 현재 A/B/C/D 및 최근 20일 급등 제외를 새로 적용하지 않습니다. 매수 후 24시간 단위 종가의 누적 순수익률(편도 0.04%). 공란은 미경과 또는 미수집. 7일차는 원본 CSV 값 유지. 재조회 7일차 불일치 시 다른 일차 값은 표시하지 않음. 자동 주문 없음.</small><p><button id="go">1~15일 가격 조회</button><a href="/live143">기존 스캐너</a><a id="csv" href="/track15/csv" hidden>결과 CSV</a></p><progress id="p" max="132" value="0"></progress><p id="msg">대기</p><div class="scroll" id="out"></div><details><summary>수집 오류</summary><pre id="err" style="white-space:pre-wrap"></pre></details><script>
+const $=x=>document.getElementById(x);let shown=false;
+$('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/track15/start',{method:'POST'});if(!r.ok)throw Error(r.status);shown=false;await poll()}catch(e){$('msg').textContent=e.message;$('go').disabled=false}};
+function render(s){let t=document.createElement('table'),h=t.insertRow();for(let label of ['종목','진입일시','진입가',...Array.from({length:15},(_,i)=>(i+1)+'일'),'7일 검증','누락']){let th=document.createElement('th');th.textContent=label;h.append(th)}for(let x of s.rows){let r=t.insertRow();for(let v of [x.market.replace('KRW-',''),x.entry_time,x.buy_price])r.insertCell().textContent=v;for(let i=1;i<=15;i++){let v=x['day'+i],cell=r.insertCell();cell.textContent=v==null?'—':(v>0?'+':'')+v.toFixed(2)+'%';if(v!=null)cell.className=v>0?'pos':v<0?'neg':''}r.insertCell().textContent=x.day7_check;r.insertCell().textContent=x.missing_days}$('out').replaceChildren(t)}
+async function poll(){try{let s=await(await fetch('/track15/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';$('p').max=s.total||132;$('p').value=s.done;$('csv').hidden=s.status!=='done';$('msg').textContent=s.status==='done'?'완료 '+s.rows.length+'건 · 오류 '+s.errors.length+' · 15일 완료 '+s.rows.filter(x=>x.mature_days===15&&x.missing_days===0).length+'건':s.status==='running'?'조회 중 '+s.done+'/'+s.total:s.status==='error'?'조회 실패':'대기';$('err').textContent=s.errors.join('\n');if(s.status==='done'&&!shown){render(s);shown=true}if(s.status==='running'){shown=false;$('out').replaceChildren()}}catch(e){$('msg').textContent='연결 확인: '+e.message}}poll();setInterval(poll,2500);
+</script></html>"""
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
         if not isinstance(body,bytes):body=body.encode()
@@ -1655,6 +1723,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/track15/start":return self.js({"started":d15start()})
         if u.path in ("/research13/start","/research131/start"):
             try:
                 days=int(parse_qs(u.query).get("days",["60"])[0])
@@ -1695,6 +1764,16 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if p=="/track15":return self.send(HTML_D15,"text/html; charset=utf-8")
+        if p=="/track15/status":
+            with D15_LOCK:data=dict(D15)
+            return self.js(data)
+        if p=="/track15/csv":
+            with D15_LOCK:data=dict(D15)
+            if data["status"]!="done":return self.js({"error":"not complete"},409)
+            cols=["market","entry_time","buy_price"]+["day"+str(d) for d in range(1,16)]+["day7_check","mature_days","missing_days"]
+            stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=cols);w.writeheader();w.writerows(data["rows"])
+            return self.send(stream.getvalue().encode("utf-8-sig"),"text/csv; charset=utf-8",filename="REVERSE_SWING_TRACK15_T1_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
         if p=="/app-test":return self.send(APP_LINK_TEST,"text/html; charset=utf-8")
         if p=="/":return self.send(HTML,"text/html; charset=utf-8")
         if p=="/stage2":return self.send(HTML2,"text/html; charset=utf-8")
@@ -2026,7 +2105,11 @@ def selftest():
     assert not preset14_ok(dict(peak_to_last_pct=-34.99,down_days=20),"D")
     assert not preset14_ok(dict(peak_to_last_pct=-35,down_days=13),"B")
     assert paper142_allowed(dict(preset="D",status="WATCH"),"WATCH")
-    print("REVERSE SWING V1.4.3 D preset, WATCH paper entry and historical spike guard self-test PASS",flush=True)
+    assert len(D15_ENTRIES)==174 and len({r[0] for r in D15_ENTRIES})==132
+    e=["KRW-A",start,100,round(100*((1-FEE81)/(1+FEE81)-1),6)]
+    check=d15row(e,{start+7*DAY-HOUR:(start+7*DAY-HOUR,100,100,100,100,1,100)},start+8*DAY)
+    assert check["day7_check"]=="ok" and check["day1"] is None and check["day15"] is None
+    print("REVERSE SWING V1.4.3 + independent TRACK15 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
