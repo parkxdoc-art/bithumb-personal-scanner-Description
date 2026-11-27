@@ -2731,6 +2731,90 @@ def runtrend23(bull=False,pull=False,gate=False,refine=False):
             for r in summaries:r.update(btc_up_hours=sum(v["btc_regime"]=="up" for v in regimes.values()),btc_not_up_hours=sum(v["btc_regime"]=="not_up" for v in regimes.values()),btc_unknown_hours=sum(v["btc_regime"]=="unknown" for v in regimes.values()))
         patch(status="done",phase="완료",rank=out,features=out,coverage=cov,summary=summaries,elapsed_seconds=round(time.monotonic()-begin,1))
     except Exception as e:record_error(str(e));patch(status="error",phase="실패")
+EXIT28_METHODS=("A1","A2","A3","B","C")
+def exit28simulate(raw,t,method,stop):
+    seq=[raw.get(t+i*HOUR) for i in range(72)]
+    if not all(r131valid(r) for r in seq):return None
+    p=seq[0][1];fee_ratio=(1+FEE81)/(1-FEE81)
+    sl=p*(1-stop/100)*fee_ratio
+    tp=p*(1+(int(method[1]) if method.startswith("A") else 1)/100)*fee_ratio
+    remaining=1.;net=0.;legs=[];ambiguous=0;pending=False
+    def sell(q,price,at,why):
+        nonlocal remaining,net
+        remaining-=q;net+=q*trend20net(p,price)
+        legs.append(dict(fraction=q,price=price,time=iso(at),reason=why))
+    for i,r in enumerate(seq):
+        at=t+i*HOUR;op,hi,lo,cl=r[1:5]
+        if op<=sl:
+            sell(remaining,op,at,"stop_gap");break
+        if pending:
+            sell(remaining,op,at,"sma5_exit");break
+        target_active=method.startswith("A") or (method=="B" and remaining>.99)
+        if target_active and op>=tp:
+            sell(remaining if method.startswith("A") else .7,tp,at,"target")
+            if remaining<1e-9:break
+            target_active=False
+        if lo<=sl:
+            if target_active and hi>=tp:ambiguous+=1
+            sell(remaining,sl,at+HOUR,"stop");break
+        if target_active and hi>=tp:
+            sell(remaining if method.startswith("A") else .7,tp,at+HOUR,"target")
+            if remaining<1e-9:break
+        if i==71:
+            sell(remaining,cl,at+HOUR,"72h");break
+        if method=="C" or (method=="B" and remaining<.99):
+            rr=[raw.get(at-j*HOUR) for j in range(4,-1,-1)]
+            if all(r131valid(x) for x in rr):
+                pending=cl<mean([x[4] for x in rr])
+    if remaining>1e-9:return None
+    return dict(exit_method=method,stop_net_pct=-stop,realized_net_pct=net,exit_reason=legs[-1]["reason"],exit_time=legs[-1]["time"],holding_hours=(datetime.strptime(legs[-1]["time"],"%Y-%m-%d %H:%M").replace(tzinfo=KST).timestamp()-t)/HOUR,partial_taken=int(len(legs)>1),ambiguous_bars=ambiguous,exit_legs=json.dumps(legs,ensure_ascii=False))
+def runexit28(entry,method,stop):
+    begin=time.monotonic()
+    try:
+        end=int(now().timestamp());cut=end//HOUR*HOUR;step=4*HOUR
+        universe=sorted({x["market"] for x in api("market/all") if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
+        if not universe:raise RuntimeError("시장 목록 없음")
+        probe=candles("KRW-BTC",240,end,8,latest=True)
+        if len(probe)<2 or any(r[0]%step!=probe[-1][0]%step for r in probe) or probe[-1][0]+step<=cut-step:raise RuntimeError("240분봉 경계 확인 실패")
+        anchor=probe[-1][0]%step
+        with state_lock:scan_id=state["scan_id"]
+        methods=EXIT28_METHODS if method=="ALL" else (method,)
+        patch(phase="15/20 진입 및 매도 방식 검증",done=0,total=len(universe))
+        out=[];cov=[];success=0
+        def fetch(m):
+            rr=candles(m,240,end,150,latest=True)
+            direct={r[0]:r for r in rr if r[0]%step==anchor and r[0]+step<=cut}
+            if not direct:return None
+            raw,n,why=r131page(m,cut-23*DAY,cut)
+            return raw,direct,n,why
+        for m,pack in parallel(universe,fetch):
+            base=dict(market=m,preset="EXIT28",strategy="exit28",scan_id=scan_id,**trend27group(entry))
+            if not pack or not pack[0]:
+                cov.append(dict(base,status="fetch_error",valid_hours=0,missing_hours=360,buy_signals=0,overlap_skipped=0,outcome_missing=0));continue
+            raw,direct,n,why=pack;success+=1
+            trades,audit=trend23eval(raw,direct,cut,anchor,False,False,None,True)
+            a=audit[entry]
+            cov.append(dict(base,status="ok" if a["valid_hours"] else "history",pages=n,page_stop=why,**a))
+            for row in trades[entry]:
+                results=[exit28simulate(raw,row["entry_ts"],k,stop) for k in methods]
+                if not all(x is not None for x in results):raise RuntimeError("매도 비교 자료 불일치")
+                for x in results:out.append(dict(base,**{k:v for k,v in row.items() if k not in base},**x))
+        if not success or not any(r["valid_hours"] for r in cov):raise RuntimeError("유효한 시간봉 부족")
+        out.sort(key=lambda r:(r["exit_method"],r["entry_ts"],r["market"]))
+        summaries=[]
+        for k in methods:
+            a=[r for r in out if r["exit_method"]==k];n=len(a)
+            vals=[r["realized_net_pct"] for r in a]
+            summaries.append(dict(preset="EXIT28",strategy="exit28",scan_id=scan_id,**trend27group(entry),exit_method=k,stop_net_pct=-stop,fee_oneway_pct=.04,max_hold_hours=72,entry_days=15,first_entry=iso(cut-18*DAY),last_entry_exclusive=iso(cut-3*DAY),universe=len(universe),market_success=success,matches=n,mean_net_pct=mean(vals) if n else None,median_net_pct=statistics.median(vals) if n else None,win_pct=100*sum(v>0 for v in vals)/n if n else None,mean_hold_hours=mean([r["holding_hours"] for r in a]) if n else None,stop_count=sum(r["exit_reason"].startswith("stop") for r in a),partial_count=sum(r["partial_taken"] for r in a),ambiguous_bars=sum(r["ambiguous_bars"] for r in a),outcome_missing=sum(r.get("outcome_missing",0) for r in cov),valid_hours=sum(r["valid_hours"] for r in cov),missing_hours=sum(r["missing_hours"] for r in cov),buy_signals=sum(r["buy_signals"] for r in cov),overlap_skipped=sum(r["overlap_skipped"] for r in cov)))
+        patch(status="done",phase="완료",rank=out,features=out,coverage=cov,summary=summaries,elapsed_seconds=round(time.monotonic()-begin,1))
+    except Exception as e:record_error(str(e));patch(status="error",phase="실패")
+def startexit28(entry,method,stop):
+    if entry not in range(4) or method not in ("ALL",)+EXIT28_METHODS or stop not in (1,2,3):return False
+    with state_lock:
+        if state["status"]=="running":return False
+        state.clear();state.update(mode="exit28",preset="EXIT28",scan_id=str(time.time_ns()),status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
+    threading.Thread(target=runexit28,args=(entry,method,stop),daemon=True).start()
+    return True
 def runtrend20(preset,back):
     begin=time.monotonic()
     try:
@@ -2806,6 +2890,17 @@ def starttrend20(preset,back):
     if preset in ("T42ALL","U20ALL","P20ALL","G20ALL","R415ALL"):threading.Thread(target=runtrend23,args=(preset=="U20ALL",preset in ("P20ALL","G20ALL"),preset=="G20ALL",preset=="R415ALL"),daemon=True).start()
     else:threading.Thread(target=runtrend20,args=(preset,back),daemon=True).start()
     return True
+HTML28=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BITHUMB SWING V2.8 TEST</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:800px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}a,button,select{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:10px;margin:4px;border-radius:7px;text-decoration:none}button:disabled,select:disabled{opacity:.5}progress{width:100%}small{color:#b4c4d1;line-height:1.7}pre{white-space:pre-wrap}.coin{background:#111923;border:1px solid #3b4d60;border-radius:10px;padding:12px;margin:8px 0}.line{display:flex;justify-content:space-between;gap:10px;margin:6px 0}h1{font-size:23px}h3{margin:0 0 8px}</style><h1>BITHUMB SWING V2.8 TEST</h1><a href="/live143">기존 V1.4.3 실시간</a><a href="/swing27">기존 V2.7 진입 비교</a><section><h2>15/20 단타 + 추세 보유 (백테스트)</h2><p>진입 조건 <select id="entry"><option value="0">A 기본 15/20</option><option value="1">B 하락폭 10~20%</option><option value="2">C 거래량 0.5~1.5배 미만</option><option value="3">D 하락폭 + 거래량</option></select></p><p>매도 방식 <select id="method"><option value="ALL">전체 비교 (A1/A2/A3/B/C)</option><option value="A1">A1 전량 +1%</option><option value="A2">A2 전량 +2%</option><option value="A3">A3 전량 +3%</option><option value="B">B +1% 70% / 추세 30%</option><option value="C">C 전량 추세 추종</option></select></p><p>순손절 <select id="stop"><option value="1">-1%</option><option value="2" selected>-2%</option><option value="3">-3%</option></select></p><small>기존 V2.7 진입 그대로. 15일 진입, 최대 72시간, 편도 0.04%. B/C 추세 청산: 완료 1시간봉 종가가 SMA5 미만이면 다음 시간봉 시가. B 잔량도 최초 손절가 유지. 같은 시간봉에서 손절/익절 순서 불명확하면 손절 우선, 갭 손절은 시가. 시간봉 내부 청산 시각은 봉 종료로 기록. 모든 방식 동일 진입, 72시간 중복 제외 유지. 실제 주문 없음.</small><p><button id="go">15일 백테스트 실행</button></p><p id="phase">대기</p><progress id="progress" value="0" max="1"></progress><pre id="errors"></pre></section><section id="out" hidden><h2>매도 방식 비교 결과</h2><p id="audit"></p><a href="/csv/features?mode=exit28">상세 CSV</a><a href="/csv/summary?mode=exit28">요약 CSV</a><a href="/csv/coverage?mode=exit28">수집 상태 CSV</a><a href="/csv/errors?mode=exit28">오류 CSV</a><div id="results"></div></section><script>
+const $=id=>document.getElementById(id);let loaded=null,loading=false;const names={A1:'A1 전량 +1%',A2:'A2 전량 +2%',A3:'A3 전량 +3%',B:'B 70% 익절 + 30% 추세',C:'C 전량 추세'};
+function fmt(x,unit='%'){return typeof x==='number'?x.toFixed(2)+unit:'—'}
+function node(tag,s){let e=document.createElement(tag);e.textContent=s;return e}
+function line(c,k,v){let r=node('div','');r.className='line';r.append(node('span',k),node('strong',v));c.append(r)}
+function lock(b){for(let id of ['entry','method','stop','go'])$(id).disabled=b}
+$('go').onclick=async()=>{lock(true);$('out').hidden=true;loaded=null;try{let q=new URLSearchParams({entry:$('entry').value,method:$('method').value,stop:$('stop').value});let r=await fetch('/exit28/start?'+q,{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 검색 실행 중 또는 조건 오류');await poll()}catch(e){$('phase').textContent=e.message;lock(false)}};
+async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'})).json();lock(s.status==='running');if(s.mode!=='exit28'){$('phase').textContent=s.status==='running'?'다른 연구 진행 중':'대기';$('out').hidden=true;return} $('phase').textContent=s.phase+' '+s.done+'/'+s.total+' · '+(s.elapsed_seconds??'—')+'초';$('progress').max=Math.max(1,s.total);$('progress').value=s.done;$('errors').textContent=(s.errors||[]).join('\n');if(s.status!=='done'||loaded===s.scan_id||loading)return;loading=true;try{let d=await(await fetch('/results',{cache:'no-store'})).json();let x=d.summary[0];if(!x||x.scan_id!==s.scan_id||x.preset!=='EXIT28')return;loaded=s.scan_id;$('audit').textContent='진입 '+['A 기본','B 하락폭','C 거래량','D 둘 다'][x.comparison_id]+' · 손절 '+x.stop_net_pct+'% · '+x.first_entry+' ~ '+x.last_entry_exclusive+' (미포함) · 수집 '+x.market_success+'/'+x.universe+' · 평가 누락 '+x.outcome_missing+'건';$('results').replaceChildren(...d.summary.map(r=>{let c=node('article','');c.className='coin';c.append(node('h3',names[r.exit_method]+' · '+r.matches+'건'));line(c,'평균 순수익 / 중앙값',fmt(r.mean_net_pct)+' / '+fmt(r.median_net_pct));line(c,'종료 승률',fmt(r.win_pct));line(c,'평균 보유',fmt(r.mean_hold_hours,'시간'));line(c,'손절 / 분할 실행',r.stop_count+' / '+r.partial_count+'건');line(c,'동일 봉 충돌',r.ambiguous_bars+'건');return c}));$('out').hidden=false}finally{loading=false}}catch(e){$('phase').textContent='연결 확인: '+e.message}}
+poll();setInterval(poll,1500);
+</script></html>"""
+
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
         if not isinstance(body,bytes):body=body.encode()
@@ -2817,6 +2912,12 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/exit28/start":
+            try:
+                q=parse_qs(u.query);entry=int(q.get("entry",["0"])[0]);method=q.get("method",["ALL"])[0];stop=int(q.get("stop",["2"])[0])
+                if entry not in range(4) or method not in ("ALL",)+EXIT28_METHODS or stop not in (1,2,3):raise ValueError()
+            except ValueError:return self.js({"error":"invalid settings"},400)
+            return self.js({"started":startexit28(entry,method,stop)})
         if u.path=="/trend20/start":
             q=parse_qs(u.query);preset=q.get("preset",["T4"])[0];back=q.get("back",["0"])[0]
             if preset not in TREND20_NAME or back not in ("0","1"):return self.js({"error":"invalid mode"},400)
@@ -2862,6 +2963,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if p=="/swing28":return self.send(HTML28,"text/html; charset=utf-8")
         if p=="/swing27":return self.send(HTML27,"text/html; charset=utf-8")
         if p=="/swing26":return self.send(HTML26,"text/html; charset=utf-8")
         if p=="/swing25":return self.send(HTML25,"text/html; charset=utf-8")
@@ -3073,7 +3175,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=(("BITHUMB_SWING_V2_2_TEST_" if csv_preset=="T430" else "BITHUMB_SWING_V2_7_TEST_" if csv_preset=="R415ALL" else "BITHUMB_SWING_V2_6_TEST_" if csv_preset=="G20ALL" else "BITHUMB_SWING_V2_5_TEST_" if csv_preset=="P20ALL" else "BITHUMB_SWING_V2_4_TEST_" if csv_preset=="U20ALL" else "BITHUMB_SWING_V2_3_TEST_" if csv_preset=="T42ALL" else "BITHUMB_SWING_V2_1_TEST_" if csv_preset=="T415" else "BITHUMB_SWING_V2_0_TEST_")+("BACK_" if mode=="trendback20" else "LIVE_")+str(csv_preset)+"_" if mode in ("trend20","trendback20") else "REVERSE_SWING_V1_4_3_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=(("BITHUMB_SWING_V2_2_TEST_" if csv_preset=="T430" else "BITHUMB_SWING_V2_7_TEST_" if csv_preset=="R415ALL" else "BITHUMB_SWING_V2_6_TEST_" if csv_preset=="G20ALL" else "BITHUMB_SWING_V2_5_TEST_" if csv_preset=="P20ALL" else "BITHUMB_SWING_V2_4_TEST_" if csv_preset=="U20ALL" else "BITHUMB_SWING_V2_3_TEST_" if csv_preset=="T42ALL" else "BITHUMB_SWING_V2_1_TEST_" if csv_preset=="T415" else "BITHUMB_SWING_V2_0_TEST_")+("BACK_" if mode=="trendback20" else "LIVE_")+str(csv_preset)+"_" if mode in ("trend20","trendback20") else "BITHUMB_SWING_V2_8_TEST_EXIT_" if mode=="exit28" else "REVERSE_SWING_V1_4_3_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -3305,7 +3407,15 @@ def selftest():
     assert not any(trend27match(dict(s27,down_bars=14),g) for g in range(4))
     empty27,audit27=trend23eval({}, {},cut23,0,False,False,None,True)
     assert set(empty27)==set(range(4)) and all(audit27[g]["missing_hours"]==360 for g in empty27)
-    print("REVERSE SWING V1.4.3 preserved + BITHUMB SWING V2.7 TEST self-test PASS",flush=True)
+    t28=start
+    raw28={t28+i*HOUR:(t28+i*HOUR,100,104,96,100,1,100) for i in range(-4,72)}
+    z28=exit28simulate(raw28,t28,"A1",2)
+    assert z28["exit_reason"]=="stop" and abs(z28["realized_net_pct"]+2)<1e-8 and z28["ambiguous_bars"]==1
+    raw28={t28+i*HOUR:(t28+i*HOUR,100,102,99.9,101,1,100) for i in range(-4,72)}
+    z28=exit28simulate(raw28,t28,"B",2)
+    assert z28["partial_taken"]==1 and z28["exit_reason"]=="72h" and z28["holding_hours"]==72
+    assert exit28simulate({},t28,"A1",2) is None
+    print("REVERSE SWING V1.4.3 preserved + BITHUMB SWING V2.8 TEST self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
