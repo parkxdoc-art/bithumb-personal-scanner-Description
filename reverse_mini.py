@@ -1410,7 +1410,7 @@ function showTrend(x){
  $('applied').textContent='결과 적용 조건: '+names[x.preset];
  $('headline').textContent=resultMode==='trendback20'?'15일 과거 BUY 진입 '+x.matches+'건 · 3일 평균 '+pct(x.day3_mean_pct):'BUY '+x.buys+'개 · WATCH '+x.watches+'개';
  $('audit').textContent='분석 '+x.valid+'/'+x.universe+' · 이력 부족 종목 '+x.history_missing+' · 검색 완료 '+x.finished_at;
- $('notice').textContent=resultMode==='trendback20'?'1일 평균 '+pct(x.day1_mean_pct)+' · 3일 최고 순수익 5% 도달률 '+pct(x.day3_hit5_pct)+' · 평가 누락 '+x.outcome_missing+'건 · 누락 시간 '+x.missing_hours+' · 매수 후 72시간 중복 제외':'상승 눌림 실험 조건 · 편도 0.04% · BUY/WATCH 모의매수만 가능';
+ $('notice').textContent=resultMode==='trendback20'?'1일 평균 '+pct(x.day1_mean_pct)+' · 3일 최고 순수익 5% 도달률 '+pct(x.day3_hit5_pct)+' · 평가 누락 '+x.outcome_missing+'건 · 누락 시간 '+x.missing_hours+' · 가격 범위 제외 '+x.price_skipped+' · 매수 후 72시간 중복 제외':'상승 눌림 실험 조건 · 편도 0.04% · BUY/WATCH 모의매수만 가능';
  limit=5;render();
 }
 function renderTrend(){
@@ -1430,6 +1430,7 @@ async function poll(){try{
  if(s.status==='done'&&loadedScan!==s.scan_id&&!loading){
   // Do not overwrite a user's deliberate strategy selection after a previous completed scan.
   if((s.mode==='live14')!==($('strategy').value==='reverse'))return;
+  if(s.mode==='live14'&&$('preset').value!==s.preset)return;
   if(s.mode!=='live14'&&$('trendTf').value!==s.preset)return;
   loading=true;try{let d=await(await fetch('/results',{cache:'no-store'})).json();if(!d.summary[0]||d.summary[0].scan_id!==s.scan_id)return;result=d;loadedScan=s.scan_id;resultMode=s.mode;if(s.mode==='live14')$('preset').value=s.preset;
   for(let k of ['features','summary','coverage','errors'])$(k+'CSV').href='/csv/'+k+'?mode='+s.mode;
@@ -1451,9 +1452,9 @@ async function paperBuy(x){
  let a=Number($('paperAmount').value),s=paperStats();
  if(!Number.isFinite(a)||a<5000||a>s.cash){paperMsg('가상 잔액 내에서 5,000원 이상 입력해 주세요.');return}
  if(s.open.some(t=>t.market===x.market)){paperMsg('이미 모의 보유 중인 종목입니다.');return}
- if(s.closed.some(t=>t.market===x.market&&t.signalTime===x.signal_time)){paperMsg('같은 일봉 신호에서 이미 매매한 종목입니다.');return}
+ if(s.closed.some(t=>t.market===x.market&&t.signalTime===x.signal_time)){paperMsg('같은 신호에서 이미 매매한 종목입니다.');return}
  paperBusy=true;renderPaper();paperMsg('새로운 현재가 조회 중...');
- try{let r=await fetch((x.strategy==='trend'?'/trend20/entry':'/paper/entry')+'?market='+encodeURIComponent(x.market)+'&signal='+encodeURIComponent(x.signal_time)+'&hour='+encodeURIComponent(x.hour_signal_time)+'&preset='+encodeURIComponent(x.preset)+'&scan_id='+encodeURIComponent(result.summary[0].scan_id)+'&entry_status='+encodeURIComponent(x.status),{cache:'no-store'});if(!r.ok)throw Error('신호 만료, 급등 제외 또는 가격 조회 실패. 다시 검색해 주세요.');let q=await r.json();if(q.entry_status!==x.status)throw Error('검색 판정 변경. 다시 검색해 주세요.');let p=q.price;if(!Number.isFinite(p)||p<=0)throw Error('유효한 현재가 없음');
+ try{let r=await fetch((x.strategy==='trend'?'/trend20/entry':'/paper/entry')+'?market='+encodeURIComponent(x.market)+'&signal='+encodeURIComponent(x.signal_time)+'&hour='+encodeURIComponent(x.hour_signal_time)+'&preset='+encodeURIComponent(x.preset)+'&scan_id='+encodeURIComponent(result.summary[0].scan_id)+'&entry_status='+encodeURIComponent(x.status),{cache:'no-store'});if(!r.ok)throw Error('신호 만료, 진입 범위 제외 또는 가격 조회 실패. 다시 검색해 주세요.');let q=await r.json();if(q.entry_status!==x.status)throw Error('검색 판정 변경. 다시 검색해 주세요.');let p=q.price;if(!Number.isFinite(p)||p<=0)throw Error('유효한 현재가 없음');
  let t={id:Date.now()+'-'+x.market,market:x.market,signalTime:x.signal_time,boughtAt:q.observed_ms,amount:a,buy:p,qty:a/(1+FEE)/p,deadline:q.observed_ms+7*86400000,signalDeadline:q.signal_deadline_ms,preset:q.preset,minDrawdownPct:q.min_drawdown_pct,minDownDays:q.min_down_days,entryStatus:q.entry_status,strategy:x.strategy||'reverse',timeframe:x.strategy==='trend'?x.preset:null};savePaper({trades:[...account.trades,t]});quotes[x.market]=q;paperMsg(x.market+' '+q.entry_status+' 모의매수 완료 (시장 참고가 가정).');
  }catch(e){paperMsg(e.message)}finally{paperBusy=false;renderPaper();render()}
 }
@@ -1864,7 +1865,7 @@ def trend20eval(raw,cut,preset,back):
     if not back:
         why,s=trend20signal(raw,bars,cut,preset)
         return why,s
-    rows=[];missing=0;signals=0;out_missing=0;skipped=0;last=0;valid=0
+    rows=[];missing=0;signals=0;out_missing=0;skipped=0;price_skipped=0;last=0;valid=0
     # Fifteen entry days, all with a completed 72h outcome window.
     first=cut-18*DAY
     for t in range(first,cut-3*DAY,HOUR):
@@ -1874,12 +1875,14 @@ def trend20eval(raw,cut,preset,back):
         if why!="BUY":continue
         signals+=1
         if t<last:skipped+=1;continue
+        # Match the live entry-price guard at the simulated next-hour open.
+        if r131valid(raw.get(t)) and not s["pullback_low"]<=raw[t][1]<=s["prior_peak"]:price_skipped+=1;continue
         # Reserve the same 72h window even if the future data are missing.
         last=t+3*DAY
         a=trend20out(raw,t,24);b=trend20out(raw,t,72)
         if not a or not b:out_missing+=1;continue
         rows.append(dict(s,signal_time=iso(t),entry_ts=t,buy_price=raw[t][1],day1_close_pct=a["close"],day1_peak_pct=a["peak"],day3_close_pct=b["close"],day3_peak_pct=b["peak"],day3_low_pct=b["low"]))
-    return rows,dict(valid_hours=valid,missing_hours=missing,buy_signals=signals,overlap_skipped=skipped,outcome_missing=out_missing)
+    return rows,dict(valid_hours=valid,missing_hours=missing,buy_signals=signals,overlap_skipped=skipped,price_skipped=price_skipped,outcome_missing=out_missing)
 def runtrend20(preset,back):
     begin=time.monotonic()
     try:
@@ -1933,7 +1936,7 @@ def runtrend20(preset,back):
         else:out.sort(key=lambda r:(r["entry_ts"],r["market"]))
         summary=dict(preset=preset,strategy="trend",scan_id=scan_id,signal_time=iso(cut),finished_at=iso(int(now().timestamp())),universe=len(universe),market_success=success,valid=valid,matches=len(out),buys=sum(r["status"]=="BUY" for r in out),watches=sum(r["status"]=="WATCH" for r in out),history_missing=sum(r["status"]=="history" for r in cov),no_quote=sum(r["status"]=="no_quote" for r in cov),fee_oneway_pct=.04)
         if back:
-            summary.update(entry_days=15,first_entry=iso(cut-18*DAY),last_entry_exclusive=iso(cut-3*DAY),valid_hours=sum(r.get("valid_hours",0) for r in cov),missing_hours=sum(r.get("missing_hours",0) for r in cov),buy_signals=sum(r.get("buy_signals",0) for r in cov),outcome_missing=sum(r.get("outcome_missing",0) for r in cov),overlap_skipped=sum(r.get("overlap_skipped",0) for r in cov),day1_mean_pct=mean([r["day1_close_pct"] for r in out]) if out else None,day3_mean_pct=mean([r["day3_close_pct"] for r in out]) if out else None,day3_hit5_pct=100*sum(r["day3_peak_pct"]>=5 for r in out)/len(out) if out else None)
+            summary.update(entry_days=15,first_entry=iso(cut-18*DAY),last_entry_exclusive=iso(cut-3*DAY),valid_hours=sum(r.get("valid_hours",0) for r in cov),missing_hours=sum(r.get("missing_hours",0) for r in cov),buy_signals=sum(r.get("buy_signals",0) for r in cov),outcome_missing=sum(r.get("outcome_missing",0) for r in cov),overlap_skipped=sum(r.get("overlap_skipped",0) for r in cov),price_skipped=sum(r.get("price_skipped",0) for r in cov),day1_mean_pct=mean([r["day1_close_pct"] for r in out]) if out else None,day3_mean_pct=mean([r["day3_close_pct"] for r in out]) if out else None,day3_hit5_pct=100*sum(r["day3_peak_pct"]>=5 for r in out)/len(out) if out else None)
         patch(status="done",phase="완료",rank=out,features=out,coverage=cov,summary=[summary],elapsed_seconds=round(time.monotonic()-begin,1))
     except Exception as e:record_error(str(e));patch(status="error",phase="실패")
 def starttrend20(preset,back):
@@ -2376,9 +2379,9 @@ def selftest():
     assert trend20signal(raw20,raw20,t20+HOUR,"T1")[0]=="BUY"
     assert trend20signal(raw20,raw20,t20,"T1")[0]=="WATCH"
     assert trend20out(raw20,t20,24) is None
-    test4={start+HOUR*i:(start+HOUR*i,100,101,99,100,1,100) for i in range(1,5)}
+    test4={start+HOUR*i:(start+HOUR*i,100,101,99,100,1,100) for i in range(3,7)}
     assert len(trend20bars(test4))==1
-    assert not trend20bars({k:v for k,v in test4.items() if k!=start+2*HOUR})
+    assert not trend20bars({k:v for k,v in test4.items() if k!=start+4*HOUR})
     print("REVERSE SWING V1.4.3 preserved + BITHUMB SWING V2.0 TEST self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
