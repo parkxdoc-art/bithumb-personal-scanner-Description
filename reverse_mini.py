@@ -1388,6 +1388,98 @@ renderPaper();
 
 poll();setInterval(poll,2000);
 </script></html>"""
+HTML20=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BITHUMB SWING V2.0 TEST</title><style>body{background:#10151d;color:#edf2f7;font:14px system-ui;max-width:1000px;margin:auto;padding:14px}section{background:#19232e;border:1px solid #324355;border-radius:12px;padding:14px;margin:12px 0}button,a,select,input{display:inline-block;background:#225b51;color:white;border:1px solid #476073;padding:10px;margin:4px;border-radius:7px;text-decoration:none}input{background:#10151d}button:disabled{opacity:.5}small{color:#b4c4d1;line-height:1.7}progress{width:100%}pre{white-space:pre-wrap}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px}.coin{background:#111923;border:1px solid #3b4d60;border-radius:12px;padding:12px}.coin h3{margin:0 0 8px}.line{display:flex;justify-content:space-between;gap:10px;margin:6px 0}.green{color:#72ddb0}.red{color:#ff9b9b}.muted{color:#a9bac9}h1{font-size:23px;margin-bottom:4px}</style><h1>BITHUMB SWING V2.0 TEST</h1><a href="/live143">기존 V1.4.3 보존판</a><section><h2>매수 후보 검색</h2><p><label>전략 <select id="strategy"><option value="reverse">저점 반등형 (기존)</option><option value="trend">상승 눌림형 (실험)</option></select></label></p><div id="reverseRules"><p>20일 하락 추세 + 선택한 하락폭·하락일 수 + 전일 거래량 2배 이상 + D-3 대비 2배 이상 · RSI 제외</p><small>최근 20일과 오늘의 일별 고가가 시가 또는 전일 종가 대비 한 번이라도 30% 이상 상승하면 제외. 과거 급등 이력 부족 시 제외. 강화 일봉 조건 충족 WATCH. 가장 최근 완료 1시간봉의 SMA5 상향 돌파만 BUY 후보. 미완료 봉 제외. BUY/WATCH 모의매수 모두 검색된 1시간 동안 유효. WATCH는 5이평 상향 돌파 미확인 상태의 비교 실험이며 BUY로 변경하지 않음. 검증 전 실전 매수 권장 아님. 검색 시점의 가격은 실제 체결가가 아니며 당일 시가 진입 백테스트와 다를 수 있음. 최고가 매도 가정 결과는 실제 승률이 아님. 자동 주문 없음. 별도 매도·손절 신호 미검증. 기존 보유 종목은 직접 제외.</small></div><div id="trendRules" hidden><p>선택 시간봉: 눌림 전 20개 봉 상승폭 10% 이상 · 연속 음봉 2~4개 · 종가 눌림 3~10% (저가 최대 10%) · 눌림 평균 거래량 감소.</p><small>4시간봉은 KST 00/04/08/12/16/20시, 1시간봉으로 합성(누락 봉 제외). BUY: 완료 1시간봉 양봉·직전 고가 돌파·직전 3시간 평균 거래량 1.2배 이상, 이전 고점 미초과. WATCH는 반등 미확인. 일봉 추세 필터는 아직 적용하지 않음. 15일 백테스트는 같은 조건의 BUY만 다음 시간봉 시가 진입, 1·3일 수익률, 동일 코인 72시간 중복 제외. 현재 상장종목 기준, 누락은 제외. 실제 주문 없음.</small><p>시간봉 <select id="trendTf"><option value="T4">4시간봉</option><option value="T1">1시간봉</option></select><button id="back">15일 백테스트</button></p></div><p><label id="presetLabel" for="preset">검색 조건</label><select id="preset"><option value="A">A · 30% / 15일</option><option value="B">B · 35% / 14일</option><option value="C">C · 40% / 15일</option><option value="D" selected>D · 35% / 13일 (완화 테스트)</option></select><button id="go">전체 코인 검색 시작</button></p><p id="applied" class="muted">조건을 선택하고 검색해 주세요.</p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre></section><section><h2>모의매매 계좌</h2><small>가상 원금 100만원, 1회 투자금 변경 가능. 현재가 조회 후 전량 가상 체결(편도 0.04%). 직접 매수/매도, 7일 경과 표시만 제공. 실제 주문 없음. 기록은 이 브라우저에만 저장, 기기·브라우저 변경/데이터 삭제 시 유실될 수 있음. CSV 백업 권장.</small><p>1회 투자금(원) <input id="paperAmount" type="number" min="5000" step="1000" value="100000" style="width:105px"><button id="refreshPaper">보유 가격 갱신</button><button id="paperCSV">모의매매 CSV</button></p><p id="paperSummary"></p><p id="paperWin"></p><p id="paperMsg" class="muted"></p><h3>보유 종목</h3><div class="cards" id="paperOpen"></div><details><summary>청산 기록 (최근 100건)</summary><div class="cards" id="paperClosed"></div></details></section><section id="out" hidden><h2 id="headline"></h2><p id="audit" class="muted"></p><p id="notice" class="muted"></p><a id="featuresCSV" href="/csv/features?mode=live14">결과 CSV</a><a id="summaryCSV" href="/csv/summary?mode=live14">요약 CSV</a><a id="coverageCSV" href="/csv/coverage?mode=live14">수집 상태 CSV</a><a id="errorsCSV" href="/csv/errors?mode=live14">오류 CSV</a><p><input id="query" placeholder="코인 검색" style="width:105px"><select id="sort"><option value="market">종목명 순</option><option value="volume">거래량 증가율 순</option><option value="depth">고점 대비 하락폭 순</option><option value="gap">당일 시가 대비 변동률 순</option></select></p><p id="count"></p><div class="cards" id="cards"></div><button id="more">더 보기</button></section><script>
+const $=id=>document.getElementById(id);let result=null,loading=false,limit=5,loadedScan=null;const names={A:"A · 30% / 15일",B:"B · 35% / 14일",C:"C · 40% / 15일",D:"D · 35% / 13일",T4:"상승 눌림 · 4시간봉",T1:"상승 눌림 · 1시간봉"};
+function num(x){return typeof x==='number'?x.toLocaleString('ko-KR',{maximumSignificantDigits:8}):'—'}
+function pct(x){return typeof x==='number'?(x>0?'+':'')+x.toFixed(2)+'%':'—'}
+function node(tag,txt,cls){let e=document.createElement(tag);if(txt!=null)e.textContent=txt;if(cls)e.className=cls;return e}
+function line(card,k,v,cls){let r=node('div',null,'line');r.append(node('span',k,'muted'),node('strong',v,cls));card.append(r)}
+function render(){if(!result)return;if(result.summary[0].strategy==="trend"){renderTrend();return;}let q=$('query').value.trim().toUpperCase(),sort=$('sort').value;let a=result.rank.filter(x=>x.market.includes(q));let key={volume:'volume_increase_pct',depth:'peak_to_last_pct',gap:'change_from_open_pct'}[sort];if(key)a.sort((x,y)=>sort==='depth'?(x[key]??Infinity)-(y[key]??Infinity):(y[key]??-Infinity)-(x[key]??-Infinity));else a.sort((x,y)=>x.market.localeCompare(y.market));$('count').textContent=a.length+'종목 · '+Math.min(limit,a.length)+'개 표시';a.sort((x,y)=>Number(y.status==="BUY")-Number(x.status==="BUY"));let cards=a.slice(0,limit).map(x=>{let c=node('article',null,'coin');c.append(node('h3',x.market.replace('KRW-','')+' · '+(x.status==='BUY'?'BUY 후보':'WATCH'),x.status==='BUY'?'green':'muted'));line(c,'적용 검색식',names[x.preset]||x.preset);line(c,'검색 시 참고가',num(x.reference_price)+'원');line(c,'당일 시가',num(x.day_open)+'원');line(c,'시가 대비',pct(x.change_from_open_pct),x.change_from_open_pct>=0?'green':'red');line(c,'당일 최고 상승률',pct(x.day_high_pct));line(c,'20일+오늘 최대 일중 급등',pct(x.lookback_max_spike_pct));line(c,'최대 급등 날짜',x.lookback_max_spike_date||'—');line(c,'20일 실제 하락일',x.down_days+'/20일');line(c,'20일 종가 변화',pct(x.trend_net_pct),'red');line(c,'고점 대비 전일 종가',pct(x.peak_to_last_pct),'red');line(c,'거래량 배수',num(x.vol_ratio_d3)+' → '+num(x.vol_ratio_d1)+'배','green');line(c,'거래량 배수 증가율',pct(x.volume_increase_pct));line(c,'참고가 기준 본전',num(x.breakeven_price)+'원');line(c,'신호 확정(KST)',x.signal_time);line(c,'가격 조회(KST)',x.observed_at);line(c,'1시간봉 5이평',num(x.hour_ma5));line(c,'1시간봉 확인',x.hour_valid?x.hour_signal_time:'데이터 부족');line(c,'7일째 일봉 날짜',x.planned_last_day);let b=node('button',paperStats().open.some(t=>t.market===x.market)?'모의 보유 중':x.status==='WATCH'?'WATCH 모의매수':'BUY 모의매수');b.disabled=!['BUY','WATCH'].includes(x.status)||paperBusy||!storageOK||paperStats().open.some(t=>t.market===x.market);b.onclick=()=>paperBuy(x);c.append(b);return c});$('cards').replaceChildren(...cards);$('more').hidden=a.length<=limit}
+function show(){let x=result.summary[0];if(x.strategy==="trend"){showTrend(x);return;}$('applied').textContent='결과 적용 조건: '+names[x.preset];$('headline').textContent='BUY '+x.buys+'개 · WATCH '+x.watches+'개 · 20일+오늘 급등 제외 '+x.spike_excluded+'개';$('audit').textContent='신호 확정 '+x.signal_time+' KST · 검색 완료 '+x.finished_at+' KST · 분석 '+x.valid+'/'+x.universe+' · 이력 부족 '+x.history_missing+' · 현재가 없음 '+x.no_quote+' · 급등 이력 미확인 '+x.spike_history_missing;$('notice').textContent='수수료 편도 0.04% 적용. 본전가는 참고가 기준 이론값(호가단위·슬리피지 미반영). 직접 매매 전 현재가와 보유 여부 확인.';limit=5;render()}
+
+let resultMode=null;
+function syncMode(){let trend=$('strategy').value==='trend';$('reverseRules').hidden=trend;$('trendRules').hidden=!trend;$('preset').hidden=trend;$('presetLabel').hidden=trend;}
+function clearResult(){result=null;loadedScan=null;resultMode=null;$('out').hidden=true;}
+$('strategy').onchange=()=>{syncMode();clearResult();$('applied').textContent='전략을 선택하고 새로 검색해 주세요.'};
+$('trendTf').onchange=()=>{clearResult();$('applied').textContent='시간봉 변경: 다시 검색해 주세요.'};
+$('preset').onchange=()=>{clearResult();$('applied').textContent='조건 변경: 다시 검색해 주세요.'};
+$('query').oninput=$('sort').onchange=()=>{limit=5;render()};$('more').onclick=()=>{limit+=5;render()};
+async function begin20(back){try{$('go').disabled=true;$('back').disabled=true;$('strategy').disabled=true;$('preset').disabled=true;$('trendTf').disabled=true;let trend=$('strategy').value==='trend';let url=trend?'/trend20/start?preset='+encodeURIComponent($('trendTf').value)+'&back='+(back?'1':'0'):'/live14/start?preset='+encodeURIComponent($('preset').value);let r=await fetch(url,{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 검색 실행 중');clearResult();await poll()}catch(e){$('phase').textContent=e.message;for(let id of ['go','back','strategy','preset','trendTf'])$(id).disabled=false}}
+$('go').onclick=()=>begin20(false);$('back').onclick=()=>begin20(true);
+function showTrend(x){
+ $('applied').textContent='결과 적용 조건: '+names[x.preset];
+ $('headline').textContent=resultMode==='trendback20'?'15일 과거 BUY 진입 '+x.matches+'건 · 3일 평균 '+pct(x.day3_mean_pct):'BUY '+x.buys+'개 · WATCH '+x.watches+'개';
+ $('audit').textContent='분석 '+x.valid+'/'+x.universe+' · 이력 부족 종목 '+x.history_missing+' · 검색 완료 '+x.finished_at;
+ $('notice').textContent=resultMode==='trendback20'?'1일 평균 '+pct(x.day1_mean_pct)+' · 3일 최고 순수익 5% 도달률 '+pct(x.day3_hit5_pct)+' · 평가 누락 '+x.outcome_missing+'건 · 누락 시간 '+x.missing_hours+' · 매수 후 72시간 중복 제외':'상승 눌림 실험 조건 · 편도 0.04% · BUY/WATCH 모의매수만 가능';
+ limit=5;render();
+}
+function renderTrend(){
+ let q=$('query').value.trim().toUpperCase();let a=result.rank.filter(x=>x.market.includes(q));
+ if(resultMode!=='trendback20'){let sort=$('sort').value;if(sort==='volume')a.sort((x,y)=>y.confirm_volume_ratio-x.confirm_volume_ratio);else if(sort==='depth')a.sort((x,y)=>y.pullback_pct-x.pullback_pct);else if(sort==='market')a.sort((x,y)=>x.market.localeCompare(y.market));a.sort((x,y)=>Number(y.status==='BUY')-Number(x.status==='BUY'))}
+ $('count').textContent=a.length+'건 · '+Math.min(limit,a.length)+'개 표시';$('more').hidden=a.length<=limit;
+ $('cards').replaceChildren(...a.slice(0,limit).map(x=>{let c=node('article',null,'coin');c.append(node('h3',x.market.replace('KRW-','')+' · '+x.status,x.status==='BUY'?'green':'muted'));line(c,'전략',names[x.preset]);line(c,'이전 20봉 상승',pct(x.prior_gain_pct));line(c,'연속 음봉',x.pullback_bars+'개');line(c,'눌림폭',pct(-x.pullback_pct));line(c,'눌림 거래량 / 이전 평균',num(x.pullback_volume_ratio)+'배');line(c,'반등 시간봉 거래량',num(x.confirm_volume_ratio)+'배');line(c,'신호 확정(KST)',x.signal_time);
+ if(resultMode==='trendback20'){line(c,'진입가',num(x.buy_price)+'원');line(c,'1일 종료 / 최고',pct(x.day1_close_pct)+' / '+pct(x.day1_peak_pct));line(c,'3일 종료 / 최고',pct(x.day3_close_pct)+' / '+pct(x.day3_peak_pct));line(c,'3일 최저',pct(x.day3_low_pct));}
+ else{line(c,'검색 참고가',num(x.reference_price)+'원');line(c,'이전 고점',num(x.prior_peak)+'원');line(c,'눌림 저점',num(x.pullback_low)+'원');let held=paperStats().open.some(t=>t.market===x.market),b=node('button',held?'모의 보유 중':x.status+' 모의매수');b.disabled=held||paperBusy||!storageOK;b.onclick=()=>paperBuy(x);c.append(b)}return c}));
+}
+async function poll(){try{
+ let s=await(await fetch('/status',{cache:'no-store'})).json();let running=s.status==='running';
+ for(let id of ['go','back','strategy','preset','trendTf'])$(id).disabled=running;
+ if(!['live14','trend20','trendback20'].includes(s.mode)){$('phase').textContent=running?'다른 연구 실행 중':'대기';clearResult();return}
+ $('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 오류 '+s.error_count+' · 전체 '+(s.elapsed_seconds??'—')+'초';$('errors').textContent=s.errors.join('\n');
+ if(running){clearResult();$('applied').textContent='검색 중: '+names[s.preset];return}
+ if(s.status==='done'&&loadedScan!==s.scan_id&&!loading){
+  // Do not overwrite a user's deliberate strategy selection after a previous completed scan.
+  if((s.mode==='live14')!==($('strategy').value==='reverse'))return;
+  if(s.mode!=='live14'&&$('trendTf').value!==s.preset)return;
+  loading=true;try{let d=await(await fetch('/results',{cache:'no-store'})).json();if(!d.summary[0]||d.summary[0].scan_id!==s.scan_id)return;result=d;loadedScan=s.scan_id;resultMode=s.mode;if(s.mode==='live14')$('preset').value=s.preset;
+  for(let k of ['features','summary','coverage','errors'])$(k+'CSV').href='/csv/'+k+'?mode='+s.mode;
+  $('out').hidden=false;show()}finally{loading=false}
+ }
+ }catch(e){$('phase').textContent='연결 확인: '+e.message}}
+syncMode();
+
+const FEE=.0004,STORE='reverse-swing-paper-v1',INITIAL=1000000;
+let account={trades:[]},storageOK=true,paperBusy=false,quotes={};
+try{let raw=localStorage.getItem(STORE);if(raw){let a=JSON.parse(raw);if(!Array.isArray(a.trades))throw Error('invalid data');account=a}}catch(e){storageOK=false}
+function savePaper(next){localStorage.setItem(STORE,JSON.stringify(next));account=next}
+function paperStats(){let closed=account.trades.filter(x=>x.closedAt),open=account.trades.filter(x=>!x.closedAt),real=closed.reduce((s,x)=>s+x.pnl,0),spent=open.reduce((s,x)=>s+x.amount,0);return {closed,open,real,cash:INITIAL+real-spent,wins:closed.filter(x=>x.pnl>0).length,losses:closed.filter(x=>x.pnl<0).length}}
+function paperMsg(s){$('paperMsg').textContent=s}
+function paperTime(t){return new Date(t).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})}
+async function quote(markets){let all={};for(let i=0;i<markets.length;i+=40){let r=await fetch('/paper/quotes?markets='+encodeURIComponent(markets.slice(i,i+40).join(',')),{cache:'no-store'});if(!r.ok)throw Error('현재가 조회 실패');let d=await r.json();Object.assign(all,d.quotes)}return all}
+async function paperBuy(x){
+ if(paperBusy||!storageOK||!result||!['BUY','WATCH'].includes(x.status))return;
+ let a=Number($('paperAmount').value),s=paperStats();
+ if(!Number.isFinite(a)||a<5000||a>s.cash){paperMsg('가상 잔액 내에서 5,000원 이상 입력해 주세요.');return}
+ if(s.open.some(t=>t.market===x.market)){paperMsg('이미 모의 보유 중인 종목입니다.');return}
+ if(s.closed.some(t=>t.market===x.market&&t.signalTime===x.signal_time)){paperMsg('같은 일봉 신호에서 이미 매매한 종목입니다.');return}
+ paperBusy=true;renderPaper();paperMsg('새로운 현재가 조회 중...');
+ try{let r=await fetch((x.strategy==='trend'?'/trend20/entry':'/paper/entry')+'?market='+encodeURIComponent(x.market)+'&signal='+encodeURIComponent(x.signal_time)+'&hour='+encodeURIComponent(x.hour_signal_time)+'&preset='+encodeURIComponent(x.preset)+'&scan_id='+encodeURIComponent(result.summary[0].scan_id)+'&entry_status='+encodeURIComponent(x.status),{cache:'no-store'});if(!r.ok)throw Error('신호 만료, 급등 제외 또는 가격 조회 실패. 다시 검색해 주세요.');let q=await r.json();if(q.entry_status!==x.status)throw Error('검색 판정 변경. 다시 검색해 주세요.');let p=q.price;if(!Number.isFinite(p)||p<=0)throw Error('유효한 현재가 없음');
+ let t={id:Date.now()+'-'+x.market,market:x.market,signalTime:x.signal_time,boughtAt:q.observed_ms,amount:a,buy:p,qty:a/(1+FEE)/p,deadline:q.observed_ms+7*86400000,signalDeadline:q.signal_deadline_ms,preset:q.preset,minDrawdownPct:q.min_drawdown_pct,minDownDays:q.min_down_days,entryStatus:q.entry_status,strategy:x.strategy||'reverse',timeframe:x.strategy==='trend'?x.preset:null};savePaper({trades:[...account.trades,t]});quotes[x.market]=q;paperMsg(x.market+' '+q.entry_status+' 모의매수 완료 (시장 참고가 가정).');
+ }catch(e){paperMsg(e.message)}finally{paperBusy=false;renderPaper();render()}
+}
+async function paperSell(t){
+ if(paperBusy||!storageOK)return;paperBusy=true;renderPaper();paperMsg('매도 참고가 조회 중...');
+ try{let q=(await quote([t.market]))[t.market];if(!q)throw Error('가격 확인 불가');let proceeds=t.qty*q.price*(1-FEE),pnl=proceeds-t.amount;let closed={...t,closedAt:q.observed_ms,sell:q.price,proceeds,pnl,netPct:100*pnl/t.amount};savePaper({trades:account.trades.map(x=>x.id===t.id?closed:x)});quotes[t.market]=q;paperMsg(t.market+' 모의매도 완료. 순손익 '+num(pnl)+'원');
+ }catch(e){paperMsg(e.message)}finally{paperBusy=false;renderPaper();render()}
+}
+async function refreshPaper(){
+ if(paperBusy||!storageOK)return;paperBusy=true;renderPaper();paperMsg('보유 종목 가격 조회 중...');
+ try{let m=paperStats().open.map(x=>x.market);if(m.length)quotes=await quote(m);paperMsg('가격 갱신 완료. 가격 확인 불가 종목은 — 표시.')}catch(e){quotes={};paperMsg(e.message)}finally{paperBusy=false;renderPaper()}
+}
+function renderPaper(){
+ let s=paperStats();$('paperSummary').textContent='가상 원금 1,000,000원 · 잔액 '+num(s.cash)+'원 · 실현손익 '+num(s.real)+'원';$('paperWin').textContent='보유 '+s.open.length+' · 청산 '+s.closed.length+' · 수익 '+s.wins+' · 손실 '+s.losses+' · 승률 '+(s.closed.length?(100*s.wins/s.closed.length).toFixed(2)+'%':'—');
+ $('refreshPaper').disabled=paperBusy||!storageOK;
+ let cards=s.open.map(t=>{let c=node('article',null,'coin');c.append(node('h3',t.market+' · 모의 보유'));line(c,'매수 조건',names[t.preset]||'기존 기록');line(c,'전략',t.strategy==='trend'?'상승 눌림':'저점 반등');line(c,'매수 당시 판정',t.entryStatus||'기존 기록 (미기록)');line(c,'매수 시각',paperTime(t.boughtAt));line(c,'매수가',num(t.buy)+'원');line(c,'투자금(수수료 포함)',num(t.amount)+'원');let q=quotes[t.market];let val=q?t.qty*q.price*(1-FEE)-t.amount:null;line(c,'조회 가격',q?num(q.price)+'원':'—');line(c,'가격 조회',q?paperTime(q.observed_ms):'—');line(c,'평가 순손익',val===null?'—':num(val)+'원 / '+pct(100*val/t.amount),val===null?'muted':val>=0?'green':'red');line(c,'7일 보유 만료',paperTime(t.deadline),Date.now()>=t.deadline?'red':'muted');if(Date.now()>=t.deadline)c.append(node('p','7일 경과: 직접 모의매도 필요','red'));let b=node('button','모의매도');b.disabled=paperBusy||!storageOK;b.onclick=()=>paperSell(t);c.append(b);return c});
+ $('paperOpen').replaceChildren(...cards);if(!cards.length)$('paperOpen').textContent='보유 종목 없음';
+ let hist=s.closed.slice().reverse().slice(0,100).map(t=>{let c=node('article',null,'coin');c.append(node('h3',t.market+' · 청산 완료'));line(c,'매수 조건',names[t.preset]||'기존 기록');line(c,'전략',t.strategy==='trend'?'상승 눌림':'저점 반등');line(c,'매수 당시 판정',t.entryStatus||'기존 기록 (미기록)');line(c,'매수 / 매도',num(t.buy)+' / '+num(t.sell));line(c,'매수 시각',paperTime(t.boughtAt));line(c,'매도 시각',paperTime(t.closedAt));line(c,'순손익',num(t.pnl)+'원 / '+pct(t.netPct),t.pnl>=0?'green':'red');return c});$('paperClosed').replaceChildren(...hist);if(!hist.length)$('paperClosed').textContent='청산 기록 없음';if(!storageOK)paperMsg('브라우저 저장소 사용 불가 또는 기록 손상. 모의매매를 중단합니다.');
+}
+$('refreshPaper').onclick=refreshPaper;
+$('paperCSV').onclick=()=>{let keys=['market','strategy','timeframe','preset','entryStatus','minDrawdownPct','minDownDays','signalTime','boughtAt','amount','buy','qty','deadline','closedAt','sell','proceeds','pnl','netPct'];let esc=v=>'"'+String(v??'').replaceAll('"','""')+'"';let rows=[keys.join(','),...account.trades.map(x=>keys.map(k=>esc(x[k])).join(','))];let url=URL.createObjectURL(new Blob(['\ufeff'+rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));let a=document.createElement('a');a.href=url;a.download='BITHUMB_SWING_V2_0_TEST_PAPER_'+new Date().toISOString().slice(0,10)+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+renderPaper();
+
+poll();setInterval(poll,2000);
+</script></html>"""
+
 
 
 
@@ -1712,6 +1804,145 @@ $('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/track15/
 function render(s){let t=document.createElement('table'),h=t.insertRow();for(let label of ['종목','진입일시','진입가',...Array.from({length:15},(_,i)=>(i+1)+'일'),'7일 검증','누락']){let th=document.createElement('th');th.textContent=label;h.append(th)}for(let x of s.rows){let r=t.insertRow();for(let v of [x.market.replace('KRW-',''),x.entry_time,x.buy_price])r.insertCell().textContent=v;for(let i=1;i<=15;i++){let v=x['day'+i],cell=r.insertCell();cell.textContent=v==null?'—':(v>0?'+':'')+v.toFixed(2)+'%';if(v!=null)cell.className=v>0?'pos':v<0?'neg':''}r.insertCell().textContent=x.day7_check;r.insertCell().textContent=x.missing_days}$('out').replaceChildren(t)}
 async function poll(){try{let s=await(await fetch('/track15/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';$('p').max=s.total||132;$('p').value=s.done;$('csv').hidden=s.status!=='done';$('msg').textContent=s.status==='done'?'완료 '+s.rows.length+'건 · 오류 '+s.errors.length+' · 15일 완료 '+s.rows.filter(x=>x.mature_days===15&&x.missing_days===0).length+'건':s.status==='running'?'조회 중 '+s.done+'/'+s.total:s.status==='error'?'조회 실패':'대기';$('err').textContent=s.errors.join('\n');if(s.status==='done'&&!shown){render(s);shown=true}if(s.status==='running'){shown=false;$('out').replaceChildren()}}catch(e){$('msg').textContent='연결 확인: '+e.message}}poll();setInterval(poll,2500);
 </script></html>"""
+
+# V2.0 experimental trend-pullback; independent strategy, same paper account.
+TREND20_NAME={"T4":"4시간봉","T1":"1시간봉"}
+def trend20bars(raw):
+    # Explicit KST 00/04/08/12/16/20 alignment, no synthesized missing hours.
+    anchor=-9*HOUR;step=4*HOUR;out={}
+    for t in raw:
+        b=(t-anchor)//step*step+anchor
+        if b in out:continue
+        rr=[raw.get(b+i*HOUR) for i in range(4)]
+        if all(r131valid(r) for r in rr):
+            out[b]=(b,rr[0][1],max(r[2] for r in rr),min(r[3] for r in rr),rr[-1][4],sum(r[5] for r in rr),sum(r[6] for r in rr))
+    return out
+def trend20setup(by,end,step):
+    # end is an exclusive completed-bar boundary.
+    rr=[by.get(end-i*step) for i in range(25,0,-1)]
+    if not all(r131valid(r) for r in rr):return "history",None
+    n=0
+    for r in reversed(rr):
+        if r[4]>=r[1]:break
+        n+=1
+    if not 2<=n<=4:return "no_setup",None
+    prior=rr[-n-20:-n];pull=rr[-n:]
+    gain=pct(prior[-1][4],prior[0][1]);peak=max(r[2] for r in prior)
+    depth=-pct(min(r[3] for r in pull),peak)
+    close_depth=-pct(pull[-1][4],peak)
+    vol=mean([r[5] for r in prior]);pv=mean([r[5] for r in pull])
+    if gain<10 or not 3<=close_depth<=10 or depth>10 or vol<=0 or pv>=vol:return "no_setup",None
+    return "setup",dict(prior_gain_pct=gain,pullback_pct=close_depth,pullback_low_pct=depth,pullback_bars=n,pullback_volume_ratio=pv/vol,prior_peak=peak,pullback_low=min(r[3] for r in pull))
+def trend20signal(raw,bars,cut,preset):
+    step=4*HOUR if preset=="T4" else HOUR
+    anchor=-9*HOUR if preset=="T4" else 0
+    def boundary(t):return (t-anchor)//step*step+anchor
+    # The preceding setup must be complete BEFORE the confirming hourly candle starts.
+    before=boundary(cut-HOUR);cur=boundary(cut)
+    why,s=trend20setup(bars,before,step)
+    hr=[raw.get(cut-i*HOUR) for i in (4,3,2,1)]
+    if not all(r131valid(r) for r in hr):return "history",None
+    avg=mean([r[5] for r in hr[:-1]])
+    last=hr[-1];ratio=last[5]/avg if avg>0 else 0
+    if s and last[4]>last[1] and last[4]>hr[-2][2] and ratio>=1.2:
+        # No BUY if the confirming close has already exceeded the prior swing high.
+        if last[4]<=s["prior_peak"] and last[3]>=s["prior_peak"]*.90:
+            return "BUY",dict(s,confirm_volume_ratio=ratio,signal_close=last[4],status="BUY")
+    why2,w=trend20setup(bars,cur,step)
+    if w:return "WATCH",dict(w,confirm_volume_ratio=ratio,signal_close=last[4],status="WATCH")
+    # A 4h setup may still be actionable during the same forming 4h bar.
+    if s and before==cur:return "WATCH",dict(s,confirm_volume_ratio=ratio,signal_close=last[4],status="WATCH")
+    return ("history" if "history" in (why,why2) else "no_setup"),None
+def trend20net(p,q):return 100*(q/p*(1-FEE81)/(1+FEE81)-1)
+def trend20out(raw,t,hours):
+    seq=[raw.get(t+i*HOUR) for i in range(hours)]
+    if not all(r131valid(r) for r in seq):return None
+    p=seq[0][1]
+    return dict(close=trend20net(p,seq[-1][4]),peak=trend20net(p,max(r[2] for r in seq)),low=trend20net(p,min(r[3] for r in seq)))
+def trend20eval(raw,cut,preset,back):
+    bars=trend20bars(raw) if preset=="T4" else raw
+    if not back:
+        why,s=trend20signal(raw,bars,cut,preset)
+        return why,s
+    rows=[];missing=0;signals=0;out_missing=0;skipped=0;last=0;valid=0
+    # Fifteen entry days, all with a completed 72h outcome window.
+    first=cut-18*DAY
+    for t in range(first,cut-3*DAY,HOUR):
+        why,s=trend20signal(raw,bars,t,preset)
+        if why=="history":missing+=1;continue
+        valid+=1
+        if why!="BUY":continue
+        signals+=1
+        if t<last:skipped+=1;continue
+        # Reserve the same 72h window even if the future data are missing.
+        last=t+3*DAY
+        a=trend20out(raw,t,24);b=trend20out(raw,t,72)
+        if not a or not b:out_missing+=1;continue
+        rows.append(dict(s,signal_time=iso(t),entry_ts=t,buy_price=raw[t][1],day1_close_pct=a["close"],day1_peak_pct=a["peak"],day3_close_pct=b["close"],day3_peak_pct=b["peak"],day3_low_pct=b["low"]))
+    return rows,dict(valid_hours=valid,missing_hours=missing,buy_signals=signals,overlap_skipped=skipped,outcome_missing=out_missing)
+def runtrend20(preset,back):
+    begin=time.monotonic()
+    try:
+        end=int(now().timestamp());cut=end//HOUR*HOUR
+        universe=sorted({x["market"] for x in api("market/all") if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
+        if not universe:raise RuntimeError("시장 목록 없음")
+        with state_lock:scan_id=state["scan_id"]
+        patch(phase="15일 과거 진입 검증" if back else "상승 눌림 검색",done=0,total=len(universe))
+        out=[];cov=[];valid=0;success=0
+        def fetch(m):
+            if back:
+                raw,n,reason=r131page(m,cut-23*DAY,cut)
+                return raw,n,reason
+            rr=candles(m,60,end,120,latest=True)
+            return {r[0]:r for r in rr},1,"latest"
+        for m,pack in parallel(universe,fetch):
+            base=dict(market=m,preset=preset,strategy="trend",scan_id=scan_id)
+            if not pack or not pack[0]:cov.append(dict(base,status="fetch_error"));continue
+            raw,pages,reason=pack;success+=1
+            if back:
+                rows,meta=trend20eval(raw,cut,preset,True)
+                valid+=int(meta["valid_hours"]>0)
+                cov.append(dict(base,status="ok" if meta["valid_hours"] else "history",pages=pages,page_stop=reason,**meta))
+                out.extend(dict(base,**r) for r in rows)
+            else:
+                why,s=trend20eval(raw,cut,preset,False)
+                valid+=int(why!="history")
+                cov.append(dict(base,status=why,pages=pages))
+                if s:out.append(dict(base,**s,signal_time=iso(cut),hour_signal_time=iso(cut)))
+        if not success or not valid:raise RuntimeError("유효한 시간봉 부족")
+        if not back:
+            # Obtain fresh reference prices only for candidates, after scan.
+            prices={};patch(phase="후보 현재가 조회",done=0,total=math.ceil(len(out)/40))
+            for i in range(0,len(out),40):
+                batch=[r["market"] for r in out[i:i+40]]
+                try:
+                    for q in api("ticker",markets=",".join(batch)):
+                        p=float(q.get("trade_price",0))
+                        if q.get("market") in batch and math.isfinite(p) and p>0:prices[q["market"]]=p
+                except Exception as e:record_error(str(e))
+                advance()
+            kept=[];audit={r["market"]:r for r in cov}
+            for r in out:
+                p=prices.get(r["market"])
+                if p is None:audit[r["market"]]["status"]="no_quote";continue
+                r.update(reference_price=p,observed_at=iso(int(now().timestamp())),breakeven_price=p*(1+FEE81)/(1-FEE81))
+                kept.append(r)
+            out=kept
+            if int(now().timestamp())//HOUR*HOUR!=cut:raise RuntimeError("시간봉 경계 변경: 다시 검색")
+            out.sort(key=lambda r:(r["status"]!="BUY",-r["confirm_volume_ratio"],r["market"]))
+        else:out.sort(key=lambda r:(r["entry_ts"],r["market"]))
+        summary=dict(preset=preset,strategy="trend",scan_id=scan_id,signal_time=iso(cut),finished_at=iso(int(now().timestamp())),universe=len(universe),market_success=success,valid=valid,matches=len(out),buys=sum(r["status"]=="BUY" for r in out),watches=sum(r["status"]=="WATCH" for r in out),history_missing=sum(r["status"]=="history" for r in cov),no_quote=sum(r["status"]=="no_quote" for r in cov),fee_oneway_pct=.04)
+        if back:
+            summary.update(entry_days=15,first_entry=iso(cut-18*DAY),last_entry_exclusive=iso(cut-3*DAY),valid_hours=sum(r.get("valid_hours",0) for r in cov),missing_hours=sum(r.get("missing_hours",0) for r in cov),buy_signals=sum(r.get("buy_signals",0) for r in cov),outcome_missing=sum(r.get("outcome_missing",0) for r in cov),overlap_skipped=sum(r.get("overlap_skipped",0) for r in cov),day1_mean_pct=mean([r["day1_close_pct"] for r in out]) if out else None,day3_mean_pct=mean([r["day3_close_pct"] for r in out]) if out else None,day3_hit5_pct=100*sum(r["day3_peak_pct"]>=5 for r in out)/len(out) if out else None)
+        patch(status="done",phase="완료",rank=out,features=out,coverage=cov,summary=[summary],elapsed_seconds=round(time.monotonic()-begin,1))
+    except Exception as e:record_error(str(e));patch(status="error",phase="실패")
+def starttrend20(preset,back):
+    if preset not in TREND20_NAME:return False
+    with state_lock:
+        if state["status"]=="running":return False
+        state.clear();state.update(mode="trendback20" if back else "trend20",preset=preset,scan_id=str(time.time_ns()),status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
+    threading.Thread(target=runtrend20,args=(preset,back),daemon=True).start()
+    return True
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
         if not isinstance(body,bytes):body=body.encode()
@@ -1723,6 +1954,10 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/trend20/start":
+            q=parse_qs(u.query);preset=q.get("preset",["T4"])[0];back=q.get("back",["0"])[0]
+            if preset not in TREND20_NAME or back not in ("0","1"):return self.js({"error":"invalid mode"},400)
+            return self.js({"started":starttrend20(preset,back=="1")})
         if u.path=="/track15/start":return self.js({"started":d15start()})
         if u.path in ("/research13/start","/research131/start"):
             try:
@@ -1764,6 +1999,25 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if p=="/swing20":return self.send(HTML20,"text/html; charset=utf-8")
+        if p=="/trend20/entry":
+            q=parse_qs(u.query);market=q.get("market",[""])[0];scan=q.get("scan_id",[""])[0]
+            with state_lock:
+                match=next((dict(r) for r in state["rank"] if r["market"]==market and r["scan_id"]==scan),None) if state.get("mode")=="trend20" and state.get("status")=="done" else None
+            if not match or match["preset"]!=q.get("preset",[""])[0] or match["status"]!=q.get("entry_status",[""])[0] or match["signal_time"]!=q.get("signal",[""])[0]:return self.js({"error":"scan changed"},409)
+            try:
+                cut=int(datetime.strptime(match["signal_time"],"%Y-%m-%d %H:%M").replace(tzinfo=KST).timestamp())
+                if not cut<=int(now().timestamp())<cut+HOUR:return self.js({"error":"expired"},409)
+                quotes=api("ticker",markets=market)
+                price=next((float(r["trade_price"]) for r in quotes if r.get("market")==market),0)
+                at=int(now().timestamp()*1000)
+                if not math.isfinite(price) or price<=0 or at>=(cut+HOUR)*1000:return self.js({"error":"expired or missing price"},409)
+                # Reject entries which have broken the recorded pullback low or already surpassed the swing high.
+                if not match["pullback_low"]<=price<=match["prior_peak"]:return self.js({"error":"price outside setup"},409)
+                with state_lock:
+                    if state.get("mode")!="trend20" or state.get("status")!="done" or state.get("scan_id")!=scan:return self.js({"error":"scan changed"},409)
+                return self.js(dict(price=price,observed_ms=at,signal_deadline_ms=(cut+7*DAY)*1000,preset=match["preset"],entry_status=match["status"]))
+            except Exception:return self.js({"error":"quote unavailable"},502)
         if p=="/track15":return self.send(HTML_D15,"text/html; charset=utf-8")
         if p=="/track15/status":
             with D15_LOCK:data=dict(D15)
@@ -1949,7 +2203,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("REVERSE_SWING_V1_4_3_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("BITHUMB_SWING_V2_0_TEST_"+("BACK_" if mode=="trendback20" else "LIVE_")+str(csv_preset)+"_" if mode in ("trend20","trendback20") else "REVERSE_SWING_V1_4_3_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -2109,7 +2363,23 @@ def selftest():
     e=["KRW-A",start,100,round(100*((1-FEE81)/(1+FEE81)-1),6)]
     check=d15row(e,{start+7*DAY-HOUR:(start+7*DAY-HOUR,100,100,100,100,1,100)},start+8*DAY)
     assert check["day7_check"]=="ok" and check["day1"] is None and check["day15"] is None
-    print("REVERSE SWING V1.4.3 + independent TRACK15 self-test PASS",flush=True)
+    # Synthetic, contiguous 1h data: prior uptrend, 2 bearish low-volume bars, then breakout.
+    t20=start+30*HOUR
+    raw20={}
+    for i in range(25):
+        op=100+i*.8;cl=op+.6
+        raw20[t20-(25-i)*HOUR]=(t20-(25-i)*HOUR,op,cl+.1,op-.1,cl,100,10000)
+    raw20[t20-2*HOUR]=(t20-2*HOUR,118,118.1,114.9,115,30,3000)
+    raw20[t20-HOUR]=(t20-HOUR,115,115.1,111.9,112,30,3000)
+    assert trend20signal(raw20,raw20,t20,"T1")[0]=="WATCH"
+    raw20[t20]=(t20,112,116.1,111.9,116,200,20000)
+    assert trend20signal(raw20,raw20,t20+HOUR,"T1")[0]=="BUY"
+    assert trend20signal(raw20,raw20,t20,"T1")[0]=="WATCH"
+    assert trend20out(raw20,t20,24) is None
+    test4={start+HOUR*i:(start+HOUR*i,100,101,99,100,1,100) for i in range(1,5)}
+    assert len(trend20bars(test4))==1
+    assert not trend20bars({k:v for k,v in test4.items() if k!=start+2*HOUR})
+    print("REVERSE SWING V1.4.3 preserved + BITHUMB SWING V2.0 TEST self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
