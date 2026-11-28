@@ -3361,6 +3361,7 @@ $('go').onclick=async()=>{if(starting||busy)return;starting=true;try{$('go').dis
 
 import whale_back03
 import whale_detector
+import whale_bt11
 
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
@@ -3373,6 +3374,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if whale_bt11.handle(self,u,globals(),post=True):return
         if whale_detector.handle(self,u,globals(),post=True):return
         if whale_back03.handle(self,u,globals(),post=True):return
         if u.path=="/whaleback/start":
@@ -3441,6 +3443,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if whale_bt11.handle(self,u,globals()):return
         if whale_detector.handle(self,u,globals()):return
         if whale_back03.handle(self,u,globals()):return
         if p in ("/whaleback","/whaleback02"):return self.send(HTMLWB,"text/html; charset=utf-8")
