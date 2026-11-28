@@ -3365,6 +3365,7 @@ import whale_bt11
 import whale_reverse12
 import whale_reverse13
 import whale_reverse14
+import whale_reverse15
 
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
@@ -3377,6 +3378,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if whale_reverse15.handle(self,u,globals(),post=True):return
         if whale_reverse14.handle(self,u,globals(),post=True):return
         if whale_reverse13.handle(self,u,globals(),post=True):return
         if whale_reverse12.handle(self,u,globals(),post=True):return
@@ -3449,6 +3451,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if whale_reverse15.handle(self,u,globals()):return
         if whale_reverse14.handle(self,u,globals()):return
         if whale_reverse13.handle(self,u,globals()):return
         if whale_reverse12.handle(self,u,globals()):return
