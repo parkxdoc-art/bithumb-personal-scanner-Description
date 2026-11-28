@@ -149,7 +149,7 @@ def advanced_summary(rows):
     return out
 def patterns(rows):
     out=[]
-    for scope,rs in (("all",rows),("exclude_first_boundary",[r for r in rows if not r["boundary_first"]]),("no_chase",[r for r in rows if not r["boundary_first"] and r["period_change_pct_3d"]<=15 and not r["extreme_peak_flag"]])):
+    for scope,rs in (("all",rows),("exclude_first_boundary",[r for r in rows if not r["boundary_first"]]),("no_chase",[r for r in rows if not r["boundary_first"] and r["period_change_pct_3d"] is not None and r["period_change_pct_3d"]<=15 and not r["extreme_peak_flag"]])):
         for key,label in PATTERNS.items():
             row=dict(record_type="pattern",pattern=key,pattern_label=label,scope=scope)
             for name,group in (("control",[r for r in rs if r["kind"]=="CONTROL"]),("pump30",[r for r in rs if r["kind"]=="PUMP"]),("pump50",[r for r in rs if r["kind"]=="PUMP" and r["peak_7d_pct"]>=50-1e-9]),("pump100",[r for r in rs if r["kind"]=="PUMP" and r["peak_7d_pct"]>=100-1e-9])):
@@ -178,11 +178,11 @@ def run(ctx,limit):
             universe=[m for m in universe if m not in DISCOVERY]
             if len(universe)>160:universe=[universe[i*len(universe)//160] for i in range(160)]
         pages=math.ceil((180+241+41)/200)
-        btc={}
+        btc={};btc_error=None
         try:btc={r[0]:r for r in candles("KRW-BTC",240,cut,200,pages=pages,latest=False) if ctx["r131valid"](r)}
-        except Exception:pass
+        except Exception as e:btc_error=str(e)
         patch(phase="급등 및 대조 구간 추출",total=len(universe),universe=len(universe),total_universe=total,limit=limit,signal_start=iso(start),signal_end_exclusive=iso(stop),data_end=iso(cut))
-        rows=[];cov=[];errors=[]
+        rows=[];cov=[];errors=[dict(market="KRW-BTC",error="상대강도: "+btc_error)] if btc_error else []
         def fetch(m):return evaluate(m,candles(m,240,cut,200,pages=pages,latest=False),start,stop,ctx,btc)
         with ThreadPoolExecutor(max_workers=4) as pool:
             jobs={pool.submit(fetch,m):m for m in universe}
@@ -196,7 +196,7 @@ def run(ctx,limit):
         summary=summarize(rows)
         for r in summary:r.update(signal_start=iso(start),signal_end_exclusive=iso(stop),data_end=iso(cut),universe=len(universe),total_universe=total,valid_markets=sum(c.get("valid_windows",0)>0 for c in cov),sample_limit=limit,sample_method={80:"new_80_excludes_discovery",81:"original_80",160:"new_160_excludes_discovery",0:"all"}[limit])
         pattern_rows=patterns(rows);advanced_rows=advanced_summary(rows)
-        for p in pattern_rows:p.update(sample_limit=limit,signal_start=iso(start),signal_end_exclusive=iso(stop))
+        for p in pattern_rows+advanced_rows:p.update(sample_limit=limit,signal_start=iso(start),signal_end_exclusive=iso(stop),btc_bars=len(btc))
         allrows=summary+pattern_rows+advanced_rows+rows+[dict(r,record_type="coverage") for r in cov]+[dict(r,record_type="error") for r in errors]
         fields=list(dict.fromkeys(k for r in allrows for k in r))
         b=io.StringIO();w=csv.DictWriter(b,fieldnames=fields);w.writeheader();w.writerows(allrows)
@@ -211,7 +211,7 @@ def start(ctx,limit):
 HTML=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WHALE DETECTOR V1.4</title><style>
 *{box-sizing:border-box}[hidden]{display:none!important}body{font:14px/1.55 system-ui;max-width:820px;margin:auto;padding:14px;background:#f5f8f7;color:#172a23}section{background:white;border:1px solid #d7e3dd;border-radius:12px;padding:14px;margin:12px 0}h1{font-size:23px}button,a,select{display:inline-block;padding:10px;margin:3px;border-radius:8px;border:1px solid #a5bbb0;background:white;color:#176345;text-decoration:none;font:inherit}button{background:#176345;color:white;width:97%}button:disabled{opacity:.5}progress{width:100%}small{display:block;color:#53645d}.scroll{overflow:auto}table{border-collapse:collapse;white-space:nowrap;font-size:12px;width:100%}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:right}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap}</style>
 <h1>WHALE DETECTOR V1.4</h1><small>실제 급등 종목 역추적 · 매집 공통점 확인</small><a href="/whaledetector">기존 실시간</a><a href="/whalebt11">기존 백테스트</a><section><label>30일 검증 <select id="limit"><option value="80">새로운 80종목 (기본)</option><option value="160">새로운 160종목</option><option value="81">기존 80종목</option><option value="0">전체 KRW</option></select></label><small>7일 결과가 성숙한 최근 30일의 4시간 시점. 다음 봉 시가 대비 7일 내 +30% 이상을 기록한 최초 기준 시점부터 같은 종목 7일 중복 제거. +50/+100%는 그 급등 사례의 부분집합. 실제 상승 개시 시점으로 단정하지 않음. 비급등 대조군은 +30% 미만이며 선정 급등 구간과 후속 7일이 겹치지 않도록 선택. 1/3/7/14/20일 완료 봉 특징 비교. 14/20일 동기간 비교에 필요한 봉이 부족하면 해당 지표만 미확인. 아랫꼬리·하락봉 거래대금은 매도 압력의 캔들 대용 지표이며 실제 체결 방향이나 흡수 증거가 아님. 과거 체결·호가 미확인. 현재 상장 종목 기준, 새 표본은 V1.2 기존 80개 종목을 제외한 균등 표본. 동일 시장 기간이므로 시간 외부검증은 아님.</small><button id="go">급등 역추적 시작</button><p id="phase">대기</p><progress id="bar" max="1" value="0"></progress><p id="audit"></p><pre id="err"></pre></section>
-<section id="out" hidden><h2>급등군 vs 비급등군</h2><label>선행 기간 <select id="days"><option>1</option><option selected>3</option><option>7</option></select>일</label><div class="scroll"><table id="tbl"></table></div><p><small>급등군과 대조군의 중앙값 비교. 사후 선택된 표본의 특징이며 예측 성능이나 고래 매집 입증이 아님. +50/+100%군은 중복 포함. 기존 포착률은 선정 기준 시점에서의 캔들 예비 검색식 통과 비율.</small></p><h2>추가 공통점 재확인</h2><label>시작 경계 <select id="scope"><option value="all">전체</option><option value="exclude_first_boundary">종목별 첫 유효 시점 제외</option><option value="no_chase">첫 시점·3일 +15% 초과·+300% 초과 제외</option></select></label><div class="scroll"><table id="patterns"></table></div><small>V1.2에서 정한 조건을 그대로 확인. 각 비율은 해당 사례군의 충족 건수/유효 건수. 매집 증거나 실전 승률이 아님.</small><h2>추가 지표 중앙값 비교</h2><label>기간 <select id="advdays"><option>1</option><option selected>3</option><option>7</option><option>14</option><option>20</option></select>일</label><div class="scroll"><table id="adv"></table></div><small>각 값 뒤 괄호는 유효 사례 수. 하락 강도·하락봉 거래대금·가격 영향은 기간 후반/전반 비율 (1 미만 감소). 거래량·거래대금 배수는 직전 동일 기간 대비. BTC 상대강도는 종가 수익률의 상대 비율. 과거 체결·호가 미검증. 탐색 가설이며 별도 기간 검증 필요.</small><h2>급등 사례 상위 20개</h2><div class="scroll"><table id="events"></table></div><p id="links"></p></section>
+<section id="out" hidden><h2>급등군 vs 비급등군</h2><label>선행 기간 <select id="days"><option>1</option><option selected>3</option><option>7</option></select>일</label><div class="scroll"><table id="tbl"></table></div><p><small>급등군과 대조군의 중앙값 비교. 사후 선택된 표본의 특징이며 예측 성능이나 고래 매집 입증이 아님. +50/+100%군은 중복 포함. 기존 포착률은 선정 기준 시점에서의 캔들 예비 검색식 통과 비율.</small></p><h2>추가 공통점 재확인</h2><label>시작 경계 <select id="scope"><option value="all">전체</option><option value="exclude_first_boundary">종목별 첫 유효 시점 제외</option><option value="no_chase">첫 시점·3일 +15% 초과·+300% 초과 제외</option></select></label><div class="scroll"><table id="patterns"></table></div><small>기존 조건과 추가 탐색 가설을 같은 표본에서 확인. +300% 초과 제외는 사후 민감도 비교에만 사용. 각 비율은 해당 사례군의 충족 건수/유효 건수. 매집 증거나 실전 승률이 아님.</small><h2>추가 지표 중앙값 비교</h2><label>기간 <select id="advdays"><option>1</option><option selected>3</option><option>7</option><option>14</option><option>20</option></select>일</label><div class="scroll"><table id="adv"></table></div><small>각 값 뒤 괄호는 유효 사례 수. 하락 강도·하락봉 거래대금·가격 영향은 기간 후반/전반 비율 (1 미만 감소). 거래량·거래대금 배수는 직전 동일 기간 대비. BTC 상대강도는 종가 수익률의 상대 비율. 과거 체결·호가 미검증. 탐색 가설이며 별도 기간 검증 필요.</small><h2>급등 사례 상위 20개</h2><div class="scroll"><table id="events"></table></div><p id="links"></p></section>
 <script>
 const $=id=>document.getElementById(id);let data=[],events=[],ps=[],adv=[],loaded=null,busy=false,starting=false;const cacheKey='whale_reverse14_summary';
 const f=x=>typeof x==='number'?x.toFixed(2):'—';
