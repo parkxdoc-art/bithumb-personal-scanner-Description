@@ -3359,6 +3359,8 @@ async function poll(){if(busy||starting)return;busy=true;try{let s=await(await f
 $('go').onclick=async()=>{if(starting||busy)return;starting=true;try{$('go').disabled=true;$('entryDays').disabled=true;let r=await fetch('/whaleback/start?days='+encodeURIComponent($('entryDays').value),{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('이미 실행 중 또는 설정 오류');$('out').hidden=true;loaded=null;}catch(e){$('phase').textContent=e.message;$('go').disabled=false;$('entryDays').disabled=false}finally{starting=false;poll()}};poll();setInterval(poll,2000);
 </script></html>"""
 
+import whale_back03
+
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
         if not isinstance(body,bytes):body=body.encode()
@@ -3370,6 +3372,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if whale_back03.handle(self,u,globals(),post=True):return
         if u.path=="/whaleback/start":
             try:
                 days=int(parse_qs(u.query).get("days",["90"])[0])
@@ -3436,6 +3439,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if whale_back03.handle(self,u,globals()):return
         if p in ("/whaleback","/whaleback02"):return self.send(HTMLWB,"text/html; charset=utf-8")
         if p=="/whaleback/status":
             with WB_LOCK:
