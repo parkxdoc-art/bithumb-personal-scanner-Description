@@ -2215,22 +2215,52 @@ def whale31coverage(rows,cut):
     missing=sum(r is None for r in seq)
     invalid=sum(r is not None and not r131valid(r) for r in seq)
     return dict(status="missing_hours" if missing else "invalid_ohlcv" if invalid else "complete",received_bars=len(by),missing_hours_97=missing,invalid_hours_97=invalid,oldest_candle=iso(min(by)) if by else None,latest_candle=iso(max(by)) if by else None,endpoint_7d_available=bool(r131valid(by.get(cut-169*HOUR))))
-def runwhale30(target):
+
+# V3.1: native 4h candles, independently selected 1/3/7-day accumulation windows.
+WHALE32_RULES={1:(3,8),3:(5,12),7:(8,18)}
+def whale32candles(rows,cut,days):
+    step=4*HOUR;n=days*6;change_limit,range_limit=WHALE32_RULES[days]
+    by={r[0]:r for r in rows if r[0]+step<=cut}
+    seq=[by.get(cut-i*step) for i in range(4*n+1,0,-1)]
+    missing=sum(r is None for r in seq)
+    invalid=sum(r is not None and not r131valid(r) for r in seq)
+    audit=dict(received_bars=len(by),required_bars=4*n+1,missing_bars=missing,invalid_bars=invalid,period_days=days,candle_minutes=240,oldest_candle=iso(min(by)) if by else None,latest_candle=iso(max(by)) if by else None)
+    if missing or invalid:return None,dict(audit,status="missing_4h" if missing else "invalid_ohlcv")
+    recent=seq[-n:];base=seq[-4*n:-n];prev=seq[-2*n:-n]
+    ret=pct(recent[-1][4],seq[-n-1][4])
+    span=pct(max(r[2] for r in recent),min(r[3] for r in recent))
+    vol=ratio(mean([r[5] for r in recent]),mean([r[5] for r in base]))
+    lo1=min(r[3] for r in prev);lo2=min(r[3] for r in recent)
+    obv=sum((1 if b[4]>a[4] else -1 if b[4]<a[4] else 0)*b[5] for a,b in zip(seq[-n-1:-1],recent))
+    obv_ratio=ratio(obv,sum(r[5] for r in recent))
+    if vol is None or obv_ratio is None:return None,dict(audit,status="zero_volume")
+    signals=[bool(abs(ret)<=change_limit and span<=range_limit and vol>=1.5),bool(lo2>=lo1*1.005),bool(obv_ratio>=.10 and ret<=change_limit)]
+    def close_return(d):
+        old=by.get(cut-(d*6+1)*step)
+        return pct(recent[-1][4],old[4]) if r131valid(old) else None
+    data=dict(reference_price=recent[-1][4],price_basis="completed_4h_close",signal_time=iso(cut),period_days=days,candle_minutes=240,period_change_pct=ret,period_range_pct=span,change_limit_pct=change_limit,range_limit_pct=range_limit,change_1d_pct=close_return(1),change_3d_pct=close_return(3),change_7d_pct=close_return(7),volume_ratio=vol,turnover_period=sum(r[6] for r in recent),low_change_pct=pct(lo2,lo1),obv_ratio_pct=100*obv_ratio,volume_flat=signals[0],higher_low=signals[1],obv_up=signals[2],candle_score=sum(signals))
+    return data,dict(audit,status="valid")
+
+def runwhale30(target,days=1):
     begin=time.monotonic()
     try:
-        end=int(now().timestamp());cut=end//HOUR*HOUR
+        end=int(now().timestamp());step=4*HOUR
+        probe=candles("KRW-BTC",240,end,8,latest=True)
+        if len(probe)<2:raise RuntimeError("BTC 4시간봉 경계 확인 실패")
+        anchor=probe[-1][0]%step
+        if any(r[0]%step!=anchor for r in probe):raise RuntimeError("4시간봉 경계 불일치")
+        cut=((end-anchor)//step)*step+anchor
+        if not any(r[0]==cut-step and r131valid(r) for r in probe):raise RuntimeError("완료 BTC 4시간봉 지연")
         universe=sorted({x["market"] for x in api("market/all") if x["market"].startswith("KRW-") and x["market"][4:] not in STABLE})
         if target and target not in universe:raise RuntimeError("해당 KRW 종목 없음")
         if target:universe=[target]
         if not universe:raise RuntimeError("시장 목록 없음")
         with state_lock:scan_id=state["scan_id"]
-        patch(phase="1단계 · 1시간봉 매집 징후 검색",done=0,total=len(universe))
+        patch(phase="1단계 · "+str(days)+"일 매집 4시간봉 검색",done=0,total=len(universe))
         allrows=[];cov=[]
-        for m,rows in parallel(universe,lambda m:candles(m,60,cut,200,latest=False)):
-            s=whale30candles(rows,cut) if rows else None
-            audit=whale31coverage(rows,cut)
-            if s:audit["status"]="valid"
-            elif audit["status"]=="complete":audit["status"]="zero_volume_or_invalid_ratio"
+        for m,rows in parallel(universe,lambda m:candles(m,240,cut,200,latest=False)):
+            if rows is None:s,audit=None,dict(status="fetch_error",period_days=days,candle_minutes=240)
+            else:s,audit=whale32candles(rows,cut,days)
             cov.append(dict(market=m,**audit))
             if s:allrows.append(dict(market=m,scan_id=scan_id,strategy="whale",**s))
         allrows.sort(key=lambda r:(-r["candle_score"],-r["volume_ratio"],r["market"]))
@@ -2241,8 +2271,8 @@ def runwhale30(target):
             m=r["market"];out={}
             if r.get("change_7d_pct") is None:
                 try:
-                    old=candles(m,60,cut-168*HOUR,3,latest=False)
-                    exact=next((x for x in old if x[0]==cut-169*HOUR and r131valid(x)),None)
+                    old=candles(m,240,cut-168*HOUR,3,latest=False)
+                    exact=next((x for x in old if x[0]==cut-172*HOUR and r131valid(x)),None)
                     if exact:out["change_7d_pct"]=pct(r["reference_price"],exact[4])
                 except Exception as e:record_error(m+" 7d endpoint: "+str(e))
             try:
@@ -2267,17 +2297,17 @@ def runwhale30(target):
         qualified=[r for r in candidates if r["qualified"]]
         shown=candidates if target else qualified[:5]
         for r in allrows:r["displayed"]=any(x["market"]==r["market"] for x in shown)
-        summary=dict(strategy="whale",preset="WHALE30",scan_id=scan_id,universe=len(universe),valid=len(allrows),history_missing=len(universe)-len(allrows),candle_candidates=len(eligible),deep_checked=len(candidates),trade_valid=sum(r["trade_checked"] for r in candidates),suspects=len(qualified),displayed=len(shown),target=target,seven_day_valid=sum(r.get("change_7d_pct") is not None for r in allrows),missing_hour_markets=sum(r["status"]=="missing_hours" for r in cov),fetch_errors=sum(r["status"]=="fetch_error" for r in cov),signal_time=iso(cut),finished_at=iso(int(now().timestamp())))
+        summary=dict(strategy="whale",preset="WHALE30",period_days=days,candle_minutes=240,scan_id=scan_id,universe=len(universe),valid=len(allrows),history_missing=len(universe)-len(allrows),candle_candidates=len(eligible),deep_checked=len(candidates),trade_valid=sum(r["trade_checked"] for r in candidates),suspects=len(qualified),displayed=len(shown),target=target,seven_day_valid=sum(r.get("change_7d_pct") is not None for r in allrows),missing_4h_markets=sum(r["status"]=="missing_4h" for r in cov),fetch_errors=sum(r["status"]=="fetch_error" for r in cov),signal_time=iso(cut),finished_at=iso(int(now().timestamp())))
         patch(status="done",phase="완료",rank=shown,features=allrows,coverage=cov,summary=[summary],elapsed_seconds=round(time.monotonic()-begin,1))
     except Exception as e:record_error(str(e));patch(status="error",phase="실패")
-def startwhale30(target):
+def startwhale30(target,days=1):
     with state_lock:
         if state["status"]=="running":return False
-        state.clear();state.update(mode="whale30",preset="WHALE30",target=target,scan_id=str(time.time_ns()),status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
-    threading.Thread(target=runwhale30,args=(target,),daemon=True).start()
+        state.clear();state.update(mode="whale30",preset="WHALE30",target=target,period_days=days,scan_id=str(time.time_ns()),status="running",phase="준비",done=0,total=0,rank=[],features=[],summary=[],errors=[],coverage=[])
+    threading.Thread(target=runwhale30,args=(target,days),daemon=True).start()
     return True
 
-HTML29=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BITHUMB V3.0.1 LIVE</title><style>
+HTML29=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BITHUMB V3.1 LIVE</title><style>
 :root{color-scheme:light;--ink:#192421;--muted:#64716b;--green:#16734e;--line:#e0e7e3;--soft:#f4f7f5}
 *{box-sizing:border-box}[hidden]{display:none!important}
 body{margin:0 auto;max-width:820px;padding:22px 14px 48px;background:#f6f8f7;color:var(--ink);font:15px/1.55 system-ui,-apple-system,sans-serif}
@@ -2301,7 +2331,7 @@ details{margin:10px 0;color:var(--muted)}summary{cursor:pointer;font-size:13px;f
 .actions{display:flex;flex-wrap:wrap;gap:7px;margin:12px 0}.actions button,.actions a{font-size:13px;background:#f4f7f5;font-weight:600}.actions input,.actions select{min-width:0}.results-tools{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}.results-tools input,.results-tools select{width:100%;font-size:13px}
 #more{width:100%;margin:10px 0}#paperSummary{font-weight:650;background:var(--soft);padding:12px;border-radius:10px;font-size:14px}#paperWin,#count,#audit,#notice{font-size:12.5px;color:var(--muted)}#paperMsg{font-size:13px}
 @media(max-width:360px){section{padding:12px}body{padding:14px 10px}.strategy span{font-size:11px}}
-</style><header><h1>BITHUMB V3.0.1 LIVE</h1><p>실시간 코인 스캐너 · 빗썸 KRW</p></header><section><h2>전략 선택</h2><select id="strategy" hidden aria-label="전략"><option value="reverse">저점형 (일봉)</option><option value="trend">돌파형 (4시간봉)</option><option value="whale">매집형</option></select><div class="strategies"><button type="button" class="strategy" id="pickReverse" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20v-4m5 4v-8m5 8v-5m5 5V9M3 11l6-6 4 4 8-7"/></svg><strong>저점형</strong><span>일봉 스윙</span></button><button type="button" class="strategy" id="pickTrend" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 7-7 4 4 7-9m-7 0h7v7"/></svg><strong>돌파형</strong><span>4시간봉 단타</span></button><button type="button" class="strategy" id="pickWhale" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 5 5M8 11h6m-3-3v6"/></svg><strong>매집형</strong><span>매집 탐지</span></button></div><div id="whaleRules" hidden><div class="settings"><div class="field"><label for="whaleTarget">검색 종목 (비워두면 전체 KRW)</label><input id="whaleTarget" placeholder="예: CFG" maxlength="36" autocomplete="off"></div><small>강화 조건 충족 종목만 최대 5개 표시 · 개별 종목은 진단 표시</small></div><details><summary>매집 탐지 기준</summary><p>1시간봉 24시간 가격 변화 ±3% 이내, 고저 범위 8% 이내, 직전 72시간 대비 거래량 1.5배 이상 (1점). 저점 0.5% 이상 상승 (1점). OBV 순증가량이 24시간 거래량의 10% 이상이며 가격 상승 3% 이하 (1점). 횡보 중 거래량 증가 필수 + 캔들 2점 이상 후보 최대 20개를 정밀 분석합니다. 전체 검색에서는 유효 체결 표본과 4/6점 이상까지 충족한 종목만 최대 5개 표시합니다. 단일 종목은 조건 미충족이어도 진단을 표시합니다.</p><p>최근 최대 500체결 중 30분 이내 표본: 매수 체결대금 60% 이상, 큰 매수 체결 3건 이상 우세(100만원 또는 표본 중앙값 5배 중 큰 기준), 매도 우세인데 가격 유지 및 저점 회복을 각각 1점으로 평가. 30건 및 30초 이상, 마지막 체결 2분 이내인 경우에만 채점. 전체 30분 CVD가 아니라 관측 표본입니다. 호가 5단계 잔량 비율은 참고값. 호가 재충전 및 실제 고래 신원은 확인하지 않습니다. 임시 기준이며 BUY 신호나 상승 확률이 아닙니다.</p></details></div><details id="reverseRules"><summary>저점형 전략 설명</summary><p>20일 하락 추세 + 선택한 하락폭·하락일 수 + 전일 거래량 2배 이상 + D-3 대비 2배 이상 · RSI 제외</p><small>최근 20일과 오늘의 일별 고가가 시가 또는 전일 종가 대비 한 번이라도 30% 이상 상승하면 제외. 과거 급등 이력 부족 시 제외. 강화 일봉 조건 충족 WATCH. 가장 최근 완료 1시간봉의 SMA5 상향 돌파만 BUY 후보. 미완료 봉 제외. BUY/WATCH 모의매수 모두 검색된 1시간 동안 유효. WATCH는 5이평 상향 돌파 미확인 상태의 비교 실험이며 BUY로 변경하지 않음. 검증 전 실전 매수 권장 아님. 검색 시점의 가격은 실제 체결가가 아니며 당일 시가 진입 백테스트와 다를 수 있음. 최고가 매도 가정 결과는 실제 승률이 아님. 자동 주문 없음. 별도 매도·손절 신호 미검증. 기존 보유 종목은 직접 제외.</small></details><div id="trendRules" hidden><details><summary>돌파형 전략 설명</summary><p>완료 4시간봉 20개 중 음봉 15개 이상 (연속 불필요). BUY: 완료 1시간봉 양봉, 직전 고가 돌파, 거래량 직전 3봉 평균 1.2배 이상. WATCH는 반등 미확인. 별도 하락폭·4시간 거래량·BTC 필터 없음.</p></details><div class="settings"><div class="field"><label for="exitPlan">매도 방식</label><select id="exitPlan"><option value="B" selected>분할 +1% 70% / 추세 30%</option><option value="A1">전량 +1%</option><option value="A2">전량 +2%</option><option value="A3">전량 +3%</option><option value="C">전량 추세 추종</option></select></div><div class="field"><label for="stopPlan">순손절</label><select id="stopPlan"><option value="1">-1%</option><option value="2">-2%</option><option value="3" selected>-3%</option></select></div><small>최대 보유 72시간 · 왕복 수수료 0.08%</small></div><details><summary>매도 방식 및 주의사항</summary><small>돌파형 최대 72시간. 추세 이탈은 완료 1시간봉 종가가 SMA5 미만일 때 표시. 매도는 직접 실행, 자동 주문 없음. 매도 계획은 모의매수 시 저장. 실시간 수익성 미검증.</small></details></div><div class="settings" id="reverseSettings"><div class="field"><label id="presetLabel" for="preset">검색 조건</label><select id="preset"><option value="A">A · 30% / 15일</option><option value="B">B · 35% / 14일</option><option value="C">C · 40% / 15일</option><option value="D" selected>D · 35% / 13일 (완화 테스트)</option></select></div></div><button id="go">전체 코인 검색 시작</button><p id="applied" class="muted">조건을 선택하고 검색해 주세요.</p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre><nav class="quick" aria-label="바로가기"><a href="#paperSection"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 9h18m-5 5h3"/></svg>모의매매 계좌<span class="arrow">›</span></a><a href="#resultAnchor"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18m-12 0v10m6-10v10"/></svg>검색 결과 및 CSV 저장<span class="arrow">›</span></a></nav></section><div id="resultAnchor"><section id="out" hidden><h2 id="headline"></h2><p id="audit" class="muted"></p><p id="notice" class="muted"></p><div id="compare23" hidden></div><p class="results-tools"><input id="query" placeholder="코인 검색" style="width:105px"><select id="sort"><option value="market">종목명 순</option><option value="volume">거래량 증가율 순</option><option value="depth">고점 대비 하락폭 순</option><option value="gap">당일 시가 대비 변동률 순</option></select></p><p id="count"></p><div class="cards" id="cards"></div><button id="more">더 보기</button><div class="actions"><a id="featuresCSV" href="/csv/features?mode=live14">결과 CSV</a><a id="summaryCSV" href="/csv/summary?mode=live14">요약 CSV</a><a id="coverageCSV" href="/csv/coverage?mode=live14">수집 상태 CSV</a><a id="errorsCSV" href="/csv/errors?mode=live14">오류 CSV</a></div></section><p id="resultEmpty" class="muted" style="padding:0 4px">검색 후 이곳에 결과가 표시됩니다.</p></div><section id="paperSection"><h2>모의매매 계좌</h2><details><summary>계좌 이용 안내</summary><small>가상 원금 100만원, 1회 투자금 변경 가능. 현재가 조회 후 전량 가상 체결(편도 0.04%). 직접 모의매수/매도. 저점형 기존 7일, 돌파형 72시간 청산 안내. 계획은 자동으로 체결되지 않음. 실제 주문 없음. 기록은 이 브라우저에만 저장, 기기·브라우저 변경/데이터 삭제 시 유실될 수 있음. CSV 백업 권장.</small></details><p class="actions"><label for="paperAmount">1회 투자금(원)</label><input id="paperAmount" type="number" min="5000" step="1000" value="100000" style="width:105px"><button id="refreshPaper">보유 가격 갱신</button><button id="paperCSV">모의매매 CSV</button></p><p id="paperSummary"></p><p id="paperWin"></p><p id="paperMsg" class="muted"></p><h3>보유 종목</h3><div class="cards" id="paperOpen"></div><details><summary>청산 기록 (최근 100건)</summary><div class="cards" id="paperClosed"></div></details></section><script>
+</style><header><h1>BITHUMB V3.1 LIVE</h1><p>실시간 코인 스캐너 · 빗썸 KRW</p></header><section><h2>전략 선택</h2><select id="strategy" hidden aria-label="전략"><option value="reverse">저점형 (일봉)</option><option value="trend">돌파형 (4시간봉)</option><option value="whale">매집형</option></select><div class="strategies"><button type="button" class="strategy" id="pickReverse" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20v-4m5 4v-8m5 8v-5m5 5V9M3 11l6-6 4 4 8-7"/></svg><strong>저점형</strong><span>일봉 스윙</span></button><button type="button" class="strategy" id="pickTrend" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 7-7 4 4 7-9m-7 0h7v7"/></svg><strong>돌파형</strong><span>4시간봉 단타</span></button><button type="button" class="strategy" id="pickWhale" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 5 5M8 11h6m-3-3v6"/></svg><strong>매집형</strong><span>매집 탐지</span></button></div><div id="whaleRules" hidden><div class="settings"><div class="field"><label for="whaleDays">매집 관찰 기간</label><select id="whaleDays"><option value="1">1일 · 단기</option><option value="3" selected>3일 · 지속</option><option value="7">7일 · 장기</option></select></div><div class="field"><label for="whaleTarget">검색 종목 (비워두면 전체 KRW)</label><input id="whaleTarget" placeholder="예: CFG" maxlength="36" autocomplete="off"></div><small>강화 조건 충족 종목만 최대 5개 표시 · 개별 종목은 진단 표시</small></div><details><summary>매집 탐지 기준</summary><p>완료 4시간봉 기준 1일(6봉), 3일(18봉), 7일(42봉). 기간별 종가 변화 ±3/5/8% 이내 및 고저 범위 8/12/18% 이내, 직전 3배 기간의 봉당 평균 거래량 대비 1.5배 이상 (1점). 직전 동일 길이 기간 대비 저점 0.5% 이상 상승 (1점). OBV 순증가량이 선택 기간 거래량의 10% 이상이며 종가 상승률이 기간별 상한 이하 (1점). 필요 봉 누락 시 제외. 이 기준은 연구용이며 검증되지 않았습니다. 횡보 중 거래량 증가 필수 + 캔들 2점 이상 후보 최대 20개를 정밀 분석합니다. 전체 검색에서는 유효 체결 표본과 4/6점 이상까지 충족한 종목만 최대 5개 표시합니다. 단일 종목은 조건 미충족이어도 진단을 표시합니다.</p><p>최근 최대 500체결 중 30분 이내 표본: 매수 체결대금 60% 이상, 큰 매수 체결 3건 이상 우세(100만원 또는 표본 중앙값 5배 중 큰 기준), 매도 우세인데 가격 유지 및 저점 회복을 각각 1점으로 평가. 30건 및 30초 이상, 마지막 체결 2분 이내인 경우에만 채점. 선택 기간 전체의 체결이 아닌 현재 시점의 관측 표본입니다. 전체 30분 CVD도 아닙니다. 호가 5단계 잔량 비율은 참고값. 호가 재충전 및 실제 고래 신원은 확인하지 않습니다. 임시 기준이며 BUY 신호나 상승 확률이 아닙니다.</p></details></div><details id="reverseRules"><summary>저점형 전략 설명</summary><p>20일 하락 추세 + 선택한 하락폭·하락일 수 + 전일 거래량 2배 이상 + D-3 대비 2배 이상 · RSI 제외</p><small>최근 20일과 오늘의 일별 고가가 시가 또는 전일 종가 대비 한 번이라도 30% 이상 상승하면 제외. 과거 급등 이력 부족 시 제외. 강화 일봉 조건 충족 WATCH. 가장 최근 완료 1시간봉의 SMA5 상향 돌파만 BUY 후보. 미완료 봉 제외. BUY/WATCH 모의매수 모두 검색된 1시간 동안 유효. WATCH는 5이평 상향 돌파 미확인 상태의 비교 실험이며 BUY로 변경하지 않음. 검증 전 실전 매수 권장 아님. 검색 시점의 가격은 실제 체결가가 아니며 당일 시가 진입 백테스트와 다를 수 있음. 최고가 매도 가정 결과는 실제 승률이 아님. 자동 주문 없음. 별도 매도·손절 신호 미검증. 기존 보유 종목은 직접 제외.</small></details><div id="trendRules" hidden><details><summary>돌파형 전략 설명</summary><p>완료 4시간봉 20개 중 음봉 15개 이상 (연속 불필요). BUY: 완료 1시간봉 양봉, 직전 고가 돌파, 거래량 직전 3봉 평균 1.2배 이상. WATCH는 반등 미확인. 별도 하락폭·4시간 거래량·BTC 필터 없음.</p></details><div class="settings"><div class="field"><label for="exitPlan">매도 방식</label><select id="exitPlan"><option value="B" selected>분할 +1% 70% / 추세 30%</option><option value="A1">전량 +1%</option><option value="A2">전량 +2%</option><option value="A3">전량 +3%</option><option value="C">전량 추세 추종</option></select></div><div class="field"><label for="stopPlan">순손절</label><select id="stopPlan"><option value="1">-1%</option><option value="2">-2%</option><option value="3" selected>-3%</option></select></div><small>최대 보유 72시간 · 왕복 수수료 0.08%</small></div><details><summary>매도 방식 및 주의사항</summary><small>돌파형 최대 72시간. 추세 이탈은 완료 1시간봉 종가가 SMA5 미만일 때 표시. 매도는 직접 실행, 자동 주문 없음. 매도 계획은 모의매수 시 저장. 실시간 수익성 미검증.</small></details></div><div class="settings" id="reverseSettings"><div class="field"><label id="presetLabel" for="preset">검색 조건</label><select id="preset"><option value="A">A · 30% / 15일</option><option value="B">B · 35% / 14일</option><option value="C">C · 40% / 15일</option><option value="D" selected>D · 35% / 13일 (완화 테스트)</option></select></div></div><button id="go">전체 코인 검색 시작</button><p id="applied" class="muted">조건을 선택하고 검색해 주세요.</p><p id="phase">대기</p><progress id="p" value="0" max="1"></progress><p id="stats"></p><pre id="errors"></pre><nav class="quick" aria-label="바로가기"><a href="#paperSection"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 9h18m-5 5h3"/></svg>모의매매 계좌<span class="arrow">›</span></a><a href="#resultAnchor"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18m-12 0v10m6-10v10"/></svg>검색 결과 및 CSV 저장<span class="arrow">›</span></a></nav></section><div id="resultAnchor"><section id="out" hidden><h2 id="headline"></h2><p id="audit" class="muted"></p><p id="notice" class="muted"></p><div id="compare23" hidden></div><p class="results-tools"><input id="query" placeholder="코인 검색" style="width:105px"><select id="sort"><option value="market">종목명 순</option><option value="volume">거래량 증가율 순</option><option value="depth">고점 대비 하락폭 순</option><option value="gap">당일 시가 대비 변동률 순</option></select></p><p id="count"></p><div class="cards" id="cards"></div><button id="more">더 보기</button><div class="actions"><a id="featuresCSV" href="/csv/features?mode=live14">결과 CSV</a><a id="summaryCSV" href="/csv/summary?mode=live14">요약 CSV</a><a id="coverageCSV" href="/csv/coverage?mode=live14">수집 상태 CSV</a><a id="errorsCSV" href="/csv/errors?mode=live14">오류 CSV</a></div></section><p id="resultEmpty" class="muted" style="padding:0 4px">검색 후 이곳에 결과가 표시됩니다.</p></div><section id="paperSection"><h2>모의매매 계좌</h2><details><summary>계좌 이용 안내</summary><small>가상 원금 100만원, 1회 투자금 변경 가능. 현재가 조회 후 전량 가상 체결(편도 0.04%). 직접 모의매수/매도. 저점형 기존 7일, 돌파형 72시간 청산 안내. 계획은 자동으로 체결되지 않음. 실제 주문 없음. 기록은 이 브라우저에만 저장, 기기·브라우저 변경/데이터 삭제 시 유실될 수 있음. CSV 백업 권장.</small></details><p class="actions"><label for="paperAmount">1회 투자금(원)</label><input id="paperAmount" type="number" min="5000" step="1000" value="100000" style="width:105px"><button id="refreshPaper">보유 가격 갱신</button><button id="paperCSV">모의매매 CSV</button></p><p id="paperSummary"></p><p id="paperWin"></p><p id="paperMsg" class="muted"></p><h3>보유 종목</h3><div class="cards" id="paperOpen"></div><details><summary>청산 기록 (최근 100건)</summary><div class="cards" id="paperClosed"></div></details></section><script>
 const $=id=>document.getElementById(id);let result=null,loading=false,limit=5,loadedScan=null;const names={A:"A · 30% / 15일",B:"B · 35% / 14일",C:"C · 40% / 15일",D:"D · 35% / 13일",T415:"돌파형 · 4시간봉 음봉 15/20",WHALE30:"매집형"};
 function num(x){return typeof x==='number'?x.toLocaleString('ko-KR',{maximumSignificantDigits:8}):'—'}
 function pct(x){return typeof x==='number'?(x>0?'+':'')+x.toFixed(2)+'%':'—'}
@@ -2316,18 +2346,18 @@ function pickStrategy(v){if($('strategy').disabled||$('strategy').value===v)retu
 $('pickReverse').onclick=()=>pickStrategy('reverse');$('pickTrend').onclick=()=>pickStrategy('trend');$('pickWhale').onclick=()=>pickStrategy('whale');
 function clearResult(){result=null;loadedScan=null;resultMode=null;$('out').hidden=true;$('resultEmpty').hidden=false;}
 $('strategy').onchange=()=>{syncMode();clearResult();$('applied').textContent='전략을 선택하고 새로 검색해 주세요.'};
-$('preset').onchange=()=>{clearResult();$('applied').textContent='조건 변경: 다시 검색해 주세요.'};
+$('preset').onchange=()=>{clearResult();$('applied').textContent='조건 변경: 다시 검색해 주세요.'};$('whaleDays').onchange=$('whaleTarget').onchange=()=>{clearResult();$('applied').textContent='매집 설정 변경: 다시 검색해 주세요.'};
 $('query').oninput=$('sort').onchange=()=>{limit=5;render()};$('more').onclick=()=>{limit+=5;render()};
-async function begin29(){try{for(let id of ['go','strategy','preset','exitPlan','stopPlan','pickReverse','pickTrend','pickWhale','whaleTarget'])$(id).disabled=true;let trend=$('strategy').value==='trend';let url=$('strategy').value==='whale'?'/whale30/start?market='+encodeURIComponent($('whaleTarget').value.trim().toUpperCase()):trend?'/trend20/start?preset=T415&back=0':'/live14/start?preset='+encodeURIComponent($('preset').value);let r=await fetch(url,{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 검색 실행 중');clearResult();await poll()}catch(e){$('phase').textContent=e.message;for(let id of ['go','strategy','preset','exitPlan','stopPlan','pickReverse','pickTrend','pickWhale','whaleTarget'])$(id).disabled=false}}
+async function begin29(){try{for(let id of ['go','strategy','preset','exitPlan','stopPlan','pickReverse','pickTrend','pickWhale','whaleTarget','whaleDays'])$(id).disabled=true;let trend=$('strategy').value==='trend';let url=$('strategy').value==='whale'?'/whale30/start?days='+encodeURIComponent($('whaleDays').value)+'&market='+encodeURIComponent($('whaleTarget').value.trim().toUpperCase()):trend?'/trend20/start?preset=T415&back=0':'/live14/start?preset='+encodeURIComponent($('preset').value);let r=await fetch(url,{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('다른 검색 실행 중');clearResult();await poll()}catch(e){$('phase').textContent=e.message;for(let id of ['go','strategy','preset','exitPlan','stopPlan','pickReverse','pickTrend','pickWhale','whaleTarget','whaleDays'])$(id).disabled=false}}
 $('go').onclick=begin29;
 function showWhale(x){
- $('applied').textContent='매집형 · 연구용';$('headline').textContent='매집 의심 '+x.suspects+'개 · 표시 '+x.displayed+'개';$('audit').textContent='1차 유효 '+x.valid+'/'+x.universe+' · 이력 부족 '+x.history_missing+' · 1차 후보 '+x.candle_candidates+' · 정밀 분석 '+x.deep_checked+' · 체결 유효 '+x.trade_valid+' · 7일 비교 가능 '+x.seven_day_valid+' · 완료 '+x.finished_at;$('notice').textContent='전체 검색: 횡보·거래량 필수, 유효 체결 및 4/6 이상만 최대 5개. 개별 검색은 미충족도 진단. 실제 고래 보유량이나 BUY 신호가 아님. 호가 재충전 미측정. CSV에 1차 결과와 누락 사유 포함.';limit=5;render();
+ $('applied').textContent='매집형 · '+x.period_days+'일 · 4시간봉 연구용';$('headline').textContent='매집 의심 '+x.suspects+'개 · 표시 '+x.displayed+'개';$('audit').textContent='1차 유효 '+x.valid+'/'+x.universe+' · 이력 부족 '+x.history_missing+' · 1차 후보 '+x.candle_candidates+' · 정밀 분석 '+x.deep_checked+' · 체결 유효 '+x.trade_valid+' · 7일 비교 가능 '+x.seven_day_valid+' · 완료 '+x.finished_at;$('notice').textContent='전체 검색: 선택 기간의 횡보·거래량 필수, 현재 체결 표본 유효 및 4/6 이상만 최대 5개. 개별 검색은 미충족도 진단. 실제 고래 보유량이나 BUY 신호가 아님. 호가 재충전 미측정. CSV에 1차 결과와 누락 사유 포함.';limit=5;render();
 }
 function renderWhale(){
  let q=$('query').value.trim().toUpperCase(),a=result.rank.filter(x=>x.market.includes(q));let sort=$('sort').value;
- if(sort==='volume')a.sort((x,y)=>y.volume_ratio-x.volume_ratio);else if(sort==='gap')a.sort((x,y)=>y.change_1d_pct-x.change_1d_pct);else if(sort==='depth')a.sort((x,y)=>y.low_change_pct-x.low_change_pct);else a.sort((x,y)=>Number(y.trade_checked)-Number(x.trade_checked)||y.score-x.score||y.candle_score-x.candle_score);
+ if(sort==='volume')a.sort((x,y)=>y.volume_ratio-x.volume_ratio);else if(sort==='gap')a.sort((x,y)=>y.period_change_pct-x.period_change_pct);else if(sort==='depth')a.sort((x,y)=>y.low_change_pct-x.low_change_pct);else a.sort((x,y)=>Number(y.trade_checked)-Number(x.trade_checked)||y.score-x.score||y.candle_score-x.candle_score);
  $('count').textContent=a.length+'개 · '+Math.min(limit,a.length)+'개 표시';$('more').hidden=a.length<=limit;
- $('cards').replaceChildren(...a.slice(0,limit).map(x=>{let c=node('article',null,'coin');c.append(node('h3',x.market.replace('KRW-','')+' · '+x.status,x.status==='매집 의심'?'green':'muted'));line(c,'매집 징후',x.score+'/'+x.score_max+' · '+(x.trade_checked?'체결 포함':'캔들만'));line(c,'완료 1h 종가',num(x.reference_price)+'원');line(c,'1일 / 3일 / 7일 변화',[x.change_1d_pct,x.change_3d_pct,x.change_7d_pct].map(pct).join(' / '));line(c,'24시간 거래량 배수',num(x.volume_ratio)+'배');line(c,'24시간 저점 변화',pct(x.low_change_pct));line(c,'OBV 순증가 비율',pct(x.obv_ratio_pct));let checks=[['횡보 중 거래량 증가','volume_flat'],['저점 상승','higher_low'],['OBV 상승','obv_up'],['매수 체결 우세','buy_flow'],['대량 매수 반복','big_buy_repeat'],['매도 흡수 의심','sell_absorption']];for(let [label,key] of checks)line(c,label,x[key]===true?'✓ 충족':x[key]===false?'미충족':'미확인',x[key]===true?'green':'muted');line(c,'체결 표본',x.trade_count==null?'미확인':x.trade_count+'건 / '+num(x.trade_span_seconds)+'초');line(c,'표본 매수 대금 비율',pct(x.buy_share_pct));line(c,'표본 순매수 대금',num(x.trade_delta_krw)+'원');line(c,'대량 매수 / 매도 건수',num(x.big_buy_count)+' / '+num(x.big_sell_count));line(c,'호가 5단계 매수/매도',num(x.book_bid_ask_ratio)+'배');line(c,'호가 재충전','미측정');line(c,'체결 표본 종료',x.trade_latest||'—');line(c,'호가 조회 시각',x.book_time||'—');return c}));
+ $('cards').replaceChildren(...a.slice(0,limit).map(x=>{let c=node('article',null,'coin');c.append(node('h3',x.market.replace('KRW-','')+' · '+x.status,x.status==='매집 의심'?'green':'muted'));line(c,'매집 징후',x.score+'/'+x.score_max+' · '+(x.trade_checked?'체결 포함':'캔들만'));line(c,'관찰 기간',x.period_days+'일 · 4시간봉');line(c,'완료 4h 종가',num(x.reference_price)+'원');line(c,'1일 / 3일 / 7일 변화',[x.change_1d_pct,x.change_3d_pct,x.change_7d_pct].map(pct).join(' / '));line(c,'선택 기간 가격 변화',pct(x.period_change_pct));line(c,'선택 기간 고저 범위',pct(x.period_range_pct));line(c,'선택 기간 거래량 배수',num(x.volume_ratio)+'배');line(c,'직전 동일 기간 대비 저점',pct(x.low_change_pct));line(c,'OBV 순증가 비율',pct(x.obv_ratio_pct));let checks=[['횡보 중 거래량 증가','volume_flat'],['저점 상승','higher_low'],['OBV 상승','obv_up'],['매수 체결 우세','buy_flow'],['대량 매수 반복','big_buy_repeat'],['매도 흡수 의심','sell_absorption']];for(let [label,key] of checks)line(c,label,x[key]===true?'✓ 충족':x[key]===false?'미충족':'미확인',x[key]===true?'green':'muted');line(c,'체결 표본',x.trade_count==null?'미확인':x.trade_count+'건 / '+num(x.trade_span_seconds)+'초');line(c,'표본 매수 대금 비율',pct(x.buy_share_pct));line(c,'표본 순매수 대금',num(x.trade_delta_krw)+'원');line(c,'대량 매수 / 매도 건수',num(x.big_buy_count)+' / '+num(x.big_sell_count));line(c,'호가 5단계 매수/매도',num(x.book_bid_ask_ratio)+'배');line(c,'호가 재충전','미측정');line(c,'체결 표본 종료',x.trade_latest||'—');line(c,'호가 조회 시각',x.book_time||'—');return c}));
  if(!a.length)$('cards').textContent='조건을 충족한 종목 없음 (또는 데이터 부족). 억지로 후보를 표시하지 않습니다.';
 }
 function showTrend(x){$('applied').textContent='돌파형 · 4시간봉 15/20';$('headline').textContent='BUY '+x.buys+'개 · WATCH '+x.watches+'개';$('audit').textContent='분석 '+x.valid+'/'+x.universe+' · 이력 부족 '+x.history_missing+' · 검색 완료 '+x.finished_at;$('notice').textContent='BUY는 1시간봉 돌파 확인, WATCH는 관찰 후보. 돌파형 모의매수는 BUY만 가능. 최대 72시간. 편도 0.04%.';limit=5;render();}
@@ -2338,7 +2368,7 @@ function renderTrend(){
 }
 async function poll(){try{
  let s=await(await fetch('/status',{cache:'no-store'})).json();let running=s.status==='running';
- for(let id of ['go','strategy','preset','exitPlan','stopPlan','pickReverse','pickTrend','pickWhale','whaleTarget'])$(id).disabled=running;
+ for(let id of ['go','strategy','preset','exitPlan','stopPlan','pickReverse','pickTrend','pickWhale','whaleTarget','whaleDays'])$(id).disabled=running;
  if(!['live14','trend20','whale30'].includes(s.mode)){$('phase').textContent=running?'다른 연구 실행 중':'대기';clearResult();return}
  $('phase').textContent=s.phase+' '+s.done+'/'+s.total;$('p').max=Math.max(1,s.total);$('p').value=s.done;$('stats').textContent='수집 오류 '+s.error_count+' · 전체 '+(s.elapsed_seconds??'—')+'초';$('errors').textContent=s.errors.join('\n');
  if(running){clearResult();$('applied').textContent='검색 중: '+names[s.preset];return}
@@ -2347,6 +2377,7 @@ async function poll(){try{
   if(({live14:'reverse',trend20:'trend',whale30:'whale'})[s.mode]!==$('strategy').value)return;
   if(s.mode==='live14'&&$('preset').value!==s.preset)return;
   if(s.mode==='trend20'&&s.preset!=='T415')return;
+  if(s.mode==='whale30'){let target=$('whaleTarget').value.trim().toUpperCase();if(target&&!target.startsWith('KRW-'))target='KRW-'+target;if(Number($('whaleDays').value)!==s.period_days||target!==(s.target||''))return;}
   loading=true;try{let d=await(await fetch('/results',{cache:'no-store'})).json();if(!d.summary[0]||d.summary[0].scan_id!==s.scan_id)return;result=d;loadedScan=s.scan_id;resultMode=s.mode;if(s.mode==='live14')$('preset').value=s.preset;
   for(let k of ['features','summary','coverage','errors'])$(k+'CSV').href='/csv/'+k+'?mode='+s.mode+(s.mode==='whale30'?'':'&live29=1')+'&scan_id='+encodeURIComponent(s.scan_id);
   $('out').hidden=false;$('resultEmpty').hidden=true;show()}finally{loading=false}
@@ -2398,7 +2429,7 @@ function renderPaper(){
  let hist=s.closed.slice().reverse().slice(0,100).map(t=>{let c=node('article',null,'coin');c.append(node('h3',t.market+' · 청산 완료'));line(c,'매수 조건',names[t.preset]||'기존 기록');line(c,'전략',t.strategy==='trend'?'돌파형 / 기존 4시간봉':'저점형');line(c,'매수 당시 판정',t.entryStatus||'기존 기록 (미기록)');line(c,'매수 / 매도',num(t.buy)+' / '+num(t.sell));line(c,'매수 시각',paperTime(t.boughtAt));line(c,'매도 시각',paperTime(t.closedAt));line(c,'순손익',num(t.pnl)+'원 / '+pct(t.netPct),t.pnl>=0?'green':'red');return c});$('paperClosed').replaceChildren(...hist);if(!hist.length)$('paperClosed').textContent='청산 기록 없음';if(!storageOK)paperMsg('브라우저 저장소 사용 불가 또는 기록 손상. 모의매매를 중단합니다.');
 }
 $('refreshPaper').onclick=refreshPaper;
-$('paperCSV').onclick=()=>{let keys=['market','strategy','timeframe','preset','entryStatus','minDrawdownPct','minDownDays','signalTime','boughtAt','amount','buy','qty','deadline','exitPlan','stopPlan','partialDone','exitLeg','closedAt','sell','proceeds','pnl','netPct'];let esc=v=>'"'+String(v??'').replaceAll('"','""')+'"';let rows=[keys.join(','),...account.trades.map(x=>keys.map(k=>esc(x[k])).join(','))];let url=URL.createObjectURL(new Blob(['\ufeff'+rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));let a=document.createElement('a');a.href=url;a.download='BITHUMB_V3_0_1_LIVE_PAPER_'+new Date().toISOString().slice(0,10)+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+$('paperCSV').onclick=()=>{let keys=['market','strategy','timeframe','preset','entryStatus','minDrawdownPct','minDownDays','signalTime','boughtAt','amount','buy','qty','deadline','exitPlan','stopPlan','partialDone','exitLeg','closedAt','sell','proceeds','pnl','netPct'];let esc=v=>'"'+String(v??'').replaceAll('"','""')+'"';let rows=[keys.join(','),...account.trades.map(x=>keys.map(k=>esc(x[k])).join(','))];let url=URL.createObjectURL(new Blob(['\ufeff'+rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));let a=document.createElement('a');a.href=url;a.download='BITHUMB_V3_1_LIVE_PAPER_'+new Date().toISOString().slice(0,10)+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
 renderPaper();
 
 poll();setInterval(poll,2000);
@@ -3161,7 +3192,11 @@ class Handler(BaseHTTPRequestHandler):
             target=parse_qs(u.query).get("market",[""])[0].strip().upper()
             if target and not target.startswith("KRW-"):target="KRW-"+target
             if target and (len(target)>40 or not target[4:].isascii() or not target[4:].isalnum()):return self.js({"error":"invalid market"},400)
-            return self.js({"started":startwhale30(target)})
+            try:
+                days=int(parse_qs(u.query).get("days",["1"])[0])
+                if days not in WHALE32_RULES:raise ValueError()
+            except ValueError:return self.js({"error":"invalid days"},400)
+            return self.js({"started":startwhale30(target,days)})
         if u.path=="/exit28/start":
             try:
                 q=parse_qs(u.query);entry=int(q.get("entry",["0"])[0]);method=q.get("method",["ALL"])[0];stop=int(q.get("stop",["2"])[0])
@@ -3213,7 +3248,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
-        if p in ("/","/live29","/live30","/live301","/swing","/swing20","/swing21","/swing22","/swing23","/swing24","/swing25","/swing26","/swing27","/swing28"):return self.send(HTML29,"text/html; charset=utf-8")
+        if p in ("/","/live29","/live30","/live301","/live31","/swing","/swing20","/swing21","/swing22","/swing23","/swing24","/swing25","/swing26","/swing27","/swing28"):return self.send(HTML29,"text/html; charset=utf-8")
         if p=="/live29/trend":
             markets=list(dict.fromkeys(parse_qs(u.query).get("markets",[""])[0].split(",")))
             if not 1<=len(markets)<=20 or any(not m.startswith("KRW-") or not m[4:].isalnum() or len(m)>40 for m in markets):return self.js({"error":"invalid markets"},400)
@@ -3409,7 +3444,7 @@ class Handler(BaseHTTPRequestHandler):
                 if key=="features.zip":key="features"
                 if key not in ("rank","features","summary","coverage","errors"):return self.js({"error":"not found"},404)
                 if state["status"] not in ("done","error"):return self.js({"error":"not complete"},409)
-                x=list(state[key]); mode=state.get("mode");csv_preset=state.get("preset")
+                x=list(state[key]); mode=state.get("mode");csv_preset=state.get("preset");csv_whale_days=state.get("period_days",1)
                 expected_mode=parse_qs(u.query).get("mode",[""])[0]
                 if expected_mode and expected_mode!=mode:return self.js({"error":"scan again"},409)
                 csv_live29=parse_qs(u.query).get("live29",["0"])[0]=="1"
@@ -3443,7 +3478,7 @@ class Handler(BaseHTTPRequestHandler):
         fields=list(dict.fromkeys(k for row in x for k in row))
         stream=io.StringIO();w=csv.DictWriter(stream,fieldnames=fields)
         if fields:w.writeheader();w.writerows(x)
-        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("BITHUMB_V3_0_1_LIVE_"+("BREAKOUT_" if mode=="trend20" else "BOTTOM_")+str(csv_preset)+"_" if csv_live29 else ("BITHUMB_SWING_V2_2_TEST_" if csv_preset=="T430" else "BITHUMB_SWING_V2_7_TEST_" if csv_preset=="R415ALL" else "BITHUMB_SWING_V2_6_TEST_" if csv_preset=="G20ALL" else "BITHUMB_SWING_V2_5_TEST_" if csv_preset=="P20ALL" else "BITHUMB_SWING_V2_4_TEST_" if csv_preset=="U20ALL" else "BITHUMB_SWING_V2_3_TEST_" if csv_preset=="T42ALL" else "BITHUMB_SWING_V2_1_TEST_" if csv_preset=="T415" else "BITHUMB_SWING_V2_0_TEST_")+("BACK_" if mode=="trendback20" else "LIVE_")+str(csv_preset)+"_" if mode in ("trend20","trendback20") else "BITHUMB_V3_0_1_LIVE_WHALE_" if mode=="whale30" else "BITHUMB_SWING_V2_8_TEST_EXIT_" if mode=="exit28" else "REVERSE_SWING_V1_4_3_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
+        return self.send(("\ufeff"+stream.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename=("BITHUMB_V3_1_LIVE_"+("BREAKOUT_" if mode=="trend20" else "BOTTOM_")+str(csv_preset)+"_" if csv_live29 else ("BITHUMB_SWING_V2_2_TEST_" if csv_preset=="T430" else "BITHUMB_SWING_V2_7_TEST_" if csv_preset=="R415ALL" else "BITHUMB_SWING_V2_6_TEST_" if csv_preset=="G20ALL" else "BITHUMB_SWING_V2_5_TEST_" if csv_preset=="P20ALL" else "BITHUMB_SWING_V2_4_TEST_" if csv_preset=="U20ALL" else "BITHUMB_SWING_V2_3_TEST_" if csv_preset=="T42ALL" else "BITHUMB_SWING_V2_1_TEST_" if csv_preset=="T415" else "BITHUMB_SWING_V2_0_TEST_")+("BACK_" if mode=="trendback20" else "LIVE_")+str(csv_preset)+"_" if mode in ("trend20","trendback20") else "BITHUMB_V3_1_LIVE_WHALE_"+str(csv_whale_days)+"D_" if mode=="whale30" else "BITHUMB_SWING_V2_8_TEST_EXIT_" if mode=="exit28" else "REVERSE_SWING_V1_4_3_LIVE_"+str(csv_preset)+"_" if mode=="live14" else "REVERSE_SWING_V1_2_1_LIVE_" if mode=="live12" else "REVERSE_SWING_V1_2_1_BACKTEST_" if mode=="back12" else "REVERSE_SWING_V1_1_LIVE_" if mode=="live10" else "REVERSE_SWING_V0_8_1_" if mode=="reverse81" else "REVERSE_SWING_V0_8_" if mode=="reverse8" else "REVERSE_SWING_V0_7_" if mode=="reverse7" else "REVERSE_SWING_V0_6_1_" if mode=="reverse6" else "REVERSE_SWING_V0_5_" if mode=="reverse5" else "REVERSE_SWING_V0_4_" if mode=="reverse4" else "REVERSE_SWING_V0_3_3_" if mode=="stage3" else "REVERSE_MINI_V0_2_" if mode=="stage2" else "REVERSE_MINI_V0_1_3_")+key.upper()+("_"+n+"D" if mode=="reverse7" and key=="features" and n else "")+("_"+group+"_"+horizon+"D" if mode=="stage3" and key=="features" and horizon and group else "")+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
 def selftest():
     start=20000*DAY
     assert kststr(start).endswith("09:00:00")
@@ -3700,7 +3735,14 @@ def selftest():
     assert whale31coverage(None,start+97*HOUR)["status"]=="fetch_error"
     old7=(start-72*HOUR,95,96,94,95,10,950)
     assert abs(whale30candles([old7]+wrows,start+97*HOUR)["change_7d_pct"]-pct(100,95))<1e-9
-    print("REVERSE SWING V1.4.3 preserved + BITHUMB V3.0.1 LIVE self-test PASS",flush=True)
+    for days in (1,3,7):
+        n=days*6;step=4*HOUR;end32=start+(4*n+1)*step
+        rows32=[(start+i*step,100,101,99,100,10 if i<3*n+1 else 20,1000) for i in range(4*n+1)]
+        z,audit=whale32candles(rows32,end32,days)
+        assert z and z["period_days"]==days and abs(z["volume_ratio"]-2)<1e-9 and z["volume_flat"] and z["candle_score"]==1
+        assert whale32candles(rows32[:-1],end32,days)[1]["missing_bars"]==1
+        assert whale32candles(rows32,end32,days)[1]["required_bars"]==4*n+1
+    print("REVERSE SWING V1.4.3 preserved + BITHUMB V3.1 LIVE self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
