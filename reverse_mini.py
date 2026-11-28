@@ -3485,9 +3485,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(("\ufeff"+buf.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="BITHUMB_WHALE_RESEARCH_V0_2_"+str(entry_days)+"D_"+kind.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
         if p in ("/","/live29"):
             page=HTML29
-            page=page.replace("<p>실시간 코인 스캐너 · 빗썸 KRW</p>","<p>실시간 코인 스캐너 · 저점 / 단타 / 매집 V2.0</p>",1)
+            page=page.replace("<p>실시간 코인 스캐너 · 빗썸 KRW</p>","<p>실시간 코인 스캐너 · 저점 / 단타 / 매집 V2.1</p>",1)
             page=page.replace("<strong>돌파형</strong><span>4시간봉 단타</span>","<strong>단타형</strong><span>4시간봉 돌파</span>",1)
-            page=page.replace("<strong>매집형</strong><span>매집 탐지</span>","<strong>매집형</strong><span>V2.0 · 7일 추적</span>",1)
+            page=page.replace("<strong>매집형</strong><span>매집 탐지</span>","<strong>매집형</strong><span>V2.1 · 7일 추적</span>",1)
             page=page.replace("$('pickWhale').onclick=()=>pickStrategy('whale');","$('pickWhale').onclick=()=>{if(!$('pickWhale').disabled)location.href='/whalelive20';};",1)
             return self.send(page,"text/html; charset=utf-8")
         if p in ("/live30","/live301","/live31","/live311","/swing","/swing20","/swing21","/swing22","/swing23","/swing24","/swing25","/swing26","/swing27","/swing28"):return self.send(HTML29,"text/html; charset=utf-8")
