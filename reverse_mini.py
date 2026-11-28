@@ -3195,6 +3195,161 @@ async function poll(){try{let s=await(await fetch('/status',{cache:'no-store'}))
 poll();setInterval(poll,1500);
 </script></html>"""
 
+
+# WHALE RESEARCH V0.1 -- independent state and UI. Live strategy functions remain unchanged.
+WBSTEP=4*HOUR
+WB_DAYS=(1,3,7)
+WB_TARGETS=(3,5,10,20)
+WB_GROUPS=("ALL","NONE","D1_2","D1_3","D3_2","D3_3","D7_2","D7_3","MULTI2","MULTI3","WATCH","VOL2","VOL3","VOL5")
+WB_LABELS={"ALL":"전체 기준군","NONE":"캔들 후보 없음","D1_2":"1일 2점 이상","D1_3":"1일 3점","D3_2":"3일 2점 이상","D3_3":"3일 3점","D7_2":"7일 2점 이상","D7_3":"7일 3점","MULTI2":"2개 이상 기간 공통","MULTI3":"3개 기간 공통","WATCH":"V3.1.1 WATCH 캔들 기준","VOL2":"후보 중 거래량 2배 이상","VOL3":"후보 중 거래량 3배 이상","VOL5":"후보 중 거래량 5배 이상"}
+WB_LOCK=threading.Lock()
+WB={"status":"idle","phase":"대기","done":0,"total":0,"summary":[],"features":[],"coverage":[],"errors":[],"events":[]}
+def wbpatch(**kw):
+    with WB_LOCK:WB.update(kw)
+def wbnet(p,q):return 100*(q/p*(1-FEE81)/(1+FEE81)-1)
+def wboutcome(by,t):
+    seq=[by.get(t+i*WBSTEP) for i in range(42)]
+    if not all(r131valid(r) for r in seq):return None
+    p=seq[0][1]
+    out={"entry_price":p}
+    for d in WB_DAYS:
+        win=seq[:d*6];hi=max(r[2] for r in win);lo=min(r[3] for r in win)
+        out.update({"peak_"+str(d)+"d":wbnet(p,hi),"low_"+str(d)+"d":wbnet(p,lo),"close_"+str(d)+"d":wbnet(p,win[-1][4])})
+    for k in WB_TARGETS:
+        hit=next((i+1 for i,r in enumerate(seq) if wbnet(p,r[2])>=k-1e-9),None)
+        out["hit"+str(k)+"_within_hours"]=hit*4 if hit is not None else None
+    return out
+def wbgroups(periods):
+    matched=[d for d in WB_DAYS if periods[d]["volume_flat"] and periods[d]["candle_score"]>=2]
+    groups=["ALL"]
+    if not matched:groups.append("NONE")
+    for d in matched:
+        groups.append("D"+str(d)+"_2")
+        if periods[d]["candle_score"]==3:groups.append("D"+str(d)+"_3")
+    if len(matched)>=2:groups.append("MULTI2")
+    if len(matched)==3:groups.append("MULTI3")
+    if any(periods[d]["candle_score"]==3 for d in matched) or len(matched)>=2:groups.append("WATCH")
+    maxvol=max((periods[d]["volume_ratio"] for d in matched),default=0)
+    for k in (2,3,5):
+        if maxvol>=k:groups.append("VOL"+str(k))
+    return groups,matched,maxvol
+def wbnewstats():
+    return {"signals":0,"outcome_missing":0,"evaluated":0,**{"raw_hit"+str(k)+"_"+str(d)+"d":0 for k in WB_TARGETS for d in WB_DAYS}}
+def wbeval(m,rows,start,stop,scan):
+    by={r[0]:r for r in rows}
+    cov=dict(market=m,scan_id=scan,received_bars=len(by),expected_windows=(stop-start)//WBSTEP,valid_1d=0,valid_3d=0,valid_7d=0,valid_common=0,common_outcome_missing=0,common_evaluated=0)
+    raw={g:wbnewstats() for g in WB_GROUPS};reserved={g:0 for g in WB_GROUPS};overlap={g:0 for g in WB_GROUPS};picked=[];events=[]
+    for t in range(start,stop,WBSTEP):
+        periods={d:whale32candles(rows,t,d)[0] for d in WB_DAYS}
+        for d,z in periods.items():cov["valid_"+str(d)+"d"]+=int(z is not None)
+        if any(z is None for z in periods.values()):continue
+        cov["valid_common"]+=1
+        groups,matched,maxvol=wbgroups(periods)
+        outcome=wboutcome(by,t)
+        cov["common_evaluated" if outcome else "common_outcome_missing"]+=1
+        detail=dict(market=m,scan_id=scan,signal_time=iso(t),entry_time=iso(t),entry_ts=t,matched_periods="/".join(map(str,matched)),matched_count=len(matched),max_candidate_volume_ratio=maxvol)
+        for d,z in periods.items():
+            for key in ("candle_score","volume_flat","higher_low","obv_up","volume_ratio","period_change_pct","period_range_pct","low_change_pct","obv_ratio_pct"):
+                detail[key+"_"+str(d)+"d"]=z[key]
+        for g in groups:
+            s=raw[g];s["signals"]+=1
+            if outcome is None:s["outcome_missing"]+=1
+            else:
+                s["evaluated"]+=1
+                for d in WB_DAYS:
+                    for k in WB_TARGETS:s["raw_hit"+str(k)+"_"+str(d)+"d"]+=int(outcome["peak_"+str(d)+"d"]>=k-1e-9)
+            # Chronological, reserve even when later outcome missing. No overlapping positions per market/group.
+            if t<reserved[g]:overlap[g]+=1;continue
+            reserved[g]=t+7*DAY
+            picked.append(dict(detail,group=g,evaluated=outcome is not None,**(outcome or {})))
+        # Reverse view: all eligible 4h windows leading to >=20% within 7d, not distinct pumps.
+        # Retain only best 3 examples per market (global UI/CSV capped separately).
+        if outcome and outcome["peak_7d"]>=20-1e-9:
+            events.append(dict(detail,groups="/".join(groups),**outcome))
+            events.sort(key=lambda x:(-x["peak_7d"],x["entry_ts"]))
+            del events[3:]
+    cov["status"]="ok" if cov["valid_common"] else "common_history_missing"
+    return cov,raw,overlap,picked,events
+def wbsummary(raw,overlap,features):
+    out=[]
+    for g in WB_GROUPS:
+        s=raw[g];subset=[r for r in features if r["group"]==g];valid=[r for r in subset if r["evaluated"]];n=len(valid)
+        row=dict(group=g,label=WB_LABELS[g],raw_signals=s["signals"],raw_evaluated=s["evaluated"],raw_outcome_missing=s["outcome_missing"],overlap_skipped=overlap[g],dedup_signals=len(subset),evaluated=n,outcome_missing=len(subset)-n,distinct_markets=len({r["market"] for r in valid}))
+        for d in WB_DAYS:
+            for key in ("peak","close","low"):
+                vals=[r[key+"_"+str(d)+"d"] for r in valid]
+                row[key+"_mean_"+str(d)+"d"]=mean(vals) if vals else None
+                row[key+"_median_"+str(d)+"d"]=statistics.median(vals) if vals else None
+            for k in WB_TARGETS:
+                key="hit"+str(k)+"_"+str(d)+"d";hits=sum(r["peak_"+str(d)+"d"]>=k-1e-9 for r in valid)
+                rawhits=s["raw_"+key];den=raw["ALL"]["raw_"+key]
+                row[key+"_count"]=hits;row[key+"_pct"]=100*hits/n if n else None
+                row["raw_"+key+"_count"]=rawhits
+                row["raw_"+key+"_pct"]=100*rawhits/s["evaluated"] if s["evaluated"] else None
+                row["capture_"+key+"_pct"]=100*rawhits/den if den else None
+        for k in WB_TARGETS:
+            hours=[r["hit"+str(k)+"_within_hours"] for r in valid if r["hit"+str(k)+"_within_hours"] is not None]
+            row["median_hit"+str(k)+"_hours_upper"]=statistics.median(hours) if hours else None
+        out.append(row)
+    return out
+def wbrun():
+    begin=time.monotonic()
+    try:
+        end=int(now().timestamp())
+        probe=candles("KRW-BTC",240,end,8,latest=True)
+        if len(probe)<2:raise RuntimeError("BTC 4시간봉 경계 확인 실패")
+        anchor=probe[-1][0]%WBSTEP
+        if any(r[0]%WBSTEP!=anchor for r in probe):raise RuntimeError("4시간봉 경계 불일치")
+        cut=((end-anchor)//WBSTEP)*WBSTEP+anchor
+        if not any(r[0]==cut-WBSTEP and r131valid(r) for r in probe):raise RuntimeError("완료 BTC 4시간봉 지연")
+        stop=cut-7*DAY+WBSTEP;start=stop-30*DAY
+        universe=sorted({r["market"] for r in api("market/all") if r["market"].startswith("KRW-") and r["market"][4:] not in STABLE})
+        if not universe:raise RuntimeError("시장 목록 없음")
+        with WB_LOCK:scan=WB["scan_id"]
+        wbpatch(phase="4시간봉 수집 및 과거 시점 검증",total=len(universe),entry_start=iso(start),entry_end_exclusive=iso(stop),data_end=iso(cut),fee_roundtrip_pct=.08)
+        raw={g:wbnewstats() for g in WB_GROUPS};overlap={g:0 for g in WB_GROUPS};features=[];coverage=[];events=[];errors=[]
+        def fetch(m):
+            rows=candles(m,240,cut,200,pages=2,latest=False)
+            return wbeval(m,rows,start,stop,scan)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            jobs={pool.submit(fetch,m):m for m in universe}
+            for fut in as_completed(jobs):
+                m=jobs[fut]
+                try:
+                    cov,stats,skips,rows,ev=fut.result()
+                    coverage.append(cov);features.extend(rows);events.extend(ev)
+                    for g in WB_GROUPS:
+                        overlap[g]+=skips[g]
+                        for k,v in stats[g].items():raw[g][k]+=v
+                except Exception as e:
+                    errors.append(dict(market=m,error=str(e)))
+                    coverage.append(dict(market=m,scan_id=scan,status="fetch_or_eval_error",expected_windows=180))
+                with WB_LOCK:WB["done"]+=1;WB["error_count"]=len(errors)
+        wbpatch(phase="비교군 집계")
+        summary=wbsummary(raw,overlap,features)
+        for r in summary:r.update(scan_id=scan,entry_start=iso(start),entry_end_exclusive=iso(stop),data_end=iso(cut),fee_oneway_pct=.04,universe=len(universe),common_valid_windows=sum(x.get("valid_common",0) for x in coverage))
+        features.sort(key=lambda x:(x["group"],x["entry_ts"],x["market"]))
+        coverage.sort(key=lambda x:x["market"])
+        events.sort(key=lambda x:(-x["peak_7d"],x["market"],x["entry_ts"]))
+        wbpatch(status="done",phase="완료",summary=summary,features=features,coverage=coverage,errors=errors,events=events[:100],elapsed_seconds=round(time.monotonic()-begin,1),valid_markets=sum(x.get("valid_common",0)>0 for x in coverage),common_valid_windows=sum(x.get("valid_common",0) for x in coverage),common_evaluated_windows=raw["ALL"]["evaluated"],error_count=len(errors))
+    except Exception as e:wbpatch(status="error",phase="실패",errors=[dict(error=str(e))],error_count=1)
+def wbstart():
+    with WB_LOCK:
+        if WB["status"]=="running":return False
+        WB.clear();WB.update(status="running",phase="준비",scan_id=str(time.time_ns()),done=0,total=0,summary=[],features=[],coverage=[],events=[],errors=[],error_count=0)
+    threading.Thread(target=wbrun,daemon=True).start()
+    return True
+HTMLWB=r"""<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BITHUMB WHALE RESEARCH V0.1</title><style>
+*{box-sizing:border-box}[hidden]{display:none!important}body{max-width:980px;margin:auto;padding:16px;background:#f6f8f7;color:#192421;font:14px/1.5 system-ui,sans-serif}section{padding:15px;background:#fff;border:1px solid #dce5df;border-radius:16px;margin:12px 0}h1{font-size:22px;margin:4px 0}h2{font-size:17px}p{margin:8px 0}small{color:#63716a;display:block;line-height:1.65}button,a,select{font:inherit;border:1px solid #dce5df;border-radius:9px;padding:10px;color:#16734e;background:white;text-decoration:none;display:inline-block;margin:3px}button{background:#16734e;color:white;width:100%;font-weight:bold;padding:14px}button:disabled{opacity:.5}progress{width:100%;accent-color:#16734e}table{border-collapse:collapse;white-space:nowrap;width:100%;font-size:12px}td,th{border-bottom:1px solid #dce5df;padding:8px;text-align:right}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto}.muted{color:#63716a}.good{color:#16734e}.bad{color:#b33b39}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}
+</style><h1>BITHUMB WHALE RESEARCH V0.1</h1><small>매집형 과거 검증 · 실시간 스캐너와 별도</small><a href="/live311">기존 LIVE 스캐너</a><section><h2>30일 매집 신호 비교</h2><small>전체 KRW(스테이블 제외) · 완료 4시간봉 · 1/3/7일 동일 구간 · 왕복 수수료 0.08% · 신호 확정 후 다음 4시간봉 시가 기준</small><details><summary>검증 방법 및 한계</summary><small>7일 결과가 성숙한 과거 30일 동안 4시간마다 평가. 1/3/7일 캔들 지표가 모두 계산 가능한 시점만 공통 비교. 42개 후속 봉 누락 시 결과 제외. 각 비교군별 동일 종목 7일 중복 제거(결과 누락 신호도 예약). 거래량 필수인 2점 이상 후보와 3점, 복수 기간, 거래량 2/3/5배 비교. 모든 비교군은 중첩 가능. 전체 기준군 및 후보 없음 비교. 실제 체결과 호가는 미검증이며 STRONG 검증 아님. 최고·최저는 해당 기간 극값, 매도 성과나 실제 승률 아님. 고점 도달 시간은 4시간봉 종료 기준 상한. 현재 상장 종목 기준 생존편향, 누락 편향, 거래비용 외 슬리피지 미반영.</small></details><button id="go">30일 백테스트 시작</button><p id="phase">대기</p><progress id="bar" max="1" value="0"></progress><p id="audit" class="muted"></p><pre id="error"></pre></section><section id="out" hidden><h2>비교 결과</h2><p><label>신호 후 기간 <select id="horizon"><option value="1">1일</option><option value="3">3일</option><option value="7" selected>7일</option></select></label></p><small>7일 중복 제외 표본 · 수익률은 수수료 반영 · 도달률은 기간 중 최고가 기준</small><div class="scroll"><table id="tbl"></table></div><details><summary>급등 역추적 지표 읽는 법</summary><small>CSV capture_hit 열은 중복 제거 전 전체 평가 가능 4시간 시점 중 목표에 도달한 시점에서 각 신호가 포착한 비율. 실제 고유 급등 건수나 거래 승률이 아닙니다. 급등 사례 CSV는 7일 최고 +20% 이상 중 종목별 상위 3개, 전체 상위 100개 예시입니다. 중복 시점 포함.</small></details><div id="links"></div><p class="muted">CSV를 저장하면 이후 실시간 검색과 무관하게 보관할 수 있습니다.</p></section><script>
+const $=x=>document.getElementById(x);let data=[],loaded=null,busy=false;
+function fmt(x){return typeof x==='number'?x.toFixed(2)+'%':'—'}
+function render(){let d=$('horizon').value,t=$('tbl');t.replaceChildren();let head=t.createTHead().insertRow();for(let k of ['비교군','평가 건수','+3%','+5%','+10%','+20%','평균 최고','평균 종료','평균 최저']){let th=document.createElement('th');th.textContent=k;head.append(th)}let body=t.createTBody();for(let r of data){let tr=body.insertRow();for(let v of [r.label,r.evaluated,...[3,5,10,20].map(k=>fmt(r['hit'+k+'_'+d+'d_pct'])),fmt(r['peak_mean_'+d+'d']),fmt(r['close_mean_'+d+'d']),fmt(r['low_mean_'+d+'d'])])tr.insertCell().textContent=v}}
+$('horizon').onchange=render;
+async function poll(){if(busy)return;busy=true;try{let s=await(await fetch('/whaleback/status',{cache:'no-store'})).json();$('go').disabled=s.status==='running';$('phase').textContent=s.phase+' · '+s.done+'/'+s.total;$('bar').max=Math.max(1,s.total);$('bar').value=s.done;$('audit').textContent=(s.entry_start?'신호 '+s.entry_start+' ~ '+s.entry_end_exclusive+' (미포함) · ':'')+'오류 '+(s.error_count||0)+(s.status==='done'?' · 공통 유효 종목 '+s.valid_markets+' · 공통 평가 시점 '+s.common_evaluated_windows+' · '+s.elapsed_seconds+'초':'');$('error').textContent=(s.error_preview||[]).map(x=>(x.market||'')+' '+x.error).join('\n');if(s.status==='running'){$('out').hidden=true;loaded=null}if(s.status==='done'&&loaded!==s.scan_id){let d=await(await fetch('/whaleback/results',{cache:'no-store'})).json();if(d.scan_id!==s.scan_id)return;data=d.summary;loaded=s.scan_id;render();$('links').replaceChildren(...['summary','features','coverage','errors','events'].map((k,i)=>{let a=document.createElement('a');a.href='/whaleback/csv?kind='+k+'&scan_id='+encodeURIComponent(loaded);a.textContent=['요약 CSV','상세 CSV','수집 상태 CSV','오류 CSV','급등 사례 CSV'][i];return a}));$('out').hidden=false}}catch(e){$('phase').textContent='연결 오류: '+e.message;$('go').disabled=false}finally{busy=false}}
+$('go').onclick=async()=>{try{$('go').disabled=true;let r=await fetch('/whaleback/start',{method:'POST'});if(!r.ok||!(await r.json()).started)throw Error('이미 실행 중');$('out').hidden=true;loaded=null;poll()}catch(e){$('phase').textContent=e.message;$('go').disabled=false}};poll();setInterval(poll,2000);
+</script></html>"""
+
 class Handler(BaseHTTPRequestHandler):
     def send(self,body,ctype="application/json; charset=utf-8",status=200,filename=None):
         if not isinstance(body,bytes):body=body.encode()
@@ -3206,6 +3361,7 @@ class Handler(BaseHTTPRequestHandler):
     def js(self,data,status=200):self.send(json.dumps(data,ensure_ascii=False,allow_nan=False),status=status)
     def do_POST(self):
         u=urlparse(self.path)
+        if u.path=="/whaleback/start":return self.js({"started":wbstart()})
         if u.path=="/whale30/start":
             target=parse_qs(u.query).get("market",[""])[0].strip().upper()
             if target and not target.startswith("KRW-"):target="KRW-"+target
@@ -3266,6 +3422,25 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"started":start_job(days,threshold,today)})
     def do_GET(self):
         u=urlparse(self.path); p=u.path
+        if p=="/whaleback":return self.send(HTMLWB,"text/html; charset=utf-8")
+        if p=="/whaleback/status":
+            with WB_LOCK:
+                data={k:v for k,v in WB.items() if k not in ("summary","features","coverage","errors","events")}
+                data["error_preview"]=WB["errors"][:10]
+            return self.js(data)
+        if p=="/whaleback/results":
+            with WB_LOCK:data=dict(scan_id=WB.get("scan_id"),summary=WB["summary"])
+            return self.js(data)
+        if p=="/whaleback/csv":
+            q=parse_qs(u.query);kind=q.get("kind",["summary"])[0];scan=q.get("scan_id",[""])[0]
+            if kind not in ("summary","features","coverage","errors","events"):return self.js({"error":"invalid kind"},400)
+            with WB_LOCK:
+                if WB["status"]!="done" or scan!=WB.get("scan_id"):return self.js({"error":"scan again"},409)
+                data=list(WB[kind])
+            fields=list(dict.fromkeys(k for r in data for k in r))
+            buf=io.StringIO();writer=csv.DictWriter(buf,fieldnames=fields)
+            if fields:writer.writeheader();writer.writerows(data)
+            return self.send(("\ufeff"+buf.getvalue()).encode("utf-8"),"text/csv; charset=utf-8",filename="BITHUMB_WHALE_RESEARCH_V0_1_"+kind.upper()+"_"+now().astimezone(KST).strftime("%Y%m%d%H%M")+".csv")
         if p in ("/","/live29","/live30","/live301","/live31","/live311","/swing","/swing20","/swing21","/swing22","/swing23","/swing24","/swing25","/swing26","/swing27","/swing28"):return self.send(HTML29,"text/html; charset=utf-8")
         if p=="/live29/trend":
             markets=list(dict.fromkeys(parse_qs(u.query).get("markets",[""])[0].split(",")))
@@ -3765,7 +3940,19 @@ def selftest():
     assert whale33class(dict(volume_flat=True,candle_score=2,matched_period_count=2))=="WATCH"
     assert whale33class(dict(volume_flat=True,candle_score=2,matched_period_count=1))=="NONE"
     assert whale33class(dict(volume_flat=False,candle_score=3,matched_period_count=3))=="NONE"
-    print("REVERSE SWING V1.4.3 preserved + BITHUMB V3.1.1 LIVE self-test PASS",flush=True)
+    # Whale research synthetic regression: exact forward windows, missing data, overlap.
+    testrows=[(start+i*WBSTEP,100,106,99,100,10,1000) for i in range(250)]
+    testby={r[0]:r for r in testrows};t=start+170*WBSTEP
+    wbo=wboutcome(testby,t)
+    assert wbo and wbo["hit5_within_hours"]==4 and wbo["hit10_within_hours"] is None
+    assert wboutcome({k:v for k,v in testby.items() if k!=t+WBSTEP},t) is None
+    cv,rs,sk,rr,ev=wbeval("KRW-TEST",testrows,t,t+4*WBSTEP,"test")
+    assert cv["valid_common"]==4 and rs["ALL"]["evaluated"]==4 and sk["ALL"]==3
+    assert rs["NONE"]["signals"]==4 and len([r for r in rr if r["group"]=="ALL"])==1
+    sm=wbsummary(rs,sk,rr)
+    assert sm[0]["hit5_7d_pct"]==100 and sm[0]["capture_hit5_7d_pct"]==100
+    assert "whaleback/start" in HTMLWB
+    print("LIVE V3.1.1 preserved + WHALE RESEARCH V0.1 self-test PASS",flush=True)
 if __name__=="__main__":
     import sys
     if "--selftest" in sys.argv:selftest()
